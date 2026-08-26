@@ -7,11 +7,15 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 ## Packages
 
 - `@ubeeq/core` — neutral domain entities and lifecycle contracts.
+- `@ubeeq/auth` — authenticated-subject and authorization contracts.
+- `@ubeeq/billing` — append-only usage and credit-reservation ledger primitives.
 - `@ubeeq/extension-sdk` — versioned extension manifests and product-policy interfaces.
+- `@ubeeq/ui` — unbranded UI token, accessible-action, and localization contracts.
 - `@ubeeq/integrations` — capability vocabulary, operation gates, and executable connector conformance runner.
 - `@ubeeq/moderation` — evidence, review-case, hold, and auditable human-decision lifecycle primitives.
 - `@ubeeq/processing` — asset-processing requests and idempotent usage measurement interfaces.
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
+- `@ubeeq/federation` — remote actor and publication-reference contracts.
 - `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
