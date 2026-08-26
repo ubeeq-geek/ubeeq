@@ -1,0 +1,13 @@
+{
+  "name": "ubeeq",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {
+    "build": "npm run build --workspace @ubeeq/core && npm run build --workspace @ubeeq/extension-sdk && npm run build --workspace @ubeeq/api",
+    "test": "npm run --workspaces --if-present test"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
