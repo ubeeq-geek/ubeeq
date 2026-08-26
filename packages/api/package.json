@@ -2,11 +2,13 @@
   "name": "@ubeeq/api",
   "version": "0.1.0",
   "private": false,
+  "publishConfig": { "access": "public" },
+  "files": ["dist"],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.mjs"
   },
-  "dependencies": { "@ubeeq/extension-sdk": "file:../extension-sdk" }
+  "dependencies": { "@ubeeq/extension-sdk": "^0.1.0" }
 }

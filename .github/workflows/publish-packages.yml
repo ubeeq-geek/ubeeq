@@ -1,0 +1,32 @@
+name: Publish public packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: npm distribution tag
+        required: true
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run pack:verify
+      - run: npm publish --workspace @ubeeq/core --workspace @ubeeq/extension-sdk --workspace @ubeeq/integrations --workspace @ubeeq/moderation --workspace @ubeeq/processing --workspace @ubeeq/storage --workspace @ubeeq/api --access public --tag "${{ inputs.tag }}" --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
