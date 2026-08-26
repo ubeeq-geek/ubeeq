@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "workspaces": ["packages/*", "apps/*"],
   "scripts": {
-    "build": "npm run check:public-boundary && npm run build --workspace @ubeeq/core && npm run build --workspace @ubeeq/extension-sdk && npm run build --workspace @ubeeq/integrations && npm run build --workspace @ubeeq/moderation && npm run build --workspace @ubeeq/api",
+    "build": "npm run check:public-boundary && npm run build --workspace @ubeeq/core && npm run build --workspace @ubeeq/extension-sdk && npm run build --workspace @ubeeq/integrations && npm run build --workspace @ubeeq/moderation && npm run build --workspace @ubeeq/processing && npm run build --workspace @ubeeq/api",
     "check:public-boundary": "node scripts/check-public-boundary.mjs",
     "test": "npm run --workspaces --if-present test"
   },
