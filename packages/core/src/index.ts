@@ -213,3 +213,69 @@ export const isCollectionVisible = (collection: Pick<Collection, "status" | "vis
 
 export const isPublicationActive = (publication: Pick<Publication, "status">): boolean =>
   publication.status === "live" || publication.status === "updating";
+
+export type ContentBlockType =
+  | "section"
+  | "heading"
+  | "paragraph"
+  | "image"
+  | "video"
+  | "audio"
+  | "quote"
+  | "divider"
+  | "embed"
+  | "file"
+  | "link"
+  | "credit"
+  | "grouping"
+  | "carousel"
+  | "pdf_preview"
+  | "html_fragment";
+
+/** A portable, structured content tree. Rendering and sanitization are adapter responsibilities. */
+export interface ContentBlock {
+  id: EntityId;
+  type: ContentBlockType;
+  text?: string;
+  level?: number;
+  assetId?: EntityId;
+  fileId?: EntityId;
+  caption?: string;
+  quote?: string;
+  author?: string;
+  url?: string;
+  mimeType?: string;
+  title?: string;
+  label?: string;
+  html?: string;
+  data?: Readonly<Record<string, unknown>>;
+  children?: readonly ContentBlock[];
+}
+
+export interface ContentMediaReference {
+  assetId: EntityId;
+  discoverable?: boolean;
+  position?: number;
+  caption?: string;
+  credit?: { label: string; url?: string };
+  comparison?: {
+    type?: string;
+    role?: string;
+    order?: number;
+    item?: { assetId: EntityId; role?: string; order?: number; caption?: string; credit?: { label: string; url?: string } };
+  };
+}
+
+export const validateContentBlocks = (blocks: readonly ContentBlock[]): void => {
+  const ids = new Set<string>();
+  const visit = (items: readonly ContentBlock[]): void => {
+    for (const block of items) {
+      if (!block.id?.trim()) throw new Error("Content block id is required");
+      if (ids.has(block.id)) throw new Error(`Content block id ${block.id} is duplicated`);
+      ids.add(block.id);
+      if (block.level !== undefined && (!Number.isInteger(block.level) || block.level < 1)) throw new Error(`Content block ${block.id} has an invalid level`);
+      if (block.children) visit(block.children);
+    }
+  };
+  visit(blocks);
+};

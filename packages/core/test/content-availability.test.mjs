@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contentAvailabilityFor, isCollectionVisible, isPublicationActive } from "../dist/index.js";
+import { contentAvailabilityFor, isCollectionVisible, isPublicationActive, validateContentBlocks } from "../dist/index.js";
 
 const imported = { origin: { type: "import", remoteId: "remote-1" } };
 const local = { origin: { type: "local" } };
@@ -17,6 +17,15 @@ test("derives neutral collection visibility and publication activity", () => {
   assert.equal(isPublicationActive({ status: "live" }), true);
   assert.equal(isPublicationActive({ status: "updating" }), true);
   assert.equal(isPublicationActive({ status: "queued" }), false);
+});
+
+test("validates a portable, nested content tree", () => {
+  assert.doesNotThrow(() => validateContentBlocks([
+    { id: "section", type: "section", children: [{ id: "paragraph", type: "paragraph", text: "Hello" }] },
+    { id: "image", type: "image", assetId: "asset" }
+  ]));
+  assert.throws(() => validateContentBlocks([{ id: "same", type: "paragraph" }, { id: "same", type: "quote" }]), /duplicated/);
+  assert.throws(() => validateContentBlocks([{ id: "heading", type: "heading", level: 0 }]), /invalid level/);
 });
 
 test("derives neutral content availability from assets and origin", () => {
