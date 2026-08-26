@@ -1,15 +1,9 @@
 /** Product-neutral remote integration capabilities. */
-export type IntegrationCapability =
-  | "connect"
-  | "catalogue_import"
-  | "source_migration"
-  | "publish"
-  | "remote_update"
-  | "remote_delete"
-  | "engagement_read"
-  | "engagement_write"
-  | "webhook_receive"
-  | "reconcile";
+export const INTEGRATION_CAPABILITIES = [
+  "connect", "catalogue_import", "source_migration", "publish", "remote_update",
+  "remote_delete", "engagement_read", "engagement_write", "webhook_receive", "reconcile"
+] as const;
+export type IntegrationCapability = (typeof INTEGRATION_CAPABILITIES)[number];
 
 export type IntegrationOperation =
   | "connect"
@@ -71,4 +65,3 @@ export const runIntegrationConformanceSuite = async (adapter: IntegrationConform
     }
   }
 };
-
