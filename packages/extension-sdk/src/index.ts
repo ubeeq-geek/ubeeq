@@ -10,6 +10,15 @@ export type ExtensionContract =
   | "federation-policy"
   | "operations";
 
+export type IntegrationCapability =
+  | "import.metadata"
+  | "import.media"
+  | "publish.work"
+  | "publish.announcement"
+  | "sync.comments"
+  | "sync.activity"
+  | "delete.remote";
+
 export interface ExtensionManifest {
   id: string;
   apiVersion: ExtensionApiVersion;
@@ -61,6 +70,12 @@ export interface IntegrationProvider {
   isEnabled(input: { integrationId: string; accountId: string }): Promise<boolean>;
 }
 
+export interface IntegrationConnectorManifest {
+  id: string;
+  apiVersion: ExtensionApiVersion;
+  capabilities: readonly IntegrationCapability[];
+}
+
 export interface FederationPolicy {
   id: string;
   apiVersion: ExtensionApiVersion;
@@ -77,9 +92,16 @@ export const validateExtensionManifest = (
   manifest: ExtensionManifest,
   requiredContracts: readonly ExtensionContract[]
 ): void => {
+  if (!/^[a-z0-9][a-z0-9.-]*$/.test(manifest.id)) throw new Error(`Extension id ${manifest.id} is invalid`);
   if (manifest.apiVersion !== EXTENSION_API_VERSION) throw new Error(`Extension ${manifest.id} requires unsupported API version ${manifest.apiVersion}`);
+  if (new Set(manifest.contracts).size !== manifest.contracts.length) throw new Error(`Extension ${manifest.id} declares duplicate contracts`);
   for (const contract of requiredContracts) {
     if (!manifest.contracts.includes(contract)) throw new Error(`Extension ${manifest.id} does not implement required contract ${contract}`);
   }
 };
 
+export const validateIntegrationConnectorManifest = (manifest: IntegrationConnectorManifest): void => {
+  if (!/^[a-z0-9][a-z0-9.-]*$/.test(manifest.id)) throw new Error(`Integration connector id ${manifest.id} is invalid`);
+  if (manifest.apiVersion !== EXTENSION_API_VERSION) throw new Error(`Integration connector ${manifest.id} requires unsupported API version ${manifest.apiVersion}`);
+  if (new Set(manifest.capabilities).size !== manifest.capabilities.length) throw new Error(`Integration connector ${manifest.id} declares duplicate capabilities`);
+};
