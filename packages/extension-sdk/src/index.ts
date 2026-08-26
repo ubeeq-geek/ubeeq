@@ -1,23 +1,27 @@
 export const EXTENSION_API_VERSION = "1" as const;
 export type ExtensionApiVersion = typeof EXTENSION_API_VERSION;
 
-export type ExtensionContract =
-  | "brand"
-  | "moderation-policy"
-  | "billing-provider"
-  | "discovery"
-  | "integration-provider"
-  | "federation-policy"
-  | "operations";
+export const EXTENSION_CONTRACTS = [
+  "brand",
+  "moderation-policy",
+  "billing-provider",
+  "discovery",
+  "integration-provider",
+  "federation-policy",
+  "operations"
+] as const;
+export type ExtensionContract = (typeof EXTENSION_CONTRACTS)[number];
 
-export type IntegrationCapability =
-  | "import.metadata"
-  | "import.media"
-  | "publish.work"
-  | "publish.announcement"
-  | "sync.comments"
-  | "sync.activity"
-  | "delete.remote";
+export const INTEGRATION_CAPABILITIES = [
+  "import.metadata",
+  "import.media",
+  "publish.work",
+  "publish.announcement",
+  "sync.comments",
+  "sync.activity",
+  "delete.remote"
+] as const;
+export type IntegrationCapability = (typeof INTEGRATION_CAPABILITIES)[number];
 
 export interface ExtensionManifest {
   id: string;
