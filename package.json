@@ -6,6 +6,7 @@
   "scripts": {
     "build": "npm run check:public-boundary && npm run build --workspace @ubeeq/core && npm run build --workspace @ubeeq/extension-sdk && npm run build --workspace @ubeeq/integrations && npm run build --workspace @ubeeq/moderation && npm run build --workspace @ubeeq/processing && npm run build --workspace @ubeeq/storage && npm run build --workspace @ubeeq/api",
     "check:public-boundary": "node scripts/check-public-boundary.mjs",
+    "dev:reference": "npm run start --workspace @ubeeq/web-reference",
     "pack:verify": "npm run build && npm pack --dry-run --workspace @ubeeq/core && npm pack --dry-run --workspace @ubeeq/extension-sdk && npm pack --dry-run --workspace @ubeeq/integrations && npm pack --dry-run --workspace @ubeeq/moderation && npm pack --dry-run --workspace @ubeeq/processing && npm pack --dry-run --workspace @ubeeq/storage && npm pack --dry-run --workspace @ubeeq/api",
     "test": "npm run --workspaces --if-present test"
   },
