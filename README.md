@@ -11,6 +11,7 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/integrations` — capability vocabulary, operation gates, and executable connector conformance runner.
 - `@ubeeq/moderation` — evidence, review-case, hold, and auditable human-decision lifecycle primitives.
 - `@ubeeq/processing` — asset-processing requests and idempotent usage measurement interfaces.
+- `@ubeeq/storage` — object storage and delivery adapter interfaces.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
 
