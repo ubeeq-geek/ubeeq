@@ -6,7 +6,11 @@ import {
   requireIntegrationOperation,
   runIntegrationConformanceSuite,
   recordRemotePublicationState,
-  scheduleRemotePublicationRetry
+  scheduleRemotePublicationRetry,
+  stableReconciliationJson,
+  diffReconciliationSnapshots,
+  reconciliationStatus,
+  resolveReconciliation
 } from "../dist/index.js";
 
 const definition = {
@@ -63,4 +67,17 @@ test("records remote publication state and preserves retry idempotency", () => {
   const first = scheduleRemotePublicationRetry(deleted, { idempotencyKey: "key-1", connectionCooldownUntil: "later", now: "now" });
   const second = scheduleRemotePublicationRetry(first, { idempotencyKey: "key-2", now: "later" });
   assert.deepEqual(second.sync.retry, { idempotencyKey: "key-1", attempt: 2, connectionCooldownUntil: "later", nextAttemptAt: undefined });
+});
+
+test("normalizes, classifies, and explicitly resolves reconciliation", () => {
+  assert.equal(stableReconciliationJson({ tags: ["b", "a"], title: "Work" }), stableReconciliationJson({ title: "Work", tags: ["a", "b"] }));
+  const nonConflicting = diffReconciliationSnapshots({ title: "Original", tags: ["one"] }, { title: "Local", tags: ["one"] }, { title: "Original", tags: ["two"] });
+  assert.equal(reconciliationStatus(nonConflicting), "non_conflicting_changes");
+  const conflict = diffReconciliationSnapshots({ title: "Original" }, { title: "Local" }, { title: "Remote" });
+  assert.equal(reconciliationStatus(conflict), "conflict");
+  assert.throws(() => resolveReconciliation({}, {}, { action: "accept_remote", confirmed: false }), /confirmation/);
+  assert.deepEqual(
+    resolveReconciliation({ title: "Local" }, { title: "Remote", remoteId: "provider-id" }, { action: "create_detached_copy", confirmed: true }, { detachedCopyExcludedKeys: ["remoteId"] }),
+    { local: { title: "Local" }, detachedCopy: { title: "Remote" } }
+  );
 });

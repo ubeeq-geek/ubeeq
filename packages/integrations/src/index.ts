@@ -134,3 +134,75 @@ export const scheduleRemotePublicationRetry = <T extends RemotePublicationRecord
   },
   updatedAt: input.now || new Date().toISOString()
 }) as T;
+
+/** A normalized, user-meaningful projection supplied by an adapter; never pass raw provider payloads. */
+export type ReconciliationSnapshot = Readonly<Record<string, unknown>>;
+export interface ReconciliationFieldDiff {
+  field: string;
+  lastSynced: unknown;
+  local: unknown;
+  remote: unknown;
+  localChanged: boolean;
+  remoteChanged: boolean;
+  conflict: boolean;
+}
+export type ReconciliationStatus = "in_sync" | "local_newer" | "remote_newer" | "non_conflicting_changes" | "conflict";
+export type ReconciliationAction = "accept_remote" | "keep_local" | "create_detached_copy";
+export interface ReconciliationResolution { action: ReconciliationAction; confirmed: boolean; }
+export interface ReconciliationResolutionResult { local: Record<string, unknown>; detachedCopy?: Record<string, unknown>; }
+
+const stableReconciliationValue = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(stableReconciliationValue).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, item]) => [key, stableReconciliationValue(item)]));
+  return value;
+};
+
+/** A deterministic serialization suitable for adapter-owned fingerprints. */
+export const stableReconciliationJson = (snapshot: ReconciliationSnapshot): string => JSON.stringify(stableReconciliationValue(snapshot));
+const equalReconciliationValues = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(stableReconciliationValue(left)) === JSON.stringify(stableReconciliationValue(right));
+
+export const diffReconciliationSnapshots = (
+  lastSynced: ReconciliationSnapshot,
+  local: ReconciliationSnapshot,
+  remote: ReconciliationSnapshot
+): ReconciliationFieldDiff[] => {
+  const fields = [...new Set([...Object.keys(lastSynced), ...Object.keys(local), ...Object.keys(remote)])].sort();
+  return fields.map((field) => {
+    const baseline = lastSynced[field];
+    const localValue = local[field];
+    const remoteValue = remote[field];
+    const localChanged = !equalReconciliationValues(baseline, localValue);
+    const remoteChanged = !equalReconciliationValues(baseline, remoteValue);
+    return {
+      field, lastSynced: baseline, local: localValue, remote: remoteValue, localChanged, remoteChanged,
+      conflict: localChanged && remoteChanged && !equalReconciliationValues(localValue, remoteValue)
+    };
+  }).filter((diff) => diff.localChanged || diff.remoteChanged);
+};
+
+export const reconciliationStatus = (diffs: readonly ReconciliationFieldDiff[]): ReconciliationStatus => {
+  if (diffs.some((diff) => diff.conflict)) return "conflict";
+  const localChanged = diffs.some((diff) => diff.localChanged);
+  const remoteChanged = diffs.some((diff) => diff.remoteChanged);
+  return localChanged && remoteChanged ? "non_conflicting_changes" : localChanged ? "local_newer" : remoteChanged ? "remote_newer" : "in_sync";
+};
+
+/** Destructive or duplicating reconciliation choices require an explicit acknowledgement. */
+export const resolveReconciliation = (
+  local: ReconciliationSnapshot,
+  remote: ReconciliationSnapshot,
+  resolution: ReconciliationResolution,
+  options: { detachedCopyExcludedKeys?: readonly string[] } = {}
+): ReconciliationResolutionResult => {
+  if (!resolution.confirmed) throw new Error("Explicit reconciliation confirmation is required.");
+  if (resolution.action === "accept_remote") return { local: { ...remote } };
+  if (resolution.action === "keep_local") return { local: { ...local } };
+  if (resolution.action === "create_detached_copy") {
+    const excluded = new Set(options.detachedCopyExcludedKeys || []);
+    return { local: { ...local }, detachedCopy: Object.fromEntries(Object.entries(remote).filter(([key]) => !excluded.has(key))) };
+  }
+  throw new Error("Unsupported reconciliation action.");
+};
