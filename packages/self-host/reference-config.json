@@ -1,0 +1,9 @@
+{
+  "instanceId": "my-ubeeq-instance",
+  "publicOrigin": "https://example.invalid",
+  "storage": {
+    "adapter": "local",
+    "dataDirectory": "/var/lib/ubeeq"
+  },
+  "extensions": []
+}

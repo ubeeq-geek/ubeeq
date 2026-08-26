@@ -12,6 +12,7 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/moderation` — evidence, review-case, hold, and auditable human-decision lifecycle primitives.
 - `@ubeeq/processing` — asset-processing requests and idempotent usage measurement interfaces.
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
+- `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
 
@@ -24,3 +25,7 @@ The SDK also defines platform-neutral integration capabilities, such as metadata
 ## Repository boundary
 
 Public Ubeeq code may provide reusable mechanisms such as storage, processing, audit, authorization hooks, federation protocols, and integration lifecycle contracts. Product policy, branding, commercial plans, discovery decisions, operational procedures, and credentials belong in private product repositories.
+
+## Self-hosting reference configuration
+
+[`packages/self-host/reference-config.json`](packages/self-host/reference-config.json) is a product-neutral starting point. Replace its example origin and local storage path, provide any desired extension manifests, and validate the resulting configuration with `@ubeeq/self-host`. It contains neither hosted product settings nor credentials.
