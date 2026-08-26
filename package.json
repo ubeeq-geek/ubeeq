@@ -8,7 +8,8 @@
     "check:public-boundary": "node scripts/check-public-boundary.mjs",
     "dev:reference": "npm run start --workspace @ubeeq/web-reference",
     "pack:verify": "npm run build && npm pack --dry-run --workspace @ubeeq/core && npm pack --dry-run --workspace @ubeeq/extension-sdk && npm pack --dry-run --workspace @ubeeq/integrations && npm pack --dry-run --workspace @ubeeq/moderation && npm pack --dry-run --workspace @ubeeq/processing && npm pack --dry-run --workspace @ubeeq/storage && npm pack --dry-run --workspace @ubeeq/api",
-    "test": "npm run --workspaces --if-present test"
+    "test": "npm run --workspaces --if-present test && npm run test:landing",
+    "test:landing": "node scripts/validate-landing.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
