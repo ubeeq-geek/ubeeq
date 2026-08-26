@@ -106,3 +106,110 @@ export const contentAvailabilityFor = (work: Pick<Work, "origin">, assets: WorkW
   if (hosted.some((asset) => asset.metadata?.sourceCopyQuality !== "display_copy")) return "original_hosted";
   return hosted.length ? "display_copy" : "external_reference";
 };
+
+export type CreatorStatus = "active" | "inactive";
+export type CollectionType = "collection" | "gallery" | "series" | "playlist";
+export type CollectionStatus = "draft" | "published" | "archived" | "deleted";
+export type PublicationVisibility = "private" | "unlisted" | "public";
+export type PublicationStatus = "draft" | "scheduled" | "queued" | "publishing" | "live" | "updating" | "failed" | "missing" | "removed" | "unknown";
+export type PublicationSyncStatus = "not_applicable" | "in_sync" | "local_newer" | "remote_newer" | "conflict" | "error" | "unknown";
+export type PublicationIntentStatus = "draft" | "live" | "scheduled";
+
+export interface Creator {
+  id: EntityId;
+  instanceId: EntityId;
+  name: string;
+  slug: string;
+  slugHistory: readonly string[];
+  bio?: string;
+  links?: readonly { label: string; url: string }[];
+  status: CreatorStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Collection {
+  id: EntityId;
+  instanceId: EntityId;
+  creatorId: EntityId;
+  type: CollectionType;
+  title: string;
+  slug: string;
+  slugHistory: readonly string[];
+  description?: string;
+  coverAssetId?: EntityId;
+  status: CollectionStatus;
+  visibility: PublicationVisibility;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+  deletedAt?: string;
+}
+
+export interface CollectionWork {
+  collectionId: EntityId;
+  workId: EntityId;
+  position: number;
+  addedAt: string;
+}
+
+export interface PublicationReconciliationField {
+  field: string;
+  lastSynced: unknown;
+  local: unknown;
+  remote: unknown;
+  localChanged: boolean;
+  remoteChanged: boolean;
+  conflict: boolean;
+}
+
+export interface Publication {
+  id: EntityId;
+  instanceId: EntityId;
+  creatorId: EntityId;
+  workId: EntityId;
+  /** Product extensions choose a destination; Ubeeq core does not maintain a provider list. */
+  destinationId: string;
+  connectionId?: EntityId;
+  status: PublicationStatus;
+  visibility: PublicationVisibility;
+  remoteId?: string;
+  remoteUrl?: string;
+  metadataOverrides?: Readonly<{ title?: string; description?: string; tags?: readonly string[]; fields?: Readonly<Record<string, unknown>> }>;
+  sync: {
+    status: PublicationSyncStatus;
+    lastAttemptAt?: string;
+    lastSuccessfulAt?: string;
+    localRevision?: number;
+    remoteMetadataFingerprint?: string;
+    remoteContentFingerprint?: string;
+    retry?: { idempotencyKey: string; attempt: number; nextAttemptAt?: string; connectionCooldownUntil?: string };
+    errorCode?: string;
+    errorMessage?: string;
+    reconciliation?: { status: "in_sync" | "local_newer" | "remote_newer" | "non_conflicting_changes" | "conflict"; fields: readonly PublicationReconciliationField[]; updatedAt: string };
+  };
+  createdAt: string;
+  updatedAt: string;
+  publishedAt?: string;
+  removedAt?: string;
+}
+
+export interface PublicationIntent {
+  id: EntityId;
+  instanceId: EntityId;
+  creatorId: EntityId;
+  workId: EntityId;
+  destinationId: string;
+  connectionId?: EntityId;
+  enabled: boolean;
+  desiredStatus: PublicationIntentStatus;
+  scheduledAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const isCollectionVisible = (collection: Pick<Collection, "status" | "visibility">): boolean =>
+  collection.status === "published" && collection.visibility !== "private";
+
+export const isPublicationActive = (publication: Pick<Publication, "status">): boolean =>
+  publication.status === "live" || publication.status === "updating";
