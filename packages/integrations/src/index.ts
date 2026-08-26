@@ -65,3 +65,72 @@ export const runIntegrationConformanceSuite = async (adapter: IntegrationConform
     }
   }
 };
+
+export type RemotePublicationState = "active" | "missing" | "restricted" | "deleted" | "unknown";
+export type RemotePublicationStatus = "draft" | "scheduled" | "queued" | "publishing" | "live" | "updating" | "failed" | "missing" | "removed" | "unknown";
+export type RemotePublicationSyncStatus = "not_applicable" | "in_sync" | "local_newer" | "remote_newer" | "conflict" | "error" | "unknown";
+
+export interface RemotePublicationRecord {
+  status: RemotePublicationStatus;
+  sync: {
+    status: RemotePublicationSyncStatus;
+    remoteCursor?: string;
+    remoteMetadataFingerprint?: string;
+    remoteContentFingerprint?: string;
+    remoteState?: "active" | "missing" | "restricted" | "unknown";
+    lastSuccessfulAt?: string;
+    errorCode?: string;
+    errorMessage?: string;
+    retry?: { idempotencyKey: string; attempt: number; nextAttemptAt?: string; connectionCooldownUntil?: string };
+  };
+  updatedAt: string;
+}
+
+export const publicationStatusForRemoteState = (state: RemotePublicationState): RemotePublicationStatus =>
+  state === "missing" ? "missing" : state === "deleted" ? "removed" : "unknown";
+
+export const syncStatusForRemoteState = (state: RemotePublicationState): RemotePublicationSyncStatus =>
+  state === "active" ? "in_sync" : state === "unknown" ? "unknown" : "remote_newer";
+
+/** Records one normalized remote observation without exposing provider payloads in the common contract. */
+export const recordRemotePublicationState = <T extends RemotePublicationRecord>(
+  publication: T,
+  state: RemotePublicationState,
+  input: { cursor?: string; metadataFingerprint?: string; contentFingerprint?: string; observedAt?: string; reason?: string }
+): T => {
+  const observedAt = input.observedAt || new Date().toISOString();
+  return {
+    ...publication,
+    ...(state === "active" ? {} : { status: publicationStatusForRemoteState(state) }),
+    sync: {
+      ...publication.sync,
+      status: syncStatusForRemoteState(state),
+      remoteCursor: input.cursor || publication.sync.remoteCursor,
+      remoteMetadataFingerprint: input.metadataFingerprint || publication.sync.remoteMetadataFingerprint,
+      remoteContentFingerprint: input.contentFingerprint || publication.sync.remoteContentFingerprint,
+      remoteState: state === "deleted" ? "missing" : state,
+      ...(state === "active"
+        ? { lastSuccessfulAt: observedAt, errorCode: undefined, errorMessage: undefined }
+        : { errorCode: `REMOTE_${state.toUpperCase()}`, errorMessage: input.reason })
+    },
+    updatedAt: observedAt
+  } as T;
+};
+
+/** Preserves one idempotency key and does not discard an existing connection-wide cooldown. */
+export const scheduleRemotePublicationRetry = <T extends RemotePublicationRecord>(
+  publication: T,
+  input: { idempotencyKey: string; nextAttemptAt?: string; connectionCooldownUntil?: string; now?: string }
+): T => ({
+  ...publication,
+  sync: {
+    ...publication.sync,
+    retry: {
+      idempotencyKey: publication.sync.retry?.idempotencyKey || input.idempotencyKey,
+      attempt: (publication.sync.retry?.attempt || 0) + 1,
+      nextAttemptAt: input.nextAttemptAt ?? publication.sync.retry?.nextAttemptAt,
+      connectionCooldownUntil: input.connectionCooldownUntil ?? publication.sync.retry?.connectionCooldownUntil
+    }
+  },
+  updatedAt: input.now || new Date().toISOString()
+}) as T;

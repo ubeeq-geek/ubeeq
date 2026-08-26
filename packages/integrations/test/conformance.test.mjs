@@ -4,7 +4,9 @@ import {
   INTEGRATION_CAPABILITIES,
   UnsupportedIntegrationOperationError,
   requireIntegrationOperation,
-  runIntegrationConformanceSuite
+  runIntegrationConformanceSuite,
+  recordRemotePublicationState,
+  scheduleRemotePublicationRetry
 } from "../dist/index.js";
 
 const definition = {
@@ -45,4 +47,20 @@ test("requires executable evidence for every conformance scenario", async () => 
     scenarios: { ...passingAdapter.scenarios, "oauth-expiry": async () => ({ assertions: 0, summary: "none" }) }
   };
   await assert.rejects(() => runIntegrationConformanceSuite(invalidAdapter), /did not report executable assertions/);
+});
+
+test("records remote publication state and preserves retry idempotency", () => {
+  const publication = { status: "live", sync: { status: "in_sync", errorCode: "OLD", errorMessage: "old" }, updatedAt: "before" };
+  const active = recordRemotePublicationState(publication, "active", { observedAt: "2026-01-01T00:00:00.000Z" });
+  assert.equal(active.status, "live");
+  assert.equal(active.sync.status, "in_sync");
+  assert.equal(active.sync.errorCode, undefined);
+  const deleted = recordRemotePublicationState(active, "deleted", { observedAt: "2026-01-02T00:00:00.000Z", reason: "removed remotely" });
+  assert.equal(deleted.status, "removed");
+  assert.equal(deleted.sync.remoteState, "missing");
+  assert.equal(deleted.sync.errorCode, "REMOTE_DELETED");
+
+  const first = scheduleRemotePublicationRetry(deleted, { idempotencyKey: "key-1", connectionCooldownUntil: "later", now: "now" });
+  const second = scheduleRemotePublicationRetry(first, { idempotencyKey: "key-2", now: "later" });
+  assert.deepEqual(second.sync.retry, { idempotencyKey: "key-1", attempt: 2, connectionCooldownUntil: "later", nextAttemptAt: undefined });
 });
