@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/adapters-local";
-import type { IdentityAdapter, PasswordIdentityAdapter } from "@ubeeq/auth";
+import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
@@ -11,6 +11,7 @@ import { validateRemotePublicationEvent, verifyFederationEnvelope, type Federati
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import { CellOwnershipError, type AssetRecord, type CreatorRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
 import { cellScopedObjectKey, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
+import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 const json = (response: ServerResponse, status: number, body: unknown, requestId: string): void => {
   response.statusCode = status; response.setHeader("content-type", "application/json; charset=utf-8"); response.setHeader("x-request-id", requestId); response.end(JSON.stringify(body));
@@ -36,6 +37,13 @@ export type ReferenceAdapterSet = {
   federation?: FederationSignatureVerifier & FederationReplayStore & { keyId: string; publicKey: string };
 };
 
+export interface RegionalControlPlane {
+  routingDirectory: RoutingDirectory;
+  migrationCheckpoints: MigrationCheckpointStore;
+  /** Omitted in read-only cell runtimes; migrations execute in a dedicated control-plane worker. */
+  orchestrator?: MigrationOrchestrator;
+}
+
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   publicBaseUrl: string;
   instanceId?: string;
@@ -46,6 +54,9 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   federationVerifier?: FederationSignatureVerifier;
   mediaProcessor?: MediaProcessor;
   adapters?: ReferenceAdapterSet;
+  regionalControlPlane?: RegionalControlPlane;
+  /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
+  operatorAuthorization?: AuthorizationRequirement;
   diagnostics?: readonly DependencyDiagnostic[];
 }
 
@@ -87,6 +98,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     const verified = await adapters.identity.verifySession({ credential });
     if (!verified) throw new HttpError(401, "authentication_invalid", "The session is invalid or expired");
     return verified;
+  };
+  const operatorSession = async (request: IncomingMessage) => {
+    if (!configuration.operatorAuthorization) throw new HttpError(404, "operations_unavailable", "Regional operator operations are not configured");
+    const authenticated = await session(request);
+    requireAuthorization(authenticated.subject, configuration.operatorAuthorization);
+    return authenticated;
+  };
+  const regionalControl = (): RegionalControlPlane => {
+    if (!configuration.regionalControlPlane) throw new HttpError(503, "regional_control_unavailable", "This cell is not configured with a managed routing control plane");
+    return configuration.regionalControlPlane;
   };
   const creatorFor = async (subjectId: string): Promise<CreatorRecord> => {
     let cursor: string | undefined;
@@ -163,6 +184,44 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         return json(response, ready ? 200 : 503, { ok: ready, status: ready ? "ok" : "degraded", cell: composition.configuration.cell, routingRevision: 1, dependencies, requestId }, requestId);
       }
       if (!url.pathname.startsWith("/v1/")) throw new HttpError(404, "not_found", "Route was not found");
+
+      const routeMatch = url.pathname.match(/^\/v1\/routing\/creators\/([^/]+)$/);
+      if (method === "GET" && routeMatch) {
+        const route = await regionalControl().routingDirectory.get(routeMatch[1]);
+        if (!route) throw new HttpError(404, "routing_not_found", "No home cell route exists for this creator");
+        const requestedPath = url.searchParams.get("path");
+        if (requestedPath) {
+          const redirected = routeToHomeCell(route, requestedPath);
+          response.statusCode = 307; response.setHeader("location", redirected.location); response.setHeader("x-request-id", requestId); response.end(); return;
+        }
+        return json(response, 200, { route: { creatorId: route.creatorId, homeCellId: route.homeCellId, homeRegion: route.homeRegion, endpoint: route.endpoint, routingRevision: route.routingRevision, state: route.state }, requestId }, requestId);
+      }
+
+      if (method === "POST" && url.pathname === "/v1/migrations") {
+        const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator);
+        const body = await parseBody(request); const orchestrator = regionalControl().orchestrator; if (!orchestrator) throw new HttpError(503, "migration_worker_unavailable", "This cell has read-only routing access; migration execution is not configured"); const checkpoint = await orchestrator.request({ id: randomUUID(), creatorId: creator.id, destination: { cellId: requireString(body.destinationCellId, "destinationCellId"), region: requireString(body.destinationRegion, "destinationRegion"), endpoint: requireString(body.destinationEndpoint, "destinationEndpoint") } });
+        await audit({ action: "regional_migration.requested", actorId: identity.subject.id, subjectId: creator.id, payload: { migrationId: checkpoint.id, destinationCellId: checkpoint.destination.cellId } });
+        return json(response, 202, { migration: checkpoint, requestId }, requestId);
+      }
+      if (method === "GET" && url.pathname === "/v1/migrations/me") {
+        const identity = await session(request); const creator = await creatorFor(identity.subject.id); const page = await regionalControl().migrationCheckpoints.list({ creatorId: creator.id, ...pageRequest(url) });
+        return json(response, 200, { migrations: page.items, nextCursor: page.nextCursor, requestId }, requestId);
+      }
+      if (method === "GET" && url.pathname === "/v1/operations/regional/routes") {
+        await operatorSession(request); const page = await regionalControl().routingDirectory.list(pageRequest(url));
+        return json(response, 200, { routes: page.items, nextCursor: page.nextCursor, requestId }, requestId);
+      }
+      if (method === "GET" && url.pathname === "/v1/operations/regional/migrations") {
+        await operatorSession(request); const page = await regionalControl().migrationCheckpoints.list({ creatorId: url.searchParams.get("creatorId") || undefined, ...pageRequest(url) });
+        return json(response, 200, { migrations: page.items, nextCursor: page.nextCursor, requestId }, requestId);
+      }
+      const regionalOperationMatch = url.pathname.match(/^\/v1\/operations\/regional\/migrations\/([^/]+)\/(resume|rollback|retire)$/);
+      if (method === "POST" && regionalOperationMatch) {
+        const identity = await operatorSession(request); const [, migrationId, operation] = regionalOperationMatch;
+        const control = regionalControl(); if (!control.orchestrator) throw new HttpError(503, "migration_worker_unavailable", "This cell has read-only routing access; migration execution is not configured"); const migration = operation === "resume" ? await control.orchestrator.resume(migrationId) : operation === "rollback" ? await control.orchestrator.rollback(migrationId) : await control.orchestrator.retire(migrationId);
+        await audit({ action: `regional_migration.${operation}`, actorId: identity.subject.id, subjectId: migration.creatorId, payload: { migrationId } });
+        return json(response, 200, { migration, requestId }, requestId);
+      }
 
       if (method === "POST" && url.pathname === "/v1/federation/inbox") {
         const body = await parseBody(request); const envelope = body.envelope as Parameters<typeof verifyFederationEnvelope>[0];
@@ -270,8 +329,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : error instanceof AdmissionBlockedError ? 409 : error instanceof CellRoutingError || error instanceof CellOwnershipError ? 409 : 500;
-      const code = error instanceof HttpError ? error.code : error instanceof AdmissionBlockedError ? "admission_blocked" : error instanceof CellRoutingError || error instanceof CellOwnershipError ? "foreign_cell" : "internal_error";
+      const status = error instanceof HttpError ? error.status : error instanceof AuthorizationDeniedError ? 403 : error instanceof AdmissionBlockedError ? 409 : error instanceof CellRoutingError || error instanceof CellOwnershipError ? 409 : 500;
+      const code = error instanceof HttpError ? error.code : error instanceof AuthorizationDeniedError ? "authorization_denied" : error instanceof AdmissionBlockedError ? "admission_blocked" : error instanceof CellRoutingError || error instanceof CellOwnershipError ? "foreign_cell" : "internal_error";
       const message = error instanceof Error ? error.message : "Unexpected error";
       const details = error instanceof AdmissionBlockedError ? error.decision : undefined;
       json(response, status, { error: { code, message, requestId, ...(details ? { details } : {}) } }, requestId);

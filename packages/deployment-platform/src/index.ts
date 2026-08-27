@@ -54,6 +54,84 @@ export class RoutingDirectoryConflictError extends Error {
   constructor(message: string) { super(message); this.name = "RoutingDirectoryConflictError"; }
 }
 
+/** Provider-specific workers perform these idempotent operations; core owns only the lifecycle. */
+export interface MigrationExecutor {
+  placeSourceHold(checkpoint: MigrationCheckpoint): Promise<void>;
+  exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number }>;
+  transferObjects(checkpoint: MigrationCheckpoint): Promise<void>;
+  importDestination(checkpoint: MigrationCheckpoint): Promise<void>;
+  verifyDestination(checkpoint: MigrationCheckpoint): Promise<{ objectCount: number; verifiedObjectCount: number }>;
+  enableDestination(checkpoint: MigrationCheckpoint): Promise<void>;
+  rollbackDestination(checkpoint: MigrationCheckpoint): Promise<void>;
+  retireSource(checkpoint: MigrationCheckpoint): Promise<void>;
+}
+
+/**
+ * Resumable migration coordinator. Each provider operation must be idempotent:
+ * a process may stop after a remote operation but before the checkpoint write.
+ * No source deletion occurs before explicit post-cutover retirement.
+ */
+export class MigrationOrchestrator {
+  private lastTimestamp = 0;
+  constructor(private readonly routes: RoutingDirectory, private readonly checkpoints: MigrationCheckpointStore, private readonly executor: MigrationExecutor, private readonly clock: () => string = () => new Date().toISOString()) {}
+  async request(input: { id: string; creatorId: string; destination: { cellId: string; region: string; endpoint: string } }): Promise<MigrationCheckpoint> {
+    const source = await this.routes.get(input.creatorId);
+    if (!source) throw new Error(`No routing entry exists for creator ${input.creatorId}.`);
+    const checkpoint = createMigrationCheckpoint({ id: input.id, creatorId: input.creatorId, source, destination: input.destination, now: this.now() });
+    return this.checkpoints.create(checkpoint);
+  }
+  async resume(id: string, rollbackWindowSeconds = 86_400): Promise<MigrationCheckpoint> {
+    let checkpoint = await this.required(id);
+    if (checkpoint.state === "requested") { await this.executor.placeSourceHold(checkpoint); checkpoint = await this.advance(checkpoint, "source_hold"); }
+    if (checkpoint.state === "source_hold") { const exported = await this.executor.exportSource(checkpoint); checkpoint = await this.advance(checkpoint, "exported", exported); }
+    if (checkpoint.state === "exported") { await this.executor.transferObjects(checkpoint); checkpoint = await this.advance(checkpoint, "transferred"); }
+    if (checkpoint.state === "transferred") { await this.executor.importDestination(checkpoint); const verified = await this.executor.verifyDestination(checkpoint); checkpoint = await this.advance(checkpoint, "verified", verified); }
+    if (checkpoint.state === "verified") {
+      await this.executor.enableDestination(checkpoint);
+      const route = await this.routes.get(checkpoint.creatorId);
+      if (!route) throw new Error(`No routing entry exists for creator ${checkpoint.creatorId}.`);
+      const alreadyCutOver = route.homeCellId === checkpoint.destination.cellId && route.homeRegion === checkpoint.destination.region && route.endpoint === checkpoint.destination.endpoint && route.routingRevision === checkpoint.source.routingRevision + 1;
+      if (!alreadyCutOver) {
+        const nextRoute = cutoverCellRoute(route, checkpoint, this.now());
+        await this.routes.compareAndSwap({ route: nextRoute, expectedRoutingRevision: route.routingRevision });
+      }
+      checkpoint = await this.advance(checkpoint, "cutover", { rollbackUntil: new Date(Date.parse(this.now()) + rollbackWindowSeconds * 1_000).toISOString() });
+    }
+    return checkpoint;
+  }
+  async rollback(id: string): Promise<MigrationCheckpoint> {
+    const checkpoint = await this.required(id);
+    if (checkpoint.state !== "cutover") throw new MigrationTransitionError("Only a cut-over migration can roll back.");
+    const route = await this.routes.get(checkpoint.creatorId);
+    if (!route) throw new Error(`No routing entry exists for creator ${checkpoint.creatorId}.`);
+    await this.executor.rollbackDestination(checkpoint);
+    const restored = rollbackCellRoute(route, checkpoint, this.now());
+    await this.routes.compareAndSwap({ route: restored, expectedRoutingRevision: route.routingRevision });
+    return this.advance(checkpoint, "rolled_back");
+  }
+  async retire(id: string): Promise<MigrationCheckpoint> {
+    const checkpoint = await this.required(id);
+    if (checkpoint.state !== "cutover") throw new MigrationTransitionError("Only a cut-over migration can retire its source.");
+    if (checkpoint.rollbackUntil && Date.parse(checkpoint.rollbackUntil) > Date.parse(this.now())) throw new MigrationTransitionError("The rollback retention window has not expired.");
+    await this.executor.retireSource(checkpoint);
+    return this.advance(checkpoint, "retired");
+  }
+  private async required(id: string): Promise<MigrationCheckpoint> { const checkpoint = await this.checkpoints.get(id); if (!checkpoint) throw new Error(`Migration checkpoint ${id} was not found.`); return checkpoint; }
+  private async advance(checkpoint: MigrationCheckpoint, state: MigrationState, input: Omit<Parameters<typeof advanceMigration>[2], "now"> = {}): Promise<MigrationCheckpoint> {
+    const next = advanceMigration(checkpoint, state, { ...input, now: this.now() });
+    return this.checkpoints.compareAndSwap({ checkpoint: next, expectedUpdatedAt: checkpoint.updatedAt });
+  }
+  private now(): string { const requested = Date.parse(this.clock()); this.lastTimestamp = Math.max(this.lastTimestamp + 1, Number.isFinite(requested) ? requested : Date.now()); return new Date(this.lastTimestamp).toISOString(); }
+}
+
+/** Builds a same-method redirect to a home cell without proxying creator writes. */
+export const routeToHomeCell = (route: CellRoute, relativePath: string): { endpoint: string; routingRevision: number; location: string } => {
+  validateCellRoute(route);
+  if (!relativePath.startsWith("/") || relativePath.startsWith("//")) throw new Error("A routed request path must be an absolute local path.");
+  const location = new URL(relativePath, route.endpoint).toString();
+  return { endpoint: route.endpoint, routingRevision: route.routingRevision, location };
+};
+
 export class MigrationTransitionError extends Error {
   constructor(message: string) { super(message); this.name = "MigrationTransitionError"; }
 }

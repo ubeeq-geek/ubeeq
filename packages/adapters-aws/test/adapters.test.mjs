@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3ObjectStorage, SecretsManagerCredentialVault } from "../dist/index.js";
+import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3ObjectStorage, SecretsManagerCredentialVault, createDynamoRoutingControlPlane } from "../dist/index.js";
+import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, RoutingDirectoryConflictError } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
 import { verifyObjectStorageContract } from "@ubeeq/storage";
@@ -12,8 +13,9 @@ class MemoryDynamo {
     const input = command.input;
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
     if (command.constructor.name === "QueryCommand") {
+      const partition = input.ExpressionAttributeValues[":pk"];
       const repository = input.ExpressionAttributeValues[":repository"];
-      const all = [...this.values.values()].filter((value) => value.repository === repository).sort((left, right) => left.id.localeCompare(right.id));
+      const all = [...this.values.values()].filter((value) => partition ? value.pk === partition : value.repository === repository).sort((left, right) => String(left.sk ?? left.id).localeCompare(String(right.sk ?? right.id)));
       const start = input.ExclusiveStartKey ? all.findIndex((value) => value.pk === input.ExclusiveStartKey.pk && value.sk === input.ExclusiveStartKey.sk) + 1 : 0; const items = all.slice(start, start + input.Limit); const last = items.at(-1);
       return { Items: items, ...(last && start + items.length < all.length ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } } : {}) };
     }
@@ -22,6 +24,8 @@ class MemoryDynamo {
       const current = this.values.get(key);
       if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       if (input.ConditionExpression?.includes("#revision") && (!current || current.revision !== input.ExpressionAttributeValues[":revision"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression?.includes("#routingRevision") && (!current || current.routingRevision !== input.ExpressionAttributeValues[":expected"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression?.includes("#updatedAt") && (!current || current.updatedAt !== input.ExpressionAttributeValues[":expected"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       this.values.set(key, input.Item); return {};
     }
     if (command.constructor.name === "DeleteCommand") {
@@ -52,6 +56,25 @@ test("DynamoDB revisioned repository obeys the shared persistence contract", asy
 test("DynamoDB canonical repositories enforce the shared cell boundary", async () => {
   const base = new DynamoRevisionedRepository(new MemoryDynamo(), { tableName: "records", cellId: "cell-a" }, "cell-contract");
   await verifyCellScopedRepositoryContract({ repository: new CellScopedRepository(base, "cell-a"), unscopedRepository: base, cellId: "cell-a" });
+});
+
+test("DynamoDB routing control-plane is separate and guards cutover/checkpoint concurrency", async () => {
+  const control = createDynamoRoutingControlPlane(new MemoryDynamo(), "routing-control");
+  const timestamp = "2026-08-27T00:00:00.000Z";
+  const source = { creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "us-east-2", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: timestamp };
+  await control.routingDirectory.create(source);
+  await assert.rejects(() => control.routingDirectory.create(source), RoutingDirectoryConflictError);
+  let checkpoint = createMigrationCheckpoint({ id: "move-1", creatorId: source.creatorId, source, destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://cell-b.example/" }, now: timestamp });
+  await control.migrationCheckpoints.create(checkpoint);
+  checkpoint = advanceMigration(checkpoint, "source_hold", { now: "2026-08-27T00:01:00.000Z" });
+  await control.migrationCheckpoints.compareAndSwap({ checkpoint, expectedUpdatedAt: timestamp });
+  checkpoint = advanceMigration(checkpoint, "exported", { now: "2026-08-27T00:02:00.000Z", manifestChecksum: "a".repeat(64) });
+  checkpoint = advanceMigration(checkpoint, "transferred", { now: "2026-08-27T00:03:00.000Z" });
+  checkpoint = advanceMigration(checkpoint, "verified", { now: "2026-08-27T00:04:00.000Z", objectCount: 1, verifiedObjectCount: 1 });
+  const destination = cutoverCellRoute(source, checkpoint, "2026-08-27T00:05:00.000Z");
+  await control.routingDirectory.compareAndSwap({ route: destination, expectedRoutingRevision: 1 });
+  await assert.rejects(() => control.routingDirectory.compareAndSwap({ route: { ...destination, routingRevision: 3, updatedAt: "2026-08-27T00:06:00.000Z" }, expectedRoutingRevision: 1 }), RoutingDirectoryConflictError);
+  assert.equal((await control.routingDirectory.get(source.creatorId))?.endpoint, "https://cell-b.example/");
 });
 
 test("SQS-notified DynamoDB queue obeys the shared durable job contract", async () => {

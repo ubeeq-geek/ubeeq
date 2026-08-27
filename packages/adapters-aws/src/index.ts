@@ -14,6 +14,7 @@ import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapt
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
+import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
 export type AwsFunctionUrlEvent = { rawPath?: string; requestContext?: { http?: { method?: string } } };
@@ -46,6 +47,76 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
 export const createDynamoRepositories = (dynamo: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction: async (work) => work({ id: randomUUID() }), creators: cellRepository(dynamo, config, "creators"), works: cellRepository(dynamo, config, "works"), assets: cellRepository(dynamo, config, "assets"), collections: cellRepository(dynamo, config, "collections"), workMemberships: cellRepository(dynamo, config, "workMemberships"), publicationIntents: cellRepository(dynamo, config, "publicationIntents"), publications: cellRepository(dynamo, config, "publications"), reconciliationSnapshots: cellRepository(dynamo, config, "reconciliationSnapshots"), moderationEvidence: cellRepository(dynamo, config, "moderationEvidence"), moderationHolds: cellRepository(dynamo, config, "moderationHolds"), reviewCases: cellRepository(dynamo, config, "reviewCases"), auditEvents: cellRepository(dynamo, config, "auditEvents"), usageEvents: cellRepository(dynamo, config, "usageEvents"), creditLots: cellRepository(dynamo, config, "creditLots"), creditReservations: cellRepository(dynamo, config, "creditReservations"), balances: cellRepository(dynamo, config, "balances"), integrationAccounts: cellRepository(dynamo, config, "integrationAccounts"), syncCursors: cellRepository(dynamo, config, "syncCursors"), integrationJobs: cellRepository(dynamo, config, "integrationJobs"), exportManifests: cellRepository(dynamo, config, "exportManifests"), importCheckpoints: cellRepository(dynamo, config, "importCheckpoints"), federationActors: repository(dynamo, config, "federationActors"), remotePublicationReferences: repository(dynamo, config, "remotePublicationReferences") });
+
+/**
+ * Optional managed-edge control plane.  Its table is deliberately distinct
+ * from every regional records table, and contains routing/checkpoint metadata
+ * only.  It is safe to place this table in one declared operator control
+ * region; it does not make creator data globally mutable.
+ */
+class DynamoControlPlane {
+  constructor(readonly dynamo: Dynamo, readonly tableName: string) {}
+  conflict(error: unknown, message: string): Error { if ((error as { name?: string }).name === "ConditionalCheckFailedException") return new RoutingDirectoryConflictError(message); return error instanceof Error ? error : new Error(message); }
+}
+
+export class DynamoRoutingDirectory implements RoutingDirectory {
+  private readonly control: DynamoControlPlane;
+  constructor(dynamo: Dynamo, tableName: string) { this.control = new DynamoControlPlane(dynamo, tableName); }
+  async get(creatorId: string): Promise<CellRoute | undefined> {
+    const response = await this.control.dynamo.send(new GetCommand({ TableName: this.control.tableName, Key: { pk: "route", sk: creatorId } }));
+    return response.Item?.route ? validateCellRoute(response.Item.route as CellRoute) : undefined;
+  }
+  async create(route: CellRoute): Promise<CellRoute> {
+    validateCellRoute(route);
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: route.creatorId, route, routingRevision: route.routingRevision }, ConditionExpression: "attribute_not_exists(pk)" })); return route; }
+    catch (error) { throw this.control.conflict(error, `A route already exists for creator ${route.creatorId}.`); }
+  }
+  async compareAndSwap(input: { route: CellRoute; expectedRoutingRevision: number }): Promise<CellRoute> {
+    validateCellRoute(input.route);
+    if (input.route.routingRevision !== input.expectedRoutingRevision + 1) throw new RoutingDirectoryConflictError("The replacement route must advance routingRevision by exactly one.");
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: input.route.creatorId, route: input.route, routingRevision: input.route.routingRevision }, ConditionExpression: "attribute_exists(pk) AND #routingRevision = :expected", ExpressionAttributeNames: { "#routingRevision": "routingRevision" }, ExpressionAttributeValues: { ":expected": input.expectedRoutingRevision } })); return input.route; }
+    catch (error) { throw this.control.conflict(error, `Route revision ${input.expectedRoutingRevision} is no longer current for creator ${input.route.creatorId}.`); }
+  }
+  async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }> {
+    const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "route" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
+    return { items: (response.Items ?? []).map((item) => validateCellRoute(item.route as CellRoute)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+  }
+}
+
+export class DynamoMigrationCheckpoints implements MigrationCheckpointStore {
+  private readonly control: DynamoControlPlane;
+  constructor(dynamo: Dynamo, tableName: string) { this.control = new DynamoControlPlane(dynamo, tableName); }
+  async get(id: string): Promise<MigrationCheckpoint | undefined> {
+    const response = await this.control.dynamo.send(new GetCommand({ TableName: this.control.tableName, Key: { pk: "migration", sk: id } }));
+    return response.Item?.checkpoint ? validateMigrationCheckpoint(response.Item.checkpoint as MigrationCheckpoint) : undefined;
+  }
+  async create(checkpoint: MigrationCheckpoint): Promise<MigrationCheckpoint> {
+    validateMigrationCheckpoint(checkpoint);
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: checkpoint.id, checkpoint, creatorId: checkpoint.creatorId, updatedAt: checkpoint.updatedAt }, ConditionExpression: "attribute_not_exists(pk)" })); return checkpoint; }
+    catch (error) { throw this.control.conflict(error, `Migration checkpoint ${checkpoint.id} already exists.`); }
+  }
+  async compareAndSwap(input: { checkpoint: MigrationCheckpoint; expectedUpdatedAt: string }): Promise<MigrationCheckpoint> {
+    validateMigrationCheckpoint(input.checkpoint);
+    if (input.checkpoint.updatedAt === input.expectedUpdatedAt) throw new RoutingDirectoryConflictError("A migration update must advance updatedAt.");
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: input.checkpoint.id, checkpoint: input.checkpoint, creatorId: input.checkpoint.creatorId, updatedAt: input.checkpoint.updatedAt }, ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": input.expectedUpdatedAt } })); return input.checkpoint; }
+    catch (error) { throw this.control.conflict(error, `Migration checkpoint ${input.checkpoint.id} has changed.`); }
+  }
+  async list(input: { creatorId?: string; limit: number; cursor?: string }): Promise<{ items: readonly MigrationCheckpoint[]; nextCursor?: string }> {
+    // The partition remains intentionally small metadata. Querying the dedicated
+    // control-plane table avoids scans across any regional creator records.
+    const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "migration" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
+    const items = (response.Items ?? []).map((item) => validateMigrationCheckpoint(item.checkpoint as MigrationCheckpoint)).filter((checkpoint) => !input.creatorId || checkpoint.creatorId === input.creatorId);
+    return { items, nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+  }
+}
+
+export const createDynamoRoutingControlPlane = (dynamo: Dynamo, tableName: string) => {
+  return { routingDirectory: new DynamoRoutingDirectory(dynamo, tableName), migrationCheckpoints: new DynamoMigrationCheckpoints(dynamo, tableName) };
+};
+
+/** Creates only managed-edge ports; it never shares a cell's DynamoDB client/table. */
+export const createAwsRoutingControlPlane = (configuration: { tableName: string; region?: string }) =>
+  createDynamoRoutingControlPlane(DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region })), configuration.tableName);
 
 export class S3ObjectStorage implements ObjectStorage {
   constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string) {}
