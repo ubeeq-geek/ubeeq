@@ -48,6 +48,16 @@ export interface PasswordIdentityAdapter extends IdentityAdapter {
   authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }>;
 }
 
+/** Executable baseline shared by OIDC/Cognito and password-capable identity adapters. */
+export const verifyIdentityAdapterContract = async (adapter: IdentityAdapter, fixture: { credential: string; subjectId: string }): Promise<void> => {
+  const session = await adapter.verifySession({ credential: fixture.credential });
+  if (!session || session.subject.id !== fixture.subjectId) throw new Error("Identity contract violation: a valid provider session cannot be resolved.");
+  const account = await adapter.getAccount(fixture.subjectId);
+  if (!account || account.subjectId !== fixture.subjectId) throw new Error("Identity contract violation: provider account lookup is inconsistent.");
+  await adapter.revokeSession({ sessionId: session.id, reason: "contract" });
+  if (await adapter.verifySession({ credential: fixture.credential })) throw new Error("Identity contract violation: revoked provider session remains valid.");
+};
+
 /** Executable baseline for password-capable development adapters. */
 export const verifyPasswordIdentityContract = async (adapter: PasswordIdentityAdapter): Promise<void> => {
   const unique = `contract-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
