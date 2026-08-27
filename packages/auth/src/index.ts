@@ -42,6 +42,23 @@ export interface IdentityAdapter {
   revokeSession(input: { sessionId: string; reason?: string }): Promise<void>;
 }
 
+/** Optional local/password-capable identity surface; hosted OIDC adapters need only implement IdentityAdapter. */
+export interface PasswordIdentityAdapter extends IdentityAdapter {
+  register(input: { email: string; password: string }): Promise<IdentityAccount>;
+  authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }>;
+}
+
+/** Executable baseline for password-capable development adapters. */
+export const verifyPasswordIdentityContract = async (adapter: PasswordIdentityAdapter): Promise<void> => {
+  const unique = `contract-${Date.now()}-${Math.random().toString(16).slice(2)}@example.test`;
+  const account = await adapter.register({ email: unique, password: "contract-safe-password" });
+  const authenticated = await adapter.authenticate({ email: unique, password: "contract-safe-password" });
+  const verified = await adapter.verifySession({ credential: authenticated.token });
+  if (!verified || verified.subject.id !== account.subjectId) throw new Error("Identity contract violation: registered session cannot be verified.");
+  await adapter.revokeSession({ sessionId: verified.id, reason: "contract" });
+  if (await adapter.verifySession({ credential: authenticated.token })) throw new Error("Identity contract violation: revoked session remains valid.");
+};
+
 export const effectiveAuthorizationSubject = (
   session: AuthenticatedSession,
   delegations: readonly CreatorDelegation[],

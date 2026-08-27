@@ -2,7 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
+import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import { OptimisticConcurrencyError, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
@@ -136,7 +136,7 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadAdapter, Del
   }
 }
 
-export class LocalIdentityAdapter implements IdentityAdapter {
+export class LocalIdentityAdapter implements PasswordIdentityAdapter {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async register(input: { email: string; password: string }): Promise<IdentityAccount> {
     if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
