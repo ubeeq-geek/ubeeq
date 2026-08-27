@@ -1,7 +1,28 @@
 /** Stable, product-neutral domain identifiers. */
 export type EntityId = string & { readonly __entityId: unique symbol };
 
-export interface AuditEvent {
+/** The single authoritative regional cell for creator-owned mutable data. */
+export interface DataHome {
+  cellId: string;
+  region: string;
+  assignedAt: string;
+  routingRevision: number;
+}
+
+/** Common shape inherited by every creator-owned aggregate. */
+export interface CellOwned {
+  dataHome: DataHome;
+}
+
+export const validateDataHome = (dataHome: DataHome): DataHome => {
+  if (!dataHome.cellId?.trim()) throw new Error("Data-home cellId is required");
+  if (!dataHome.region?.trim()) throw new Error("Data-home region is required");
+  if (!dataHome.assignedAt || Number.isNaN(Date.parse(dataHome.assignedAt))) throw new Error("Data-home assignedAt must be an ISO timestamp");
+  if (!Number.isSafeInteger(dataHome.routingRevision) || dataHome.routingRevision < 1) throw new Error("Data-home routingRevision must be a positive integer");
+  return dataHome;
+};
+
+export interface AuditEvent extends CellOwned {
   id: EntityId;
   occurredAt: string;
   actorId?: EntityId;
@@ -10,7 +31,7 @@ export interface AuditEvent {
   metadata?: Record<string, unknown>;
 }
 
-export interface UsageRecord {
+export interface UsageRecord extends CellOwned {
   id: EntityId;
   accountId: EntityId;
   meter: string;
@@ -38,7 +59,7 @@ export interface WorkOrigin {
   importedAt?: string;
 }
 
-export interface Work {
+export interface Work extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -65,7 +86,7 @@ export interface AssetStorage {
   externalUrl?: string;
 }
 
-export interface Asset {
+export interface Asset extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -115,7 +136,7 @@ export type PublicationStatus = "draft" | "scheduled" | "queued" | "publishing" 
 export type PublicationSyncStatus = "not_applicable" | "in_sync" | "local_newer" | "remote_newer" | "conflict" | "error" | "unknown";
 export type PublicationIntentStatus = "draft" | "live" | "scheduled";
 
-export interface Creator {
+export interface Creator extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   name: string;
@@ -128,7 +149,7 @@ export interface Creator {
   updatedAt: string;
 }
 
-export interface Collection {
+export interface Collection extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -163,7 +184,7 @@ export interface PublicationReconciliationField {
   conflict: boolean;
 }
 
-export interface Publication {
+export interface Publication extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -194,7 +215,7 @@ export interface Publication {
   removedAt?: string;
 }
 
-export interface PublicationIntent {
+export interface PublicationIntent extends CellOwned {
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;

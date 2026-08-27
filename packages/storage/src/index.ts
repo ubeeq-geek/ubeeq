@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /** Storage and delivery ports with no product-specific retention or access policy. */
 export type ObjectAccessScope = "private" | "restricted" | "public";
 
@@ -38,10 +40,19 @@ export interface UploadInitiation {
 
 export interface UploadCompletion {
   uploadId: string;
+  /** The authenticated aggregate scope expected by the API completing this upload. */
+  cellId: string;
+  creatorId: string;
   checksum: string;
   byteLength: number;
   parts?: readonly { partNumber: number; checksum?: string }[];
 }
+export interface UploadAcceptance { uploadId: string; cellId: string; creatorId: string; body: Uint8Array; operation: "upload_content"; }
+
+export const requireCreatorScopedObject = (key: string, input: { cellId: string; creatorId: string }): void => {
+  const prefix = `cells/${input.cellId}/creators/${input.creatorId}/`;
+  if (!key.startsWith(prefix)) throw new Error(`Object key is not scoped to creator ${input.creatorId} in cell ${input.cellId}`);
+};
 
 export interface ObjectLifecycleSignal {
   type: "deleted" | "restored" | "eligible_for_garbage_collection";
@@ -54,8 +65,27 @@ export interface ObjectLifecycleSignal {
 export interface UploadAdapter {
   initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation>;
   complete(input: UploadCompletion): Promise<StoredObject>;
-  abort?(input: { uploadId: string }): Promise<void>;
+  abort?(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void>;
 }
+
+/** Storage endpoints that proxy upload bytes (compact/local profile) authenticate the same scope as completion. */
+export interface UploadContentAdapter extends UploadAdapter { accept(input: UploadAcceptance): Promise<void>; }
+
+export const verifyUploadContentAdapterContract = async (adapter: UploadContentAdapter): Promise<void> => {
+  const body = new TextEncoder().encode("upload-contract"); const checksum = createHash("sha256").update(body).digest("hex");
+  const initiate = (objectId: string, expiresAt = new Date(Date.now() + 60_000).toISOString()) => adapter.initiate({ object: { bucket: "cell-a", key: cellScopedObjectKey({ cellId: "cell-a", creatorId: "creator-a", kind: "uploads", objectId }), contentType: "text/plain", byteLength: body.byteLength, checksum, scope: "private" }, checksumAlgorithm: "sha256", expiresAt });
+  const scoped = await initiate("scoped");
+  for (const input of [{ cellId: "cell-b", creatorId: "creator-a" }, { cellId: "cell-a", creatorId: "creator-b" }]) {
+    let rejected = false; try { await adapter.accept({ uploadId: scoped.uploadId, ...input, body, operation: "upload_content" }); } catch { rejected = true; } if (!rejected) throw new Error("Upload contract violation: foreign content was accepted.");
+  }
+  await adapter.abort?.({ uploadId: scoped.uploadId, cellId: "cell-b", creatorId: "creator-a" });
+  for (const invalidBody of [new Uint8Array(body.byteLength), body.slice(1)]) { let wrong = false; try { await adapter.accept({ uploadId: scoped.uploadId, cellId: "cell-a", creatorId: "creator-a", body: invalidBody, operation: "upload_content" }); } catch { wrong = true; } if (!wrong) throw new Error("Upload contract violation: wrong checksum or size was accepted."); }
+  await adapter.accept({ uploadId: scoped.uploadId, cellId: "cell-a", creatorId: "creator-a", body, operation: "upload_content" });
+  for (const input of [{ cellId: "cell-b", creatorId: "creator-a" }, { cellId: "cell-a", creatorId: "creator-b" }]) { let rejected = false; try { await adapter.complete({ uploadId: scoped.uploadId, ...input, checksum, byteLength: body.byteLength }); } catch { rejected = true; } if (!rejected) throw new Error("Upload contract violation: foreign completion succeeded."); }
+  await adapter.complete({ uploadId: scoped.uploadId, cellId: "cell-a", creatorId: "creator-a", checksum, byteLength: body.byteLength });
+  let replayed = false; try { await adapter.complete({ uploadId: scoped.uploadId, cellId: "cell-a", creatorId: "creator-a", checksum, byteLength: body.byteLength }); } catch { replayed = true; } if (!replayed) throw new Error("Upload contract violation: completion replay succeeded.");
+  const expired = await initiate("expired", new Date(Date.now() - 1_000).toISOString()); let acceptedExpired = false; try { await adapter.accept({ uploadId: expired.uploadId, cellId: "cell-a", creatorId: "creator-a", body, operation: "upload_content" }); acceptedExpired = true; } catch {} if (acceptedExpired) throw new Error("Upload contract violation: expired content was accepted.");
+};
 
 /** Delivery policy is expressed in Ubeeq grants, not provider-specific URL mechanisms. */
 export interface DeliveryGrant {
@@ -77,6 +107,20 @@ export interface ObjectLifecycleAdapter {
 export const validateStoredObject = (object: StoredObject): void => {
   if (!object.bucket.trim() || !object.key.trim() || !object.contentType.trim()) throw new Error("Stored object location and content type are required");
   if (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0) throw new Error("Stored object byte length must be a non-negative integer");
+};
+
+const SAFE_KEY_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** Canonical regional key: cells/<cell>/creators/<creator>/<kind>/<id>. */
+export const cellScopedObjectKey = (input: { cellId: string; creatorId: string; kind: "originals" | "renditions" | "exports" | "uploads"; objectId: string }): string => {
+  for (const [name, value] of Object.entries(input)) {
+    if (!SAFE_KEY_SEGMENT.test(value)) throw new Error(`Invalid ${name} for a cell-scoped object key`);
+  }
+  return `cells/${input.cellId}/creators/${input.creatorId}/${input.kind}/${input.objectId}`;
+};
+
+export const requireCellScopedObject = (key: string, cellId: string): void => {
+  if (!key.startsWith(`cells/${cellId}/`)) throw new Error(`Object key is not scoped to cell ${cellId}`);
 };
 
 /** Executable baseline for provider-neutral object storage adapters. */

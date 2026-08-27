@@ -4,6 +4,7 @@ import { SelfHostConfigurationError, validateSelfHostConfiguration } from "../di
 
 const configuration = {
   instanceId: "community-instance",
+  cell: { id: "community-eu", region: "eu-west", operator: "Community", backupPolicy: "Daily encrypted regional backup" },
   publicOrigin: "https://community.example",
   storage: { adapter: "local", dataDirectory: "/srv/ubeeq" },
   extensions: [{ id: "community.brand", apiVersion: "1" }]
@@ -16,6 +17,7 @@ test("accepts a neutral self-hosted configuration", () => {
 test("requires secure public origins and local storage paths", () => {
   assert.throws(() => validateSelfHostConfiguration({ ...configuration, publicOrigin: "http://community.example" }), SelfHostConfigurationError);
   assert.throws(() => validateSelfHostConfiguration({ ...configuration, storage: { adapter: "local" } }), SelfHostConfigurationError);
+  assert.throws(() => validateSelfHostConfiguration({ ...configuration, cell: { ...configuration.cell, region: "" } }), SelfHostConfigurationError);
 });
 
 test("permits loopback development but rejects duplicate extension ids", () => {

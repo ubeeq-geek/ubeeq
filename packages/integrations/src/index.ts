@@ -46,14 +46,24 @@ export const requireIntegrationOperation = (definition: IntegrationDefinition, o
 };
 
 /** Opaque secret references prevent connector credentials from entering exports, logs, or common entities. */
-export interface CredentialVault { write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }>; read(input: { reference: string }): Promise<Uint8Array | undefined>; revoke(input: { reference: string }): Promise<void>; }
-export interface OAuthAuthorizationState { id: string; integrationId: string; ownerId: string; redirectUri: string; codeVerifier?: string; requiredScopes: readonly string[]; expiresAt: string; }
+export interface CredentialVault { write(input: { cellId: string; ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }>; read(input: { cellId: string; reference: string }): Promise<Uint8Array | undefined>; revoke(input: { cellId: string; reference: string }): Promise<void>; }
+export interface OAuthAuthorizationState { id: string; integrationId: string; cellId: string; ownerId: string; redirectUri: string; codeVerifier?: string; requiredScopes: readonly string[]; expiresAt: string; }
 export interface OAuthCallbackResult { stateId: string; credentialReference: string; grantedScopes: readonly string[]; expiresAt?: string; }
 export interface OAuthStateStore { create(input: OAuthAuthorizationState): Promise<void>; consume(id: string): Promise<OAuthAuthorizationState | undefined>; }
 
 export const requireValidOAuthState = (state: OAuthAuthorizationState, now = new Date()): OAuthAuthorizationState => {
-  if (!state.id.trim() || !state.integrationId.trim() || !state.ownerId.trim() || !state.redirectUri.trim() || Number.isNaN(Date.parse(state.expiresAt)) || Date.parse(state.expiresAt) <= now.getTime()) throw new Error("OAuth authorization state is invalid or expired.");
+  if (!state.id.trim() || !state.integrationId.trim() || !state.cellId.trim() || !state.ownerId.trim() || !state.redirectUri.trim() || Number.isNaN(Date.parse(state.expiresAt)) || Date.parse(state.expiresAt) <= now.getTime()) throw new Error("OAuth authorization state is invalid or expired.");
   return { ...state, requiredScopes: [...new Set(state.requiredScopes)].sort() };
+};
+
+export const verifyCredentialVaultContract = async (vault: CredentialVault): Promise<void> => {
+  const stored = await vault.write({ cellId: "cell-a", ownerId: "creator-a", value: new TextEncoder().encode("contract-secret") });
+  if (!stored.reference.includes("cell-a")) throw new Error("Credential vault contract violation: reference is not cell-namespaced.");
+  if (await vault.read({ cellId: "cell-b", reference: stored.reference })) throw new Error("Credential vault contract violation: foreign read succeeded.");
+  await vault.revoke({ cellId: "cell-b", reference: stored.reference });
+  if (!await vault.read({ cellId: "cell-a", reference: stored.reference })) throw new Error("Credential vault contract violation: foreign revoke succeeded.");
+  await vault.revoke({ cellId: "cell-a", reference: stored.reference });
+  if (await vault.read({ cellId: "cell-a", reference: stored.reference })) throw new Error("Credential vault contract violation: revoked credential remains readable.");
 };
 
 export type IntegrationHealthStatus = "healthy" | "degraded" | "blocked" | "unknown";

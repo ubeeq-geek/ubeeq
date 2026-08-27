@@ -1,5 +1,11 @@
 {
   "instanceId": "my-ubeeq-instance",
+  "cell": {
+    "id": "community-eu-west",
+    "region": "eu-west",
+    "operator": "Example Community",
+    "backupPolicy": "Encrypted daily backup retained for 30 days in eu-west"
+  },
   "publicOrigin": "https://example.invalid",
   "storage": {
     "adapter": "local",

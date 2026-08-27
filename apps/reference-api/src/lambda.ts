@@ -68,9 +68,13 @@ const invokeWeb = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> =>
 let application: ReturnType<typeof createReferenceApi> | undefined;
 const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??= createReferenceApi({
   instanceId: process.env.UBEEQ_INSTANCE_ID ?? "aws-reference",
+  cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
+  region: process.env.AWS_REGION ?? "unknown",
+  operator: "self-hosted",
   publicBaseUrl: required("UBEEQ_PUBLIC_BASE_URL"),
   adapters: createAwsAdapterSet({
     region: process.env.AWS_REGION,
+    cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
     tableName: required("UBEEQ_RECORDS_TABLE"),
     objectBucket: required("UBEEQ_SOURCE_BUCKET"),
     queueUrl: required("UBEEQ_JOBS_QUEUE_URL"),

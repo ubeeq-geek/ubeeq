@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3ObjectStorage, SecretsManagerCredentialVault } from "../dist/index.js";
-import { verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
+import { CellScopedRepository, verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
 import { verifyObjectStorageContract } from "@ubeeq/storage";
 import { verifyIdentityAdapterContract } from "@ubeeq/auth";
@@ -13,8 +13,9 @@ class MemoryDynamo {
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
     if (command.constructor.name === "QueryCommand") {
       const repository = input.ExpressionAttributeValues[":repository"];
-      const items = [...this.values.values()].filter((value) => value.repository === repository).slice(0, input.Limit);
-      return { Items: items };
+      const all = [...this.values.values()].filter((value) => value.repository === repository).sort((left, right) => left.id.localeCompare(right.id));
+      const start = input.ExclusiveStartKey ? all.findIndex((value) => value.pk === input.ExclusiveStartKey.pk && value.sk === input.ExclusiveStartKey.sk) + 1 : 0; const items = all.slice(start, start + input.Limit); const last = items.at(-1);
+      return { Items: items, ...(last && start + items.length < all.length ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } } : {}) };
     }
     if (command.constructor.name === "PutCommand") {
       const key = `${input.Item.pk}|${input.Item.sk}`;
@@ -35,16 +36,22 @@ class MemoryDynamo {
 test("Secrets Manager vault exposes only opaque references and reads binary credentials", async () => {
   const calls = [];
   const vault = new SecretsManagerCredentialVault({ send: async (command) => { calls.push(command.constructor.name); return command.constructor.name === "GetSecretValueCommand" ? { SecretBinary: Buffer.from("credential") } : {}; } }, "ubeeq/credentials");
-  const stored = await vault.write({ ownerId: "creator", value: Buffer.from("credential") });
-  assert.match(stored.reference, /^aws-secrets:ubeeq\/credentials\/creator\//);
-  assert.equal(Buffer.from(await vault.read({ reference: stored.reference })).toString(), "credential");
-  await vault.revoke({ reference: stored.reference });
+  const stored = await vault.write({ cellId: "cell-a", ownerId: "creator", value: Buffer.from("credential") });
+  assert.match(stored.reference, /^aws-secrets:ubeeq\/credentials\/cell-a\/creator\//);
+  assert.equal(Buffer.from(await vault.read({ cellId: "cell-a", reference: stored.reference })).toString(), "credential");
+  assert.equal(await vault.read({ cellId: "cell-b", reference: stored.reference }), undefined);
+  await vault.revoke({ cellId: "cell-a", reference: stored.reference });
   assert.deepEqual(calls, ["CreateSecretCommand", "GetSecretValueCommand", "UpdateSecretCommand"]);
 });
 
 test("DynamoDB revisioned repository obeys the shared persistence contract", async () => {
   const repository = new DynamoRevisionedRepository(new MemoryDynamo(), { tableName: "records" }, "creators");
   await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "local", handle: id, displayName: "Contract" }), change: () => ({ displayName: "Updated" }) });
+});
+
+test("DynamoDB canonical repositories enforce the shared cell boundary", async () => {
+  const base = new DynamoRevisionedRepository(new MemoryDynamo(), { tableName: "records", cellId: "cell-a" }, "cell-contract");
+  await verifyCellScopedRepositoryContract({ repository: new CellScopedRepository(base, "cell-a"), unscopedRepository: base, cellId: "cell-a" });
 });
 
 test("SQS-notified DynamoDB queue obeys the shared durable job contract", async () => {
@@ -77,9 +84,10 @@ test("S3 direct upload binds a checksum and returns the immutable object version
   const checksum = "a".repeat(64); const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects");
   // Replace the network boundary only for the completion assertion; initiation is covered by its signed-command shape below.
   upload.s3 = { send: async (command) => command.constructor.name === "HeadObjectCommand" ? { VersionId: "v1", ContentLength: 4, ContentType: "image/png", ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"), Metadata: { checksum, scope: "private" } } : {} };
-  const uploadId = Buffer.from(JSON.stringify({ bucket: "objects", key: "creator/a", contentType: "image/png", byteLength: 4, checksum, scope: "private" })).toString("base64url");
-  const completed = await upload.complete({ uploadId, checksum, byteLength: 4 });
+  const uploadId = Buffer.from(JSON.stringify({ bucket: "objects", key: "cells/cell-a/creators/creator-a/uploads/a", contentType: "image/png", byteLength: 4, checksum, scope: "private" })).toString("base64url");
+  const completed = await upload.complete({ uploadId, cellId: "cell-a", creatorId: "creator-a", checksum, byteLength: 4 });
   assert.equal(completed.versionId, "v1"); assert.equal(completed.checksum, checksum);
+  await assert.rejects(() => upload.complete({ uploadId, cellId: "cell-a", creatorId: "creator-b", checksum, byteLength: 4 }), /not scoped/);
 });
 
 test("Cognito identity verifies opaque sessions and maps access scopes", async () => {

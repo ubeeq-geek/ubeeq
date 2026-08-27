@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,8 +6,8 @@ import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } f
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
-import { OptimisticConcurrencyError, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
-import type { DeliveryAdapter, ObjectStorage, StoredObject, UploadAdapter, UploadCompletion, UploadInitiation } from "@ubeeq/storage";
+import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
@@ -15,7 +15,7 @@ const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 type SqliteDatabase = { exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
 
-export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; }
+export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
@@ -26,7 +26,8 @@ export class LocalSqliteDatabase {
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys"]) {
+    if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -94,18 +95,19 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
 }
 
 const repository = <T extends RevisionedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new SqliteRevisionedRepository<T>(local, name);
+const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(local, name), local.configuration.cellId);
 
 /** Durable local composition. It is intentionally a generic JSON-record adapter, not an in-memory default. */
 export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqRepositories => ({
   transaction: local.transaction.bind(local),
-  creators: repository(local, "creators"), works: repository(local, "works"), assets: repository(local, "assets"), collections: repository(local, "collections"), workMemberships: repository(local, "workMemberships"),
-  publicationIntents: repository(local, "publicationIntents"), publications: repository(local, "publications"), reconciliationSnapshots: repository(local, "reconciliationSnapshots"),
-  moderationEvidence: repository(local, "moderationEvidence"), moderationHolds: repository(local, "moderationHolds"), reviewCases: repository(local, "reviewCases"), auditEvents: repository(local, "auditEvents"),
-  usageEvents: repository(local, "usageEvents"), creditLots: repository(local, "creditLots"), creditReservations: repository(local, "creditReservations"), balances: repository(local, "balances"),
-  integrationAccounts: repository(local, "integrationAccounts"), syncCursors: repository(local, "syncCursors"), integrationJobs: repository(local, "integrationJobs"), exportManifests: repository(local, "exportManifests"), importCheckpoints: repository(local, "importCheckpoints"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
+  creators: cellRepository(local, "creators"), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
+  publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
+  moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
+  usageEvents: cellRepository(local, "usageEvents"), creditLots: cellRepository(local, "creditLots"), creditReservations: cellRepository(local, "creditReservations"), balances: cellRepository(local, "balances"),
+  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
 });
 
-export class LocalFilesystemStorage implements ObjectStorage, UploadAdapter, DeliveryAdapter {
+export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
   constructor(private readonly local: LocalSqliteDatabase) {}
   private objectPath(object: Pick<StoredObject, "bucket" | "key" | "versionId">): string {
     const root = resolve(this.local.configuration.dataDirectory, "objects", object.bucket);
@@ -121,20 +123,29 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadAdapter, Del
   }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const path = this.objectPath(input); rmSync(path, { force: true }); rmSync(`${path}.json`, { force: true }); }
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
-    const uploadId = randomUUID(); this.local.database.prepare("INSERT INTO ubeeq_uploads (id, object_payload, created_at) VALUES (?, ?, ?)").run(uploadId, json(input.object), now());
+    const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
+    const uploadId = randomUUID(); this.local.database.prepare("INSERT INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
     return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
   }
-  async acceptUpload(uploadId: string, body: Uint8Array): Promise<void> { const result = this.local.database.prepare("UPDATE ubeeq_uploads SET body = ? WHERE id = ?").run(body, uploadId); if (result.changes !== 1) throw new Error("Unknown upload."); }
+  async accept(input: UploadAcceptance): Promise<void> { const row = this.local.database.prepare("SELECT cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { cell_id: string; creator_id: string; expires_at: string; expected_checksum?: string; expected_byte_length: number; operation: string } | undefined; if (!row || row.cell_id !== input.cellId || row.creator_id !== input.creatorId || row.operation !== input.operation) throw new Error("Upload scope does not match the authenticated creator and cell."); if (Date.parse(row.expires_at) <= Date.now()) throw new Error("Upload session has expired."); if (input.body.byteLength !== row.expected_byte_length || (row.expected_checksum && digest(input.body) !== row.expected_checksum)) throw new Error("Upload content does not match the declared size or checksum."); this.local.database.prepare("UPDATE ubeeq_uploads SET body = ? WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.body, input.uploadId, input.cellId, input.creatorId); }
+  async abort(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void> { this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.uploadId, input.cellId, input.creatorId); }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     const row = this.local.database.prepare("SELECT object_payload, body FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { object_payload?: string; body?: Uint8Array } | undefined;
     if (!row?.object_payload || !row.body) throw new Error("Upload content has not been received.");
+    const requested = parse<StoredObject>(row.object_payload);
+    requireCreatorScopedObject(requested.key, input);
     if (row.body.byteLength !== input.byteLength || digest(row.body) !== input.checksum) throw new Error("Upload checksum or length does not match.");
-    const object = { ...parse<StoredObject>(row.object_payload), checksum: input.checksum, byteLength: input.byteLength, versionId: randomUUID() };
+    const object = { ...requested, checksum: input.checksum, byteLength: input.byteLength, versionId: randomUUID() };
     await this.put({ object, body: row.body }); this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id = ?").run(input.uploadId); return object;
   }
-  async issue(request: { object: Pick<StoredObject, "bucket" | "key" | "versionId" | "scope">; expiresAt: string }): Promise<{ url: string; expiresAt: string }> {
-    const encoded = Buffer.from(json(request.object)).toString("base64url"); return { url: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/delivery/${encoded}`, expiresAt: request.expiresAt };
+  async issue(request: { object: Pick<StoredObject, "bucket" | "key" | "versionId" | "scope">; expiresAt: string; disposition?: "inline" | "attachment" }): Promise<{ url: string; expiresAt: string }> {
+    const match = request.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match || match[1] !== this.local.configuration.cellId) throw new Error("Delivery object is not scoped to this cell.");
+    if (request.object.scope === "public" && !request.object.key.includes("/renditions/")) throw new Error("Only rendition objects may receive public cacheable delivery tokens.");
+    if (Date.parse(request.expiresAt) <= Date.now()) throw new Error("Delivery expiry must be in the future.");
+    const keyId = this.local.configuration.activeDeliveryKeyId ?? "local-v1"; const payload = Buffer.from(json({ version: 1, keyId, cellId: match[1], creatorId: match[2], ...request.object, disposition: request.disposition ?? "inline", expiresAt: request.expiresAt })).toString("base64url"); const signature = createHmac("sha256", this.deliveryKey(keyId)).update(payload).digest("base64url"); return { url: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/delivery/${payload}.${signature}`, expiresAt: request.expiresAt };
   }
+  verifyDeliveryToken(token: string): { version: 1; keyId: string; cellId: string; creatorId: string; bucket: string; key: string; versionId?: string; scope: StoredObject["scope"]; disposition: "inline" | "attachment"; expiresAt: string } { const [payload, signature, extra] = token.split("."); if (!payload || !signature || extra) throw new Error("Delivery token is malformed."); let claims: ReturnType<LocalFilesystemStorage["verifyDeliveryToken"]>; try { claims = parse(Buffer.from(payload, "base64url").toString("utf8")); } catch { throw new Error("Delivery token claims are malformed."); } const expected = createHmac("sha256", this.deliveryKey(claims.keyId)).update(payload).digest(); const supplied = Buffer.from(signature, "base64url"); if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Delivery token signature is invalid."); if (claims.version !== 1 || claims.cellId !== this.local.configuration.cellId || Date.parse(claims.expiresAt) <= Date.now()) throw new Error("Delivery token is expired or belongs to another cell."); requireCreatorScopedObject(claims.key, claims); if (claims.bucket !== claims.cellId || (claims.scope === "public" && !claims.key.includes("/renditions/"))) throw new Error("Delivery claims violate cell cache policy."); return claims; }
+  private deliveryKey(keyId: string): Buffer { const configured = this.local.configuration.deliverySigningKeys?.[keyId] ?? (keyId === (this.local.configuration.activeDeliveryKeyId ?? "local-v1") ? this.local.configuration.deliverySigningKey : undefined); if (!configured && this.local.configuration.deliverySigningKeys) throw new Error("Delivery token keyId is unknown."); return createHash("sha256").update(configured ?? this.local.configuration.credentialEncryptionKey ?? `local-delivery:${resolve(this.local.configuration.databasePath)}`).digest(); }
 }
 
 export class LocalIdentityAdapter implements PasswordIdentityAdapter {
@@ -168,17 +179,18 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
 export class LocalCredentialVault implements CredentialVault {
   private readonly key: Buffer;
   constructor(private readonly local: LocalSqliteDatabase) { this.key = createHash("sha256").update(local.configuration.credentialEncryptionKey ?? `local-development:${resolve(local.configuration.databasePath)}`).digest(); }
-  async write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }> {
+  async write(input: { cellId: string; ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }> {
+    if (input.cellId !== this.local.configuration.cellId) throw new Error("Credential belongs to another cell.");
     const id = randomUUID(), iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", this.key, iv); const ciphertext = Buffer.concat([cipher.update(input.value), cipher.final()]), tag = cipher.getAuthTag();
-    this.local.database.prepare("INSERT INTO ubeeq_credentials (id, owner_id, ciphertext, iv, auth_tag, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.ownerId, ciphertext, iv, tag, input.expiresAt ?? null, now()); return { reference: `local-vault:${id}` };
+    this.local.database.prepare("INSERT INTO ubeeq_credentials (id, cell_id, owner_id, ciphertext, iv, auth_tag, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, input.cellId, input.ownerId, ciphertext, iv, tag, input.expiresAt ?? null, now()); return { reference: `local-vault:${input.cellId}:${id}` };
   }
-  async read(input: { reference: string }): Promise<Uint8Array | undefined> {
-    const id = input.reference.replace(/^local-vault:/, ""); if (id === input.reference) return undefined;
-    const row = this.local.database.prepare("SELECT ciphertext, iv, auth_tag, expires_at, revoked_at FROM ubeeq_credentials WHERE id = ?").get(id) as { ciphertext: Uint8Array; iv: Uint8Array; auth_tag: Uint8Array; expires_at?: string; revoked_at?: string } | undefined;
+  async read(input: { cellId: string; reference: string }): Promise<Uint8Array | undefined> {
+    const prefix = `local-vault:${input.cellId}:`; if (!input.reference.startsWith(prefix) || input.cellId !== this.local.configuration.cellId) return undefined; const id = input.reference.slice(prefix.length);
+    const row = this.local.database.prepare("SELECT ciphertext, iv, auth_tag, expires_at, revoked_at FROM ubeeq_credentials WHERE id = ? AND cell_id = ?").get(id, input.cellId) as { ciphertext: Uint8Array; iv: Uint8Array; auth_tag: Uint8Array; expires_at?: string; revoked_at?: string } | undefined;
     if (!row || row.revoked_at || (row.expires_at && row.expires_at <= now())) return undefined;
     const decipher = createDecipheriv("aes-256-gcm", this.key, row.iv); decipher.setAuthTag(Buffer.from(row.auth_tag)); return Buffer.concat([decipher.update(row.ciphertext), decipher.final()]);
   }
-  async revoke(input: { reference: string }): Promise<void> { const id = input.reference.replace(/^local-vault:/, ""); if (id !== input.reference) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ?").run(now(), id); }
+  async revoke(input: { cellId: string; reference: string }): Promise<void> { const prefix = `local-vault:${input.cellId}:`; if (input.reference.startsWith(prefix) && input.cellId === this.local.configuration.cellId) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ? AND cell_id = ?").run(now(), input.reference.slice(prefix.length), input.cellId); }
 }
 
 /** Local Ed25519 signing is a portable reference; hosted instances may resolve keys from a managed provider. */
@@ -197,15 +209,16 @@ export class LocalFederationKey implements FederationSigner, FederationSignature
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
-    const existing = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE idempotency_key = ?").get(input.idempotencyKey) as Record<string, unknown> | undefined; if (existing) return this.row(existing) as DurableJob<T>;
-    const timestamp = now(), job: DurableJob<T> = { id: randomUUID(), type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, state: "queued", attempt: 0, maxAttempts: input.maxAttempts, availableAt: input.availableAt ?? timestamp, createdAt: timestamp, updatedAt: timestamp, correlationId: input.correlationId };
-    this.write(job); return job;
+    const storedIdempotencyKey = `${input.cellId}:${input.idempotencyKey}`;
+    const existing = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?").get(input.cellId, storedIdempotencyKey) as Record<string, unknown> | undefined; if (existing) return this.row(existing) as DurableJob<T>;
+    const timestamp = now(), job: DurableJob<T> = { id: randomUUID(), cellId: input.cellId, type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, state: "queued", attempt: 0, maxAttempts: input.maxAttempts, availableAt: input.availableAt ?? timestamp, createdAt: timestamp, updatedAt: timestamp, correlationId: input.correlationId };
+    this.write(job, undefined, storedIdempotencyKey); return job;
   }
-  async lease<T>(input: { types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<T> | undefined> {
+  async lease<T>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<T> | undefined> {
     // A crashed worker's expired lease becomes recoverable work before another worker claims it.
     this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE state = 'leased' AND lease_expires_at <= ?").run(now(), now(), now());
     const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
-    const row = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1`).get(now(), ...(input.types ?? [])) as Record<string, unknown> | undefined; if (!row) return undefined;
+    const row = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1`).get(input.cellId, now(), ...(input.types ?? [])) as Record<string, unknown> | undefined; if (!row) return undefined;
     const job = this.row(row) as DurableJob<T>;
     const leaseToken = randomUUID(); job.state = "leased"; job.attempt += 1; job.leaseExpiresAt = new Date(Date.now() + input.leaseDurationSeconds * 1000).toISOString(); job.updatedAt = now(); this.write(job, leaseToken); return { job, leaseToken };
   }
@@ -215,11 +228,11 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   async cancel(input: { id: string; reason?: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(input.id) as Record<string, unknown> | undefined; if (!row) throw new Error("Unknown job."); const job = this.row(row); job.state = "queued"; job.availableAt = input.availableAt ?? now(); job.lastError = undefined; job.updatedAt = now(); this.write(job); return job; }
   async get(id: string): Promise<DurableJob | undefined> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined; }
-  async list(input: { states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` WHERE state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row)); }
-  async schedule(input: { type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }
-  async cancelSchedule(idempotencyKey: string): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE idempotency_key = ?").run(now(), idempotencyKey); }
-  private row(row: Record<string, unknown>): DurableJob { return { id: String(row.id), type: String(row.type), payload: parse(String(row.payload)), idempotencyKey: String(row.idempotency_key), state: row.state as DurableJob["state"], attempt: Number(row.attempt), maxAttempts: Number(row.max_attempts), availableAt: String(row.available_at), leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined, createdAt: String(row.created_at), updatedAt: String(row.updated_at), correlationId: row.correlation_id ? String(row.correlation_id) : undefined, lastError: row.last_error ? parse(String(row.last_error)) : undefined }; }
-  private write(job: DurableJob, leaseToken?: string): void { this.local.database.prepare("INSERT INTO ubeeq_jobs (id,type,payload,idempotency_key,state,attempt,max_attempts,available_at,lease_token,lease_expires_at,created_at,updated_at,correlation_id,last_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, attempt=excluded.attempt, available_at=excluded.available_at, lease_token=excluded.lease_token, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at, last_error=excluded.last_error").run(job.id, job.type, json(job.payload), job.idempotencyKey, job.state, job.attempt, job.maxAttempts, job.availableAt, leaseToken ?? null, job.leaseExpiresAt ?? null, job.createdAt, job.updatedAt, job.correlationId ?? null, job.lastError ? json(job.lastError) : null); }
+  async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row)); }
+  async schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }
+  async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`); }
+  private row(row: Record<string, unknown>): DurableJob { const cellId = String(row.cell_id); const storedKey = String(row.idempotency_key); return { id: String(row.id), cellId, type: String(row.type), payload: parse(String(row.payload)), idempotencyKey: storedKey.startsWith(`${cellId}:`) ? storedKey.slice(cellId.length + 1) : storedKey, state: row.state as DurableJob["state"], attempt: Number(row.attempt), maxAttempts: Number(row.max_attempts), availableAt: String(row.available_at), leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined, createdAt: String(row.created_at), updatedAt: String(row.updated_at), correlationId: row.correlation_id ? String(row.correlation_id) : undefined, lastError: row.last_error ? parse(String(row.last_error)) : undefined }; }
+  private write(job: DurableJob, leaseToken?: string, storedIdempotencyKey = `${job.cellId}:${job.idempotencyKey}`): void { this.local.database.prepare("INSERT INTO ubeeq_jobs (id,cell_id,type,payload,idempotency_key,state,attempt,max_attempts,available_at,lease_token,lease_expires_at,created_at,updated_at,correlation_id,last_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, attempt=excluded.attempt, available_at=excluded.available_at, lease_token=excluded.lease_token, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at, last_error=excluded.last_error").run(job.id, job.cellId, job.type, json(job.payload), storedIdempotencyKey, job.state, job.attempt, job.maxAttempts, job.availableAt, leaseToken ?? null, job.leaseExpiresAt ?? null, job.createdAt, job.updatedAt, job.correlationId ?? null, job.lastError ? json(job.lastError) : null); }
   private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void { const result = this.local.database.prepare("UPDATE ubeeq_jobs SET state = ?, last_error = ?, available_at = COALESCE(?, available_at), lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'leased' AND lease_token = ?").run(state, error ? json(error) : null, availableAt ?? null, now(), id, leaseToken); if (result.changes !== 1) throw new Error("Job lease is no longer valid."); }
 }
 
