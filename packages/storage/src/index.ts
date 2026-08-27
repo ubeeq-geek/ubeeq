@@ -78,3 +78,15 @@ export const validateStoredObject = (object: StoredObject): void => {
   if (!object.bucket.trim() || !object.key.trim() || !object.contentType.trim()) throw new Error("Stored object location and content type are required");
   if (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0) throw new Error("Stored object byte length must be a non-negative integer");
 };
+
+/** Executable baseline for provider-neutral object storage adapters. */
+export const verifyObjectStorageContract = async (storage: ObjectStorage): Promise<void> => {
+  const object: StoredObject = { bucket: "contract", key: "object", versionId: "v1", contentType: "text/plain", byteLength: 8, scope: "private" };
+  const body = new TextEncoder().encode("contract");
+  await storage.put({ object, body });
+  const loaded = await storage.get(object);
+  if (loaded.object.checksum !== object.checksum || loaded.object.byteLength !== body.byteLength || new TextDecoder().decode(loaded.body) !== "contract") throw new Error("Object storage contract violation: stored object was not preserved.");
+  await storage.remove(object);
+  let removed = false; try { await storage.get(object); } catch { removed = true; }
+  if (!removed) throw new Error("Object storage contract violation: removed object remains available.");
+};
