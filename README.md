@@ -17,11 +17,13 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
 - `@ubeeq/jobs` — durable queue, scheduling, leasing, retry, and recovery ports.
 - `@ubeeq/persistence` — durable repository, transaction, revision, pagination, and adapter conformance contracts.
+- `@ubeeq/adapters-local` — SQLite, filesystem storage/delivery, local password sessions, and durable local jobs.
 - `@ubeeq/federation` — remote actor and publication-reference contracts.
 - `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
 - `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
+- `apps/reference-api` — runnable local API reference for the creator-to-public-Work flow.
 
 ## Extension compatibility
 

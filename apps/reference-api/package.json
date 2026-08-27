@@ -1,0 +1,16 @@
+{
+  "name": "@ubeeq/reference-api",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/adapters-local": "^0.1.0",
+    "@ubeeq/api": "^0.1.0",
+    "@ubeeq/persistence": "^0.1.0"
+  }
+}
