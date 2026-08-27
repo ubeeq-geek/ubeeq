@@ -24,6 +24,8 @@ export interface SignedFederationEnvelope<TPayload> {
 export interface FederationSignatureVerifier {
   verify(input: { keyId: string; message: string; signature: string }): Promise<boolean>;
 }
+export interface FederationSigner { keyId: string; sign(message: string): Promise<string>; }
+export const signFederationEnvelope = async <TPayload>(input: Omit<SignedFederationEnvelope<TPayload>, "keyId" | "signature">, signer: FederationSigner): Promise<SignedFederationEnvelope<TPayload>> => ({ ...input, keyId: signer.keyId, signature: await signer.sign(federationSigningInput({ ...input, keyId: signer.keyId })) });
 
 /** Durable replay protection belongs to an adapter; this port keeps it independent of a database choice. */
 export interface FederationReplayStore { consume(input: { envelopeId: string; expiresAt: string }): Promise<boolean>; }

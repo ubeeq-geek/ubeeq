@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLocalAdapterSet } from "../dist/index.js";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
+import { signFederationEnvelope, verifyFederationEnvelope } from "@ubeeq/federation";
 
 test("SQLite jobs retain idempotency and support retry, recovery, and cancellation", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-jobs-"));
@@ -38,5 +39,15 @@ test("local credential vault returns only opaque encrypted references and honors
     assert.deepEqual(Buffer.from(await credentials.read({ reference: stored.reference })), Buffer.from("not-exported-token"));
     await credentials.revoke({ reference: stored.reference });
     assert.equal(await credentials.read({ reference: stored.reference }), undefined);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("local federation key signs messages and retains replay protection", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-federation-"));
+  try {
+    const { federation } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:4100" });
+    const envelope = await signFederationEnvelope({ id: "delivery", issuedAt: "2026-01-01T00:00:00.000Z", expiresAt: "2027-01-01T00:00:00.000Z", payload: { reference: "remote" } }, federation);
+    await verifyFederationEnvelope(envelope, federation, federation, new Date("2026-02-01T00:00:00.000Z"));
+    await assert.rejects(() => verifyFederationEnvelope(envelope, federation, federation, new Date("2026-02-01T00:00:00.000Z")), /already delivered/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

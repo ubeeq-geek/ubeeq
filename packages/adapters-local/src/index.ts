@@ -1,10 +1,11 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
+import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { OptimisticConcurrencyError, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { DeliveryAdapter, ObjectStorage, StoredObject, UploadAdapter, UploadCompletion, UploadInitiation } from "@ubeeq/storage";
 
@@ -25,7 +26,7 @@ export class LocalSqliteDatabase {
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
-    for (const id of ["001-initial", "002-credential-vault"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -180,6 +181,15 @@ export class LocalCredentialVault implements CredentialVault {
   async revoke(input: { reference: string }): Promise<void> { const id = input.reference.replace(/^local-vault:/, ""); if (id !== input.reference) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ?").run(now(), id); }
 }
 
+/** Local HMAC signing is only a reference implementation; production federation uses a managed asymmetric key. */
+export class LocalFederationKey implements FederationSigner, FederationSignatureVerifier, FederationReplayStore {
+  readonly keyId = "local-federation-key"; private readonly key: Buffer;
+  constructor(private readonly local: LocalSqliteDatabase) { this.key = createHash("sha256").update(local.configuration.credentialEncryptionKey ?? `local-federation:${resolve(local.configuration.databasePath)}`).digest(); }
+  async sign(message: string): Promise<string> { return createHmac("sha256", this.key).update(message).digest("base64url"); }
+  async verify(input: { keyId: string; message: string; signature: string }): Promise<boolean> { return input.keyId === this.keyId && timingSafeEqual(Buffer.from(input.signature), Buffer.from(await this.sign(input.message))); }
+  async consume(input: { envelopeId: string; expiresAt: string }): Promise<boolean> { const result = this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_federation_replays (id, expires_at, created_at) VALUES (?, ?, ?)").run(input.envelopeId, input.expiresAt, now()); return result.changes === 1; }
+}
+
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
@@ -212,5 +222,5 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
 export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) => {
   const database = new LocalSqliteDatabase(configuration);
   const storage = new LocalFilesystemStorage(database);
-  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), jobs: new LocalSqliteJobQueue(database) };
+  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), federation: new LocalFederationKey(database), jobs: new LocalSqliteJobQueue(database) };
 };
