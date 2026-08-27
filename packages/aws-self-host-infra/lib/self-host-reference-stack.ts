@@ -18,6 +18,7 @@ export class SelfHostReferenceStack extends Stack {
     const sourceStore = new s3.Bucket(this, "SourceStore", bucketProps);
     const deliveryStore = new s3.Bucket(this, "DeliveryStore", bucketProps);
     const records = new dynamodb.Table(this, "Records", { partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING }, sortKey: { name: "sk", type: dynamodb.AttributeType.STRING }, billingMode: dynamodb.BillingMode.PAY_PER_REQUEST, pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true }, encryption: dynamodb.TableEncryption.AWS_MANAGED, removalPolicy: RemovalPolicy.RETAIN });
+    records.addGlobalSecondaryIndex({ indexName: "repository-id-index", partitionKey: { name: "repository", type: dynamodb.AttributeType.STRING }, sortKey: { name: "id", type: dynamodb.AttributeType.STRING } });
     const deadLetters = new sqs.Queue(this, "DeadLetters", { encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14), removalPolicy: RemovalPolicy.RETAIN });
     const jobs = new sqs.Queue(this, "Jobs", { encryption: sqs.QueueEncryption.SQS_MANAGED, deadLetterQueue: { queue: deadLetters, maxReceiveCount: 3 }, visibilityTimeout: Duration.minutes(5), removalPolicy: RemovalPolicy.RETAIN });
     new events.Rule(this, "RecoverySchedule", { schedule: events.Schedule.rate(Duration.minutes(5)), description: "Neutral scheduled recovery trigger for Ubeeq durable jobs" });

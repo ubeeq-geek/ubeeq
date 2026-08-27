@@ -81,7 +81,9 @@ export const validateStoredObject = (object: StoredObject): void => {
 
 /** Executable baseline for provider-neutral object storage adapters. */
 export const verifyObjectStorageContract = async (storage: ObjectStorage): Promise<void> => {
-  const object: StoredObject = { bucket: "contract", key: "object", versionId: "v1", contentType: "text/plain", byteLength: 8, scope: "private" };
+  // Object versions are assigned by the storage provider. A generic adapter contract
+  // must not fabricate one (for example, S3 rejects unknown VersionIds).
+  const object: StoredObject = { bucket: "contract", key: "object", contentType: "text/plain", byteLength: 8, scope: "private" };
   const body = new TextEncoder().encode("contract");
   await storage.put({ object, body });
   const loaded = await storage.get(object);

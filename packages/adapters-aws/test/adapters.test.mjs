@@ -11,7 +11,7 @@ class MemoryDynamo {
   async send(command) {
     const input = command.input;
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
-    if (command.constructor.name === "ScanCommand") {
+    if (command.constructor.name === "QueryCommand") {
       const repository = input.ExpressionAttributeValues[":repository"];
       const items = [...this.values.values()].filter((value) => value.repository === repository).slice(0, input.Limit);
       return { Items: items };
@@ -19,13 +19,13 @@ class MemoryDynamo {
     if (command.constructor.name === "PutCommand") {
       const key = `${input.Item.pk}|${input.Item.sk}`;
       const current = this.values.get(key);
-      if (input.ConditionExpression === "attribute_not_exists(pk)" && current) throw new Error("ConditionalCheckFailedException");
-      if (input.ConditionExpression?.includes("#value.#revision") && (!current || current.value.revision !== input.ExpressionAttributeValues[":revision"])) throw new Error("ConditionalCheckFailedException");
+      if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression?.includes("#revision") && (!current || current.revision !== input.ExpressionAttributeValues[":revision"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       this.values.set(key, input.Item); return {};
     }
     if (command.constructor.name === "DeleteCommand") {
       const key = `${input.Key.pk}|${input.Key.sk}`; const current = this.values.get(key);
-      if (!current || current.value.revision !== input.ExpressionAttributeValues[":revision"]) throw new Error("ConditionalCheckFailedException");
+      if (!current || current.revision !== input.ExpressionAttributeValues[":revision"]) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       this.values.delete(key); return {};
     }
     throw new Error(`Unsupported command ${command.constructor.name}`);
