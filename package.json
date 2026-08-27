@@ -9,6 +9,7 @@
     "check:adapter-contracts": "node scripts/check-adapter-contracts.mjs",
     "check:publish-workflow": "node scripts/check-publish-workflow.mjs",
     "dev:reference": "npm run start --workspace @ubeeq/web-reference",
+    "dev:reference-admin": "npm run start --workspace @ubeeq/admin-reference",
     "dev:reference-api": "npm run build --workspace @ubeeq/adapters-local && npm run build --workspace @ubeeq/reference-api && npm run start --workspace @ubeeq/reference-api",
     "build:self-host-infra": "npm run build --workspace @ubeeq/self-host-infra",
     "synth:self-host-infra": "npm run synth --workspace @ubeeq/self-host-infra",
