@@ -5,10 +5,14 @@ import { join } from "node:path";
 import { createLocalAdapterSet } from "../dist/index.js";
 import { verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 
-test("SQLite creator repository satisfies the shared persistence contract", async () => {
+test("every SQLite repository port satisfies the shared persistence contract", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-contract-"));
   try {
     const { repositories } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1" });
-    await verifyRevisionedRepositoryContract({ repository: repositories.creators, createRecord: (id) => ({ id, instanceId: "local", handle: "creator", displayName: "Creator" }), change: () => ({ displayName: "Updated" }) });
+    const names = Object.keys(repositories).filter((name) => name !== "transaction");
+    for (const name of names) {
+      const repository = repositories[name];
+      await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "local", contractValue: name }), change: () => ({ contractValue: `updated-${name}` }) });
+    }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
