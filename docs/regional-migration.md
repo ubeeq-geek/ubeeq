@@ -44,8 +44,9 @@ operator control region:
   npx cdk deploy UbeeqRoutingControl)
 ```
 
-For a regional cell, pass the output table name and ARN as
-`UBEEQ_ROUTING_DIRECTORY_TABLE_NAME` and `UBEEQ_ROUTING_DIRECTORY_TABLE_ARN`.
+For a regional cell, pass the output table name, ARN, and deployment region as
+`UBEEQ_ROUTING_DIRECTORY_TABLE_NAME`, `UBEEQ_ROUTING_DIRECTORY_TABLE_ARN`, and
+`UBEEQ_ROUTING_DIRECTORY_REGION`.
 The cell Lambda receives read-only access for edge route resolution. A separate,
 explicitly authorized migration-worker deployment receives write access and a
 `MigrationExecutor`; no ordinary cell runtime can mutate the global directory.

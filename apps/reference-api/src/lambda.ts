@@ -82,7 +82,7 @@ const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??
     userPoolClientId: required("UBEEQ_USER_POOL_CLIENT_ID"),
     credentialSecretPrefix: required("UBEEQ_CREDENTIAL_SECRET_PREFIX"),
   }) as ReferenceAdapterSet,
-  ...(process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME ? { regionalControlPlane: createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME, region: process.env.AWS_REGION }) } : {}),
+  ...(process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME ? { regionalControlPlane: createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME, region: required("UBEEQ_ROUTING_DIRECTORY_REGION") }) } : {}),
 });
 
 export const handler = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
