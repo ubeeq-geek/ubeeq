@@ -11,6 +11,18 @@ UBEEQ_REFERENCE_API_PUBLIC_BASE_URL=https://ubeeq.example \
 npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
 ```
 
+To map the API Gateway edge to a delegated Route 53 zone, also provide a regional ACM certificate and the hosted-zone ID. The custom domain must be the apex of that delegated zone:
+
+```sh
+UBEEQ_REFERENCE_API_PUBLIC_BASE_URL=https://dev-demo.example \
+UBEEQ_REFERENCE_API_DOMAIN_NAME=dev-demo.example \
+UBEEQ_PUBLIC_HOSTED_ZONE_ID=<delegated-public-zone-id> \
+UBEEQ_REFERENCE_API_CERTIFICATE_ARN=<regional-acm-certificate-arn> \
+npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
+```
+
+The stack creates the regional API Gateway domain, its `$default` API mapping, and the Route 53 alias record. A regional API Gateway certificate must be issued in the API’s region.
+
 The emitted Function URL is IAM-protected for operator diagnostics. The stack also emits `ReferenceApiGatewayUrl`, the HTTP API edge for the reference API; it passes requests to the API, whose protected routes validate Cognito bearer tokens through the identity port. Do not treat either generated hostname as a production public base URL. AWS uploads return a checksum-bound, time-limited S3 PUT URL; upload content goes directly to S3 and then `/v1/uploads/{uploadId}/complete` records the immutable object version. SQS invokes the bundled worker Lambda to process the completed asset.
 
 Keep production backup retention, alert routing, key management, domains, and network policy in your own deployment configuration. See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for the operational runbook.

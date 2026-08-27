@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as apigwv2Integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
@@ -10,6 +11,8 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3 from "aws-cdk-lib/aws-s3";
+import * as route53 from "aws-cdk-lib/aws-route53";
+import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
@@ -43,6 +46,17 @@ export class SelfHostReferenceStack extends Stack {
     const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });
     api.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiIntegration", health) });
     api.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiRootIntegration", health) });
+    const customDomainName = this.node.tryGetContext("referenceApiDomainName") || process.env.UBEEQ_REFERENCE_API_DOMAIN_NAME;
+    const publicHostedZoneId = this.node.tryGetContext("publicHostedZoneId") || process.env.UBEEQ_PUBLIC_HOSTED_ZONE_ID;
+    const certificateArn = this.node.tryGetContext("referenceApiCertificateArn") || process.env.UBEEQ_REFERENCE_API_CERTIFICATE_ARN;
+    if (customDomainName || publicHostedZoneId || certificateArn) {
+      if (!customDomainName || !publicHostedZoneId || !certificateArn) throw new Error("Custom API domains require UBEEQ_REFERENCE_API_DOMAIN_NAME, UBEEQ_PUBLIC_HOSTED_ZONE_ID, and UBEEQ_REFERENCE_API_CERTIFICATE_ARN.");
+      const zone = route53.HostedZone.fromHostedZoneAttributes(this, "PublicHostedZone", { hostedZoneId: publicHostedZoneId, zoneName: customDomainName });
+      const domain = new apigwv2.DomainName(this, "ReferenceApiCustomDomain", { domainName: customDomainName, certificate: acm.Certificate.fromCertificateArn(this, "ReferenceApiCertificate", certificateArn), securityPolicy: apigwv2.SecurityPolicy.TLS_1_2 });
+      new apigwv2.ApiMapping(this, "ReferenceApiCustomDomainMapping", { api, domainName: domain, stage: api.defaultStage });
+      new route53.ARecord(this, "ReferenceApiCustomDomainAlias", { zone, target: route53.RecordTarget.fromAlias(new route53Targets.ApiGatewayv2DomainProperties(domain.regionalDomainName, domain.regionalHostedZoneId)) });
+      new CfnOutput(this, "ReferenceApiCustomDomainUrl", { value: `https://${customDomainName}` });
+    }
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
     new CfnOutput(this, "ReferenceApiGatewayUrl", { value: api.apiEndpoint });
     new CfnOutput(this, "SourceStoreName", { value: sourceStore.bucketName });
