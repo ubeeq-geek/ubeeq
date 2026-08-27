@@ -19,6 +19,19 @@ export interface ProcessingResult {
   errorCode?: string;
 }
 
+export interface ProcessedRendition { id: string; contentType: string; byteLength: number; role: "source" | "preview" | "poster"; }
+export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
+
+/** Local reference processor: validates common image headers and records source lineage without a vendor dependency. */
+export class LocalImageProcessor implements MediaProcessor {
+  async process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }) {
+    const bytes = input.source; let width: number | undefined; let height: number | undefined;
+    if (input.contentType === "image/png" && bytes.length >= 24 && String.fromCharCode(...bytes.slice(1, 4)) === "PNG") { width = new DataView(bytes.buffer, bytes.byteOffset + 16, 8).getUint32(0); height = new DataView(bytes.buffer, bytes.byteOffset + 16, 8).getUint32(4); }
+    if (input.contentType.startsWith("image/") && (!width || !height)) { /* Other image formats remain valid source-only local media until a processor extension supplies renditions. */ }
+    return { metadata: { contentType: input.contentType, byteLength: bytes.byteLength, ...(width && height ? { width, height } : {}) }, renditions: [{ id: `source:${input.sourceVersionId}`, contentType: input.contentType, byteLength: bytes.byteLength, role: "source" as const }], measuredUnits: 1 };
+  }
+}
+
 export interface UsageMeasurement {
   id: string;
   accountId: string;
@@ -43,4 +56,3 @@ export const recordUsageMeasurement = async (repository: UsageMeterRepository, m
   validateUsageMeasurement(measurement);
   return repository.record(measurement);
 };
-

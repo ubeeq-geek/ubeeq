@@ -4,6 +4,7 @@ import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/ad
 import { composeReferenceApplication } from "@ubeeq/api";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
+import { LocalImageProcessor } from "@ubeeq/processing";
 import type { AssetRecord, CreatorRecord, WorkRecord } from "@ubeeq/persistence";
 
 const json = (response: ServerResponse, status: number, body: unknown, requestId: string): void => {
@@ -35,6 +36,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     ]
   });
   const { repositories } = composition.dependencies;
+  const processor = new LocalImageProcessor();
 
   const session = async (request: IncomingMessage) => {
     const credential = request.headers.authorization?.replace(/^Bearer\s+/i, "");
@@ -73,9 +75,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const processing = await repositories.assets.update(asset.id, asset.revision, { status: "processing" });
       const source = await adapters.storage.get(storage);
       if (source.object.checksum !== processing.checksum || source.object.byteLength <= 0) throw new Error("Processing source object failed checksum or metadata verification.");
+      const processingResult = await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
       const processed = await repositories.transaction(async (transaction) => {
         const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready" }, { transaction });
-        await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, byteLength: source.object.byteLength, renditionCount: 0 } }, { transaction });
+        await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions } }, { transaction });
         await repositories.usageEvents.create({ id: randomUUID(), instanceId: processing.instanceId, accountId: processing.creatorId, meter: "processing_units", quantity: 1, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` }, { transaction, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` });
         await repositories.auditEvents.create({ id: randomUUID(), instanceId: processing.instanceId, action: "asset.processing_completed", subjectId: processing.id, payload: { jobId: lease.job.id, sourceVersionId: processing.objectVersion } }, { transaction });
         return ready;

@@ -14,6 +14,7 @@
     "@ubeeq/moderation": "^0.1.0",
     "@ubeeq/federation": "^0.1.0",
     "@ubeeq/portability": "^0.1.0",
+    "@ubeeq/processing": "^0.1.0",
     "@ubeeq/persistence": "^0.1.0"
   }
 }
