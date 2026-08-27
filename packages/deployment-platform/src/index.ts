@@ -29,6 +29,31 @@ export interface MigrationCheckpoint {
   updatedAt: string;
 }
 
+/**
+ * Optional managed-edge control plane.  Implementations retain routing and
+ * migration metadata only; creator records, source objects, credentials, and
+ * moderation data always remain in their regional home cell.
+ */
+export interface RoutingDirectory {
+  get(creatorId: string): Promise<CellRoute | undefined>;
+  create(route: CellRoute): Promise<CellRoute>;
+  /** Atomically replaces a route only when the current routing revision matches. */
+  compareAndSwap(input: { route: CellRoute; expectedRoutingRevision: number }): Promise<CellRoute>;
+  list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }>;
+}
+
+export interface MigrationCheckpointStore {
+  get(id: string): Promise<MigrationCheckpoint | undefined>;
+  create(checkpoint: MigrationCheckpoint): Promise<MigrationCheckpoint>;
+  /** Optimistic update prevents two operators/workers from advancing one migration concurrently. */
+  compareAndSwap(input: { checkpoint: MigrationCheckpoint; expectedUpdatedAt: string }): Promise<MigrationCheckpoint>;
+  list(input: { creatorId?: string; limit: number; cursor?: string }): Promise<{ items: readonly MigrationCheckpoint[]; nextCursor?: string }>;
+}
+
+export class RoutingDirectoryConflictError extends Error {
+  constructor(message: string) { super(message); this.name = "RoutingDirectoryConflictError"; }
+}
+
 export class MigrationTransitionError extends Error {
   constructor(message: string) { super(message); this.name = "MigrationTransitionError"; }
 }
@@ -47,6 +72,12 @@ const transition: Readonly<Record<MigrationState, readonly MigrationState[]>> = 
 export const validateCellRoute = (route: CellRoute): CellRoute => {
   if (!route.creatorId.trim() || !route.homeCellId.trim() || !route.homeRegion.trim() || !validEndpoint(route.endpoint) || !Number.isSafeInteger(route.routingRevision) || route.routingRevision < 1 || Number.isNaN(Date.parse(route.updatedAt))) throw new Error("Cell route is invalid");
   return route;
+};
+
+export const validateMigrationCheckpoint = (checkpoint: MigrationCheckpoint): MigrationCheckpoint => {
+  createMigrationCheckpoint({ ...checkpoint, now: checkpoint.createdAt });
+  if (!transition[checkpoint.state] || Number.isNaN(Date.parse(checkpoint.updatedAt))) throw new Error("Migration checkpoint is invalid");
+  return checkpoint;
 };
 
 export const createMigrationCheckpoint = (input: Omit<MigrationCheckpoint, "state" | "createdAt" | "updatedAt"> & { now?: string }): MigrationCheckpoint => {

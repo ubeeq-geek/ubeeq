@@ -12,4 +12,19 @@ The required lifecycle is `requested → source_hold → exported → transferre
 
 An operator implementing `CellRoute` storage must use an atomic conditional write for the routing revision. The routing directory must not store source files, credentials, moderation evidence, private profiles, or mutable Work records. Transfers and imports use the existing export/object-store ports and must record checksums; credentials require a dedicated re-encryption capability and creator authorization, otherwise the creator reconnects them in the destination cell.
 
+## Reference control-plane adapter
+
+`@ubeeq/adapters-local` supplies `LocalRoutingDirectory` and
+`LocalMigrationCheckpoints`. They use SQLite tables separate from the regular
+creator repositories and implement creation plus optimistic compare-and-swap
+updates. The adapter is useful for local operator workflow development and
+restart-safe migration workers; it is not exposed as a public reference API
+route. An operator-facing route must be protected by a deployment's own
+administrator authorization extension before it can disclose even routing
+metadata.
+
+The next managed deployment adapter must implement the same two interfaces in
+an operator control plane (for example, a dedicated DynamoDB table), rather
+than placing routing records in any regional creator-data table.
+
 The reference API remains a single-cell application. A managed multi-cell deployment supplies the directory and migration worker outside the reference application's data plane. Until such an operator adapter is installed, a regional outage remains unavailable for writes and cannot trigger failover.

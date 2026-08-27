@@ -8,6 +8,7 @@ import { verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract 
 import { verifyObjectStorageContract, verifyUploadContentAdapterContract } from "@ubeeq/storage";
 import { verifyPasswordIdentityContract } from "@ubeeq/auth";
 import { verifyCredentialVaultContract } from "@ubeeq/integrations";
+import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, RoutingDirectoryConflictError } from "@ubeeq/deployment-platform";
 
 test("every SQLite repository port satisfies the shared persistence contract", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-contract-"));
@@ -58,5 +59,28 @@ test("local delivery tokens are signed, expiring, and cell scoped", async () => 
     const foreignDirectory = mkdtempSync(join(tmpdir(), "ubeeq-local-delivery-foreign-")); const foreign = createLocalAdapterSet({ databasePath: join(foreignDirectory, "state.sqlite"), dataDirectory: foreignDirectory, publicBaseUrl: "http://127.0.0.1", cellId: "cell-b", deliverySigningKeys: { current: "current-key" }, activeDeliveryKeyId: "current" }).storage;
     assert.throws(() => foreign.verifyDeliveryToken(token), /another cell/); rmSync(foreignDirectory, { recursive: true, force: true });
     const expiring = await storage.issue({ object: { bucket: "cell-a", key: "cells/cell-a/creators/creator-a/renditions/expiring", scope: "public" }, expiresAt: new Date(Date.now() + 5).toISOString() }); await new Promise((resolve) => setTimeout(resolve, 10)); assert.throws(() => storage.verifyDeliveryToken(expiring.url.split("/").at(-1)), /expired/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("local routing metadata is durable, compare-and-swap guarded, and contains no cell data", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-routing-"));
+  try {
+    const { routingDirectory, migrationCheckpoints } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1", cellId: "cell-a" });
+    const timestamp = "2026-08-27T00:00:00.000Z";
+    const source = { creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "us-east-2", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: timestamp };
+    await routingDirectory.create(source);
+    await assert.rejects(() => routingDirectory.create(source), RoutingDirectoryConflictError);
+    let checkpoint = createMigrationCheckpoint({ id: "migration-1", creatorId: source.creatorId, source, destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://cell-b.example/" }, now: timestamp });
+    await migrationCheckpoints.create(checkpoint);
+    checkpoint = advanceMigration(checkpoint, "source_hold", { now: "2026-08-27T00:01:00.000Z" });
+    await migrationCheckpoints.compareAndSwap({ checkpoint, expectedUpdatedAt: timestamp });
+    await assert.rejects(() => migrationCheckpoints.compareAndSwap({ checkpoint: { ...checkpoint, updatedAt: "2026-08-27T00:02:00.000Z" }, expectedUpdatedAt: timestamp }), RoutingDirectoryConflictError);
+    checkpoint = advanceMigration(checkpoint, "exported", { now: "2026-08-27T00:02:00.000Z", manifestChecksum: "a".repeat(64) });
+    checkpoint = advanceMigration(checkpoint, "transferred", { now: "2026-08-27T00:03:00.000Z" });
+    checkpoint = advanceMigration(checkpoint, "verified", { now: "2026-08-27T00:04:00.000Z", objectCount: 2, verifiedObjectCount: 2 });
+    const destination = cutoverCellRoute(source, checkpoint, "2026-08-27T00:05:00.000Z");
+    await routingDirectory.compareAndSwap({ route: destination, expectedRoutingRevision: source.routingRevision });
+    assert.equal((await routingDirectory.get(source.creatorId))?.homeCellId, "cell-b");
+    await assert.rejects(() => routingDirectory.compareAndSwap({ route: { ...destination, routingRevision: 3, updatedAt: "2026-08-27T00:06:00.000Z" }, expectedRoutingRevision: 1 }), RoutingDirectoryConflictError);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

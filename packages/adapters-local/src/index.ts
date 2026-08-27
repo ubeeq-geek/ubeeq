@@ -6,6 +6,7 @@ import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } f
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
+import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import { requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
@@ -27,7 +28,7 @@ export class LocalSqliteDatabase {
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -236,8 +237,79 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void { const result = this.local.database.prepare("UPDATE ubeeq_jobs SET state = ?, last_error = ?, available_at = COALESCE(?, available_at), lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'leased' AND lease_token = ?").run(state, error ? json(error) : null, availableAt ?? null, now(), id, leaseToken); if (result.changes !== 1) throw new Error("Job lease is no longer valid."); }
 }
 
+/**
+ * SQLite control-plane implementation for a single operator.  It is not part
+ * of `UbeeqRepositories`: routes are intentionally outside any creator's home
+ * cell data set and contain no private creator state.
+ */
+export class LocalRoutingDirectory implements RoutingDirectory {
+  constructor(private readonly local: LocalSqliteDatabase) {}
+  async get(creatorId: string): Promise<CellRoute | undefined> {
+    const row = this.local.database.prepare("SELECT creator_id, home_cell_id, home_region, endpoint, routing_revision, state, updated_at FROM ubeeq_cell_routes WHERE creator_id = ?").get(creatorId) as Record<string, unknown> | undefined;
+    return row ? this.route(row) : undefined;
+  }
+  async create(route: CellRoute): Promise<CellRoute> {
+    validateCellRoute(route);
+    try {
+      this.local.database.prepare("INSERT INTO ubeeq_cell_routes (creator_id, home_cell_id, home_region, endpoint, routing_revision, state, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(route.creatorId, route.homeCellId, route.homeRegion, route.endpoint, route.routingRevision, route.state, route.updatedAt);
+      return route;
+    } catch (error) {
+      if (error instanceof Error && /unique|constraint/i.test(error.message)) throw new RoutingDirectoryConflictError(`A route already exists for creator ${route.creatorId}.`);
+      throw error;
+    }
+  }
+  async compareAndSwap(input: { route: CellRoute; expectedRoutingRevision: number }): Promise<CellRoute> {
+    validateCellRoute(input.route);
+    if (input.route.routingRevision !== input.expectedRoutingRevision + 1) throw new RoutingDirectoryConflictError("The replacement route must advance routingRevision by exactly one.");
+    const result = this.local.database.prepare("UPDATE ubeeq_cell_routes SET home_cell_id = ?, home_region = ?, endpoint = ?, routing_revision = ?, state = ?, updated_at = ? WHERE creator_id = ? AND routing_revision = ?").run(input.route.homeCellId, input.route.homeRegion, input.route.endpoint, input.route.routingRevision, input.route.state, input.route.updatedAt, input.route.creatorId, input.expectedRoutingRevision);
+    if (result.changes !== 1) throw new RoutingDirectoryConflictError(`Route revision ${input.expectedRoutingRevision} is no longer current for creator ${input.route.creatorId}.`);
+    return input.route;
+  }
+  async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }> {
+    const limit = Math.max(1, Math.min(100, input.limit)), after = input.cursor ? Buffer.from(input.cursor, "base64url").toString("utf8") : "";
+    const rows = this.local.database.prepare("SELECT creator_id, home_cell_id, home_region, endpoint, routing_revision, state, updated_at FROM ubeeq_cell_routes WHERE creator_id > ? ORDER BY creator_id LIMIT ?").all(after, limit + 1) as Record<string, unknown>[];
+    const items = rows.slice(0, limit).map((row) => this.route(row));
+    return { items, nextCursor: rows.length > limit ? Buffer.from(items.at(-1)!.creatorId).toString("base64url") : undefined };
+  }
+  private route(row: Record<string, unknown>): CellRoute { return validateCellRoute({ creatorId: String(row.creator_id), homeCellId: String(row.home_cell_id), homeRegion: String(row.home_region), endpoint: String(row.endpoint), routingRevision: Number(row.routing_revision), state: row.state as CellRoute["state"], updatedAt: String(row.updated_at) }); }
+}
+
+/** Durable migration state lets a worker resume after a process restart. */
+export class LocalMigrationCheckpoints implements MigrationCheckpointStore {
+  constructor(private readonly local: LocalSqliteDatabase) {}
+  async get(id: string): Promise<MigrationCheckpoint | undefined> {
+    const row = this.local.database.prepare("SELECT payload FROM ubeeq_migration_checkpoints WHERE id = ?").get(id) as { payload?: string } | undefined;
+    return row?.payload ? validateMigrationCheckpoint(parse<MigrationCheckpoint>(row.payload)) : undefined;
+  }
+  async create(checkpoint: MigrationCheckpoint): Promise<MigrationCheckpoint> {
+    validateMigrationCheckpoint(checkpoint);
+    try {
+      this.local.database.prepare("INSERT INTO ubeeq_migration_checkpoints (id, creator_id, payload, updated_at) VALUES (?, ?, ?, ?)").run(checkpoint.id, checkpoint.creatorId, json(checkpoint), checkpoint.updatedAt);
+      return checkpoint;
+    } catch (error) {
+      if (error instanceof Error && /unique|constraint/i.test(error.message)) throw new RoutingDirectoryConflictError(`Migration checkpoint ${checkpoint.id} already exists.`);
+      throw error;
+    }
+  }
+  async compareAndSwap(input: { checkpoint: MigrationCheckpoint; expectedUpdatedAt: string }): Promise<MigrationCheckpoint> {
+    validateMigrationCheckpoint(input.checkpoint);
+    if (input.checkpoint.updatedAt === input.expectedUpdatedAt) throw new RoutingDirectoryConflictError("A migration update must advance updatedAt.");
+    const result = this.local.database.prepare("UPDATE ubeeq_migration_checkpoints SET creator_id = ?, payload = ?, updated_at = ? WHERE id = ? AND updated_at = ?").run(input.checkpoint.creatorId, json(input.checkpoint), input.checkpoint.updatedAt, input.checkpoint.id, input.expectedUpdatedAt);
+    if (result.changes !== 1) throw new RoutingDirectoryConflictError(`Migration checkpoint ${input.checkpoint.id} has changed.`);
+    return input.checkpoint;
+  }
+  async list(input: { creatorId?: string; limit: number; cursor?: string }): Promise<{ items: readonly MigrationCheckpoint[]; nextCursor?: string }> {
+    const limit = Math.max(1, Math.min(100, input.limit)), after = input.cursor ? Buffer.from(input.cursor, "base64url").toString("utf8") : "";
+    const rows = input.creatorId
+      ? this.local.database.prepare("SELECT id, payload FROM ubeeq_migration_checkpoints WHERE creator_id = ? AND id > ? ORDER BY id LIMIT ?").all(input.creatorId, after, limit + 1)
+      : this.local.database.prepare("SELECT id, payload FROM ubeeq_migration_checkpoints WHERE id > ? ORDER BY id LIMIT ?").all(after, limit + 1);
+    const typed = rows as Array<{ id: string; payload: string }>, items = typed.slice(0, limit).map((row) => validateMigrationCheckpoint(parse<MigrationCheckpoint>(row.payload)));
+    return { items, nextCursor: typed.length > limit ? Buffer.from(items.at(-1)!.id).toString("base64url") : undefined };
+  }
+}
+
 export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) => {
   const database = new LocalSqliteDatabase(configuration);
   const storage = new LocalFilesystemStorage(database);
-  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), federation: new LocalFederationKey(database), jobs: new LocalSqliteJobQueue(database) };
+  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), federation: new LocalFederationKey(database), jobs: new LocalSqliteJobQueue(database), routingDirectory: new LocalRoutingDirectory(database), migrationCheckpoints: new LocalMigrationCheckpoints(database) };
 };
