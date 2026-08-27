@@ -1,5 +1,6 @@
 /** Neutral evidence and human-review lifecycle. Product policy evaluates evidence separately. */
 export interface ModerationEvidence {
+  cellId: string;
   id: string;
   subjectId: string;
   source: string;
@@ -9,6 +10,7 @@ export interface ModerationEvidence {
 }
 
 export interface ReviewHold {
+  cellId: string;
   id: string;
   subjectId: string;
   active: boolean;
@@ -83,6 +85,7 @@ export type ReviewCaseStatus = "open" | "assigned" | "decided";
 export type ReviewCaseOutcome = "cleared" | "confirmed" | "escalated";
 
 export interface ReviewCase {
+  cellId: string;
   id: string;
   subjectId: string;
   sourceId: string;
@@ -96,6 +99,7 @@ export interface ReviewCase {
 }
 
 export interface ModerationAuditEvent {
+  cellId: string;
   id: string;
   subjectId: string;
   action: string;

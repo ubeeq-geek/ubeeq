@@ -28,6 +28,7 @@ export const loadProductExtensions = <TExtension extends ExtensionManifest>(
 
 export interface InstanceConfiguration {
   instanceId: string;
+  cell: { id: string; region: string; operator: string };
   publicBaseUrl: string;
   extensions: readonly ExtensionManifest[];
   requiredExtensions: Readonly<Record<string, readonly ExtensionContract[]>>;
@@ -53,6 +54,21 @@ export interface ReferenceApplicationDependencies {
   diagnostics?: readonly DependencyDiagnostic[];
 }
 
+export interface RequestContext { requestId: string; cellId: string; creatorId?: string; routingRevision?: number; }
+
+export class CellRoutingError extends Error {
+  readonly code = "foreign_cell";
+  constructor(readonly localCellId: string, readonly homeCellId: string) {
+    super(`Creator writes are authoritative in cell ${homeCellId}, not ${localCellId}`);
+    this.name = "CellRoutingError";
+  }
+}
+
+/** Enforces fail-closed routing for writes; callers must never redirect the write implicitly. */
+export const requireHomeCell = (context: Pick<RequestContext, "cellId">, aggregate: { homeCellId: string }): void => {
+  if (!context.cellId.trim() || context.cellId !== aggregate.homeCellId) throw new CellRoutingError(context.cellId, aggregate.homeCellId);
+};
+
 export const validateInstanceConfiguration = (configuration: InstanceConfiguration): void => {
   if (!/^[a-z0-9][a-z0-9.-]*$/.test(configuration.instanceId)) throw new Error("Instance id is invalid");
   let origin: URL;
@@ -63,6 +79,9 @@ export const validateInstanceConfiguration = (configuration: InstanceConfigurati
   }
   if (configuration.localAdapter && (!configuration.localAdapter.sqliteDatabasePath.trim() || !configuration.localAdapter.storageDirectory.trim())) {
     throw new Error("Local adapter configuration requires SQLite database and storage paths");
+  }
+  if (!configuration.cell?.id?.trim() || !configuration.cell.region?.trim() || !configuration.cell.operator?.trim()) {
+    throw new Error("Cell id, region, and operator are required");
   }
   validateProductExtensions(configuration.extensions, configuration.requiredExtensions);
 };

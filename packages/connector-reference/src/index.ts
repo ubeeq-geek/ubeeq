@@ -10,12 +10,12 @@ export class ReferenceConnector {
   async completeOAuth(input: { stateId: string; credential: Uint8Array; grantedScopes: readonly string[]; expiresAt?: string }): Promise<OAuthCallbackResult> {
     if (!this.runtime) throw new Error("Connector runtime is required for OAuth"); const state = await this.runtime.oauthStates.consume(input.stateId); if (!state) throw new Error("oauth_state_not_found"); requireValidOAuthState(state);
     const missing = state.requiredScopes.filter((scope) => !input.grantedScopes.includes(scope)); if (missing.length) throw new Error(`missing_required_scopes:${missing.join(",")}`);
-    const stored = await this.runtime.vault.write({ ownerId: state.ownerId, value: input.credential, expiresAt: input.expiresAt });
+    const stored = await this.runtime.vault.write({ cellId: state.cellId, ownerId: state.ownerId, value: input.credential, expiresAt: input.expiresAt });
     return { stateId: state.id, credentialReference: stored.reference, grantedScopes: [...new Set(input.grantedScopes)].sort(), expiresAt: input.expiresAt };
   }
-  async enqueueSync(input: { accountId: string; credentialReference: string; idempotencyKey: string }): Promise<string> {
+  async enqueueSync(input: { cellId: string; accountId: string; credentialReference: string; idempotencyKey: string }): Promise<string> {
     if (!this.runtime) throw new Error("Connector runtime is required for sync");
-    const job = await this.runtime.jobs.enqueue({ type: "reference.connector.sync", payload: { accountId: input.accountId, credentialReference: input.credentialReference }, idempotencyKey: input.idempotencyKey, maxAttempts: 4 }); return job.id;
+    const job = await this.runtime.jobs.enqueue({ cellId: input.cellId, type: "reference.connector.sync", payload: { accountId: input.accountId, credentialReference: input.credentialReference }, idempotencyKey: input.idempotencyKey, maxAttempts: 4 }); return job.id;
   }
   health(input: { tokenExpiresAt?: string; grantedScopes: readonly string[]; requiredScopes: readonly string[]; cooldownUntil?: string; lastSuccessfulSyncAt?: string }): IntegrationAccountHealth { return deriveIntegrationAccountHealth(input); }
   page(cursor?: string) { const values = ["one", "two", "three"]; const index = cursor ? Number(cursor) : 0; return { items: values.slice(index, index + 2), nextCursor: index + 2 < values.length ? String(index + 2) : undefined }; }

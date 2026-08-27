@@ -1,6 +1,7 @@
 /** Neutral, portable configuration required by a self-hosted Ubeeq instance. */
 export interface SelfHostConfiguration {
   instanceId: string;
+  cell: { id: string; region: string; operator: string; backupPolicy: string };
   publicOrigin: string;
   storage: { adapter: string; dataDirectory?: string };
   extensions: readonly { id: string; apiVersion: string }[];
@@ -30,6 +31,9 @@ export const validateSelfHostConfiguration = (input: SelfHostConfiguration): Sel
     throw new SelfHostConfigurationError("publicOrigin must use HTTPS except for a loopback development instance.");
   }
   if (!input.storage.adapter.trim()) throw new SelfHostConfigurationError("A storage adapter is required.");
+  if (!input.cell?.id?.trim() || !input.cell.region?.trim() || !input.cell.operator?.trim() || !input.cell.backupPolicy?.trim()) {
+    throw new SelfHostConfigurationError("Cell id, region, operator, and backup policy are required.");
+  }
   if (input.storage.adapter === "local" && !input.storage.dataDirectory?.trim()) {
     throw new SelfHostConfigurationError("Local storage requires dataDirectory.");
   }
@@ -39,3 +43,6 @@ export const validateSelfHostConfiguration = (input: SelfHostConfiguration): Sel
   }
   return input;
 };
+
+export interface CellDiagnostic { cellId: string; region: string; operator: string; backupPolicy: string; mode: "single-cell"; }
+export const describeCell = (configuration: SelfHostConfiguration): CellDiagnostic => ({ ...configuration.cell, cellId: configuration.cell.id, mode: "single-cell" });

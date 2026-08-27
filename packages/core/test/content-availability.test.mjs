@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contentAvailabilityFor, isCollectionVisible, isPublicationActive, validateContentBlocks } from "../dist/index.js";
+import { contentAvailabilityFor, isCollectionVisible, isPublicationActive, validateContentBlocks, validateDataHome } from "../dist/index.js";
 
 const imported = { origin: { type: "import", remoteId: "remote-1" } };
 const local = { origin: { type: "local" } };
@@ -8,6 +8,13 @@ const attachment = { workId: "work", assetId: "asset", role: "content", position
 const asset = (storage, status = "ready", metadata) => ({
   id: "asset", instanceId: "instance", creatorId: "creator", kind: "image", status,
   mimeType: "image/jpeg", storage, metadata, createdAt: "now", updatedAt: "now", attachment
+});
+
+test("requires a complete explicit data home", () => {
+  const dataHome = { cellId: "cell-a", region: "eu-west", assignedAt: "2026-01-01T00:00:00.000Z", routingRevision: 1 };
+  assert.equal(validateDataHome(dataHome), dataHome);
+  assert.throws(() => validateDataHome({ ...dataHome, cellId: "" }), /cellId/);
+  assert.throws(() => validateDataHome({ ...dataHome, routingRevision: 0 }), /routingRevision/);
 });
 
 test("derives neutral collection visibility and publication activity", () => {

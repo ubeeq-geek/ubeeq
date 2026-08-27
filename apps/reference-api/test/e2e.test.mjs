@@ -16,7 +16,7 @@ const request = async (base, path, options = {}) => {
 
 test("runs the portable signed-in upload, publish, delivery, and export workflow", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-reference-e2e-"));
-  const api = createReferenceApi({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:0" });
+  const api = createReferenceApi({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a" });
   await new Promise((resolve) => api.server.listen(0, "127.0.0.1", resolve));
   const address = api.server.address(); const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -26,6 +26,8 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.equal((await request(base, "/v1/auth/sign-up", { method: "POST", body: JSON.stringify({ email: "creator@example.test", password: "a-safe-local-password" }) })).response.status, 201);
     const signIn = await request(base, "/v1/auth/sign-in", { method: "POST", body: JSON.stringify({ email: "creator@example.test", password: "a-safe-local-password" }) });
     const headers = { authorization: `Bearer ${signIn.body.token}` };
+    assert.equal((await request(base, "/v1/operations/holds")).response.status, 401);
+    assert.equal((await request(base, "/v1/operations/review-cases", { method: "POST", body: JSON.stringify({ subjectId: "unknown" }) })).response.status, 401);
     const creator = await request(base, "/v1/creators", { method: "POST", headers, body: JSON.stringify({ handle: "creator", displayName: "Creator" }) });
     assert.equal(creator.response.status, 201);
     const collection = await request(base, "/v1/collections", { method: "POST", headers, body: JSON.stringify({ title: "A local collection", visibility: "public" }) });
@@ -45,22 +47,27 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.equal(processed.body.result.asset.status, "ready");
     const hold = await request(base, "/v1/operations/holds", { method: "POST", headers, body: JSON.stringify({ subjectType: "work", subjectId: work.body.work.id, reason: "manual_review" }) });
     assert.equal(hold.response.status, 201);
+    const secondHold = await request(base, "/v1/operations/holds", { method: "POST", headers, body: JSON.stringify({ subjectType: "creator", subjectId: creator.body.creator.id, reason: "pagination" }) }); assert.equal(secondHold.response.status, 201);
+    const holdsPage = await request(base, "/v1/operations/holds?limit=1", { headers }); assert.equal(holdsPage.body.holds.length, 1); assert.ok(holdsPage.body.nextCursor); assert.equal(holdsPage.body.cell.cellId, "cell-a");
     const blocked = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers, body: JSON.stringify({ destination: "local" }) });
     assert.equal(blocked.response.status, 409);
     assert.equal(blocked.body.error.code, "admission_blocked");
     assert.deepEqual(blocked.body.error.details.blockedSubjectIds, [work.body.work.id]);
     const release = await request(base, `/v1/operations/holds/${hold.body.hold.id}/release`, { method: "POST", headers, body: "{}" });
     assert.equal(release.response.status, 200);
+    await request(base, `/v1/operations/holds/${secondHold.body.hold.id}/release`, { method: "POST", headers, body: "{}" });
+    const review = await request(base, "/v1/operations/review-cases", { method: "POST", headers, body: JSON.stringify({ subjectId: work.body.work.id }) }); const decided = await request(base, `/v1/operations/review-cases/${review.body.reviewCase.id}`, { method: "POST", headers, body: JSON.stringify({ state: "decided", assigneeId: "operator" }) }); assert.equal(decided.body.reviewCase.state, "decided");
     const publication = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers: { ...headers, "idempotency-key": "publish-local-work" }, body: JSON.stringify({ destination: "local" }) });
     assert.equal(publication.response.status, 201);
     const publicWork = await request(base, `/v1/public/works/${work.body.work.id}`);
     assert.equal(publicWork.response.status, 200); assert.equal(publicWork.body.work.status, "published");
+    assert.match(publicWork.body.assets[0].storage.key, /\/renditions\//);
     const delivery = await fetch(publicWork.body.assets[0].delivery.url.replace("http://127.0.0.1:0", base));
-    assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes);
+    assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes); assert.match(delivery.headers.get("cache-control"), /public/);
     const exported = await request(base, "/v1/exports/me", { headers });
-    assert.equal(exported.response.status, 200); assert.equal(exported.body.schemaVersion, "1"); assert.equal(exported.body.secretsExcluded, true); assert.equal(exported.body.works.length, 1);
+    assert.equal(exported.response.status, 200); assert.equal(exported.body.schemaVersion, "2"); assert.equal(exported.body.secretsExcluded, true); assert.equal(exported.body.works.length, 1); assert.equal(exported.body.processing.length, 1); assert.equal(exported.body.objectInventory.length, 1);
     const importDirectory = mkdtempSync(join(tmpdir(), "ubeeq-reference-import-"));
-    const importApi = createReferenceApi({ databasePath: join(importDirectory, "state.sqlite"), dataDirectory: importDirectory, publicBaseUrl: "http://127.0.0.1:0" });
+    const importApi = createReferenceApi({ databasePath: join(importDirectory, "state.sqlite"), dataDirectory: importDirectory, publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a" });
     await new Promise((resolve) => importApi.server.listen(0, "127.0.0.1", resolve));
     const importBase = `http://127.0.0.1:${importApi.server.address().port}`;
     try {
@@ -86,8 +93,8 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
 test("accepts policy-approved signed federation reference updates and withdrawals", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-federation-e2e-"));
   const remoteDirectory = mkdtempSync(join(tmpdir(), "ubeeq-federation-remote-"));
-  const remoteAdapters = createLocalAdapterSet({ databasePath: join(remoteDirectory, "state.sqlite"), dataDirectory: remoteDirectory, publicBaseUrl: "https://remote.example" });
-  const configuration = { databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "https://reference.example", credentialEncryptionKey: "federation-test-key", federationVerifier: remoteAdapters.federation, federationPolicy: { id: "allow-test", apiVersion: "1", evaluateRemote: async () => "allow" } };
+  const remoteAdapters = createLocalAdapterSet({ databasePath: join(remoteDirectory, "state.sqlite"), dataDirectory: remoteDirectory, publicBaseUrl: "https://remote.example", cellId: "remote-cell" });
+  const configuration = { databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "https://reference.example", cellId: "cell-a", credentialEncryptionKey: "federation-test-key", federationVerifier: remoteAdapters.federation, federationPolicy: { id: "allow-test", apiVersion: "1", evaluateRemote: async () => "allow" } };
   const api = createReferenceApi(configuration);
   await new Promise((resolve) => api.server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${api.server.address().port}`;

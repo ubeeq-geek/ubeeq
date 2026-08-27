@@ -2,6 +2,7 @@
 export type UsageMeter = "storage_bytes" | "delivery_bytes" | "processing_units" | "transcode_seconds";
 
 export interface ProcessingRequest {
+  cellId: string;
   id: string;
   assetId: string;
   sourceVersionId: string;
@@ -42,6 +43,7 @@ export class LocalImageProcessor implements MediaProcessor {
 }
 
 export interface UsageMeasurement {
+  cellId: string;
   id: string;
   accountId: string;
   meter: UsageMeter;
