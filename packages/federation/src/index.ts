@@ -1,4 +1,32 @@
 export type FederationVisibility = "public" | "unlisted" | "private";
+export const FEDERATION_PROTOCOL_VERSION = "1" as const;
+
+export interface FederationInstanceDocument {
+  protocolVersion: typeof FEDERATION_PROTOCOL_VERSION;
+  instanceId: string;
+  instanceUrl: string;
+  actorDocumentUrl: string;
+  publicationInboxUrl: string;
+  signingKeyId: string;
+  signingPublicKey: string;
+  capabilities: readonly ("publication-reference" | "withdrawal")[];
+}
+
+export interface SignedFederationEnvelope<TPayload> {
+  id: string;
+  issuedAt: string;
+  expiresAt: string;
+  keyId: string;
+  payload: TPayload;
+  signature: string;
+}
+
+export interface FederationSignatureVerifier {
+  verify(input: { keyId: string; message: string; signature: string }): Promise<boolean>;
+}
+
+/** Durable replay protection belongs to an adapter; this port keeps it independent of a database choice. */
+export interface FederationReplayStore { consume(input: { envelopeId: string; expiresAt: string }): Promise<boolean>; }
 
 export interface RemoteActor {
   id: string;
@@ -32,6 +60,26 @@ const normalizeHttpsUrl = (value: string, field: string): URL => {
     throw new Error(`${field} must be an absolute HTTPS URL without credentials`);
   }
   return parsed;
+};
+
+export const stableFederationJson = (value: unknown): string => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([left], [right]) => left.localeCompare(right))) : item);
+export const federationSigningInput = <TPayload>(envelope: Omit<SignedFederationEnvelope<TPayload>, "signature">): string => stableFederationJson(envelope);
+
+export const createFederationInstanceDocument = (document: FederationInstanceDocument): FederationInstanceDocument => {
+  if (document.protocolVersion !== FEDERATION_PROTOCOL_VERSION || !document.instanceId.trim() || !document.signingKeyId.trim() || !document.signingPublicKey.trim()) throw new Error("Federation instance document is incomplete or incompatible.");
+  const instanceUrl = normalizeHttpsUrl(document.instanceUrl, "instanceUrl");
+  const actorDocumentUrl = normalizeHttpsUrl(document.actorDocumentUrl, "actorDocumentUrl");
+  const publicationInboxUrl = normalizeHttpsUrl(document.publicationInboxUrl, "publicationInboxUrl");
+  if (actorDocumentUrl.host !== instanceUrl.host || publicationInboxUrl.host !== instanceUrl.host) throw new Error("Federation instance endpoints must belong to the instance host.");
+  return { ...document, instanceUrl: instanceUrl.toString(), actorDocumentUrl: actorDocumentUrl.toString(), publicationInboxUrl: publicationInboxUrl.toString(), capabilities: [...new Set(document.capabilities)].sort() as FederationInstanceDocument["capabilities"] };
+};
+
+export const verifyFederationEnvelope = async <TPayload>(envelope: SignedFederationEnvelope<TPayload>, verifier: FederationSignatureVerifier, replayStore: FederationReplayStore, now = new Date()): Promise<void> => {
+  if (!envelope.id.trim() || !envelope.keyId.trim() || !envelope.signature.trim() || Number.isNaN(Date.parse(envelope.issuedAt)) || Number.isNaN(Date.parse(envelope.expiresAt))) throw new Error("Federation envelope is malformed.");
+  if (Date.parse(envelope.expiresAt) <= now.getTime()) throw new Error("Federation envelope has expired.");
+  const { signature, ...unsigned } = envelope;
+  if (!await verifier.verify({ keyId: envelope.keyId, message: federationSigningInput(unsigned), signature })) throw new Error("Federation envelope signature is invalid.");
+  if (!await replayStore.consume({ envelopeId: envelope.id, expiresAt: envelope.expiresAt })) throw new Error("Federation envelope was already delivered.");
 };
 
 /** Returns a canonical remote host without making a trust or visibility decision. */

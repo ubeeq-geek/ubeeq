@@ -19,6 +19,8 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
   const address = api.server.address(); const base = `http://127.0.0.1:${address.port}`;
   try {
     assert.equal((await request(base, "/health")).response.status, 200);
+    const discovery = await request(base, "/.well-known/ubeeq");
+    assert.equal(discovery.response.status, 200); assert.equal(discovery.body.protocolVersion, "1"); assert.equal(discovery.body.federationEnabled, false);
     assert.equal((await request(base, "/v1/auth/sign-up", { method: "POST", body: JSON.stringify({ email: "creator@example.test", password: "a-safe-local-password" }) })).response.status, 201);
     const signIn = await request(base, "/v1/auth/sign-in", { method: "POST", body: JSON.stringify({ email: "creator@example.test", password: "a-safe-local-password" }) });
     const headers = { authorization: `Bearer ${signIn.body.token}` };
