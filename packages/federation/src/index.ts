@@ -46,6 +46,13 @@ export interface RemotePublication {
   visibility: FederationVisibility;
 }
 
+/** A signed event binds the remote actor and publication body to its operation. */
+export interface RemotePublicationEvent {
+  type: "publication_reference" | "publication_updated" | "publication_withdrawn";
+  actor: RemoteActor;
+  publication: RemotePublication;
+}
+
 export interface FederationReference {
   id: string;
   host: string;
@@ -109,4 +116,12 @@ export const validateRemotePublication = (publication: RemotePublication): Remot
   const canonicalUrl = normalizeHttpsUrl(publication.canonicalUrl, "canonicalUrl");
   if (Number.isNaN(Date.parse(publication.publishedAt))) throw new Error("publishedAt must be an ISO date-time");
   return { ...publication, canonicalUrl: canonicalUrl.toString() };
+};
+
+export const validateRemotePublicationEvent = (event: RemotePublicationEvent): RemotePublicationEvent => {
+  if (event?.type !== "publication_reference" && event?.type !== "publication_updated" && event?.type !== "publication_withdrawn") throw new Error("Federation publication event type is unsupported");
+  const actor = validateRemoteActor(event.actor);
+  const publication = validateRemotePublication(event.publication);
+  if (publication.actorId !== actor.id) throw new Error("Federation publication event actor does not match the publication");
+  return { type: event.type, actor, publication };
 };

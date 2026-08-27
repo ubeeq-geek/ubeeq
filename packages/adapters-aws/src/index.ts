@@ -1,6 +1,7 @@
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetSecretValueCommand, PutSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
@@ -33,7 +34,7 @@ export const createDynamoRepositories = (dynamo: Dynamo, config: AwsRepositoryCo
 
 export class S3ObjectStorage implements ObjectStorage {
   constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string) {}
-  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, checksum: input.object.checksum ?? "", byteLength: String(input.object.byteLength) } })); }
+  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } })); }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
 }
@@ -47,7 +48,7 @@ export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick
 interface AwsJobRecord extends DurableJob, RevisionedRecord {}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
-  constructor(dynamo: Dynamo, configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string) {
+  constructor(dynamo: Dynamo, configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
     this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs");
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
@@ -79,7 +80,11 @@ export class AwsJobQueue implements JobQueue {
   private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
   private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || job.correlationId?.split(":").at(-1) !== leaseToken) throw new Error(`Job ${id} does not hold this lease.`); return job; }
   private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.jobs.update(job.id, job.revision, change); }
-  private async notify(id: string, type: string): Promise<void> { await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: JSON.stringify({ id, type }) })); }
+  private async notify(id: string, type: string): Promise<void> {
+    const detail = JSON.stringify({ id, type });
+    await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: detail }));
+    if (this.eventBridge) await this.eventBridge.client.send(new PutEventsCommand({ Entries: [{ EventBusName: this.eventBridge.eventBusName, Source: "ubeeq.jobs", DetailType: "job.available", Detail: detail }] }));
+  }
 }
 
 export class SecretsManagerCredentialVault implements CredentialVault {

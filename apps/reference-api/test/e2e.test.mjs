@@ -5,6 +5,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReferenceApi } from "../dist/server.js";
+import { createLocalAdapterSet } from "@ubeeq/adapters-local";
+import { signFederationEnvelope } from "@ubeeq/federation";
 
 const request = async (base, path, options = {}) => {
   const response = await fetch(`${base}${path}`, { ...options, headers: { "content-type": "application/json", ...(options.headers || {}) } });
@@ -78,5 +80,23 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     const jobs = await request(base, "/v1/operations/jobs", { headers });
     assert.equal(jobs.response.status, 200); assert.equal(jobs.body.jobs[0].state, "completed");
     assert.equal((await request(base, "/ready")).response.status, 200);
+  } finally { await api.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("accepts policy-approved signed federation reference updates and withdrawals", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ubeeq-federation-e2e-"));
+  const configuration = { databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "https://reference.example", credentialEncryptionKey: "federation-test-key", federationPolicy: { id: "allow-test", apiVersion: "1", evaluateRemote: async () => "allow" } };
+  const api = createReferenceApi(configuration);
+  await new Promise((resolve) => api.server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${api.server.address().port}`;
+  const adapters = createLocalAdapterSet(configuration);
+  const event = async (type, canonicalUrl, id) => signFederationEnvelope({ id, issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), payload: { type, actor: { id: "https://remote.example/actors/creator", host: "remote.example", handle: "creator", profileUrl: "https://remote.example/creator", inboxUrl: "https://remote.example/inbox" }, publication: { id: "remote-work-1", actorId: "https://remote.example/actors/creator", canonicalUrl, publishedAt: "2026-01-01T00:00:00.000Z", visibility: "public" } } }, adapters.federation);
+  try {
+    const accepted = await request(base, "/v1/federation/inbox", { method: "POST", body: JSON.stringify({ envelope: await event("publication_reference", "https://remote.example/works/one", "ref") }) });
+    assert.equal(accepted.response.status, 201); assert.equal(accepted.body.reference.state, "accepted");
+    const updated = await request(base, "/v1/federation/inbox", { method: "POST", body: JSON.stringify({ envelope: await event("publication_updated", "https://remote.example/works/one-revised", "update") }) });
+    assert.equal(updated.response.status, 200); assert.equal(updated.body.reference.publicationUri, "https://remote.example/works/one-revised");
+    const withdrawn = await request(base, "/v1/federation/inbox", { method: "POST", body: JSON.stringify({ envelope: await event("publication_withdrawn", "https://remote.example/works/one-revised", "withdraw") }) });
+    assert.equal(withdrawn.response.status, 200); assert.equal(withdrawn.body.reference.state, "withdrawn");
   } finally { await api.close(); rmSync(directory, { recursive: true, force: true }); }
 });

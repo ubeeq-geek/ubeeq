@@ -1,9 +1,23 @@
-import { diffReconciliationSnapshots, reconciliationStatus, type IntegrationConformanceAdapter } from "@ubeeq/integrations";
+import { deriveIntegrationAccountHealth, diffReconciliationSnapshots, reconciliationStatus, requireValidOAuthState, type CredentialVault, type IntegrationAccountHealth, type IntegrationConformanceAdapter, type OAuthAuthorizationState, type OAuthCallbackResult, type OAuthStateStore } from "@ubeeq/integrations";
+import type { JobQueue } from "@ubeeq/jobs";
 
 export const referenceConnector = { id: "reference.connector", capabilities: ["connect", "catalogue_import", "publish", "remote_delete", "reconcile"] as const, credentialCustody: "application" as const, ownerModel: "creator" as const, connectionModel: "external_account" as const };
 export class ReferenceConnector {
   private published = new Map<string, { id: string; title: string }>(); private idempotency = new Map<string, string>();
+  constructor(private readonly runtime?: { vault: CredentialVault; jobs: JobQueue; oauthStates: OAuthStateStore }) {}
   authorize(expiresAt: string, now = new Date()) { if (Date.parse(expiresAt) <= now.getTime()) throw new Error("oauth_expired"); return { credentialReference: "opaque:reference", expiresAt }; }
+  async beginOAuth(state: OAuthAuthorizationState): Promise<void> { if (!this.runtime) throw new Error("Connector runtime is required for OAuth"); await this.runtime.oauthStates.create(requireValidOAuthState(state)); }
+  async completeOAuth(input: { stateId: string; credential: Uint8Array; grantedScopes: readonly string[]; expiresAt?: string }): Promise<OAuthCallbackResult> {
+    if (!this.runtime) throw new Error("Connector runtime is required for OAuth"); const state = await this.runtime.oauthStates.consume(input.stateId); if (!state) throw new Error("oauth_state_not_found"); requireValidOAuthState(state);
+    const missing = state.requiredScopes.filter((scope) => !input.grantedScopes.includes(scope)); if (missing.length) throw new Error(`missing_required_scopes:${missing.join(",")}`);
+    const stored = await this.runtime.vault.write({ ownerId: state.ownerId, value: input.credential, expiresAt: input.expiresAt });
+    return { stateId: state.id, credentialReference: stored.reference, grantedScopes: [...new Set(input.grantedScopes)].sort(), expiresAt: input.expiresAt };
+  }
+  async enqueueSync(input: { accountId: string; credentialReference: string; idempotencyKey: string }): Promise<string> {
+    if (!this.runtime) throw new Error("Connector runtime is required for sync");
+    const job = await this.runtime.jobs.enqueue({ type: "reference.connector.sync", payload: { accountId: input.accountId, credentialReference: input.credentialReference }, idempotencyKey: input.idempotencyKey, maxAttempts: 4 }); return job.id;
+  }
+  health(input: { tokenExpiresAt?: string; grantedScopes: readonly string[]; requiredScopes: readonly string[]; cooldownUntil?: string; lastSuccessfulSyncAt?: string }): IntegrationAccountHealth { return deriveIntegrationAccountHealth(input); }
   page(cursor?: string) { const values = ["one", "two", "three"]; const index = cursor ? Number(cursor) : 0; return { items: values.slice(index, index + 2), nextCursor: index + 2 < values.length ? String(index + 2) : undefined }; }
   publish(input: { idempotencyKey: string; title: string }) { const existing = this.idempotency.get(input.idempotencyKey); if (existing) return this.published.get(existing)!; const id = `remote-${this.published.size + 1}`; const value = { id, title: input.title }; this.published.set(id, value); this.idempotency.set(input.idempotencyKey, id); return value; }
   delete(id: string) { return this.published.delete(id); }

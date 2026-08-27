@@ -5,5 +5,5 @@
   "publishConfig": { "access": "public" },
   "files": ["dist"], "main": "dist/index.js", "types": "dist/index.d.ts",
   "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node --test test/*.test.mjs" },
-  "dependencies": { "@ubeeq/integrations": "^0.1.0" }
+  "dependencies": { "@ubeeq/integrations": "^0.1.0", "@ubeeq/jobs": "^0.1.0" }
 }

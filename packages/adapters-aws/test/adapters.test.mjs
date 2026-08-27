@@ -3,6 +3,7 @@ import test from "node:test";
 import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3ObjectStorage, SecretsManagerCredentialVault } from "../dist/index.js";
 import { verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
+import { verifyObjectStorageContract } from "@ubeeq/storage";
 
 class MemoryDynamo {
   values = new Map();
@@ -47,19 +48,23 @@ test("DynamoDB revisioned repository obeys the shared persistence contract", asy
 
 test("SQS-notified DynamoDB queue obeys the shared durable job contract", async () => {
   const notices = [];
-  const queue = new AwsJobQueue(new MemoryDynamo(), { tableName: "records" }, { send: async (command) => { notices.push(command.input); return {}; } }, "https://sqs.example/jobs");
+  const events = [];
+  const queue = new AwsJobQueue(new MemoryDynamo(), { tableName: "records" }, { send: async (command) => { notices.push(command.input); return {}; } }, "https://sqs.example/jobs", { client: { send: async (command) => { events.push(command.input); return {}; } }, eventBusName: "ubeeq" });
   await verifyJobQueueContract(queue);
   assert.ok(notices.length >= 2);
   assert.equal(JSON.parse(notices[0].MessageBody).type, "contract");
+  assert.equal(events[0].Entries[0].DetailType, "job.available");
 });
 
-test("S3 adapter retains content metadata without prescribing a delivery provider", async () => {
-  let put;
+test("S3 adapter obeys the shared storage contract without prescribing a delivery provider", async () => {
+  const values = new Map(); let put;
   const storage = new S3ObjectStorage({ send: async (command) => {
-    if (command.constructor.name === "PutObjectCommand") { put = command.input; return {}; }
-    if (command.constructor.name === "GetObjectCommand") return { VersionId: "v1", ContentType: "image/png", Metadata: put.Metadata, Body: { transformToByteArray: async () => Buffer.from("image") } };
+    if (command.constructor.name === "PutObjectCommand") { put = command.input; values.set(command.input.Key, command.input); return {}; }
+    if (command.constructor.name === "GetObjectCommand") { const value = values.get(command.input.Key); if (!value) throw new Error("NoSuchKey"); return { VersionId: "v1", ContentType: value.ContentType, Metadata: value.Metadata, Body: { transformToByteArray: async () => value.Body } }; }
+    if (command.constructor.name === "DeleteObjectCommand") { values.delete(command.input.Key); return {}; }
     return {};
   } }, "objects");
+  await verifyObjectStorageContract(storage);
   await storage.put({ object: { bucket: "ignored", key: "source/a", contentType: "image/png", byteLength: 5, checksum: "abc", scope: "private" }, body: Buffer.from("image") });
   const loaded = await storage.get({ bucket: "ignored", key: "source/a" });
   assert.equal(put.Bucket, "objects");
