@@ -1,9 +1,10 @@
-import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
+import type { CredentialVault } from "@ubeeq/integrations";
 import { OptimisticConcurrencyError, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { DeliveryAdapter, ObjectStorage, StoredObject, UploadAdapter, UploadCompletion, UploadInitiation } from "@ubeeq/storage";
 
@@ -13,7 +14,7 @@ const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 type SqliteDatabase = { exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
 
-export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; sessionTtlSeconds?: number; }
+export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; }
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
@@ -24,10 +25,9 @@ export class LocalSqliteDatabase {
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
-    const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get("001-initial") as { id?: string } | undefined;
-    if (!applied?.id) {
-      this.database.exec(readFileSync(join(__dirname, "migrations", "001-initial.sql"), "utf8"));
-      this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run("001-initial", now());
+    for (const id of ["001-initial", "002-credential-vault"]) {
+      const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
+      if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
   }
 
@@ -163,6 +163,23 @@ export class LocalIdentityAdapter implements IdentityAdapter {
   async revokeSession(input: { sessionId: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId); }
 }
 
+/** Development-only encrypted credential custody. Production adapters must use a managed vault/key boundary. */
+export class LocalCredentialVault implements CredentialVault {
+  private readonly key: Buffer;
+  constructor(private readonly local: LocalSqliteDatabase) { this.key = createHash("sha256").update(local.configuration.credentialEncryptionKey ?? `local-development:${resolve(local.configuration.databasePath)}`).digest(); }
+  async write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }> {
+    const id = randomUUID(), iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", this.key, iv); const ciphertext = Buffer.concat([cipher.update(input.value), cipher.final()]), tag = cipher.getAuthTag();
+    this.local.database.prepare("INSERT INTO ubeeq_credentials (id, owner_id, ciphertext, iv, auth_tag, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, input.ownerId, ciphertext, iv, tag, input.expiresAt ?? null, now()); return { reference: `local-vault:${id}` };
+  }
+  async read(input: { reference: string }): Promise<Uint8Array | undefined> {
+    const id = input.reference.replace(/^local-vault:/, ""); if (id === input.reference) return undefined;
+    const row = this.local.database.prepare("SELECT ciphertext, iv, auth_tag, expires_at, revoked_at FROM ubeeq_credentials WHERE id = ?").get(id) as { ciphertext: Uint8Array; iv: Uint8Array; auth_tag: Uint8Array; expires_at?: string; revoked_at?: string } | undefined;
+    if (!row || row.revoked_at || (row.expires_at && row.expires_at <= now())) return undefined;
+    const decipher = createDecipheriv("aes-256-gcm", this.key, row.iv); decipher.setAuthTag(Buffer.from(row.auth_tag)); return Buffer.concat([decipher.update(row.ciphertext), decipher.final()]);
+  }
+  async revoke(input: { reference: string }): Promise<void> { const id = input.reference.replace(/^local-vault:/, ""); if (id !== input.reference) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ?").run(now(), id); }
+}
+
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
@@ -195,5 +212,5 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
 export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) => {
   const database = new LocalSqliteDatabase(configuration);
   const storage = new LocalFilesystemStorage(database);
-  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), jobs: new LocalSqliteJobQueue(database) };
+  return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), jobs: new LocalSqliteJobQueue(database) };
 };

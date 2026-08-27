@@ -21,3 +21,15 @@ test("SQLite jobs retain idempotency and support retry, recovery, and cancellati
     assert.equal((await jobs.get(created.id))?.state, "cancelled");
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("local credential vault returns only opaque encrypted references and honors revocation", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-vault-"));
+  try {
+    const { credentials } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:4100", credentialEncryptionKey: "test-only-key" });
+    const stored = await credentials.write({ ownerId: "creator-1", value: Buffer.from("not-exported-token") });
+    assert.match(stored.reference, /^local-vault:/);
+    assert.deepEqual(Buffer.from(await credentials.read({ reference: stored.reference })), Buffer.from("not-exported-token"));
+    await credentials.revoke({ reference: stored.reference });
+    assert.equal(await credentials.read({ reference: stored.reference }), undefined);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

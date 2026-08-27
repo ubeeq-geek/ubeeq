@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@ubeeq/auth": "^0.1.0",
+    "@ubeeq/integrations": "^0.1.0",
     "@ubeeq/jobs": "^0.1.0",
     "@ubeeq/persistence": "^0.1.0",
     "@ubeeq/storage": "^0.1.0"
