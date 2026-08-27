@@ -31,7 +31,22 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     const upload = await request(base, "/v1/uploads", { method: "POST", headers, body: JSON.stringify({ workId: work.body.work.id, mimeType: "image/png", byteLength: bytes.length }) });
     await request(base, `/v1/uploads/${upload.body.upload.uploadId}/content`, { method: "PUT", headers, body: JSON.stringify({ base64: bytes.toString("base64") }) });
     const asset = await request(base, `/v1/uploads/${upload.body.upload.uploadId}/complete`, { method: "POST", headers, body: JSON.stringify({ workId: work.body.work.id, checksum, byteLength: bytes.length }) });
-    assert.equal(asset.response.status, 201);
+    assert.equal(asset.response.status, 202);
+    const incomplete = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers, body: JSON.stringify({ destination: "local" }) });
+    assert.equal(incomplete.response.status, 409);
+    assert.equal(incomplete.body.error.code, "processing_incomplete");
+    const processed = await request(base, "/v1/operations/jobs/run-next", { method: "POST", headers, body: JSON.stringify({ workerId: "e2e-worker" }) });
+    assert.equal(processed.response.status, 200);
+    assert.equal(processed.body.result.job.state, "completed");
+    assert.equal(processed.body.result.asset.status, "ready");
+    const hold = await request(base, "/v1/operations/holds", { method: "POST", headers, body: JSON.stringify({ subjectType: "work", subjectId: work.body.work.id, reason: "manual_review" }) });
+    assert.equal(hold.response.status, 201);
+    const blocked = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers, body: JSON.stringify({ destination: "local" }) });
+    assert.equal(blocked.response.status, 409);
+    assert.equal(blocked.body.error.code, "admission_blocked");
+    assert.deepEqual(blocked.body.error.details.blockedSubjectIds, [work.body.work.id]);
+    const release = await request(base, `/v1/operations/holds/${hold.body.hold.id}/release`, { method: "POST", headers, body: "{}" });
+    assert.equal(release.response.status, 200);
     const publication = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers: { ...headers, "idempotency-key": "publish-local-work" }, body: JSON.stringify({ destination: "local" }) });
     assert.equal(publication.response.status, 201);
     const publicWork = await request(base, `/v1/public/works/${work.body.work.id}`);
@@ -40,6 +55,8 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes);
     const exported = await request(base, "/v1/exports/me", { headers });
     assert.equal(exported.response.status, 200); assert.equal(exported.body.schemaVersion, "1"); assert.equal(exported.body.secretsExcluded, true); assert.equal(exported.body.works.length, 1);
+    const jobs = await request(base, "/v1/operations/jobs", { headers });
+    assert.equal(jobs.response.status, 200); assert.equal(jobs.body.jobs[0].state, "completed");
     assert.equal((await request(base, "/ready")).response.status, 200);
   } finally { await api.close(); rmSync(directory, { recursive: true, force: true }); }
 });

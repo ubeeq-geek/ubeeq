@@ -2,6 +2,8 @@
 
 The reference API is a neutral, local-first implementation of the creator profile, Work, Asset, Collection, upload, publication, delivery, and export flow.
 
+Upload completion creates a durable `asset.process` job instead of making an asset immediately publishable. For the local reference composition, run one queued job with `POST /v1/operations/jobs/run-next` using a signed-in session. The same operations surface exposes queued-job recovery/cancellation, neutral moderation holds, and review cases. A hosted product must supply its own authorization and review policy before exposing those operations to users.
+
 Run it from the repository root:
 
 ```sh

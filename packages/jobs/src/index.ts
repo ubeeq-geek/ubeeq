@@ -10,5 +10,7 @@ export interface JobQueue {
   deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void>;
   cancel(input: { id: string; reason?: string }): Promise<void>;
   recover(input: { id: string; availableAt?: string }): Promise<DurableJob>;
+  get(id: string): Promise<DurableJob | undefined>;
+  list(input: { states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]>;
 }
 export interface Scheduler { schedule(input: { type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void>; cancelSchedule(idempotencyKey: string): Promise<void>; }
