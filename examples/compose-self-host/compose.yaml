@@ -1,0 +1,45 @@
+services:
+  reference-api:
+    build:
+      context: ../..
+      dockerfile: examples/compose-self-host/Dockerfile
+    command: node apps/reference-api/dist/server.js
+    environment:
+      PORT: "4100"
+      UBEEQ_LISTEN_HOST: 0.0.0.0
+      UBEEQ_PUBLIC_BASE_URL: http://localhost:4100
+      UBEEQ_DATA_DIRECTORY: /var/lib/ubeeq
+      UBEEQ_DATABASE_PATH: /var/lib/ubeeq/ubeeq.sqlite
+    ports:
+      - "4100:4100"
+    volumes:
+      - ubeeq-data:/var/lib/ubeeq
+
+  reference-web:
+    build:
+      context: ../..
+      dockerfile: examples/compose-self-host/Dockerfile
+    command: node apps/web-reference/src/server.mjs
+    environment:
+      PORT: "4173"
+      UBEEQ_REFERENCE_API_URL: http://reference-api:4100
+    ports:
+      - "4173:4173"
+    depends_on:
+      - reference-api
+
+  reference-admin:
+    build:
+      context: ../..
+      dockerfile: examples/compose-self-host/Dockerfile
+    command: node apps/admin-reference/src/server.mjs
+    environment:
+      PORT: "4174"
+      UBEEQ_REFERENCE_API_URL: http://reference-api:4100
+    ports:
+      - "4174:4174"
+    depends_on:
+      - reference-api
+
+volumes:
+  ubeeq-data:

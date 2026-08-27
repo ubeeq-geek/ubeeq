@@ -14,8 +14,9 @@
     "build:self-host-infra": "npm run build --workspace @ubeeq/self-host-infra",
     "synth:self-host-infra": "npm run synth --workspace @ubeeq/self-host-infra",
     "pack:verify": "npm run build && npm run check:publish-workflow && npm pack --dry-run --workspace @ubeeq/core && npm pack --dry-run --workspace @ubeeq/auth && npm pack --dry-run --workspace @ubeeq/extension-sdk && npm pack --dry-run --workspace @ubeeq/ui && npm pack --dry-run --workspace @ubeeq/integrations && npm pack --dry-run --workspace @ubeeq/moderation && npm pack --dry-run --workspace @ubeeq/processing && npm pack --dry-run --workspace @ubeeq/storage && npm pack --dry-run --workspace @ubeeq/jobs && npm pack --dry-run --workspace @ubeeq/persistence && npm pack --dry-run --workspace @ubeeq/portability && npm pack --dry-run --workspace @ubeeq/adapters-local && npm pack --dry-run --workspace @ubeeq/billing && npm pack --dry-run --workspace @ubeeq/federation && npm pack --dry-run --workspace @ubeeq/deployment-platform && npm pack --dry-run --workspace @ubeeq/self-host && npm pack --dry-run --workspace @ubeeq/api",
-    "test": "npm run --workspaces --if-present test && npm run test:landing",
-    "test:landing": "node scripts/validate-landing.mjs"
+    "test": "npm run --workspaces --if-present test && npm run test:landing && npm run test:compose-example",
+    "test:landing": "node scripts/validate-landing.mjs",
+    "test:compose-example": "node scripts/validate-compose-example.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

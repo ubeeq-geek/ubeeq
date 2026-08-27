@@ -39,6 +39,8 @@ Public Ubeeq code may provide reusable mechanisms such as storage, processing, a
 
 [`packages/self-host/reference-config.json`](packages/self-host/reference-config.json) is a product-neutral starting point. Replace its example origin and local storage path, provide any desired extension manifests, and validate the resulting configuration with `@ubeeq/self-host`. It contains neither hosted product settings nor credentials.
 
+For a cloud-free runnable deployment, see [`examples/compose-self-host`](examples/compose-self-host). It starts the reference API, creator workspace, and operations workspace with local SQLite/filesystem adapters.
+
 ## Portable reference-instance plan
 
 The staged implementation plan for the local reference instance, durable adapters, optional AWS composition, and compatibility gates is in [`docs/portable-reference-instance-implementation-plan.md`](docs/portable-reference-instance-implementation-plan.md).
