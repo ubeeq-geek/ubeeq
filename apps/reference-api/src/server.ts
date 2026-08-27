@@ -4,7 +4,7 @@ import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/ad
 import { composeReferenceApplication } from "@ubeeq/api";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
-import { LocalImageProcessor } from "@ubeeq/processing";
+import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import type { AssetRecord, CreatorRecord, WorkRecord } from "@ubeeq/persistence";
@@ -21,7 +21,7 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("error", reject);
 });
 
-export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; federationVerifier?: FederationSignatureVerifier; }
+export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; federationVerifier?: FederationSignatureVerifier; mediaProcessor?: MediaProcessor; }
 
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; close(): Promise<void> } => {
   const adapters = createLocalAdapterSet(configuration);
@@ -38,7 +38,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     ]
   });
   const { repositories } = composition.dependencies;
-  const processor = new LocalImageProcessor();
+  const processor = configuration.mediaProcessor ?? new LocalImageProcessor();
 
   const session = async (request: IncomingMessage) => {
     const credential = request.headers.authorization?.replace(/^Bearer\s+/i, "");
@@ -80,7 +80,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const processingResult = await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
       const processed = await repositories.transaction(async (transaction) => {
         const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready" }, { transaction });
-        await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions } }, { transaction });
+        await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions, outputLineage: processingResult.renditions.map((rendition) => ({ outputId: rendition.id, sourceVersionId: rendition.sourceVersionId, role: rendition.role })) } }, { transaction });
         await repositories.usageEvents.create({ id: randomUUID(), instanceId: processing.instanceId, accountId: processing.creatorId, meter: "processing_units", quantity: 1, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` }, { transaction, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` });
         await repositories.auditEvents.create({ id: randomUUID(), instanceId: processing.instanceId, action: "asset.processing_completed", subjectId: processing.id, payload: { jobId: lease.job.id, sourceVersionId: processing.objectVersion } }, { transaction });
         return ready;

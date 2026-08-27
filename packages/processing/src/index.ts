@@ -19,8 +19,17 @@ export interface ProcessingResult {
   errorCode?: string;
 }
 
-export interface ProcessedRendition { id: string; contentType: string; byteLength: number; role: "source" | "preview" | "poster"; }
+/** Every output carries the immutable source version it was derived from. */
+export interface ProcessedRendition { id: string; sourceVersionId: string; contentType: string; byteLength: number; role: "source" | "preview" | "poster"; }
 export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
+
+/** Selects product-installed processors without teaching the application about vendors or codecs. */
+export class MediaProcessorRegistry implements MediaProcessor {
+  constructor(private readonly processors: readonly { supports(input: { contentType: string }): boolean; processor: MediaProcessor }[], private readonly fallback: MediaProcessor) {}
+  async process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }) {
+    return (this.processors.find(({ supports }) => supports({ contentType: input.contentType }))?.processor ?? this.fallback).process(input);
+  }
+}
 
 /** Local reference processor: validates common image headers and records source lineage without a vendor dependency. */
 export class LocalImageProcessor implements MediaProcessor {
@@ -28,7 +37,7 @@ export class LocalImageProcessor implements MediaProcessor {
     const bytes = input.source; let width: number | undefined; let height: number | undefined;
     if (input.contentType === "image/png" && bytes.length >= 24 && String.fromCharCode(...bytes.slice(1, 4)) === "PNG") { width = new DataView(bytes.buffer, bytes.byteOffset + 16, 8).getUint32(0); height = new DataView(bytes.buffer, bytes.byteOffset + 16, 8).getUint32(4); }
     if (input.contentType.startsWith("image/") && (!width || !height)) { /* Other image formats remain valid source-only local media until a processor extension supplies renditions. */ }
-    return { metadata: { contentType: input.contentType, byteLength: bytes.byteLength, ...(width && height ? { width, height } : {}) }, renditions: [{ id: `source:${input.sourceVersionId}`, contentType: input.contentType, byteLength: bytes.byteLength, role: "source" as const }], measuredUnits: 1 };
+    return { metadata: { contentType: input.contentType, byteLength: bytes.byteLength, ...(width && height ? { width, height } : {}) }, renditions: [{ id: `source:${input.sourceVersionId}`, sourceVersionId: input.sourceVersionId, contentType: input.contentType, byteLength: bytes.byteLength, role: "source" as const }], measuredUnits: 1 };
   }
 }
 
