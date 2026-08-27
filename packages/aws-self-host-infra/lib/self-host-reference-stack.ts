@@ -4,6 +4,7 @@ import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as sqs from "aws-cdk-lib/aws-sqs";
@@ -24,7 +25,8 @@ export class SelfHostReferenceStack extends Stack {
     const userPoolClient = userPool.addClient("ReferenceApi", { authFlows: { userPassword: true, userSrp: true } });
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
     const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "index.handler", timeout: Duration.seconds(10), code: lambda.Code.fromInline("exports.handler=async()=>({statusCode:200,headers:{'content-type':'application/json'},body:JSON.stringify({status:'ok',service:'ubeeq-reference-api'})})") });
-    records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
+    records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
+    health.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
     new cloudwatch.Alarm(this, "JobDeadLetterAlarm", { metric: deadLetters.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq durable jobs require manual recovery" });
     const url = health.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE, cors: { allowedOrigins: ["*"], allowedMethods: [lambda.HttpMethod.GET] } });
     new CfnOutput(this, "ReferenceApiHealthUrl", { value: `${url.url}health` });
@@ -34,5 +36,6 @@ export class SelfHostReferenceStack extends Stack {
     new CfnOutput(this, "JobsQueueUrl", { value: jobs.queueUrl });
     new CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new CfnOutput(this, "UserPoolClientId", { value: userPoolClient.userPoolClientId });
+    new CfnOutput(this, "CredentialSecretPrefix", { value: "ubeeq/credentials" });
   }
 }

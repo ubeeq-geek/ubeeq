@@ -1,15 +1,16 @@
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { GetSecretValueCommand, PutSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
+import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { OptimisticConcurrencyError, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
-import type { ObjectStorage, StoredObject } from "@ubeeq/storage";
+import type { DeliveryAdapter, ObjectStorage, StoredObject } from "@ubeeq/storage";
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
@@ -39,6 +40,13 @@ export class S3ObjectStorage implements ObjectStorage {
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
+export class S3PresignedDelivery implements DeliveryAdapter {
+  constructor(private readonly s3: S3Client, private readonly bucket: string) {}
+  async issue(request: Parameters<DeliveryAdapter["issue"]>[0]): Promise<{ url: string; expiresAt: string }> {
+    const expiresInSeconds = Math.max(1, Math.min(7 * 24 * 60 * 60, Math.floor((Date.parse(request.expiresAt) - Date.now()) / 1_000)));
+    return { url: await issueS3Download(this.s3, this.bucket, request.object, expiresInSeconds), expiresAt: request.expiresAt };
+  }
+}
 
 /**
  * SQS is used as a wake-up signal while the DynamoDB record is the durable source of
@@ -89,7 +97,7 @@ export class AwsJobQueue implements JobQueue {
 
 export class SecretsManagerCredentialVault implements CredentialVault {
   constructor(private readonly secrets: Pick<SecretsManagerClient, "send">, private readonly prefix: string) {}
-  async write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }> { const id = `${this.prefix}/${input.ownerId}/${randomUUID()}`; await this.secrets.send(new PutSecretValueCommand({ SecretId: id, SecretBinary: input.value })); return { reference: `aws-secrets:${id}` }; }
+  async write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }> { const id = `${this.prefix}/${input.ownerId}/${randomUUID()}`; await this.secrets.send(new CreateSecretCommand({ Name: id, SecretBinary: input.value, Tags: [{ Key: "ubeeq:credential-owner", Value: input.ownerId }, ...(input.expiresAt ? [{ Key: "ubeeq:credential-expires-at", Value: input.expiresAt }] : [])] })); return { reference: `aws-secrets:${id}` }; }
   async read(input: { reference: string }): Promise<Uint8Array | undefined> { if (!input.reference.startsWith("aws-secrets:")) return undefined; try { const result = await this.secrets.send(new GetSecretValueCommand({ SecretId: input.reference.slice("aws-secrets:".length) })); return result.SecretBinary ? new Uint8Array(result.SecretBinary) : result.SecretString ? new TextEncoder().encode(result.SecretString) : undefined; } catch { return undefined; } }
   async revoke(input: { reference: string }): Promise<void> { if (input.reference.startsWith("aws-secrets:")) await this.secrets.send(new UpdateSecretCommand({ SecretId: input.reference.slice("aws-secrets:".length), SecretString: "revoked" })); }
 }
@@ -104,3 +112,25 @@ export class CognitoIdentity implements IdentityAdapter {
 }
 
 export const issueCloudFrontDelivery = (input: { url: string; privateKey: string; keyPairId: string; expiresAt: string }): string => getCloudFrontSignedUrl({ url: input.url, privateKey: input.privateKey, keyPairId: input.keyPairId, dateLessThan: input.expiresAt });
+export class CloudFrontDelivery implements DeliveryAdapter {
+  constructor(private readonly configuration: { origin: string; privateKey: string; keyPairId: string }) {}
+  async issue(request: Parameters<DeliveryAdapter["issue"]>[0]): Promise<{ url: string; expiresAt: string }> {
+    const origin = this.configuration.origin.replace(/\/$/, ""); const key = request.object.key.split("/").map(encodeURIComponent).join("/");
+    return { url: issueCloudFrontDelivery({ url: `${origin}/${key}`, privateKey: this.configuration.privateKey, keyPairId: this.configuration.keyPairId, expiresAt: request.expiresAt }), expiresAt: request.expiresAt };
+  }
+}
+
+/** Explicit AWS composition; core/application code receives only provider-neutral ports. */
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
+  const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
+  const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
+  const storage = new S3ObjectStorage(s3, configuration.objectBucket);
+  return {
+    repositories: createDynamoRepositories(dynamo, configuration), storage,
+    delivery: configuration.cloudFront ? new CloudFrontDelivery(configuration.cloudFront) : new S3PresignedDelivery(s3, configuration.objectBucket),
+    jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
+    identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
+    credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
+  };
+};

@@ -167,7 +167,7 @@ Start source assessment early, but defer implementation until the local contract
 
 ### Deliverables
 
-- Rename or move `@ubeeq/self-host-infra` to `@ubeeq/aws-self-host-infra` or `examples/aws-self-host`.
+- Keep the optional CDK composition in `@ubeeq/aws-self-host-infra`, with deployment guidance under `examples/aws-self-host`.
 - Create `@ubeeq/adapters-aws`.
   - DynamoDB repositories.
   - S3 storage and optional CloudFront delivery.

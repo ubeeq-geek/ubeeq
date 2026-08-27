@@ -89,6 +89,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       return { job: await adapters.jobs.get(lease.job.id), asset: processed };
     } catch (error) {
       const details = { code: "processing_failed", message: error instanceof Error ? error.message : "Unknown processing failure" };
+      await audit({ action: "asset.processing_failed", subjectId: lease.job.payload.assetId, payload: { jobId: lease.job.id, attempt: lease.job.attempt + 1, error: details } });
       if (lease.job.attempt >= lease.job.maxAttempts) await adapters.jobs.deadLetter({ id: lease.job.id, leaseToken: lease.leaseToken, error: details });
       else await adapters.jobs.retry({ id: lease.job.id, leaseToken: lease.leaseToken, error: details, retryAt: new Date(Date.now() + 1_000).toISOString() });
       throw error;

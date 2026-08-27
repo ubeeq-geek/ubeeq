@@ -38,7 +38,7 @@ test("Secrets Manager vault exposes only opaque references and reads binary cred
   assert.match(stored.reference, /^aws-secrets:ubeeq\/credentials\/creator\//);
   assert.equal(Buffer.from(await vault.read({ reference: stored.reference })).toString(), "credential");
   await vault.revoke({ reference: stored.reference });
-  assert.deepEqual(calls, ["PutSecretValueCommand", "GetSecretValueCommand", "UpdateSecretCommand"]);
+  assert.deepEqual(calls, ["CreateSecretCommand", "GetSecretValueCommand", "UpdateSecretCommand"]);
 });
 
 test("DynamoDB revisioned repository obeys the shared persistence contract", async () => {
