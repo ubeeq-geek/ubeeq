@@ -1,5 +1,5 @@
 {
-  "name": "@ubeeq/self-host-infra",
+  "name": "@ubeeq/aws-self-host-infra",
   "private": true,
   "version": "0.1.0",
   "scripts": {
