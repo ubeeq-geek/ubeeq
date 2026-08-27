@@ -35,6 +35,7 @@ export class SelfHostReferenceStack extends Stack {
     const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../apps/reference-api/lambda-package");
     const referenceApiPublicBaseUrl = this.node.tryGetContext("referenceApiPublicBaseUrl") || process.env.UBEEQ_REFERENCE_API_PUBLIC_BASE_URL || "https://reference.invalid";
     const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials" } });
+    const web = new lambda.Function(this, "ReferenceWeb", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.web", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl } });
     const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials" } });
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
@@ -46,19 +47,37 @@ export class SelfHostReferenceStack extends Stack {
     const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });
     api.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiIntegration", health) });
     api.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiRootIntegration", health) });
+    const webApi = new apigwv2.HttpApi(this, "ReferenceWebGateway", { description: "Plain reference-web edge for the neutral Ubeeq reference API" });
+    webApi.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceWebIntegration", web) });
+    webApi.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceWebRootIntegration", web) });
     const customDomainName = this.node.tryGetContext("referenceApiDomainName") || process.env.UBEEQ_REFERENCE_API_DOMAIN_NAME;
+    const webCustomDomainName = this.node.tryGetContext("referenceWebDomainName") || process.env.UBEEQ_REFERENCE_WEB_DOMAIN_NAME;
     const publicHostedZoneId = this.node.tryGetContext("publicHostedZoneId") || process.env.UBEEQ_PUBLIC_HOSTED_ZONE_ID;
+    const publicHostedZoneName = this.node.tryGetContext("publicHostedZoneName") || process.env.UBEEQ_PUBLIC_HOSTED_ZONE_NAME;
     const certificateArn = this.node.tryGetContext("referenceApiCertificateArn") || process.env.UBEEQ_REFERENCE_API_CERTIFICATE_ARN;
-    if (customDomainName || publicHostedZoneId || certificateArn) {
-      if (!customDomainName || !publicHostedZoneId || !certificateArn) throw new Error("Custom API domains require UBEEQ_REFERENCE_API_DOMAIN_NAME, UBEEQ_PUBLIC_HOSTED_ZONE_ID, and UBEEQ_REFERENCE_API_CERTIFICATE_ARN.");
-      const zone = route53.HostedZone.fromHostedZoneAttributes(this, "PublicHostedZone", { hostedZoneId: publicHostedZoneId, zoneName: customDomainName });
-      const domain = new apigwv2.DomainName(this, "ReferenceApiCustomDomain", { domainName: customDomainName, certificate: acm.Certificate.fromCertificateArn(this, "ReferenceApiCertificate", certificateArn), securityPolicy: apigwv2.SecurityPolicy.TLS_1_2 });
+    if (customDomainName || publicHostedZoneId || publicHostedZoneName || certificateArn) {
+      if (!customDomainName || !publicHostedZoneId || !publicHostedZoneName || !certificateArn) throw new Error("Custom API domains require UBEEQ_REFERENCE_API_DOMAIN_NAME, UBEEQ_PUBLIC_HOSTED_ZONE_ID, UBEEQ_PUBLIC_HOSTED_ZONE_NAME, and UBEEQ_REFERENCE_API_CERTIFICATE_ARN.");
+      const normalizedZone = publicHostedZoneName.replace(/\.$/, "");
+      const normalizedDomain = customDomainName.replace(/\.$/, "");
+      const recordName = normalizedDomain === normalizedZone ? undefined : normalizedDomain.endsWith(`.${normalizedZone}`) ? normalizedDomain.slice(0, -(normalizedZone.length + 1)) : undefined;
+      if (normalizedDomain !== normalizedZone && !recordName) throw new Error("UBEEQ_REFERENCE_API_DOMAIN_NAME must be the hosted-zone apex or a subdomain of UBEEQ_PUBLIC_HOSTED_ZONE_NAME.");
+      const zone = route53.HostedZone.fromHostedZoneAttributes(this, "PublicHostedZone", { hostedZoneId: publicHostedZoneId, zoneName: normalizedZone });
+      const certificate = acm.Certificate.fromCertificateArn(this, "ReferenceApiCertificate", certificateArn);
+      const domain = new apigwv2.DomainName(this, "ReferenceApiCustomDomain", { domainName: normalizedDomain, certificate, securityPolicy: apigwv2.SecurityPolicy.TLS_1_2 });
       new apigwv2.ApiMapping(this, "ReferenceApiCustomDomainMapping", { api, domainName: domain, stage: api.defaultStage });
-      new route53.ARecord(this, "ReferenceApiCustomDomainAlias", { zone, target: route53.RecordTarget.fromAlias(new route53Targets.ApiGatewayv2DomainProperties(domain.regionalDomainName, domain.regionalHostedZoneId)) });
+      new route53.ARecord(this, "ReferenceApiCustomDomainAlias", { zone, ...(recordName ? { recordName } : {}), target: route53.RecordTarget.fromAlias(new route53Targets.ApiGatewayv2DomainProperties(domain.regionalDomainName, domain.regionalHostedZoneId)) });
+      if (webCustomDomainName) {
+        if (webCustomDomainName.replace(/\.$/, "") !== normalizedZone) throw new Error("UBEEQ_REFERENCE_WEB_DOMAIN_NAME must equal UBEEQ_PUBLIC_HOSTED_ZONE_NAME.");
+        const webDomain = new apigwv2.DomainName(this, "ReferenceWebCustomDomain", { domainName: normalizedZone, certificate, securityPolicy: apigwv2.SecurityPolicy.TLS_1_2 });
+        new apigwv2.ApiMapping(this, "ReferenceWebCustomDomainMapping", { api: webApi, domainName: webDomain, stage: webApi.defaultStage });
+        new route53.ARecord(this, "ReferenceWebCustomDomainAlias", { zone, target: route53.RecordTarget.fromAlias(new route53Targets.ApiGatewayv2DomainProperties(webDomain.regionalDomainName, webDomain.regionalHostedZoneId)) });
+        new CfnOutput(this, "ReferenceWebCustomDomainUrl", { value: `https://${normalizedZone}` });
+      }
       new CfnOutput(this, "ReferenceApiCustomDomainUrl", { value: `https://${customDomainName}` });
     }
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
     new CfnOutput(this, "ReferenceApiGatewayUrl", { value: api.apiEndpoint });
+    new CfnOutput(this, "ReferenceWebGatewayUrl", { value: webApi.apiEndpoint });
     new CfnOutput(this, "SourceStoreName", { value: sourceStore.bucketName });
     new CfnOutput(this, "DeliveryStoreName", { value: deliveryStore.bucketName });
     new CfnOutput(this, "RecordsTableName", { value: records.tableName });

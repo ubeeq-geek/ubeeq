@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handler, worker } from "../dist/lambda.js";
+import { handler, web, worker } from "../dist/lambda.js";
 
 Object.assign(process.env, {
   UBEEQ_PUBLIC_BASE_URL: "https://reference.example",
@@ -10,6 +10,8 @@ Object.assign(process.env, {
   UBEEQ_USER_POOL_ID: "pool",
   UBEEQ_USER_POOL_CLIENT_ID: "client",
   UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/test",
+  UBEEQ_REFERENCE_WEB_API_URL: "https://api.example",
+  UBEEQ_REFERENCE_WEB_MODULE_PATH: "../../web-reference/src/server.mjs",
 });
 
 test("Lambda reference API composes the standard health route without dependency access", async () => {
@@ -26,4 +28,10 @@ test("Lambda reference API exposes the standard unmatched-route error", async ()
 
 test("Lambda worker accepts an empty SQS batch without initializing a local adapter", async () => {
   assert.deepEqual(await worker({ Records: [] }), { batchItemFailures: [] });
+});
+
+test("Lambda reference web serves the same neutral workspace at the edge", async () => {
+  const response = await web({ rawPath: "/", requestContext: { http: { method: "GET" } } });
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /Ubeeq reference workspace/);
 });

@@ -46,6 +46,25 @@ const invokeApi = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> =>
   return { statusCode, headers: responseHeaders, body: responseBody.toString(binary ? "base64" : "utf8"), ...(binary ? { isBase64Encoded: true } : {}) };
 };
 
+const invokeWeb = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
+  const responseHeaders: Record<string, string> = { "cache-control": "no-store" };
+  let statusCode = 200;
+  let responseBody = Buffer.alloc(0);
+  const response = {
+    setHeader(name: string, value: number | string | readonly string[]) { responseHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value); },
+    writeHead(status: number, headers?: Record<string, string>) { statusCode = status; for (const [name, value] of Object.entries(headers ?? {})) responseHeaders[name.toLowerCase()] = value; },
+    end(value?: string | Uint8Array) { responseBody = value === undefined ? Buffer.alloc(0) : Buffer.from(value); },
+    get statusCode() { return statusCode; },
+    set statusCode(value: number) { statusCode = value; },
+  } as unknown as import("node:http").ServerResponse;
+  const modulePath = process.env.UBEEQ_REFERENCE_WEB_MODULE_PATH ?? "./web-reference/server.mjs";
+  const web = await import(modulePath) as { createReferenceHandler(input: { referenceApiUrl: string }): (request: import("node:http").IncomingMessage, response: import("node:http").ServerResponse) => Promise<void> };
+  await web.createReferenceHandler({ referenceApiUrl: required("UBEEQ_REFERENCE_WEB_API_URL") })(toRequest(event), response);
+  const contentType = responseHeaders["content-type"] ?? "";
+  const binary = !contentType.includes("json") && !contentType.startsWith("text/");
+  return { statusCode, headers: responseHeaders, body: responseBody.toString(binary ? "base64" : "utf8"), ...(binary ? { isBase64Encoded: true } : {}) };
+};
+
 let application: ReturnType<typeof createReferenceApi> | undefined;
 const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??= createReferenceApi({
   instanceId: process.env.UBEEQ_INSTANCE_ID ?? "aws-reference",
@@ -76,4 +95,10 @@ export const worker = async (event: SqsEvent): Promise<{ batchItemFailures: Arra
     catch { failures.push({ itemIdentifier: record.messageId }); }
   }
   return { batchItemFailures: failures };
+};
+
+/** Reference web edge entry point. It proxies same-origin /api calls to the configured reference API. */
+export const web = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
+  try { return await invokeWeb(event); }
+  catch (error) { return { statusCode: 503, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ error: { code: "reference_web_unavailable", message: error instanceof Error ? error.message : "Reference web is unavailable" } }) }; }
 };

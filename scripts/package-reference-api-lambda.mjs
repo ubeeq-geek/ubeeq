@@ -11,6 +11,7 @@ if (!existsSync(join(api, "dist/lambda.js"))) throw new Error("Build @ubeeq/refe
 rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 copy(join(api, "dist"), output);
+copy(join(root, "apps", "web-reference", "src"), join(output, "web-reference"));
 
 // AWS SDK v3 is explicitly packaged rather than assumed from a Lambda runtime image.
 for (const scope of ["@aws", "@aws-sdk", "@smithy"]) copy(join(root, "node_modules", scope), join(output, "node_modules", scope));
