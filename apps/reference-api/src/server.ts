@@ -5,6 +5,8 @@ import { composeReferenceApplication } from "@ubeeq/api";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor } from "@ubeeq/processing";
+import { validateRemoteActor, validateRemotePublication, verifyFederationEnvelope } from "@ubeeq/federation";
+import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import type { AssetRecord, CreatorRecord, WorkRecord } from "@ubeeq/persistence";
 
 const json = (response: ServerResponse, status: number, body: unknown, requestId: string): void => {
@@ -19,7 +21,7 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("error", reject);
 });
 
-export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; }
+export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; }
 
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; close(): Promise<void> } => {
   const adapters = createLocalAdapterSet(configuration);
@@ -106,6 +108,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         return json(response, ready ? 200 : 503, { ok: ready, status: ready ? "ok" : "degraded", dependencies, requestId }, requestId);
       }
       if (!url.pathname.startsWith("/v1/")) throw new HttpError(404, "not_found", "Route was not found");
+
+      if (method === "POST" && url.pathname === "/v1/federation/inbox") { const body = await parseBody(request); const envelope = body.envelope as Parameters<typeof verifyFederationEnvelope>[0]; const actor = validateRemoteActor(body.actor as Parameters<typeof validateRemoteActor>[0]); const publication = validateRemotePublication(body.publication as Parameters<typeof validateRemotePublication>[0]); if (!envelope || publication.actorId !== actor.id) throw new HttpError(400, "invalid_federation_reference", "Federation actor, publication, and envelope must agree"); const decision = configuration.federationPolicy ? await configuration.federationPolicy.evaluateRemote({ actorId: actor.id, host: actor.host }) : "deny"; if (decision !== "allow") throw new HttpError(403, "federation_not_accepted", "The instance policy did not accept this remote reference"); await verifyFederationEnvelope(envelope, adapters.federation, adapters.federation); const actorRecord = await repositories.federationActors.get(actor.id) ?? await repositories.federationActors.create({ id: actor.id, instanceId: configuration.instanceId ?? "local-reference", actorUri: actor.id, host: actor.host }); const reference = await repositories.remotePublicationReferences.create({ id: publication.id, instanceId: configuration.instanceId ?? "local-reference", actorId: actorRecord.id, publicationUri: publication.canonicalUrl, immutableId: publication.id, state: "accepted" }); await audit({ action: "federation.reference_accepted", subjectId: reference.id, payload: { actorId: actor.id, publicationUrl: publication.canonicalUrl } }); return json(response, 201, { reference, requestId }, requestId); }
 
       if (method === "POST" && url.pathname === "/v1/auth/sign-up") { const body = await parseBody(request); const account = await adapters.identity.register({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/auth/sign-in") { const body = await parseBody(request); const result = await adapters.identity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
