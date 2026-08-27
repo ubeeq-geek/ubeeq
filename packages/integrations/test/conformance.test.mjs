@@ -11,6 +11,7 @@ import {
   diffReconciliationSnapshots,
   reconciliationStatus,
   resolveReconciliation
+  ,requireValidOAuthState, deriveIntegrationAccountHealth, classifyIntegrationFailure
 } from "../dist/index.js";
 
 const definition = {
@@ -34,6 +35,13 @@ test("guards unsupported operations", () => {
     () => requireIntegrationOperation(definition, "reconcile"),
     UnsupportedIntegrationOperationError
   );
+});
+
+test("normalizes OAuth expiry, scopes, cooldowns, and failure classifications", () => {
+  assert.throws(() => requireValidOAuthState({ id: "state", integrationId: "connector", ownerId: "creator", redirectUri: "https://local.example/callback", requiredScopes: [], expiresAt: "2026-01-01T00:00:00.000Z" }, new Date("2026-01-01T00:01:00.000Z")), /expired/);
+  const health = deriveIntegrationAccountHealth({ tokenExpiresAt: "2027-01-01T00:00:00.000Z", grantedScopes: ["read"], requiredScopes: ["read", "write"], cooldownUntil: "2026-01-01T01:00:00.000Z", now: new Date("2026-01-01T00:00:00.000Z") });
+  assert.deepEqual(health, { status: "blocked", tokenExpiresAt: "2027-01-01T00:00:00.000Z", grantedScopes: ["read"], missingScopes: ["write"], cooldownUntil: "2026-01-01T01:00:00.000Z", lastSuccessfulSyncAt: undefined, remediation: ["grant_scopes", "wait_for_cooldown"] });
+  assert.equal(classifyIntegrationFailure({ status: 429 }), "rate_limit"); assert.equal(classifyIntegrationFailure({ code: "invalid_token" }), "authentication");
 });
 
 test("requires executable evidence for every conformance scenario", async () => {

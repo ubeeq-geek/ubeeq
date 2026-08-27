@@ -45,6 +45,34 @@ export const requireIntegrationOperation = (definition: IntegrationDefinition, o
   if (!supportsIntegrationOperation(definition, operation)) throw new UnsupportedIntegrationOperationError(definition.id, operation);
 };
 
+/** Opaque secret references prevent connector credentials from entering exports, logs, or common entities. */
+export interface CredentialVault { write(input: { ownerId: string; value: Uint8Array; expiresAt?: string }): Promise<{ reference: string }>; read(input: { reference: string }): Promise<Uint8Array | undefined>; revoke(input: { reference: string }): Promise<void>; }
+export interface OAuthAuthorizationState { id: string; integrationId: string; ownerId: string; redirectUri: string; codeVerifier?: string; requiredScopes: readonly string[]; expiresAt: string; }
+export interface OAuthCallbackResult { stateId: string; credentialReference: string; grantedScopes: readonly string[]; expiresAt?: string; }
+export interface OAuthStateStore { create(input: OAuthAuthorizationState): Promise<void>; consume(id: string): Promise<OAuthAuthorizationState | undefined>; }
+
+export const requireValidOAuthState = (state: OAuthAuthorizationState, now = new Date()): OAuthAuthorizationState => {
+  if (!state.id.trim() || !state.integrationId.trim() || !state.ownerId.trim() || !state.redirectUri.trim() || Number.isNaN(Date.parse(state.expiresAt)) || Date.parse(state.expiresAt) <= now.getTime()) throw new Error("OAuth authorization state is invalid or expired.");
+  return { ...state, requiredScopes: [...new Set(state.requiredScopes)].sort() };
+};
+
+export type IntegrationHealthStatus = "healthy" | "degraded" | "blocked" | "unknown";
+export interface IntegrationAccountHealth { status: IntegrationHealthStatus; tokenExpiresAt?: string; grantedScopes: readonly string[]; missingScopes: readonly string[]; cooldownUntil?: string; lastSuccessfulSyncAt?: string; remediation: readonly ("reconnect" | "grant_scopes" | "wait_for_cooldown" | "retry_sync")[]; }
+export const deriveIntegrationAccountHealth = (input: { tokenExpiresAt?: string; grantedScopes?: readonly string[]; requiredScopes?: readonly string[]; cooldownUntil?: string; lastSuccessfulSyncAt?: string; now?: Date }): IntegrationAccountHealth => {
+  const now = input.now ?? new Date(); const grantedScopes = [...new Set(input.grantedScopes ?? [])].sort(); const missingScopes = [...new Set(input.requiredScopes ?? [])].filter((scope) => !grantedScopes.includes(scope)).sort();
+  const expired = Boolean(input.tokenExpiresAt && Date.parse(input.tokenExpiresAt) <= now.getTime()); const coolingDown = Boolean(input.cooldownUntil && Date.parse(input.cooldownUntil) > now.getTime());
+  const remediation = [...new Set([...(expired ? ["reconnect" as const] : []), ...(missingScopes.length ? ["grant_scopes" as const] : []), ...(coolingDown ? ["wait_for_cooldown" as const] : []), ...(!expired && !missingScopes.length && !coolingDown && !input.lastSuccessfulSyncAt ? ["retry_sync" as const] : [])])];
+  return { status: expired || missingScopes.length ? "blocked" : coolingDown || !input.lastSuccessfulSyncAt ? "degraded" : "healthy", tokenExpiresAt: input.tokenExpiresAt, grantedScopes, missingScopes, cooldownUntil: input.cooldownUntil, lastSuccessfulSyncAt: input.lastSuccessfulSyncAt, remediation };
+};
+
+export type IntegrationFailureClass = "authentication" | "permission" | "rate_limit" | "transient" | "permanent";
+export const classifyIntegrationFailure = (input: { status?: number; code?: string }): IntegrationFailureClass => {
+  if (input.status === 401 || input.code === "invalid_token") return "authentication";
+  if (input.status === 403 || input.code === "insufficient_scope") return "permission";
+  if (input.status === 429 || input.code === "rate_limited") return "rate_limit";
+  return input.status && input.status >= 400 && input.status < 500 ? "permanent" : "transient";
+};
+
 export const integrationConformanceScenarios = [
   "oauth-expiry", "pagination", "rate-limit-backoff", "duplicate-retry",
   "remote-deletion", "unsupported-fields", "reconciliation"
