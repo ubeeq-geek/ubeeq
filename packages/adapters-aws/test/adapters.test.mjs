@@ -1,6 +1,34 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SecretsManagerCredentialVault } from "../dist/index.js";
+import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3ObjectStorage, SecretsManagerCredentialVault } from "../dist/index.js";
+import { verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
+import { verifyJobQueueContract } from "@ubeeq/jobs";
+
+class MemoryDynamo {
+  values = new Map();
+  async send(command) {
+    const input = command.input;
+    if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
+    if (command.constructor.name === "QueryCommand") {
+      const prefix = input.ExpressionAttributeValues[":prefix"];
+      const items = [...this.values.values()].filter((value) => value.pk.startsWith(prefix)).slice(0, input.Limit);
+      return { Items: items };
+    }
+    if (command.constructor.name === "PutCommand") {
+      const key = `${input.Item.pk}|${input.Item.sk}`;
+      const current = this.values.get(key);
+      if (input.ConditionExpression === "attribute_not_exists(pk)" && current) throw new Error("ConditionalCheckFailedException");
+      if (input.ConditionExpression?.includes("#value.#revision") && (!current || current.value.revision !== input.ExpressionAttributeValues[":revision"])) throw new Error("ConditionalCheckFailedException");
+      this.values.set(key, input.Item); return {};
+    }
+    if (command.constructor.name === "DeleteCommand") {
+      const key = `${input.Key.pk}|${input.Key.sk}`; const current = this.values.get(key);
+      if (!current || current.value.revision !== input.ExpressionAttributeValues[":revision"]) throw new Error("ConditionalCheckFailedException");
+      this.values.delete(key); return {};
+    }
+    throw new Error(`Unsupported command ${command.constructor.name}`);
+  }
+}
 
 test("Secrets Manager vault exposes only opaque references and reads binary credentials", async () => {
   const calls = [];
@@ -10,4 +38,38 @@ test("Secrets Manager vault exposes only opaque references and reads binary cred
   assert.equal(Buffer.from(await vault.read({ reference: stored.reference })).toString(), "credential");
   await vault.revoke({ reference: stored.reference });
   assert.deepEqual(calls, ["PutSecretValueCommand", "GetSecretValueCommand", "UpdateSecretCommand"]);
+});
+
+test("DynamoDB revisioned repository obeys the shared persistence contract", async () => {
+  const repository = new DynamoRevisionedRepository(new MemoryDynamo(), { tableName: "records" }, "creators");
+  await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "local", handle: id, displayName: "Contract" }), change: () => ({ displayName: "Updated" }) });
+});
+
+test("SQS-notified DynamoDB queue obeys the shared durable job contract", async () => {
+  const notices = [];
+  const queue = new AwsJobQueue(new MemoryDynamo(), { tableName: "records" }, { send: async (command) => { notices.push(command.input); return {}; } }, "https://sqs.example/jobs");
+  await verifyJobQueueContract(queue);
+  assert.ok(notices.length >= 2);
+  assert.equal(JSON.parse(notices[0].MessageBody).type, "contract");
+});
+
+test("S3 adapter retains content metadata without prescribing a delivery provider", async () => {
+  let put;
+  const storage = new S3ObjectStorage({ send: async (command) => {
+    if (command.constructor.name === "PutObjectCommand") { put = command.input; return {}; }
+    if (command.constructor.name === "GetObjectCommand") return { VersionId: "v1", ContentType: "image/png", Metadata: put.Metadata, Body: { transformToByteArray: async () => Buffer.from("image") } };
+    return {};
+  } }, "objects");
+  await storage.put({ object: { bucket: "ignored", key: "source/a", contentType: "image/png", byteLength: 5, checksum: "abc", scope: "private" }, body: Buffer.from("image") });
+  const loaded = await storage.get({ bucket: "ignored", key: "source/a" });
+  assert.equal(put.Bucket, "objects");
+  assert.equal(loaded.object.checksum, "abc");
+  assert.equal(Buffer.from(loaded.body).toString(), "image");
+});
+
+test("Cognito identity verifies opaque sessions and maps access scopes", async () => {
+  const identity = new CognitoIdentity({ send: async () => ({ Username: "subject-1", UserAttributes: [{ Name: "scope", Value: "works:write exports:read" }] }) }, "pool", "client");
+  const session = await identity.verifySession({ credential: "opaque-access-token" });
+  assert.equal(session?.subject.id, "subject-1");
+  assert.deepEqual(session?.subject.scopes, ["works:write", "exports:read"]);
 });

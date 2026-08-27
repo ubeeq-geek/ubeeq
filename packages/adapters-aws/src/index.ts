@@ -1,15 +1,17 @@
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetSecretValueCommand, PutSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { OptimisticConcurrencyError, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { ObjectStorage, StoredObject } from "@ubeeq/storage";
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
+import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
 export interface AwsRepositoryConfiguration { tableName: string; }
@@ -19,7 +21,7 @@ const pk = (repository: string, id: string) => `${repository}#${id}`;
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {}
-  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">): Promise<T> { const timestamp = now(); const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T; await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, value.id), sk: "record", repository: this.repository, id: value.id, value }, ConditionExpression: "attribute_not_exists(pk)" })); return value; }
+  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string }): Promise<T> { const timestamp = now(); const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, value.id), sk: "record", repository: this.repository, id: value.id, value }, ConditionExpression: "attribute_not_exists(pk)" })); return value; } catch (error) { const existing = options?.idempotencyKey ? await this.get(value.id) : undefined; if (existing) return existing; throw error; } }
   async get(id: string): Promise<T | undefined> { const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" } })); return response.Item?.value as T | undefined; }
   async list(request: PageRequest): Promise<Page<T>> { const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, KeyConditionExpression: "begins_with(pk, :prefix)", ExpressionAttributeValues: { ":prefix": `${this.repository}#` }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: (response.Items ?? []).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> { const current = await this.get(id); if (!current) throw new OptimisticConcurrencyError(id, expectedRevision); const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, id), sk: "record", repository: this.repository, id, value }, ConditionExpression: "attribute_exists(pk) AND #value.#revision = :revision", ExpressionAttributeNames: { "#value": "value", "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); return value; } catch { throw new OptimisticConcurrencyError(id, expectedRevision); } }
@@ -35,7 +37,50 @@ export class S3ObjectStorage implements ObjectStorage {
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
 }
-export const issueS3Download = async (s3: S3Client, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: "", Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
+export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
+
+/**
+ * SQS is used as a wake-up signal while the DynamoDB record is the durable source of
+ * truth. Workers lease atomically from DynamoDB, so duplicate SQS delivery and lost
+ * notifications are harmless: a periodic recovery worker can always re-offer queued work.
+ */
+interface AwsJobRecord extends DurableJob, RevisionedRecord {}
+export class AwsJobQueue implements JobQueue {
+  private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
+  constructor(dynamo: Dynamo, configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string) {
+    this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs");
+  }
+  async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
+    const id = `job-${createHash("sha256").update(input.idempotencyKey).digest("hex").slice(0, 32)}`;
+    const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
+    if (existing) return existing;
+    const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
+    await this.notify(created.id, created.type);
+    return created;
+  }
+  async lease<TPayload>(input: { types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
+    const candidates = await this.jobs.list({ limit: 100 });
+    const timestamp = Date.now();
+    const candidate = candidates.items.find((job) => (job.state === "queued" || job.state === "retry_scheduled") && Date.parse(job.availableAt) <= timestamp && (!input.types || input.types.includes(job.type)));
+    if (!candidate) return undefined;
+    const leaseToken = randomUUID();
+    try {
+      const leased = await this.jobs.update(candidate.id, candidate.revision, { state: "leased", leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
+      return { job: leased as DurableJob<TPayload>, leaseToken };
+    } catch { return undefined; }
+  }
+  async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "completed", leaseExpiresAt: undefined }); }
+  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); const nextAttempt = job.attempt + 1; await this.jobs.update(job.id, job.revision, nextAttempt >= job.maxAttempts ? { state: "dead_lettered", attempt: nextAttempt, lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", attempt: nextAttempt, lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (nextAttempt < job.maxAttempts) await this.notify(job.id, job.type); }
+  async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
+  async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
+  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type); return recovered; }
+  async get(id: string): Promise<DurableJob | undefined> { return this.jobs.get(id); }
+  async list(input: { states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> { const page = await this.jobs.list({ limit: Math.max(input.limit * 4, input.limit) }); return page.items.filter((job) => !input.states || input.states.includes(job.state)).slice(0, input.limit); }
+  private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
+  private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || job.correlationId?.split(":").at(-1) !== leaseToken) throw new Error(`Job ${id} does not hold this lease.`); return job; }
+  private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.jobs.update(job.id, job.revision, change); }
+  private async notify(id: string, type: string): Promise<void> { await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: JSON.stringify({ id, type }) })); }
+}
 
 export class SecretsManagerCredentialVault implements CredentialVault {
   constructor(private readonly secrets: Pick<SecretsManagerClient, "send">, private readonly prefix: string) {}
