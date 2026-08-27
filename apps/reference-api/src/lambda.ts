@@ -69,8 +69,8 @@ let application: ReturnType<typeof createReferenceApi> | undefined;
 const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??= createReferenceApi({
   instanceId: process.env.UBEEQ_INSTANCE_ID ?? "aws-reference",
   cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
-  region: process.env.AWS_REGION ?? "unknown",
-  operator: "self-hosted",
+  region: process.env.UBEEQ_CELL_REGION ?? process.env.AWS_REGION ?? "unknown",
+  operator: process.env.UBEEQ_CELL_OPERATOR ?? "self-hosted",
   publicBaseUrl: required("UBEEQ_PUBLIC_BASE_URL"),
   adapters: createAwsAdapterSet({
     region: process.env.AWS_REGION,

@@ -283,7 +283,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
 if (process.argv[1] && process.argv[1].endsWith("server.js")) {
   const port = Number(process.env.PORT ?? 4100); const dataDirectory = process.env.UBEEQ_DATA_DIRECTORY ?? "./var/reference";
-  const api = createReferenceApi({ databasePath: process.env.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`, dataDirectory, publicBaseUrl: process.env.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`, cellId: process.env.UBEEQ_CELL_ID ?? "local-single-cell" });
+  const api = createReferenceApi({ databasePath: process.env.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`, dataDirectory, publicBaseUrl: process.env.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`, cellId: process.env.UBEEQ_CELL_ID ?? "local-single-cell", region: process.env.UBEEQ_CELL_REGION ?? "local", operator: process.env.UBEEQ_CELL_OPERATOR ?? "self-hosted" });
   const host = process.env.UBEEQ_LISTEN_HOST ?? "127.0.0.1";
   api.server.listen(port, host, () => console.log(`Ubeeq reference API listening on http://${host}:${port}`));
 }

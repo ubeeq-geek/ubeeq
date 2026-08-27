@@ -8,6 +8,9 @@ services:
       PORT: "4100"
       UBEEQ_LISTEN_HOST: 0.0.0.0
       UBEEQ_PUBLIC_BASE_URL: http://localhost:4100
+      UBEEQ_CELL_ID: local-single-cell
+      UBEEQ_CELL_REGION: local
+      UBEEQ_CELL_OPERATOR: self-hosted
       UBEEQ_DATA_DIRECTORY: /var/lib/ubeeq
       UBEEQ_DATABASE_PATH: /var/lib/ubeeq/ubeeq.sqlite
     ports:

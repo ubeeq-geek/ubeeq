@@ -80,6 +80,13 @@ test("S3 adapter obeys the shared storage contract without prescribing a deliver
   assert.equal(Buffer.from(loaded.body).toString(), "image");
 });
 
+test("cell-configured S3 adapters reject objects from another regional cell", async () => {
+  const storage = new S3ObjectStorage({ send: async () => ({}) }, "objects", "cell-a");
+  await assert.rejects(() => storage.put({ object: { bucket: "objects", key: "cells/cell-b/creators/creator-b/originals/file", contentType: "image/png", byteLength: 0, scope: "private" }, body: new Uint8Array() }), /cell-a/);
+  const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects", "cell-a");
+  await assert.rejects(() => upload.initiate({ object: { bucket: "objects", key: "cells/cell-b/creators/creator-b/uploads/file", contentType: "image/png", byteLength: 1, checksum: "a".repeat(64), scope: "private" }, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() }), /cell-a/);
+});
+
 test("S3 direct upload binds a checksum and returns the immutable object version", async () => {
   const checksum = "a".repeat(64); const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects");
   // Replace the network boundary only for the completion assertion; initiation is covered by its signed-command shape below.

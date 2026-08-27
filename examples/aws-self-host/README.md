@@ -4,9 +4,11 @@ The CDK composition in [`packages/aws-self-host-infra`](../../packages/aws-self-
 
 It does not make AWS a Ubeeq requirement. Local and Compose reference deployments remain the default portable path. The deployment packages `apps/reference-api` with its Ubeeq and AWS runtime dependencies, then composes the same `/v1` API against DynamoDB, S3, SQS, Cognito, and Secrets Manager ports.
 
-To synthesize, run `npm run synth:aws-self-host-infra` from the repository root. To deploy, set `UBEEQ_REFERENCE_API_PUBLIC_BASE_URL` to the HTTPS URL users will reach (normally a custom domain) and run:
+To synthesize, run `npm run synth:aws-self-host-infra` from the repository root. Each deployment is one regional cell, so choose a stable cell identifier before deploying. To deploy, set `UBEEQ_REFERENCE_API_PUBLIC_BASE_URL` to the HTTPS URL users will reach (normally a custom domain) and run:
 
 ```sh
+UBEEQ_CELL_ID=community-us-east-2 \
+UBEEQ_CELL_REGION=us-east-2 \
 UBEEQ_REFERENCE_API_PUBLIC_BASE_URL=https://ubeeq.example \
 npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
 ```
@@ -24,6 +26,8 @@ npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval neve
 ```
 
 The stack creates separate regional API Gateway domains: the reference web at the hosted-zone apex and the API at the configured API hostname. It creates each `$default` mapping and its Route 53 alias record. A regional API Gateway certificate must be issued in the API’s region and cover both names.
+
+The cell ID and region are injected into the API and worker, emitted as stack outputs, and applied as `ubeeq:cell-id`/`ubeeq:cell-region` resource tags. Create another independent stack for another region; do not enable DynamoDB Global Tables or S3 cross-region replication for normal operation. The adapter rejects a record, job, credential, upload, delivery object, or object key that belongs to a different cell.
 
 The emitted Function URL is IAM-protected for operator diagnostics. The stack also emits `ReferenceApiGatewayUrl`, the HTTP API edge for the reference API; it passes requests to the API, whose protected routes validate Cognito bearer tokens through the identity port. Do not treat either generated hostname as a production public base URL. AWS uploads return a checksum-bound, time-limited S3 PUT URL; upload content goes directly to S3 and then `/v1/uploads/{uploadId}/complete` records the immutable object version. SQS invokes the bundled worker Lambda to process the completed asset.
 

@@ -10,7 +10,7 @@ import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdent
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
-import { requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
@@ -48,10 +48,11 @@ const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dy
 export const createDynamoRepositories = (dynamo: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction: async (work) => work({ id: randomUUID() }), creators: cellRepository(dynamo, config, "creators"), works: cellRepository(dynamo, config, "works"), assets: cellRepository(dynamo, config, "assets"), collections: cellRepository(dynamo, config, "collections"), workMemberships: cellRepository(dynamo, config, "workMemberships"), publicationIntents: cellRepository(dynamo, config, "publicationIntents"), publications: cellRepository(dynamo, config, "publications"), reconciliationSnapshots: cellRepository(dynamo, config, "reconciliationSnapshots"), moderationEvidence: cellRepository(dynamo, config, "moderationEvidence"), moderationHolds: cellRepository(dynamo, config, "moderationHolds"), reviewCases: cellRepository(dynamo, config, "reviewCases"), auditEvents: cellRepository(dynamo, config, "auditEvents"), usageEvents: cellRepository(dynamo, config, "usageEvents"), creditLots: cellRepository(dynamo, config, "creditLots"), creditReservations: cellRepository(dynamo, config, "creditReservations"), balances: cellRepository(dynamo, config, "balances"), integrationAccounts: cellRepository(dynamo, config, "integrationAccounts"), syncCursors: cellRepository(dynamo, config, "syncCursors"), integrationJobs: cellRepository(dynamo, config, "integrationJobs"), exportManifests: cellRepository(dynamo, config, "exportManifests"), importCheckpoints: cellRepository(dynamo, config, "importCheckpoints"), federationActors: repository(dynamo, config, "federationActors"), remotePublicationReferences: repository(dynamo, config, "remotePublicationReferences") });
 
 export class S3ObjectStorage implements ObjectStorage {
-  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string) {}
-  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } })); }
-  async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
-  async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
+  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string) {}
+  private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }
+  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { this.requireLocalKey(input.object.key); await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } })); }
+  async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { this.requireLocalKey(input.key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
+  async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.requireLocalKey(input.key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
 }
 
 const checksumBase64 = (checksum: string): string => /^[a-f0-9]{64}$/i.test(checksum) ? Buffer.from(checksum, "hex").toString("base64") : checksum;
@@ -63,10 +64,11 @@ const objectForDirectUpload = (uploadId: string): StoredObject => {
 
 /** S3 direct uploads bind the SHA-256 checksum to the presigned write and verify the immutable version at completion. */
 export class S3DirectUploadAdapter implements UploadAdapter {
-  constructor(private readonly s3: S3Client, private readonly bucket: string) {}
+  constructor(private readonly s3: S3Client, private readonly bucket: string, private readonly cellId?: string) {}
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
     if (input.multipart) throw new Error("Multipart uploads require a dedicated multipart adapter.");
     if (Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
+    if (this.cellId) requireCellScopedObject(input.object.key, this.cellId);
     const requestedChecksum = input.object.checksum;
     if (!requestedChecksum) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
     const object = { ...input.object, checksum: requestedChecksum, bucket: this.bucket, scope: input.object.scope };
@@ -82,7 +84,7 @@ export class S3DirectUploadAdapter implements UploadAdapter {
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     const requested = objectForDirectUpload(input.uploadId);
-    requireCreatorScopedObject(requested.key, input);
+    requireCreatorScopedObject(requested.key, input); if (this.cellId) requireCellScopedObject(requested.key, this.cellId);
     const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key }));
     if (!response.VersionId || response.ContentLength !== input.byteLength || response.Metadata?.checksum !== input.checksum || (response.ChecksumSHA256 && response.ChecksumSHA256 !== checksumBase64(input.checksum))) throw new Error("AWS upload completion did not match the signed object checksum, size, or version.");
     return { ...requested, versionId: response.VersionId, contentType: response.ContentType ?? requested.contentType, byteLength: response.ContentLength, checksum: input.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? requested.scope };
@@ -90,8 +92,9 @@ export class S3DirectUploadAdapter implements UploadAdapter {
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
 export class S3PresignedDelivery implements DeliveryAdapter {
-  constructor(private readonly s3: S3Client, private readonly bucket: string) {}
+  constructor(private readonly s3: S3Client, private readonly bucket: string, private readonly cellId?: string) {}
   async issue(request: Parameters<DeliveryAdapter["issue"]>[0]): Promise<{ url: string; expiresAt: string }> {
+    if (this.cellId) requireCellScopedObject(request.object.key, this.cellId);
     const expiresInSeconds = Math.max(1, Math.min(7 * 24 * 60 * 60, Math.floor((Date.parse(request.expiresAt) - Date.now()) / 1_000)));
     return { url: await issueS3Download(this.s3, this.bucket, request.object, expiresInSeconds), expiresAt: request.expiresAt };
   }
@@ -164,8 +167,9 @@ export class CognitoIdentity implements IdentityAdapter {
 
 export const issueCloudFrontDelivery = (input: { url: string; privateKey: string; keyPairId: string; expiresAt: string }): string => getCloudFrontSignedUrl({ url: input.url, privateKey: input.privateKey, keyPairId: input.keyPairId, dateLessThan: input.expiresAt });
 export class CloudFrontDelivery implements DeliveryAdapter {
-  constructor(private readonly configuration: { origin: string; privateKey: string; keyPairId: string }) {}
+  constructor(private readonly configuration: { origin: string; privateKey: string; keyPairId: string; cellId?: string }) {}
   async issue(request: Parameters<DeliveryAdapter["issue"]>[0]): Promise<{ url: string; expiresAt: string }> {
+    if (this.configuration.cellId) requireCellScopedObject(request.object.key, this.configuration.cellId);
     const origin = this.configuration.origin.replace(/\/$/, ""); const key = request.object.key.split("/").map(encodeURIComponent).join("/");
     return { url: issueCloudFrontDelivery({ url: `${origin}/${key}`, privateKey: this.configuration.privateKey, keyPairId: this.configuration.keyPairId, expiresAt: request.expiresAt }), expiresAt: request.expiresAt };
   }
@@ -176,10 +180,10 @@ export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { re
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
-  const storage = new S3ObjectStorage(s3, configuration.objectBucket);
+  const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
   return {
-    repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket),
-    delivery: configuration.cloudFront ? new CloudFrontDelivery(configuration.cloudFront) : new S3PresignedDelivery(s3, configuration.objectBucket),
+    repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
+    delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),
     jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
     identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
     credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)

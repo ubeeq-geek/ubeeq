@@ -1,4 +1,4 @@
-import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
+import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Stack, Tags, type StackProps } from "aws-cdk-lib";
 import { resolve } from "node:path";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
@@ -21,6 +21,12 @@ import { Construct } from "constructs";
 export class SelfHostReferenceStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
+    // One stack is one authoritative regional cell. This value is deliberately
+    // injected into every runtime rather than inferred from a global control plane.
+    const cellId = this.node.tryGetContext("cellId") || process.env.UBEEQ_CELL_ID || `aws-${this.region}`;
+    const cellRegion = this.node.tryGetContext("cellRegion") || process.env.UBEEQ_CELL_REGION || this.region;
+    Tags.of(this).add("ubeeq:cell-id", cellId);
+    Tags.of(this).add("ubeeq:cell-region", cellRegion);
     const bucketProps = { blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, encryption: s3.BucketEncryption.S3_MANAGED, enforceSSL: true, versioned: true, removalPolicy: RemovalPolicy.RETAIN, autoDeleteObjects: false };
     const sourceStore = new s3.Bucket(this, "SourceStore", bucketProps);
     const deliveryStore = new s3.Bucket(this, "DeliveryStore", bucketProps);
@@ -34,9 +40,10 @@ export class SelfHostReferenceStack extends Stack {
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
     const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../apps/reference-api/lambda-package");
     const referenceApiPublicBaseUrl = this.node.tryGetContext("referenceApiPublicBaseUrl") || process.env.UBEEQ_REFERENCE_API_PUBLIC_BASE_URL || "https://reference.invalid";
-    const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials" } });
+    const runtimeEnvironment = { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_CELL_ID: cellId, UBEEQ_CELL_REGION: cellRegion, UBEEQ_CELL_OPERATOR: "self-hosted", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials" };
+    const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     const web = new lambda.Function(this, "ReferenceWeb", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.web", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl } });
-    const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials" } });
+    const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
     health.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
@@ -76,6 +83,8 @@ export class SelfHostReferenceStack extends Stack {
       new CfnOutput(this, "ReferenceApiCustomDomainUrl", { value: `https://${customDomainName}` });
     }
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
+    new CfnOutput(this, "CellId", { value: cellId });
+    new CfnOutput(this, "CellRegion", { value: cellRegion });
     new CfnOutput(this, "ReferenceApiGatewayUrl", { value: api.apiEndpoint });
     new CfnOutput(this, "ReferenceWebGatewayUrl", { value: webApi.apiEndpoint });
     new CfnOutput(this, "SourceStoreName", { value: sourceStore.bucketName });

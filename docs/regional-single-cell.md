@@ -18,3 +18,11 @@ Creator creation assigns that cell and region with routing revision 1. Creator-o
 Object storage uses `cells/<cellId>/creators/<creatorId>/<kind>/<objectId>`. Buckets should also be dedicated to the cell. Normal uploads, processing, originals, and renditions use only this namespace; a CDN may cache public delivery but is not canonical storage.
 
 Creator exports contain the creator's data-home fields on all exported aggregates, reject mixed-cell contents, exclude secrets, and require no cloud credentials or global database. Import into another cell explicitly rebinds imported records to the destination data home; this is portable import behavior, not automatic migration or replication.
+
+## Runtime profile
+
+The compact Compose profile declares `UBEEQ_CELL_ID`, `UBEEQ_CELL_REGION`, and `UBEEQ_CELL_OPERATOR` explicitly. Its SQLite database, filesystem objects, jobs, credentials, and delivery tokens are all scoped to that one cell.
+
+The optional AWS CDK stack uses the same values. Pass `-c cellId=<stable-cell-id> -c cellRegion=<operator-region>` when deploying each regional stack (or set the matching environment variables). It creates regional DynamoDB, S3, SQS, Lambda, Cognito, and Secrets Manager resources, tags them with the cell identity, and injects that identity into the API and worker. The AWS adapters reject foreign-cell record, object-key, upload, delivery, credential, and job operations. The stack does not enable DynamoDB Global Tables or S3 replication.
+
+Deploy one independent stack per region. A cell outage remains an outage for that cell; recovery restores the regional resources or uses a future explicit migration process. Do not reuse a cell ID for a different regional resource set.
