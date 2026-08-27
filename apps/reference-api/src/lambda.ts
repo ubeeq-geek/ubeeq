@@ -1,30 +1,79 @@
-/**
- * AWS edge entry point for the reference API. It deliberately imports only AWS SDK
- * clients available in the Lambda Node runtime; application services remain behind
- * provider-neutral packages and are composed by the deployment runtime.
- */
-import { DescribeTableCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
-import { GetQueueAttributesCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { Readable } from "node:stream";
+import { createAwsAdapterSet } from "@ubeeq/adapters-aws";
+import { createReferenceApi, type ReferenceAdapterSet } from "./server.js";
 
-type FunctionUrlEvent = { rawPath?: string; requestContext?: { http?: { method?: string } } };
-type FunctionUrlResult = { statusCode: number; headers: Record<string, string>; body: string };
-const json = (statusCode: number, body: unknown): FunctionUrlResult => ({ statusCode, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(body) });
-
-const region = process.env.AWS_REGION;
-const dynamo = new DynamoDBClient({ region }); const s3 = new S3Client({ region }); const sqs = new SQSClient({ region });
+type FunctionUrlEvent = {
+  rawPath?: string;
+  rawQueryString?: string;
+  headers?: Record<string, string | undefined>;
+  body?: string;
+  isBase64Encoded?: boolean;
+  requestContext?: { http?: { method?: string } };
+};
+type FunctionUrlResult = { statusCode: number; headers: Record<string, string>; body: string; isBase64Encoded?: boolean };
+type SqsEvent = { Records?: readonly { messageId: string }[] };
 const required = (name: string): string => { const value = process.env[name]; if (!value) throw new Error(`${name} is not configured`); return value; };
 
+/**
+ * Small Function URL bridge. It intentionally adapts Lambda events at the edge, so
+ * the reference API keeps its usual HTTP transport and receives only neutral ports.
+ */
+const toRequest = (event: FunctionUrlEvent): import("node:http").IncomingMessage => {
+  const body = event.body ? Buffer.from(event.body, event.isBase64Encoded ? "base64" : "utf8") : Buffer.alloc(0);
+  const request = Readable.from(body.length ? [body] : []) as import("node:http").IncomingMessage;
+  Object.assign(request, {
+    method: event.requestContext?.http?.method ?? "GET",
+    url: `${event.rawPath ?? "/"}${event.rawQueryString ? `?${event.rawQueryString}` : ""}`,
+    headers: Object.fromEntries(Object.entries(event.headers ?? {}).filter(([, value]) => value !== undefined)),
+  });
+  return request;
+};
+
+const invokeApi = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
+  const responseHeaders: Record<string, string> = { "cache-control": "no-store" };
+  let statusCode = 200;
+  let responseBody = Buffer.alloc(0);
+  const response = {
+    setHeader(name: string, value: number | string | readonly string[]) { responseHeaders[name.toLowerCase()] = Array.isArray(value) ? value.join(", ") : String(value); },
+    end(value?: string | Uint8Array) { responseBody = value === undefined ? Buffer.alloc(0) : Buffer.from(value); },
+    get statusCode() { return statusCode; },
+    set statusCode(value: number) { statusCode = value; },
+  } as unknown as import("node:http").ServerResponse;
+  const api = referenceApi();
+  await api.handle(toRequest(event), response);
+  const contentType = responseHeaders["content-type"] ?? "";
+  const binary = !contentType.includes("json") && !contentType.startsWith("text/");
+  return { statusCode, headers: responseHeaders, body: responseBody.toString(binary ? "base64" : "utf8"), ...(binary ? { isBase64Encoded: true } : {}) };
+};
+
+let application: ReturnType<typeof createReferenceApi> | undefined;
+const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??= createReferenceApi({
+  instanceId: process.env.UBEEQ_INSTANCE_ID ?? "aws-reference",
+  publicBaseUrl: required("UBEEQ_PUBLIC_BASE_URL"),
+  adapters: createAwsAdapterSet({
+    region: process.env.AWS_REGION,
+    tableName: required("UBEEQ_RECORDS_TABLE"),
+    objectBucket: required("UBEEQ_SOURCE_BUCKET"),
+    queueUrl: required("UBEEQ_JOBS_QUEUE_URL"),
+    userPoolId: required("UBEEQ_USER_POOL_ID"),
+    userPoolClientId: required("UBEEQ_USER_POOL_CLIENT_ID"),
+    credentialSecretPrefix: required("UBEEQ_CREDENTIAL_SECRET_PREFIX"),
+  }) as ReferenceAdapterSet,
+});
+
 export const handler = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
-  const path = event.rawPath ?? "/";
-  if (path === "/health") return json(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" });
-  if (path !== "/ready") return json(404, { error: { code: "not_found", message: "Route was not found" } });
-  try {
-    await Promise.all([
-      dynamo.send(new DescribeTableCommand({ TableName: required("UBEEQ_RECORDS_TABLE") })),
-      s3.send(new HeadBucketCommand({ Bucket: required("UBEEQ_SOURCE_BUCKET") })),
-      sqs.send(new GetQueueAttributesCommand({ QueueUrl: required("UBEEQ_JOBS_QUEUE_URL"), AttributeNames: ["QueueArn"] }))
-    ]);
-    return json(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] });
-  } catch (error) { return json(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); }
+  try { return await invokeApi(event); }
+  catch (error) {
+    return { statusCode: 503, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ error: { code: "runtime_unavailable", message: error instanceof Error ? error.message : "Reference API runtime is unavailable" } }) };
+  }
+};
+
+/** SQS entry point for the same durable job service used by the local reference worker. */
+export const worker = async (event: SqsEvent): Promise<{ batchItemFailures: Array<{ itemIdentifier: string }> }> => {
+  const failures: Array<{ itemIdentifier: string }> = [];
+  for (const record of event.Records ?? []) {
+    try { await referenceApi().runNextJob(`aws-worker:${record.messageId}`); }
+    catch { failures.push({ itemIdentifier: record.messageId }); }
+  }
+  return { batchItemFailures: failures };
 };

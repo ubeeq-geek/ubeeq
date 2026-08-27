@@ -64,7 +64,12 @@ export class S3DirectUploadAdapter implements UploadAdapter {
     const object = { ...input.object, checksum: requestedChecksum, bucket: this.bucket, scope: input.object.scope };
     const expiresIn = Math.max(1, Math.min(900, Math.floor((Date.parse(input.expiresAt) - Date.now()) / 1_000)));
     const checksum = checksumBase64(object.checksum);
-    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentType: object.contentType, ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), { expiresIn });
+    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentType: object.contentType, ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
+      expiresIn,
+      // The browser must send these headers with the object. Keeping them in the
+      // canonical request prevents clients from changing integrity or access metadata.
+      unhoistableHeaders: new Set(["x-amz-checksum-sha256", "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength"]),
+    });
     return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {

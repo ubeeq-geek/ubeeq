@@ -1,13 +1,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/adapters-local";
-import { composeReferenceApplication } from "@ubeeq/api";
+import type { IdentityAdapter, PasswordIdentityAdapter } from "@ubeeq/auth";
+import { composeReferenceApplication, type DependencyDiagnostic } from "@ubeeq/api";
+import type { JobQueue } from "@ubeeq/jobs";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
-import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationSignatureVerifier } from "@ubeeq/federation";
+import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
-import type { AssetRecord, CreatorRecord, WorkRecord } from "@ubeeq/persistence";
+import type { AssetRecord, CreatorRecord, WorkRecord, UbeeqRepositories } from "@ubeeq/persistence";
+import type { DeliveryAdapter, ObjectStorage, UploadAdapter } from "@ubeeq/storage";
 
 const json = (response: ServerResponse, status: number, body: unknown, requestId: string): void => {
   response.statusCode = status; response.setHeader("content-type", "application/json; charset=utf-8"); response.setHeader("x-request-id", requestId); response.end(JSON.stringify(body));
@@ -21,20 +24,56 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("error", reject);
 });
 
-export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; federationVerifier?: FederationSignatureVerifier; mediaProcessor?: MediaProcessor; }
+export type ReferenceAdapterSet = {
+  repositories: UbeeqRepositories;
+  storage: ObjectStorage;
+  uploads: UploadAdapter & Partial<{ acceptUpload(uploadId: string, body: Uint8Array): Promise<void> }>;
+  delivery: DeliveryAdapter;
+  jobs: JobQueue;
+  identity: IdentityAdapter;
+  /** Present only for the guarded local password development adapter. */
+  localIdentity?: PasswordIdentityAdapter;
+  federation?: FederationSignatureVerifier & FederationReplayStore & { keyId: string; publicKey: string };
+};
 
-export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; close(): Promise<void> } => {
-  const adapters = createLocalAdapterSet(configuration);
+export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
+  publicBaseUrl: string;
+  instanceId?: string;
+  federationPolicy?: FederationPolicy;
+  federationVerifier?: FederationSignatureVerifier;
+  mediaProcessor?: MediaProcessor;
+  adapters?: ReferenceAdapterSet;
+  diagnostics?: readonly DependencyDiagnostic[];
+}
+
+export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; close(): Promise<void> } => {
+  const localConfiguration: LocalAdapterConfiguration = {
+    databasePath: configuration.databasePath ?? "./var/reference/ubeeq.sqlite",
+    dataDirectory: configuration.dataDirectory ?? "./var/reference",
+    publicBaseUrl: configuration.publicBaseUrl,
+    sessionTtlSeconds: configuration.sessionTtlSeconds,
+    credentialEncryptionKey: configuration.credentialEncryptionKey,
+  };
+  const localAdapters = configuration.adapters ? undefined : createLocalAdapterSet(localConfiguration);
+  const adapters: ReferenceAdapterSet = configuration.adapters ?? {
+    repositories: localAdapters!.repositories,
+    storage: localAdapters!.storage,
+    uploads: localAdapters!.storage,
+    delivery: localAdapters!.storage,
+    jobs: localAdapters!.jobs,
+    identity: localAdapters!.identity,
+    localIdentity: localAdapters!.identity,
+    federation: localAdapters!.federation,
+  };
   const composition = composeReferenceApplication({
     instanceId: configuration.instanceId ?? "local-reference",
     publicBaseUrl: configuration.publicBaseUrl,
     extensions: [], requiredExtensions: {},
-    localAdapter: { sqliteDatabasePath: configuration.databasePath, storageDirectory: configuration.dataDirectory }
+    ...(configuration.adapters ? {} : { localAdapter: { sqliteDatabasePath: localConfiguration.databasePath, storageDirectory: localConfiguration.dataDirectory } })
   }, {
-    identity: adapters.identity, repositories: adapters.repositories, objectStorage: adapters.storage, delivery: adapters.storage, jobs: adapters.jobs,
-    diagnostics: [
-      { name: "sqlite", check: async () => { await adapters.repositories.creators.list({ limit: 1 }); return { status: "ok" as const }; } },
-      { name: "filesystem", check: async () => { await adapters.storage.put({ object: { bucket: "diagnostics", key: "probe", contentType: "text/plain", byteLength: 0, scope: "private" }, body: new Uint8Array() }); await adapters.storage.remove({ bucket: "diagnostics", key: "probe" }); return { status: "ok" as const }; } }
+    identity: adapters.identity, repositories: adapters.repositories, objectStorage: adapters.storage, delivery: adapters.delivery, jobs: adapters.jobs,
+    diagnostics: configuration.diagnostics ?? [
+      { name: configuration.adapters ? "persistence" : "sqlite", check: async () => { await adapters.repositories.creators.list({ limit: 1 }); return { status: "ok" as const }; } },
     ]
   });
   const { repositories } = composition.dependencies;
@@ -102,7 +141,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
       if (method === "GET" && url.pathname === "/health") return json(response, 200, { ok: true, requestId }, requestId);
-      if (method === "GET" && url.pathname === "/.well-known/ubeeq") { const publicUrl = new URL(configuration.publicBaseUrl); const enabled = publicUrl.protocol === "https:"; return json(response, 200, { protocolVersion: "1", instanceId: configuration.instanceId ?? "local-reference", federationEnabled: enabled, ...(enabled ? { instanceUrl: publicUrl.toString(), actorDocumentUrl: new URL("/v1/federation/actors", publicUrl).toString(), publicationInboxUrl: new URL("/v1/federation/inbox", publicUrl).toString(), signingKeyId: adapters.federation.keyId, signingPublicKey: adapters.federation.publicKey, capabilities: ["publication-reference", "withdrawal"] } : {}), requestId }, requestId); }
+      if (method === "GET" && url.pathname === "/.well-known/ubeeq") { const publicUrl = new URL(configuration.publicBaseUrl); const enabled = publicUrl.protocol === "https:" && !!adapters.federation; return json(response, 200, { protocolVersion: "1", instanceId: configuration.instanceId ?? "local-reference", federationEnabled: enabled, ...(enabled ? { instanceUrl: publicUrl.toString(), actorDocumentUrl: new URL("/v1/federation/actors", publicUrl).toString(), publicationInboxUrl: new URL("/v1/federation/inbox", publicUrl).toString(), signingKeyId: adapters.federation!.keyId, signingPublicKey: adapters.federation!.publicKey, capabilities: ["publication-reference", "withdrawal"] } : {}), requestId }, requestId); }
       if ((method === "GET" && url.pathname === "/ready") || (method === "GET" && url.pathname === "/diagnostics")) {
         const dependencies = await Promise.all((composition.dependencies.diagnostics ?? []).map(async (dependency) => ({ name: dependency.name, ...(await dependency.check()) })));
         const ready = dependencies.every((dependency) => dependency.status === "ok");
@@ -116,7 +155,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const event = validateRemotePublicationEvent(envelope.payload as Parameters<typeof validateRemotePublicationEvent>[0]);
         const decision = configuration.federationPolicy ? await configuration.federationPolicy.evaluateRemote({ actorId: event.actor.id, host: event.actor.host }) : "deny";
         if (decision !== "allow") throw new HttpError(403, "federation_not_accepted", "The instance policy did not accept this remote reference");
-        await verifyFederationEnvelope(envelope, configuration.federationVerifier ?? adapters.federation, adapters.federation);
+        if (!configuration.federationVerifier || !adapters.federation) throw new HttpError(503, "federation_unavailable", "Federation is not configured for this instance");
+        await verifyFederationEnvelope(envelope, configuration.federationVerifier, adapters.federation);
         const actorRecord = await repositories.federationActors.get(event.actor.id) ?? await repositories.federationActors.create({ id: event.actor.id, instanceId: configuration.instanceId ?? "local-reference", actorUri: event.actor.id, host: event.actor.host });
         const existing = await repositories.remotePublicationReferences.get(event.publication.id);
         if (existing && existing.actorId !== actorRecord.id) throw new HttpError(409, "federation_reference_conflict", "A remote publication identifier cannot change actors");
@@ -133,19 +173,19 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         return json(response, existing ? 200 : 201, { reference, requestId }, requestId);
       }
 
-      if (method === "POST" && url.pathname === "/v1/auth/sign-up") { const body = await parseBody(request); const account = await adapters.identity.register({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
-      if (method === "POST" && url.pathname === "/v1/auth/sign-in") { const body = await parseBody(request); const result = await adapters.identity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/auth/sign-up") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const account = await adapters.localIdentity.register({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/auth/sign-in") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const result = await adapters.localIdentity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
 
       if (method === "POST" && url.pathname === "/v1/creators") { const identity = await session(request); const body = await parseBody(request); const creator = await repositories.creators.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", handle: requireString(body.handle, "handle"), displayName: requireString(body.displayName, "displayName"), subjectId: identity.subject.id }); return json(response, 201, { creator, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/creators/me") { const identity = await session(request); return json(response, 200, { creator: await creatorFor(identity.subject.id), requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/works") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); const body = await parseBody(request); const work = await repositories.works.create({ id: randomUUID(), instanceId: creator.instanceId, creatorId: creator.id, title: requireString(body.title, "title"), status: "draft" }); return json(response, 201, { work, requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/collections") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); const body = await parseBody(request); const collection = await repositories.collections.create({ id: randomUUID(), instanceId: creator.instanceId, creatorId: creator.id, title: requireString(body.title, "title"), visibility: body.visibility === "public" || body.visibility === "unlisted" ? body.visibility : "private" }); return json(response, 201, { collection, requestId }, requestId); }
 
-      if (method === "POST" && url.pathname === "/v1/uploads") { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const byteLength = Number(body.byteLength); if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new HttpError(400, "invalid_request", "byteLength must be a non-negative integer"); const object = { bucket: "local", key: `creator/${work.creatorId}/work/${work.id}/${randomUUID()}`, contentType: requireString(body.mimeType, "mimeType"), byteLength, scope: "private" as const }; const upload = await adapters.storage.initiate({ object, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }); return json(response, 201, { upload, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/uploads") { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const byteLength = Number(body.byteLength); if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new HttpError(400, "invalid_request", "byteLength must be a non-negative integer"); const checksum = requireString(body.checksum, "checksum"); const object = { bucket: "local", key: `creator/${work.creatorId}/work/${work.id}/${randomUUID()}`, contentType: requireString(body.mimeType, "mimeType"), byteLength, checksum, scope: "private" as const }; const upload = await adapters.uploads.initiate({ object, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }); return json(response, 201, { upload, requestId }, requestId); }
       const contentMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/content$/);
-      if (method === "PUT" && contentMatch) { await session(request); const body = await parseBody(request); const base64 = requireString(body.base64, "base64"); await adapters.storage.acceptUpload(contentMatch[1], Buffer.from(base64, "base64")); return json(response, 204, undefined, requestId); }
+      if (method === "PUT" && contentMatch) { await session(request); if (!adapters.uploads.acceptUpload) throw new HttpError(405, "direct_upload_required", "Upload content must be sent to the issued direct-upload URL"); const body = await parseBody(request); const base64 = requireString(body.base64, "base64"); await adapters.uploads.acceptUpload(contentMatch[1], Buffer.from(base64, "base64")); return json(response, 204, undefined, requestId); }
       const completeMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/complete$/);
-      if (method === "POST" && completeMatch) { const identity = await session(request); const body = await parseBody(request); const object = await adapters.storage.complete({ uploadId: completeMatch[1], checksum: requireString(body.checksum, "checksum"), byteLength: Number(body.byteLength) }); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const result = await repositories.transaction(async (transaction) => { const asset = await repositories.assets.create({ id: randomUUID(), instanceId: work.instanceId, creatorId: work.creatorId, workId: work.id, mimeType: object.contentType, checksum: object.checksum!, objectVersion: object.versionId!, status: "pending", storage: object } as AssetRecord & { storage: typeof object }, { transaction }); await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: work.instanceId, subjectType: "asset", subjectId: asset.id, source: "local.upload", payload: { checksum: object.checksum, byteLength: object.byteLength } }, { transaction }); await repositories.auditEvents.create({ id: randomUUID(), instanceId: work.instanceId, action: "asset.upload_completed", actorId: identity.subject.id, subjectId: asset.id, payload: { workId: work.id } }, { transaction }); const job = await adapters.jobs.enqueue({ type: "asset.process", payload: { assetId: asset.id }, idempotencyKey: `asset-process:${asset.id}:${asset.objectVersion}`, maxAttempts: 3, correlationId: requestId }); return { asset, job }; }); return json(response, 202, { ...result, requestId }, requestId); }
+      if (method === "POST" && completeMatch) { const identity = await session(request); const body = await parseBody(request); const object = await adapters.uploads.complete({ uploadId: completeMatch[1], checksum: requireString(body.checksum, "checksum"), byteLength: Number(body.byteLength) }); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const result = await repositories.transaction(async (transaction) => { const asset = await repositories.assets.create({ id: randomUUID(), instanceId: work.instanceId, creatorId: work.creatorId, workId: work.id, mimeType: object.contentType, checksum: object.checksum!, objectVersion: object.versionId!, status: "pending", storage: object } as AssetRecord & { storage: typeof object }, { transaction }); await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: work.instanceId, subjectType: "asset", subjectId: asset.id, source: "reference.upload", payload: { checksum: object.checksum, byteLength: object.byteLength } }, { transaction }); await repositories.auditEvents.create({ id: randomUUID(), instanceId: work.instanceId, action: "asset.upload_completed", actorId: identity.subject.id, subjectId: asset.id, payload: { workId: work.id } }, { transaction }); const job = await adapters.jobs.enqueue({ type: "asset.process", payload: { assetId: asset.id }, idempotencyKey: `asset-process:${asset.id}:${asset.objectVersion}`, maxAttempts: 3, correlationId: requestId }); return { asset, job }; }); return json(response, 202, { ...result, requestId }, requestId); }
 
       if (method === "POST" && url.pathname === "/v1/operations/jobs/run-next") { await session(request); const body = await parseBody(request); const result = await runNextJob(typeof body.workerId === "string" && body.workerId.trim() ? body.workerId.trim() : "local-reference-worker"); return json(response, 200, { result: result ?? null, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/operations/jobs") { await session(request); const states = url.searchParams.getAll("state").filter((state): state is import("@ubeeq/jobs").JobState => ["queued", "leased", "completed", "retry_scheduled", "dead_lettered", "cancelled"].includes(state)); return json(response, 200, { jobs: await adapters.jobs.list({ states, limit: Number(url.searchParams.get("limit") ?? 50) }), requestId }, requestId); }
@@ -163,7 +203,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const publicationMatch = url.pathname.match(/^\/v1\/works\/([^/]+)\/publications$/);
       if (method === "POST" && publicationMatch) { const identity = await session(request); const work = await ownedWork(publicationMatch[1], identity.subject.id); const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.workId === work.id); if (!assets.length || assets.some((asset) => asset.status !== "ready")) throw new HttpError(409, "processing_incomplete", "All Work assets must finish processing before publication"); await requireClearAdmission("Publication", [work.id, work.creatorId, ...assets.map((asset) => asset.id)]); const body = await parseBody(request); const destination = requireString(body.destination, "destination"); const intent = await repositories.publicationIntents.create({ id: randomUUID(), instanceId: work.instanceId, workId: work.id, destination, idempotencyKey: request.headers["idempotency-key"]?.toString() || randomUUID() }); const publication = await repositories.publications.create({ id: randomUUID(), instanceId: work.instanceId, workId: work.id, destination, status: "live" }); const publishedWork = await repositories.works.update(work.id, work.revision, { status: "published" }); await audit({ action: "work.published", actorId: identity.subject.id, subjectId: work.id, payload: { publicationId: publication.id, destination } }); return json(response, 201, { intent, publication, work: publishedWork, requestId }, requestId); }
       const publicMatch = url.pathname.match(/^\/v1\/public\/works\/([^/]+)$/);
-      if (method === "GET" && publicMatch) { const work = await repositories.works.get(publicMatch[1]); if (!work || work.status !== "published") throw new HttpError(404, "work_not_found", "Published work was not found"); const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.workId === work.id && asset.status === "ready"); const publications = (await repositories.publications.list({ limit: 100 })).items.filter((publication) => publication.workId === work.id && publication.status === "live"); const delivered = await Promise.all(assets.map(async (asset) => ({ ...asset, delivery: await adapters.storage.issue({ object: { bucket: "local", key: (asset as AssetRecord & { storage: { key: string } }).storage.key, versionId: asset.objectVersion, scope: "public" }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) }))); return json(response, 200, { work, assets: delivered, publications, requestId }, requestId); }
+      if (method === "GET" && publicMatch) { const work = await repositories.works.get(publicMatch[1]); if (!work || work.status !== "published") throw new HttpError(404, "work_not_found", "Published work was not found"); const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.workId === work.id && asset.status === "ready"); const publications = (await repositories.publications.list({ limit: 100 })).items.filter((publication) => publication.workId === work.id && publication.status === "live"); const delivered = await Promise.all(assets.map(async (asset) => ({ ...asset, delivery: await adapters.delivery.issue({ object: { bucket: "local", key: (asset as AssetRecord & { storage: { key: string } }).storage.key, versionId: asset.objectVersion, scope: "public" }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) }))); return json(response, 200, { work, assets: delivered, publications, requestId }, requestId); }
       const deliveryMatch = url.pathname.match(/^\/v1\/delivery\/([^/]+)$/);
       if (method === "GET" && deliveryMatch) { const object = JSON.parse(Buffer.from(deliveryMatch[1], "base64url").toString("utf8")); if (object.scope !== "public") throw new HttpError(403, "delivery_denied", "This development delivery URL is not public"); const found = await adapters.storage.get(object); response.statusCode = 200; response.setHeader("content-type", found.object.contentType); response.setHeader("x-request-id", requestId); response.end(found.body); return; }
       if (method === "GET" && url.pathname === "/v1/exports/me") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); const works = (await repositories.works.list({ limit: 100 })).items.filter((work) => work.creatorId === creator.id); const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.creatorId === creator.id); const collections = (await repositories.collections.list({ limit: 100 })).items.filter((collection) => collection.creatorId === creator.id); const publications = (await repositories.publications.list({ limit: 100 })).items.filter((publication) => works.some((work) => work.id === publication.workId)); const manifest = createCreatorExport({ exportedAt: new Date().toISOString(), creator, works, assets, collections, publications }); await repositories.exportManifests.create({ id: `export-${manifest.checksum}`, instanceId: creator.instanceId, creatorId: creator.id, schemaVersion: manifest.schemaVersion, checksum: manifest.checksum, objectReference: `inline:${manifest.checksum}` }, { idempotencyKey: `export:${manifest.checksum}` }); await audit({ action: "creator.export_generated", actorId: identity.subject.id, subjectId: creator.id, payload: { checksum: manifest.checksum } }); return json(response, 200, { ...manifest, requestId }, requestId); }
@@ -202,7 +242,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     }
   };
   const server = createServer((request, response) => { void handle(request, response); });
-  return { server, close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) };
+  return { server, handle, runNextJob, close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())) };
 };
 
 if (process.argv[1] && process.argv[1].endsWith("server.js")) {

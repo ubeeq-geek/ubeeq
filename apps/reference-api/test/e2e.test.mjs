@@ -32,7 +32,7 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.equal(collection.response.status, 201);
     const work = await request(base, "/v1/works", { method: "POST", headers, body: JSON.stringify({ title: "A local work" }) });
     const bytes = Buffer.from("portable image bytes"); const checksum = createHash("sha256").update(bytes).digest("hex");
-    const upload = await request(base, "/v1/uploads", { method: "POST", headers, body: JSON.stringify({ workId: work.body.work.id, mimeType: "image/png", byteLength: bytes.length }) });
+    const upload = await request(base, "/v1/uploads", { method: "POST", headers, body: JSON.stringify({ workId: work.body.work.id, mimeType: "image/png", byteLength: bytes.length, checksum }) });
     await request(base, `/v1/uploads/${upload.body.upload.uploadId}/content`, { method: "PUT", headers, body: JSON.stringify({ base64: bytes.toString("base64") }) });
     const asset = await request(base, `/v1/uploads/${upload.body.upload.uploadId}/complete`, { method: "POST", headers, body: JSON.stringify({ workId: work.body.work.id, checksum, byteLength: bytes.length }) });
     assert.equal(asset.response.status, 202);

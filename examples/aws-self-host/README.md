@@ -2,9 +2,18 @@
 
 The CDK composition in [`packages/aws-self-host-infra`](../../packages/aws-self-host-infra) is the optional AWS implementation of Ubeeq ports. It provisions encrypted/versioned S3 stores, DynamoDB with point-in-time recovery, SQS with a dead-letter queue, EventBridge recovery scheduling, Cognito, Secrets Manager, and a dead-letter alarm.
 
-It does not make AWS a Ubeeq requirement. Local and Compose reference deployments remain the default portable path. Before deployment, replace the inline health Lambda with an artifact built from `apps/reference-api` and select the AWS adapters through composition.
+It does not make AWS a Ubeeq requirement. Local and Compose reference deployments remain the default portable path. The deployment packages `apps/reference-api` with its Ubeeq and AWS runtime dependencies, then composes the same `/v1` API against DynamoDB, S3, SQS, Cognito, and Secrets Manager ports.
 
-To synthesize, run `npm run synth:aws-self-host-infra` from the repository root. Keep production backup retention, alert routing, key management, domains, and network policy in your own deployment configuration.
+To synthesize, run `npm run synth:aws-self-host-infra` from the repository root. To deploy, set `UBEEQ_REFERENCE_API_PUBLIC_BASE_URL` to the HTTPS URL users will reach (normally a custom domain) and run:
+
+```sh
+UBEEQ_REFERENCE_API_PUBLIC_BASE_URL=https://ubeeq.example \
+npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
+```
+
+The emitted Function URL is IAM-protected for operator diagnostics. The stack also emits `ReferenceApiGatewayUrl`, the HTTP API edge for the reference API; it passes requests to the API, whose protected routes validate Cognito bearer tokens through the identity port. Do not treat either generated hostname as a production public base URL. AWS uploads return a checksum-bound, time-limited S3 PUT URL; upload content goes directly to S3 and then `/v1/uploads/{uploadId}/complete` records the immutable object version. SQS invokes the bundled worker Lambda to process the completed asset.
+
+Keep production backup retention, alert routing, key management, domains, and network policy in your own deployment configuration. See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for the operational runbook.
 
 After deploying an isolated stack and creating a disposable Cognito test user, use its outputs to run the real-service adapter gate:
 
@@ -21,5 +30,20 @@ npm run test:live --workspace @ubeeq/adapters-aws
 ```
 
 This gate creates and removes isolated contract records and objects, enqueues a contract job, and revokes the disposable user's session.
+
+To exercise the complete HTTP path after the stack emits `ReferenceApiGatewayUrl`, run the separate opt-in flow with the same disposable user:
+
+```sh
+UBEEQ_AWS_API_URL=<ReferenceApiGatewayUrl> \
+UBEEQ_AWS_REGION=us-east-2 \
+UBEEQ_AWS_RECORDS_TABLE=<RecordsTableName> \
+UBEEQ_AWS_OBJECT_BUCKET=<SourceStoreName> \
+UBEEQ_AWS_USER_POOL_CLIENT_ID=<UserPoolClientId> \
+UBEEQ_AWS_TEST_USERNAME=<disposable-user> \
+UBEEQ_AWS_TEST_PASSWORD=<disposable-password> \
+npm run test:aws --workspace @ubeeq/reference-api
+```
+
+It creates a marked creator/work/object set, verifies direct upload through delivery, and removes only that test data afterward.
 
 See [MIGRATION.md](MIGRATION.md) for the supported local SQLite/filesystem migration path.
