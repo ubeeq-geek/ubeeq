@@ -10,5 +10,11 @@
     "build": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.mjs"
   },
-  "dependencies": { "@ubeeq/extension-sdk": "^0.1.0" }
+  "dependencies": {
+    "@ubeeq/auth": "^0.1.0",
+    "@ubeeq/extension-sdk": "^0.1.0",
+    "@ubeeq/jobs": "^0.1.0",
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/storage": "^0.1.0"
+  }
 }

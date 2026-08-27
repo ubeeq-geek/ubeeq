@@ -27,6 +27,6 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm run pack:verify
-      - run: npm publish --workspace @ubeeq/core --workspace @ubeeq/auth --workspace @ubeeq/extension-sdk --workspace @ubeeq/ui --workspace @ubeeq/integrations --workspace @ubeeq/moderation --workspace @ubeeq/processing --workspace @ubeeq/storage --workspace @ubeeq/billing --workspace @ubeeq/federation --workspace @ubeeq/deployment-platform --workspace @ubeeq/self-host --workspace @ubeeq/api --access public --tag "${{ inputs.tag }}" --provenance
+      - run: npm publish --workspace @ubeeq/core --workspace @ubeeq/auth --workspace @ubeeq/extension-sdk --workspace @ubeeq/ui --workspace @ubeeq/integrations --workspace @ubeeq/moderation --workspace @ubeeq/processing --workspace @ubeeq/storage --workspace @ubeeq/jobs --workspace @ubeeq/persistence --workspace @ubeeq/billing --workspace @ubeeq/federation --workspace @ubeeq/deployment-platform --workspace @ubeeq/self-host --workspace @ubeeq/api --access public --tag "${{ inputs.tag }}" --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

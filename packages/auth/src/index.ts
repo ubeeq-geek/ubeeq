@@ -5,6 +5,59 @@ export interface AuthorizationSubject {
   scopes?: readonly string[];
 }
 
+export interface IdentityAccount {
+  id: string;
+  subjectId: string;
+  status: "active" | "pending_verification" | "suspended" | "closed";
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthenticatedSession {
+  id: string;
+  subject: AuthorizationSubject;
+  issuedAt: string;
+  expiresAt: string;
+  authenticationMethod: "password" | "passwordless" | "oidc" | "service" | "other";
+}
+
+export interface CreatorDelegation {
+  id: string;
+  creatorId: string;
+  subjectId: string;
+  roles: readonly string[];
+  scopes: readonly string[];
+  expiresAt?: string;
+}
+
+/** Provider-neutral boundary for local, OIDC, and future cloud identity adapters. */
+export interface IdentityAdapter {
+  verifySession(input: { credential: string; audience?: string }): Promise<AuthenticatedSession | undefined>;
+  getAccount(subjectId: string): Promise<IdentityAccount | undefined>;
+  listDelegations(input: { creatorId: string; subjectId: string; at: string }): Promise<readonly CreatorDelegation[]>;
+  beginVerification?(input: { accountId: string; channel: string }): Promise<void>;
+  completeVerification?(input: { accountId: string; proof: string }): Promise<void>;
+  beginRecovery?(input: { accountId: string; channel: string }): Promise<void>;
+  completeRecovery?(input: { accountId: string; proof: string; replacementSecret?: string }): Promise<void>;
+  revokeSession(input: { sessionId: string; reason?: string }): Promise<void>;
+}
+
+export const effectiveAuthorizationSubject = (
+  session: AuthenticatedSession,
+  delegations: readonly CreatorDelegation[],
+  creatorId: string,
+  at: string
+): AuthorizationSubject => {
+  const active = delegations.filter((delegation) => delegation.creatorId === creatorId
+    && delegation.subjectId === session.subject.id
+    && (!delegation.expiresAt || delegation.expiresAt > at));
+  return {
+    id: session.subject.id,
+    roles: [...new Set([...session.subject.roles, ...active.flatMap(({ roles }) => roles)])],
+    scopes: [...new Set([...(session.subject.scopes ?? []), ...active.flatMap(({ scopes }) => scopes)])]
+  };
+};
+
 /** A product-defined requirement evaluated by the neutral authorization helpers. */
 export interface AuthorizationRequirement {
   allRoles?: readonly string[];

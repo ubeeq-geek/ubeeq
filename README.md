@@ -15,6 +15,8 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/moderation` — evidence, review-case, hold, and auditable human-decision lifecycle primitives.
 - `@ubeeq/processing` — asset-processing requests and idempotent usage measurement interfaces.
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
+- `@ubeeq/jobs` — durable queue, scheduling, leasing, retry, and recovery ports.
+- `@ubeeq/persistence` — durable repository, transaction, revision, pagination, and adapter conformance contracts.
 - `@ubeeq/federation` — remote actor and publication-reference contracts.
 - `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
 - `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
@@ -34,3 +36,7 @@ Public Ubeeq code may provide reusable mechanisms such as storage, processing, a
 ## Self-hosting reference configuration
 
 [`packages/self-host/reference-config.json`](packages/self-host/reference-config.json) is a product-neutral starting point. Replace its example origin and local storage path, provide any desired extension manifests, and validate the resulting configuration with `@ubeeq/self-host`. It contains neither hosted product settings nor credentials.
+
+## Portable reference-instance plan
+
+The staged implementation plan for the local reference instance, durable adapters, optional AWS composition, and compatibility gates is in [`docs/portable-reference-instance-implementation-plan.md`](docs/portable-reference-instance-implementation-plan.md).
