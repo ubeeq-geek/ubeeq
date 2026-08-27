@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLocalAdapterSet } from "../dist/index.js";
+import { verifyJobQueueContract } from "@ubeeq/jobs";
 
 test("SQLite jobs retain idempotency and support retry, recovery, and cancellation", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-jobs-"));
@@ -20,6 +21,12 @@ test("SQLite jobs retain idempotency and support retry, recovery, and cancellati
     await jobs.cancel({ id: created.id, reason: "manual recovery test" });
     assert.equal((await jobs.get(created.id))?.state, "cancelled");
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("SQLite job queue satisfies the shared durable queue contract", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-job-contract-"));
+  try { await verifyJobQueueContract(createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:4100" }).jobs); }
+  finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("local credential vault returns only opaque encrypted references and honors revocation", async () => {
