@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,7 +26,7 @@ export class LocalSqliteDatabase {
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -181,12 +181,16 @@ export class LocalCredentialVault implements CredentialVault {
   async revoke(input: { reference: string }): Promise<void> { const id = input.reference.replace(/^local-vault:/, ""); if (id !== input.reference) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ?").run(now(), id); }
 }
 
-/** Local HMAC signing is only a reference implementation; production federation uses a managed asymmetric key. */
+/** Local Ed25519 signing is a portable reference; hosted instances may resolve keys from a managed provider. */
 export class LocalFederationKey implements FederationSigner, FederationSignatureVerifier, FederationReplayStore {
-  readonly keyId = "local-federation-key"; private readonly key: Buffer;
-  constructor(private readonly local: LocalSqliteDatabase) { this.key = createHash("sha256").update(local.configuration.credentialEncryptionKey ?? `local-federation:${resolve(local.configuration.databasePath)}`).digest(); }
-  async sign(message: string): Promise<string> { return createHmac("sha256", this.key).update(message).digest("base64url"); }
-  async verify(input: { keyId: string; message: string; signature: string }): Promise<boolean> { return input.keyId === this.keyId && timingSafeEqual(Buffer.from(input.signature), Buffer.from(await this.sign(input.message))); }
+  readonly keyId = "local-ed25519-v1"; readonly publicKey: string; private readonly privateKey: string;
+  constructor(private readonly local: LocalSqliteDatabase) {
+    const existing = local.database.prepare("SELECT private_key, public_key FROM ubeeq_federation_keys WHERE id = ?").get(this.keyId) as { private_key?: string; public_key?: string } | undefined;
+    if (existing?.private_key && existing.public_key) { this.privateKey = existing.private_key; this.publicKey = existing.public_key; }
+    else { const pair = generateKeyPairSync("ed25519"); this.privateKey = pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(); this.publicKey = pair.publicKey.export({ type: "spki", format: "pem" }).toString(); local.database.prepare("INSERT INTO ubeeq_federation_keys (id, private_key, public_key, created_at) VALUES (?, ?, ?, ?)").run(this.keyId, this.privateKey, this.publicKey, now()); }
+  }
+  async sign(message: string): Promise<string> { return signMessage(null, Buffer.from(message), this.privateKey).toString("base64url"); }
+  async verify(input: { keyId: string; message: string; signature: string }): Promise<boolean> { return input.keyId === this.keyId && verifyMessage(null, Buffer.from(input.message), this.publicKey, Buffer.from(input.signature, "base64url")); }
   async consume(input: { envelopeId: string; expiresAt: string }): Promise<boolean> { const result = this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_federation_replays (id, expires_at, created_at) VALUES (?, ?, ?)").run(input.envelopeId, input.expiresAt, now()); return result.changes === 1; }
 }
 

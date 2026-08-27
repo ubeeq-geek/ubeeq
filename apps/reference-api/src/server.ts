@@ -5,7 +5,7 @@ import { composeReferenceApplication } from "@ubeeq/api";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor } from "@ubeeq/processing";
-import { validateRemotePublicationEvent, verifyFederationEnvelope } from "@ubeeq/federation";
+import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import type { AssetRecord, CreatorRecord, WorkRecord } from "@ubeeq/persistence";
 
@@ -21,7 +21,7 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("error", reject);
 });
 
-export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; }
+export interface ReferenceApiConfiguration extends LocalAdapterConfiguration { instanceId?: string; federationPolicy?: FederationPolicy; federationVerifier?: FederationSignatureVerifier; }
 
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; close(): Promise<void> } => {
   const adapters = createLocalAdapterSet(configuration);
@@ -102,7 +102,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
       if (method === "GET" && url.pathname === "/health") return json(response, 200, { ok: true, requestId }, requestId);
-      if (method === "GET" && url.pathname === "/.well-known/ubeeq") { const publicUrl = new URL(configuration.publicBaseUrl); const enabled = publicUrl.protocol === "https:"; return json(response, 200, { protocolVersion: "1", instanceId: configuration.instanceId ?? "local-reference", federationEnabled: enabled, ...(enabled ? { instanceUrl: publicUrl.toString(), actorDocumentUrl: new URL("/v1/federation/actors", publicUrl).toString(), publicationInboxUrl: new URL("/v1/federation/inbox", publicUrl).toString(), capabilities: ["publication-reference", "withdrawal"] } : {}), requestId }, requestId); }
+      if (method === "GET" && url.pathname === "/.well-known/ubeeq") { const publicUrl = new URL(configuration.publicBaseUrl); const enabled = publicUrl.protocol === "https:"; return json(response, 200, { protocolVersion: "1", instanceId: configuration.instanceId ?? "local-reference", federationEnabled: enabled, ...(enabled ? { instanceUrl: publicUrl.toString(), actorDocumentUrl: new URL("/v1/federation/actors", publicUrl).toString(), publicationInboxUrl: new URL("/v1/federation/inbox", publicUrl).toString(), signingKeyId: adapters.federation.keyId, signingPublicKey: adapters.federation.publicKey, capabilities: ["publication-reference", "withdrawal"] } : {}), requestId }, requestId); }
       if ((method === "GET" && url.pathname === "/ready") || (method === "GET" && url.pathname === "/diagnostics")) {
         const dependencies = await Promise.all((composition.dependencies.diagnostics ?? []).map(async (dependency) => ({ name: dependency.name, ...(await dependency.check()) })));
         const ready = dependencies.every((dependency) => dependency.status === "ok");
@@ -116,7 +116,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const event = validateRemotePublicationEvent(envelope.payload as Parameters<typeof validateRemotePublicationEvent>[0]);
         const decision = configuration.federationPolicy ? await configuration.federationPolicy.evaluateRemote({ actorId: event.actor.id, host: event.actor.host }) : "deny";
         if (decision !== "allow") throw new HttpError(403, "federation_not_accepted", "The instance policy did not accept this remote reference");
-        await verifyFederationEnvelope(envelope, adapters.federation, adapters.federation);
+        await verifyFederationEnvelope(envelope, configuration.federationVerifier ?? adapters.federation, adapters.federation);
         const actorRecord = await repositories.federationActors.get(event.actor.id) ?? await repositories.federationActors.create({ id: event.actor.id, instanceId: configuration.instanceId ?? "local-reference", actorUri: event.actor.id, host: event.actor.host });
         const existing = await repositories.remotePublicationReferences.get(event.publication.id);
         if (existing && existing.actorId !== actorRecord.id) throw new HttpError(409, "federation_reference_conflict", "A remote publication identifier cannot change actors");

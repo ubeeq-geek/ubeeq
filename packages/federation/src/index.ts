@@ -24,6 +24,10 @@ export interface SignedFederationEnvelope<TPayload> {
 export interface FederationSignatureVerifier {
   verify(input: { keyId: string; message: string; signature: string }): Promise<boolean>;
 }
+/** Resolves an instance-discovered public key without coupling federation to a key provider. */
+export interface FederationPublicKeyResolver extends FederationSignatureVerifier {
+  register?(input: { keyId: string; publicKey: string }): Promise<void>;
+}
 export interface FederationSigner { keyId: string; sign(message: string): Promise<string>; }
 export const signFederationEnvelope = async <TPayload>(input: Omit<SignedFederationEnvelope<TPayload>, "keyId" | "signature">, signer: FederationSigner): Promise<SignedFederationEnvelope<TPayload>> => ({ ...input, keyId: signer.keyId, signature: await signer.sign(federationSigningInput({ ...input, keyId: signer.keyId })) });
 
