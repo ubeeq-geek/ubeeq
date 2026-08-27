@@ -16,8 +16,7 @@ export interface JobQueue {
 export interface Scheduler { schedule(input: { type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void>; cancelSchedule(idempotencyKey: string): Promise<void>; }
 
 /** Executable baseline for every durable queue adapter. */
-export const verifyJobQueueContract = async (queue: JobQueue): Promise<void> => {
-  const idempotencyKey = "queue-contract-job";
+export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "queue-contract-job"): Promise<void> => {
   const created = await queue.enqueue({ type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
   const repeated = await queue.enqueue({ type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
   if (created.id !== repeated.id) throw new Error("Job queue contract violation: enqueue must retain idempotency keys.");
