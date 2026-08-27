@@ -11,9 +11,9 @@ class MemoryDynamo {
   async send(command) {
     const input = command.input;
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
-    if (command.constructor.name === "QueryCommand") {
-      const prefix = input.ExpressionAttributeValues[":prefix"];
-      const items = [...this.values.values()].filter((value) => value.pk.startsWith(prefix)).slice(0, input.Limit);
+    if (command.constructor.name === "ScanCommand") {
+      const repository = input.ExpressionAttributeValues[":repository"];
+      const items = [...this.values.values()].filter((value) => value.repository === repository).slice(0, input.Limit);
       return { Items: items };
     }
     if (command.constructor.name === "PutCommand") {
