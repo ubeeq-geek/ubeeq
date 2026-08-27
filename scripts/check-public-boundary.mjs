@@ -9,8 +9,7 @@ const violations = [];
 const cloudImport = /(?:from\s*["']|require\s*\(\s*["'])(?:@aws-sdk\/|@aws-cdk\/|aws-cdk-lib|constructs)/;
 const cloudAllowedPath = (path) => path.startsWith("packages/adapters-aws/")
   || path.startsWith("examples/aws-self-host/")
-  // Transitional package retained until Stream 5 moves it beneath examples.
-  || path.startsWith("packages/self-host-infra/");
+  || path.startsWith("packages/aws-self-host-infra/");
 
 const visit = (directory) => {
   for (const entry of readdirSync(directory)) {
