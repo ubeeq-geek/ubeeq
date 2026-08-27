@@ -17,6 +17,7 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
 - `@ubeeq/federation` — remote actor and publication-reference contracts.
 - `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
+- `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
 
