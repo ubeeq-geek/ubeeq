@@ -4,7 +4,8 @@
  */
 import { CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
+import { createHash } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { verifyIdentityAdapterContract } from "@ubeeq/auth";
@@ -22,13 +23,17 @@ if (missing.length) {
   const region = process.env.UBEEQ_AWS_REGION;
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
   const repositoryConfiguration = { tableName: process.env.UBEEQ_AWS_RECORDS_TABLE };
-  await verifyRevisionedRepositoryContract({ repository: new DynamoRevisionedRepository(dynamo, repositoryConfiguration, "liveContractCreators"), createRecord: (id) => ({ id, instanceId: "aws-live", handle: id, displayName: "AWS live contract" }), change: () => ({ displayName: "AWS updated" }) });
-  await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET));
-  await verifyJobQueueContract(new AwsJobQueue(dynamo, repositoryConfiguration, new SQSClient({ region }), process.env.UBEEQ_AWS_JOBS_QUEUE_URL), `aws-live-contract-${Date.now()}`);
-  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region }), process.env.UBEEQ_AWS_USER_POOL_ID, process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID);
-  const authenticated = await identity.authenticate({ username: process.env.UBEEQ_AWS_TEST_USERNAME, password: process.env.UBEEQ_AWS_TEST_PASSWORD });
-  const session = await identity.verifySession({ credential: authenticated.token });
-  if (!session) throw new Error("Cognito did not verify its own test-user access token");
-  await verifyIdentityAdapterContract(identity, { credential: authenticated.token, subjectId: session.subject.id });
-  console.log("AWS repository, storage, job, and identity conformance passed.");
+  const key = `aws-live-contract-${Date.now()}`;
+  const jobId = `job-${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
+  try {
+    await verifyRevisionedRepositoryContract({ repository: new DynamoRevisionedRepository(dynamo, repositoryConfiguration, "liveContractCreators"), createRecord: (id) => ({ id, instanceId: "aws-live", handle: id, displayName: "AWS live contract" }), change: () => ({ displayName: "AWS updated" }) });
+    await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET));
+    await verifyJobQueueContract(new AwsJobQueue(dynamo, repositoryConfiguration, new SQSClient({ region }), process.env.UBEEQ_AWS_JOBS_QUEUE_URL), key);
+    const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region }), process.env.UBEEQ_AWS_USER_POOL_ID, process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID);
+    const authenticated = await identity.authenticate({ username: process.env.UBEEQ_AWS_TEST_USERNAME, password: process.env.UBEEQ_AWS_TEST_PASSWORD });
+    const session = await identity.verifySession({ credential: authenticated.token });
+    if (!session) throw new Error("Cognito did not verify its own test-user access token");
+    await verifyIdentityAdapterContract(identity, { credential: authenticated.token, subjectId: session.subject.id });
+    console.log("AWS repository, storage, job, and identity conformance passed.");
+  } finally { await dynamo.send(new DeleteCommand({ TableName: repositoryConfiguration.tableName, Key: { pk: `durableJobs#${jobId}`, sk: "record" } })).catch(() => undefined); }
 }

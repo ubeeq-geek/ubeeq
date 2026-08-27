@@ -163,7 +163,7 @@ export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   const storage = new S3ObjectStorage(s3, configuration.objectBucket);
   return {
-    repositories: createDynamoRepositories(dynamo, configuration), storage,
+    repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket),
     delivery: configuration.cloudFront ? new CloudFrontDelivery(configuration.cloudFront) : new S3PresignedDelivery(s3, configuration.objectBucket),
     jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
     identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
