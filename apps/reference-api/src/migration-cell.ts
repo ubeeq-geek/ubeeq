@@ -51,6 +51,12 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       for (const value of manifest.integrationAccounts) await put(input.repositories.integrationAccounts, { ...value, health: "blocked", credentialReference: undefined }, "integration");
       return {};
     }
+    if (command.operation === "enable" || command.operation === "rollback") {
+      const action = command.operation === "enable" ? "regional_migration.destination_enabled" : "regional_migration.destination_rolled_back";
+      const id = `${action}:${command.checkpoint.id}`;
+      if (!await input.repositories.auditEvents.get(id)) await input.repositories.auditEvents.create({ id, instanceId: input.instanceId, homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision + 1, action, subjectId: command.checkpoint.creatorId, payload: { migrationId: command.checkpoint.id } } as any, { idempotencyKey: id });
+      return {};
+    }
     if (command.operation !== "export") return {};
     const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
     if (!creator || creator.homeCellId !== input.cellId) throw new Error("Migration creator is not owned by this source cell.");
