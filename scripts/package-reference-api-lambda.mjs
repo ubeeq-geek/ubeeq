@@ -17,11 +17,13 @@ copy(join(root, "apps", "web-reference", "src"), join(output, "web-reference"));
 for (const scope of ["@aws", "@aws-sdk", "@smithy"]) copy(join(root, "node_modules", scope), join(output, "node_modules", scope));
 for (const dependency of ["bowser", "mnemonist", "obliterator", "tslib"]) copy(join(root, "node_modules", dependency), join(output, "node_modules", dependency));
 
-for (const entry of JSON.parse(readFileSync(join(root, "package.json"), "utf8")).workspaces) {
-  if (entry !== "packages/*") continue;
-  const packages = await import("node:fs/promises").then(({ readdir }) => readdir(join(root, "packages"), { withFileTypes: true }));
+// Workspace adapters are real production dependencies of the Lambda entry
+// point.  Keep them beside core packages in the artifact so Node can resolve
+// the same @ubeeq/* specifiers it resolves during local development.
+for (const workspaceRoot of ["packages", "adapters"]) {
+  const packages = await import("node:fs/promises").then(({ readdir }) => readdir(join(root, workspaceRoot), { withFileTypes: true }));
   for (const directory of packages.filter((item) => item.isDirectory())) {
-    const source = join(root, "packages", directory.name);
+    const source = join(root, workspaceRoot, directory.name);
     const manifestPath = join(source, "package.json");
     if (!existsSync(manifestPath)) continue;
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
