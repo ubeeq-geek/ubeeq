@@ -143,7 +143,13 @@ export const migrationControlWorker = async (event: MigrationSqsEvent): Promise<
 /** IAM Function URL identity is checked again here before any operator action. */
 const requireMigrationOperator = (event: FunctionUrlEvent): void => {
   const expected = required("UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN");
-  if (event.requestContext?.authorizer?.iam?.userArn !== expected) throw new Error("Operator authorization is required.");
+  const actual = event.requestContext?.authorizer?.iam?.userArn;
+  // Function URLs report a direct IAM principal for some callers and an STS
+  // assumed-role ARN for SSO/session callers. Match the configured role ARN,
+  // never an account-wide prefix or an arbitrary assumed role.
+  const role = expected.match(/^arn:aws(?:-us-gov|-cn)?:iam::(\d{12}):role\/(?:.*\/)?([^/]+)$/);
+  const assumed = actual?.match(/^arn:aws(?:-us-gov|-cn)?:sts::(\d{12}):assumed-role\/([^/]+)\/[^/]+$/);
+  if (actual !== expected && !(role && assumed && role[1] === assumed[1] && role[2] === assumed[2])) throw new Error("Operator authorization is required.");
 };
 
 /**

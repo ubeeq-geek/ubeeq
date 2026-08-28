@@ -51,6 +51,13 @@ test("migration control API accepts an allow-listed principal at the transport b
   assert.equal(response.statusCode, 404);
 });
 
+test("migration control API accepts an STS session for the allow-listed IAM role only", async () => {
+  const response = await migrationControlApi({ rawPath: "/not-a-route", requestContext: { http: { method: "GET" }, authorizer: { iam: { userArn: "arn:aws:sts::123456789012:assumed-role/ubeeq-operator/sso-session" } } } });
+  assert.equal(response.statusCode, 404);
+  const rejected = await migrationControlApi({ rawPath: "/not-a-route", requestContext: { http: { method: "GET" }, authorizer: { iam: { userArn: "arn:aws:sts::123456789012:assumed-role/another-role/sso-session" } } } });
+  assert.equal(rejected.statusCode, 403);
+});
+
 test("private migration cell handler rejects a command for another cell before data access", async () => {
   const result = await migrationCell({ operation: "export", checkpoint: { id: "move-1", creatorId: "creator-1", source: { homeCellId: "foreign-cell", homeRegion: "eu-central-1", endpoint: "https://foreign.example/", routingRevision: 1 }, destination: { cellId: "destination", region: "us-east-2", endpoint: "https://destination.example/" }, state: "source_hold", createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z" }, destinationBucket: "destination" });
   assert.match(result.error?.message ?? "", /foreign cell/);
