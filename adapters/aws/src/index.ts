@@ -2,6 +2,7 @@
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DescribeTableCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { GetQueueAttributesCommand, SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
+import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -14,7 +15,7 @@ import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapt
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
-import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCellRegistration, validateMigrationCheckpoint, type CellRoute, type MigrationCellRegistration, type MigrationCellRegistry, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
+import { MigrationOrchestrator, RemoteMigrationExecutor, RoutingDirectoryConflictError, validateCellRoute, validateMigrationCellRegistration, validateMigrationCheckpoint, type CellRoute, type MigrationCellCommand, type MigrationCellCommandResult, type MigrationCellEndpoint, type MigrationCellRegistration, type MigrationCellRegistry, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
 export type AwsFunctionUrlEvent = { rawPath?: string; requestContext?: { http?: { method?: string } } };
@@ -144,6 +145,59 @@ export const createDynamoRoutingControlPlane = (dynamo: Dynamo, tableName: strin
 /** Creates only managed-edge ports; it never shares a cell's DynamoDB client/table. */
 export const createAwsRoutingControlPlane = (configuration: { tableName: string; region?: string }) =>
   createDynamoRoutingControlPlane(DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region })), configuration.tableName);
+
+/** Private synchronous invocation client for a cell registered by an operator. */
+export class LambdaMigrationCellEndpoint implements MigrationCellEndpoint {
+  constructor(private readonly lambda: Pick<LambdaClient, "send">, private readonly functionName: string) {}
+  async execute(command: MigrationCellCommand): Promise<MigrationCellCommandResult> {
+    const response = await this.lambda.send(new InvokeCommand({ FunctionName: this.functionName, InvocationType: "RequestResponse", Payload: Buffer.from(JSON.stringify(command)) }));
+    const payload = response.Payload ? JSON.parse(Buffer.from(response.Payload).toString("utf8")) as { error?: { message?: string }; result?: MigrationCellCommandResult } : {};
+    if (response.FunctionError || payload.error) throw new Error(payload.error?.message ?? `Migration cell ${this.functionName} rejected ${command.operation}.`);
+    return payload.result ?? {};
+  }
+}
+
+export type AwsMigrationOperation = "resume" | "rollback" | "retire";
+/** Message body for the dedicated operator migration queue. It contains no creator data. */
+export interface AwsMigrationCommand { migrationId: string; operation: AwsMigrationOperation; rollbackWindowSeconds?: number; }
+
+/** Small operator-only queue adapter; commands contain checkpoint IDs only. */
+export class SqsMigrationCommandQueue {
+  constructor(private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string) {}
+  async enqueue(command: AwsMigrationCommand): Promise<void> {
+    if (!command.migrationId.trim() || !["resume", "rollback", "retire"].includes(command.operation) || (command.rollbackWindowSeconds !== undefined && (!Number.isSafeInteger(command.rollbackWindowSeconds) || command.rollbackWindowSeconds < 1))) throw new Error("Migration command is invalid.");
+    await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: JSON.stringify(command) }));
+  }
+}
+export const createAwsMigrationCommandQueue = (configuration: { queueUrl: string; region?: string }) => new SqsMigrationCommandQueue(new SQSClient({ region: configuration.region }), configuration.queueUrl);
+
+/**
+ * Dedicated control-plane worker. It resolves only pre-registered cell
+ * endpoints, streams objects through the migration-only transfer adapter, and
+ * advances the shared compare-and-swap checkpoint. It never accesses a cell's
+ * record table or participates in normal creator request handling.
+ */
+export class AwsMigrationControlWorker {
+  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: Pick<LambdaClient, "send">; s3ForRegion?: (region: string) => Pick<S3Client, "send">; clock?: () => string }) {}
+  async execute(command: AwsMigrationCommand): Promise<MigrationCheckpoint> {
+    if (!command.migrationId.trim() || !["resume", "rollback", "retire"].includes(command.operation)) throw new Error("Migration command is invalid.");
+    const checkpoint = await this.input.checkpoints.get(command.migrationId);
+    if (!checkpoint) throw new Error(`Migration checkpoint ${command.migrationId} was not found.`);
+    const [source, destination] = await Promise.all([this.requiredCell(checkpoint.source.homeCellId), this.requiredCell(checkpoint.destination.cellId)]);
+    const lambda = this.input.lambda ?? new LambdaClient({});
+    const s3ForRegion = this.input.s3ForRegion ?? ((region: string) => new S3Client({ region }));
+    const executor = new RemoteMigrationExecutor(new LambdaMigrationCellEndpoint(lambda, source.migrationEndpoint), new LambdaMigrationCellEndpoint(lambda, destination.migrationEndpoint), new S3MigrationObjectTransfer(s3ForRegion(source.region), s3ForRegion(destination.region)), destination.objectBucket);
+    const orchestrator = new MigrationOrchestrator(this.input.routingDirectory, this.input.checkpoints, executor, this.input.clock);
+    if (command.operation === "rollback") return orchestrator.rollback(command.migrationId);
+    if (command.operation === "retire") return orchestrator.retire(command.migrationId);
+    return orchestrator.resume(command.migrationId, command.rollbackWindowSeconds);
+  }
+  private async requiredCell(cellId: string): Promise<MigrationCellRegistration> {
+    const cell = await this.input.cells.get(cellId);
+    if (!cell || cell.state !== "active") throw new Error(`Migration cell ${cellId} is not active in the operator registry.`);
+    return cell;
+  }
+}
 
 export class S3ObjectStorage implements ObjectStorage {
   constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string) {}

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3MigrationObjectTransfer, S3ObjectStorage, SecretsManagerCredentialVault, createDynamoRoutingControlPlane } from "../dist/index.js";
+import { AwsMigrationControlWorker, CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3MigrationObjectTransfer, S3ObjectStorage, SecretsManagerCredentialVault, SqsMigrationCommandQueue, createDynamoRoutingControlPlane } from "../dist/index.js";
 import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, RoutingDirectoryConflictError } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
@@ -136,6 +136,32 @@ test("S3 migration transfer copies only declared cross-cell objects and verifies
   await transfer.transfer(checkpoint, inventory);
   assert.deepEqual(await transfer.verify(checkpoint, inventory), { objectCount: 1, verifiedObjectCount: 1 });
   await assert.rejects(() => transfer.transfer(checkpoint, [{ ...inventory[0], destination: { bucket: "destination", key: "cells/cell-c/creators/creator-1/originals/a" } }]), /undeclared cell/);
+});
+
+test("AWS control worker invokes registered private cells and transfers no undeclared objects", async () => {
+  const timestamp = "2026-08-28T00:00:00.000Z", body = Buffer.from("migration-object"), checksum = createHash("sha256").update(body).digest("hex");
+  let route = { creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "us-east-2", endpoint: "https://a.example/", routingRevision: 1, state: "active", updatedAt: timestamp };
+  let checkpoint = createMigrationCheckpoint({ id: "move-control", creatorId: route.creatorId, source: route, destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://b.example/" }, now: timestamp });
+  const inventory = [{ id: "asset-a", source: { bucket: "source", key: "cells/cell-a/creators/creator-1/originals/a" }, destination: { bucket: "destination", key: "cells/cell-b/creators/creator-1/originals/a" }, checksum, byteLength: body.byteLength }];
+  const sourceObjects = new Map([["source/cells/cell-a/creators/creator-1/originals/a", { body, contentType: "image/png" }]]), destinationObjects = new Map(), calls = [];
+  const s3ForRegion = (region) => ({ send: async (command) => { const input = command.input, key = `${input.Bucket}/${input.Key}`; if (command.constructor.name === "GetObjectCommand") return { ContentType: sourceObjects.get(key).contentType, Body: { transformToByteArray: async () => sourceObjects.get(key).body } }; if (command.constructor.name === "PutObjectCommand") { destinationObjects.set(key, { body: input.Body, metadata: input.Metadata }); return {}; } if (command.constructor.name === "HeadObjectCommand") { const object = destinationObjects.get(key); return { ContentLength: object.body.byteLength, Metadata: object.metadata }; } throw new Error(`Unexpected ${region} ${command.constructor.name}`); } });
+  const lambda = { send: async (command) => { const message = JSON.parse(Buffer.from(command.input.Payload).toString()); calls.push(`${command.input.FunctionName}:${message.operation}`); const result = message.operation === "export" ? { manifestChecksum: "a".repeat(64), objectInventory: inventory } : {}; return { Payload: Buffer.from(JSON.stringify({ result })) }; } };
+  const routes = { get: async () => route, create: async (value) => route = value, compareAndSwap: async ({ route: next, expectedRoutingRevision }) => { assert.equal(route.routingRevision, expectedRoutingRevision); route = next; return route; }, list: async () => ({ items: [route] }) };
+  const checkpoints = { get: async () => checkpoint, create: async (value) => checkpoint = value, compareAndSwap: async ({ checkpoint: next, expectedUpdatedAt }) => { assert.equal(checkpoint.updatedAt, expectedUpdatedAt); checkpoint = next; return checkpoint; }, list: async () => ({ items: [checkpoint] }) };
+  const cells = { get: async (id) => ({ cellId: id, region: id === "cell-a" ? "us-east-2" : "eu-central-1", endpoint: id === "cell-a" ? "https://a.example/" : "https://b.example/", migrationEndpoint: `arn:aws:lambda:region:123:function:${id}`, objectBucket: id === "cell-a" ? "source" : "destination", state: "active", registeredAt: timestamp, updatedAt: timestamp }), register: async () => {}, list: async () => ({ items: [] }) };
+  let tick = 0;
+  const worker = new AwsMigrationControlWorker({ routingDirectory: routes, checkpoints, cells, lambda, s3ForRegion, clock: () => new Date(Date.parse(timestamp) + ++tick * 1_000).toISOString() });
+  const completed = await worker.execute({ migrationId: "move-control", operation: "resume", rollbackWindowSeconds: 60 });
+  assert.equal(completed.state, "cutover"); assert.equal(route.homeCellId, "cell-b"); assert.deepEqual(calls, ["arn:aws:lambda:region:123:function:cell-a:source_hold", "arn:aws:lambda:region:123:function:cell-a:export", "arn:aws:lambda:region:123:function:cell-b:import", "arn:aws:lambda:region:123:function:cell-b:enable"]);
+  assert.equal(destinationObjects.get("destination/cells/cell-b/creators/creator-1/originals/a").metadata.migrationId, "move-control");
+});
+
+test("operator migration queue accepts only checkpoint commands", async () => {
+  const messages = [];
+  const queue = new SqsMigrationCommandQueue({ send: async (command) => { messages.push(command.input); return {}; } }, "https://sqs.example/migration");
+  await queue.enqueue({ migrationId: "move-1", operation: "resume", rollbackWindowSeconds: 60 });
+  assert.deepEqual(JSON.parse(messages[0].MessageBody), { migrationId: "move-1", operation: "resume", rollbackWindowSeconds: 60 });
+  await assert.rejects(() => queue.enqueue({ migrationId: "", operation: "resume" }), /invalid/);
 });
 
 test("S3 direct upload binds a checksum and returns the immutable object version", async () => {

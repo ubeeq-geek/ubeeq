@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { createAwsAdapterSet, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
+import { AwsMigrationControlWorker, createAwsAdapterSet, createAwsMigrationCommandQueue, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
 import { createReferenceApi, type ReferenceAdapterSet } from "./server.js";
 
 type FunctionUrlEvent = {
@@ -8,10 +8,11 @@ type FunctionUrlEvent = {
   headers?: Record<string, string | undefined>;
   body?: string;
   isBase64Encoded?: boolean;
-  requestContext?: { http?: { method?: string } };
+  requestContext?: { http?: { method?: string }; authorizer?: { iam?: { userArn?: string } } };
 };
 type FunctionUrlResult = { statusCode: number; headers: Record<string, string>; body: string; isBase64Encoded?: boolean };
 type SqsEvent = { Records?: readonly { messageId: string }[] };
+type MigrationSqsEvent = { Records?: readonly { messageId: string; body: string }[] };
 const required = (name: string): string => { const value = process.env[name]; if (!value) throw new Error(`${name} is not configured`); return value; };
 
 /**
@@ -100,6 +101,62 @@ export const worker = async (event: SqsEvent): Promise<{ batchItemFailures: Arra
     catch { failures.push({ itemIdentifier: record.messageId }); }
   }
   return { batchItemFailures: failures };
+};
+
+/**
+ * Operator-control-plane SQS entry point. This is deliberately separate from
+ * a cell's normal durable-job worker: it reads route/checkpoint/cell metadata
+ * only and invokes registered private migration endpoints.
+ */
+export const migrationControlWorker = async (event: MigrationSqsEvent): Promise<{ batchItemFailures: Array<{ itemIdentifier: string }> }> => {
+  const failures: Array<{ itemIdentifier: string }> = [];
+  const tableName = required("UBEEQ_ROUTING_DIRECTORY_TABLE_NAME");
+  const control = createAwsRoutingControlPlane({ tableName, region: required("UBEEQ_ROUTING_DIRECTORY_REGION") });
+  const worker = new AwsMigrationControlWorker({ routingDirectory: control.routingDirectory, checkpoints: control.migrationCheckpoints, cells: control.migrationCells });
+  for (const record of event.Records ?? []) {
+    try {
+      const command = JSON.parse(record.body) as { migrationId?: string; operation?: "resume" | "rollback" | "retire"; rollbackWindowSeconds?: number };
+      if (!command.migrationId || !command.operation) throw new Error("Migration queue message is invalid.");
+      await worker.execute({ migrationId: command.migrationId, operation: command.operation, rollbackWindowSeconds: command.rollbackWindowSeconds });
+    } catch { failures.push({ itemIdentifier: record.messageId }); }
+  }
+  return { batchItemFailures: failures };
+};
+
+/** IAM Function URL identity is checked again here before any operator action. */
+const requireMigrationOperator = (event: FunctionUrlEvent): void => {
+  const expected = required("UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN");
+  if (event.requestContext?.authorizer?.iam?.userArn !== expected) throw new Error("Operator authorization is required.");
+};
+
+/**
+ * IAM-protected operator API for the separate migration control plane. It
+ * exposes metadata/listing and enqueues opaque checkpoint commands; it never
+ * proxies a creator write or returns a cell's bucket/function identifiers.
+ */
+export const migrationControlApi = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
+  try {
+    requireMigrationOperator(event);
+    const path = event.rawPath ?? "/", method = event.requestContext?.http?.method ?? "GET", query = new URLSearchParams(event.rawQueryString ?? "");
+    const tableName = required("UBEEQ_ROUTING_DIRECTORY_TABLE_NAME"), region = required("UBEEQ_ROUTING_DIRECTORY_REGION"), queueUrl = required("UBEEQ_MIGRATION_COMMANDS_QUEUE_URL");
+    const control = createAwsRoutingControlPlane({ tableName, region }), limit = Math.max(1, Math.min(100, Number(query.get("limit") ?? 50)));
+    if (method === "GET" && path === "/v1/operations/regional/routes") return { statusCode: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(await control.routingDirectory.list({ limit, cursor: query.get("cursor") ?? undefined })) };
+    if (method === "GET" && path === "/v1/operations/regional/migrations") return { statusCode: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(await control.migrationCheckpoints.list({ limit, cursor: query.get("cursor") ?? undefined })) };
+    if (method === "GET" && path === "/v1/operations/regional/cells") {
+      const cells = await control.migrationCells.list({ limit, cursor: query.get("cursor") ?? undefined });
+      return { statusCode: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ items: cells.items.map(({ migrationEndpoint: _migrationEndpoint, objectBucket: _objectBucket, ...cell }) => cell), nextCursor: cells.nextCursor }) };
+    }
+    const command = path.match(/^\/v1\/operations\/regional\/migrations\/([^/]+)\/(resume|rollback|retire)$/);
+    if (method === "POST" && command) {
+      const body = event.body ? JSON.parse(event.isBase64Encoded ? Buffer.from(event.body, "base64").toString("utf8") : event.body) as { rollbackWindowSeconds?: number } : {};
+      await createAwsMigrationCommandQueue({ queueUrl, region }).enqueue({ migrationId: command[1], operation: command[2] as "resume" | "rollback" | "retire", rollbackWindowSeconds: body.rollbackWindowSeconds });
+      return { statusCode: 202, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ migrationId: command[1], operation: command[2], state: "queued" }) };
+    }
+    return { statusCode: 404, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ error: { code: "not_found", message: "Operator control-plane route was not found" } }) };
+  } catch (error) {
+    const unauthorized = error instanceof Error && error.message === "Operator authorization is required.";
+    return { statusCode: unauthorized ? 403 : 500, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ error: { code: unauthorized ? "operator_authorization_denied" : "control_plane_error", message: error instanceof Error ? error.message : "Control plane failed" } }) };
+  }
 };
 
 /** Reference web edge entry point. It proxies same-origin /api calls to the configured reference API. */

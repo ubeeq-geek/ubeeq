@@ -2,15 +2,25 @@
   "name": "@ubeeq/adapter-aws",
   "version": "0.1.0",
   "private": false,
-  "publishConfig": { "access": "public" },
-  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "scripts": { "build": "tsc -p tsconfig.json", "test:contract": "npm run build && node --test test/*.test.mjs", "test:live": "npm run build && node test/live-contract.mjs", "test": "npm run test:contract" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test:contract": "npm run build && node --test test/*.test.mjs",
+    "test:live": "npm run build && node test/live-contract.mjs",
+    "test": "npm run test:contract"
+  },
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.700.0",
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/client-eventbridge": "^3.700.0",
+    "@aws-sdk/client-lambda": "^3.1120.0",
     "@aws-sdk/client-s3": "^3.700.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
     "@aws-sdk/client-sqs": "^3.700.0",
