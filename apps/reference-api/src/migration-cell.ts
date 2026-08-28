@@ -57,6 +57,14 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       if (!await input.repositories.auditEvents.get(id)) await input.repositories.auditEvents.create({ id, instanceId: input.instanceId, homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision + 1, action, subjectId: command.checkpoint.creatorId, payload: { migrationId: command.checkpoint.id } } as any, { idempotencyKey: id });
       return {};
     }
+    if (command.operation === "retire") {
+      const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
+      if (!creator) return {};
+      const removeOwned = async (repository: any, predicate: (value: any) => boolean) => { for (const value of (await all(repository) as any[])) if (predicate(value)) await repository.remove(value.id, value.revision, { idempotencyKey: `migration-retire:${command.checkpoint.id}:${value.id}` }); };
+      const retiredWorks = await all(input.repositories.works) as any[]; const workIds = new Set(retiredWorks.filter((value) => value.creatorId === creator.id).map((value) => value.id));
+      await removeOwned(input.repositories.assets, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.collections, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.publications, (value) => workIds.has(value.workId)); await removeOwned(input.repositories.publicationIntents, (value) => workIds.has(value.workId)); await removeOwned(input.repositories.integrationAccounts, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.works, (value) => value.creatorId === creator.id); await input.repositories.creators.remove(creator.id, creator.revision, { idempotencyKey: `migration-retire:${command.checkpoint.id}:creator` });
+      return {};
+    }
     if (command.operation !== "export") return {};
     const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
     if (!creator || creator.homeCellId !== input.cellId) throw new Error("Migration creator is not owned by this source cell.");
