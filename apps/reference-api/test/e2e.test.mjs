@@ -5,9 +5,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReferenceApi } from "../dist/server.js";
+import { createMigrationCellEndpoint } from "../dist/migration-cell.js";
 import { createLocalAdapterSet } from "@ubeeq/adapter-local";
 import { signFederationEnvelope } from "@ubeeq/federation";
-import { MigrationOrchestrator } from "@ubeeq/deployment-platform";
+import { MigrationOrchestrator, RemoteMigrationExecutor } from "@ubeeq/deployment-platform";
 
 const request = async (base, path, options = {}) => {
   const response = await fetch(`${base}${path}`, { ...options, headers: { "content-type": "application/json", ...(options.headers || {}) } });
@@ -122,6 +123,10 @@ test("uses an explicit control plane for creator migration requests, operator cu
     const signIn = await request(base, "/v1/auth/sign-in", { method: "POST", body: JSON.stringify({ email: "regional@example.test", password: "a-safe-local-password" }) }); const headers = { authorization: `Bearer ${signIn.body.token}` };
     const created = await request(base, "/v1/creators", { method: "POST", headers, body: JSON.stringify({ handle: "regional", displayName: "Regional" }) });
     const creator = created.body.creator;
+    const migrationHold = await adapters.repositories.moderationHolds.create({ id: "migration-source-hold", instanceId: "local-reference", homeCellId: "cell-a", dataHomeRegion: "local", dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: 1, subjectType: "creator", subjectId: creator.id, state: "active", reason: "migration:in-progress" });
+    const blockedWrite = await request(base, "/v1/works", { method: "POST", headers, body: JSON.stringify({ title: "must not write" }) });
+    assert.equal(blockedWrite.response.status, 409); assert.equal(blockedWrite.body.error.code, "migration_source_held");
+    await adapters.repositories.moderationHolds.update(migrationHold.id, migrationHold.revision, { state: "released" });
     await adapters.routingDirectory.create({ creatorId: creator.id, homeCellId: "cell-a", homeRegion: "local", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: new Date().toISOString() });
     const requestMigration = await request(base, "/v1/migrations", { method: "POST", headers, body: JSON.stringify({ destinationCellId: "cell-b", destinationRegion: "other", destinationEndpoint: "https://cell-b.example/" }) });
     assert.equal(requestMigration.response.status, 202);
@@ -147,5 +152,69 @@ test("moves original objects only through an explicit migration executor, never 
     const checkpoint = await migration.request({ id: "move-object", creatorId: route.creatorId, destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } }); await migration.resume(checkpoint.id);
     const transferred = await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/source", versionId: "v1" }); assert.equal(Buffer.from(transferred.body).toString(), "data");
     assert.equal((await source.routingDirectory.get(route.creatorId))?.homeCellId, "cell-b");
+  } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
+});
+
+test("migrates a creator through real source and destination cell endpoints", async () => {
+  const sourceDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-source-"));
+  const destinationDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-destination-"));
+  const source = createLocalAdapterSet({ databasePath: join(sourceDirectory, "state.sqlite"), dataDirectory: sourceDirectory, publicBaseUrl: "https://cell-a.example", cellId: "cell-a" });
+  const destination = createLocalAdapterSet({ databasePath: join(destinationDirectory, "state.sqlite"), dataDirectory: destinationDirectory, publicBaseUrl: "https://cell-b.example", cellId: "cell-b" });
+  const assignedAt = "2026-08-28T00:00:00.000Z";
+  const dataHome = { homeCellId: "cell-a", dataHomeRegion: "region-a", dataHomeAssignedAt: assignedAt, routingRevision: 1 };
+  const bytes = Buffer.from("creator-original");
+  const checksum = createHash("sha256").update(bytes).digest("hex");
+  const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
+  let clock = Date.parse(assignedAt);
+  try {
+    await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
+    await source.repositories.works.create({ id: "work-1", instanceId: "source", ...dataHome, creatorId: "creator-1", title: "Migrating work", status: "ready" });
+    await source.storage.put({ object: original, body: bytes });
+    await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: original });
+    await source.repositories.integrationAccounts.create({ id: "integration-1", instanceId: "source", ...dataHome, creatorId: "creator-1", connectorId: "reference", health: "healthy", credentialReference: "must-not-migrate" });
+    await source.routingDirectory.create({ creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: assignedAt });
+    const sourceEndpoint = createMigrationCellEndpoint({ cellId: "cell-a", region: "region-a", instanceId: "source", repositories: source.repositories, storage: source.storage });
+    const destinationEndpoint = createMigrationCellEndpoint({ cellId: "cell-b", region: "region-b", instanceId: "destination", repositories: destination.repositories, storage: destination.storage });
+    const transfer = {
+      transfer: async (_checkpoint, inventory) => {
+        for (const entry of inventory) {
+          const stored = await source.storage.get(entry.source);
+          await destination.storage.put({ object: { ...stored.object, bucket: entry.destination.bucket, key: entry.destination.key, versionId: undefined }, body: stored.body });
+        }
+      },
+      verify: async (_checkpoint, inventory) => {
+        for (const entry of inventory) {
+          const stored = await destination.storage.get(entry.destination);
+          assert.equal(createHash("sha256").update(stored.body).digest("hex"), entry.checksum);
+          assert.equal(stored.body.byteLength, entry.byteLength);
+        }
+        return { objectCount: inventory.length, verifiedObjectCount: inventory.length };
+      }
+    };
+    const executor = new RemoteMigrationExecutor(sourceEndpoint, destinationEndpoint, transfer, "cell-b");
+    const migration = new MigrationOrchestrator(source.routingDirectory, source.migrationCheckpoints, executor, () => new Date(clock).toISOString());
+    const requested = await migration.request({ id: "migration-1", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
+    const cutOver = await migration.resume(requested.id, 60);
+    assert.equal(cutOver.state, "cutover");
+    assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-b");
+    assert.equal((await source.repositories.moderationHolds.list({ limit: 10 })).items.some((hold) => hold.reason === "migration:migration-1" && hold.state === "active"), true);
+    const importedCreator = await destination.repositories.creators.get("creator-1");
+    const importedAsset = await destination.repositories.assets.get("asset-1");
+    const importedIntegration = await destination.repositories.integrationAccounts.get("integration-1");
+    assert.equal(importedCreator?.homeCellId, "cell-b"); assert.equal(importedCreator?.routingRevision, 2);
+    assert.equal(importedAsset?.homeCellId, "cell-b"); assert.equal(importedAsset?.storage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
+    assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
+    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
+    const rolledBack = await migration.rollback(requested.id);
+    assert.equal(rolledBack.state, "rolled_back"); assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-a");
+    const second = await migration.request({ id: "migration-2", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
+    await migration.resume(second.id, 1);
+    clock += 120_000;
+    const retired = await migration.retire(second.id);
+    assert.equal(retired.state, "retired");
+    assert.equal(await source.repositories.creators.get("creator-1"), undefined);
+    assert.equal(await source.repositories.assets.get("asset-1"), undefined);
+    await assert.rejects(() => source.storage.get(original));
+    assert.equal((await source.repositories.auditEvents.get("regional_migration.source_retired:migration-2"))?.action, "regional_migration.source_retired");
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });

@@ -29,6 +29,15 @@ The stack creates separate regional API Gateway domains: the reference web at th
 
 The cell ID and region are injected into the API and worker, emitted as stack outputs, and applied as `ubeeq:cell-id`/`ubeeq:cell-region` resource tags. Create another independent stack for another region; do not enable DynamoDB Global Tables or S3 cross-region replication for normal operation. The adapter rejects a record, job, credential, upload, delivery object, or object key that belongs to a different cell.
 
+For a managed multi-cell deployment, deploy the control plane first and supply its emitted `MigrationControlWorker` role ARN when deploying each participating cell. This adds a resource-policy permission for that exact worker role to invoke the cell's otherwise private migration handler; it does not grant account-wide invocation access:
+
+```sh
+UBEEQ_MIGRATION_CONTROL_WORKER_PRINCIPAL_ARN=arn:aws:iam::123456789012:role/MigrationControlWorkerRole \
+npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell
+```
+
+The multi-cell worker still needs separately scoped IAM and bucket-policy permissions for the registered source and destination stores. See [`../../../deployments/aws-serverless/multi-cell/README.md`](../../../deployments/aws-serverless/multi-cell/README.md).
+
 The emitted Function URL is IAM-protected for operator diagnostics. The stack also emits `ReferenceApiGatewayUrl`, the HTTP API edge for the reference API; it passes requests to the API, whose protected routes validate Cognito bearer tokens through the identity port. Do not treat either generated hostname as a production public base URL. AWS uploads return a checksum-bound, time-limited S3 PUT URL; upload content goes directly to S3 and then `/v1/uploads/{uploadId}/complete` records the immutable object version. SQS invokes the bundled worker Lambda to process the completed asset.
 
 Keep production backup retention, alert routing, key management, domains, and network policy in your own deployment configuration. See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for the operational runbook.

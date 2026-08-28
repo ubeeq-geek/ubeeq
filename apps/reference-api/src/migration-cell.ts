@@ -4,7 +4,8 @@ import type { UbeeqRepositories } from "@ubeeq/persistence";
 import type { ObjectStorage } from "@ubeeq/storage";
 import type { MigrationCellCommand, MigrationCellCommandResult, MigrationCellEndpoint } from "@ubeeq/deployment-platform";
 
-type StoredAsset = { id: string; creatorId: string; checksum: string; objectVersion: string; storage?: { bucket?: string; key?: string; versionId?: string; byteLength?: number }; [key: string]: unknown };
+type StoredLocation = { bucket?: string; key?: string; versionId?: string; byteLength?: number };
+type StoredAsset = { id: string; creatorId: string; checksum: string; objectVersion: string; storage?: StoredLocation; originalStorage?: StoredLocation; [key: string]: unknown };
 const all = async <T>(repository: { list(input: { limit: number; cursor?: string }): Promise<{ items: readonly T[]; nextCursor?: string }> }): Promise<readonly T[]> => { const values: T[] = []; let cursor: string | undefined; do { const page = await repository.list({ limit: 100, cursor }); values.push(...page.items); cursor = page.nextCursor; } while (cursor); return values; };
 
 /**
@@ -19,8 +20,10 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
     if ((["source_hold", "export", "retire"] as const).includes(command.operation as "source_hold") && !source) throw new Error("Migration source command was sent to a foreign cell.");
     if ((["import", "enable", "rollback"] as const).includes(command.operation as "import") && !destination) throw new Error("Migration destination command was sent to a foreign cell.");
     if (command.operation === "source_hold") {
+      const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
+      if (!creator || creator.homeCellId !== input.cellId) throw new Error("Migration creator is not owned by this source cell.");
       const exists = (await all(input.repositories.moderationHolds)).find((hold: any) => hold.subjectId === command.checkpoint.creatorId && hold.reason === `migration:${command.checkpoint.id}` && hold.state === "active");
-      if (!exists) await input.repositories.moderationHolds.create({ id: `migration-hold:${command.checkpoint.id}`, instanceId: input.instanceId, homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision, subjectType: "creator", subjectId: command.checkpoint.creatorId, state: "active", reason: `migration:${command.checkpoint.id}` } as any, { idempotencyKey: `migration-hold:${command.checkpoint.id}` });
+      if (!exists) await input.repositories.moderationHolds.create({ id: `migration-hold:${command.checkpoint.id}`, instanceId: input.instanceId, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion, dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, subjectType: "creator", subjectId: command.checkpoint.creatorId, state: "active", reason: `migration:${command.checkpoint.id}` } as any, { idempotencyKey: `migration-hold:${command.checkpoint.id}` });
       return {};
     }
     if (command.operation === "import") {
@@ -58,11 +61,46 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       return {};
     }
     if (command.operation === "retire") {
-      const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
-      if (!creator) return {};
       const removeOwned = async (repository: any, predicate: (value: any) => boolean) => { for (const value of (await all(repository) as any[])) if (predicate(value)) await repository.remove(value.id, value.revision, { idempotencyKey: `migration-retire:${command.checkpoint.id}:${value.id}` }); };
-      const retiredWorks = await all(input.repositories.works) as any[]; const workIds = new Set(retiredWorks.filter((value) => value.creatorId === creator.id).map((value) => value.id));
-      await removeOwned(input.repositories.assets, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.collections, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.publications, (value) => workIds.has(value.workId)); await removeOwned(input.repositories.publicationIntents, (value) => workIds.has(value.workId)); await removeOwned(input.repositories.integrationAccounts, (value) => value.creatorId === creator.id); await removeOwned(input.repositories.works, (value) => value.creatorId === creator.id); await input.repositories.creators.remove(creator.id, creator.revision, { idempotencyKey: `migration-retire:${command.checkpoint.id}:creator` });
+      const creatorId = command.checkpoint.creatorId;
+      const works = (await all(input.repositories.works) as any[]).filter((value) => value.creatorId === creatorId);
+      const assets = (await all(input.repositories.assets) as unknown as readonly StoredAsset[]).filter((value) => value.creatorId === creatorId);
+      const collections = (await all(input.repositories.collections) as any[]).filter((value) => value.creatorId === creatorId);
+      const integrations = (await all(input.repositories.integrationAccounts) as any[]).filter((value) => value.creatorId === creatorId);
+      const workIds = new Set(works.map((value) => value.id)), assetIds = new Set(assets.map((value) => value.id)), collectionIds = new Set(collections.map((value) => value.id)), integrationIds = new Set(integrations.map((value) => value.id));
+      const publicationIds = new Set((await all(input.repositories.publications) as any[]).filter((value) => workIds.has(value.workId)).map((value) => value.id));
+      const subjectIds = new Set([creatorId, ...workIds, ...assetIds, ...collectionIds]);
+      // Object removal is intentionally migration-only. The normal cell path
+      // never calls this operation or receives a foreign object location.
+      for (const asset of assets) for (const location of [asset.storage, asset.originalStorage]) {
+        if (location?.bucket && location.key) await input.storage.remove({ bucket: location.bucket, key: location.key, versionId: location.versionId }).catch(() => undefined);
+      }
+      await removeOwned(input.repositories.workMemberships, (value) => workIds.has(value.workId) || collectionIds.has(value.collectionId));
+      await removeOwned(input.repositories.reconciliationSnapshots, (value) => publicationIds.has(value.publicationId));
+      await removeOwned(input.repositories.syncCursors, (value) => integrationIds.has(value.integrationAccountId));
+      await removeOwned(input.repositories.integrationJobs, (value) => integrationIds.has(value.integrationAccountId));
+      await removeOwned(input.repositories.publicationIntents, (value) => workIds.has(value.workId));
+      await removeOwned(input.repositories.publications, (value) => workIds.has(value.workId));
+      await removeOwned(input.repositories.moderationEvidence, (value) => subjectIds.has(value.subjectId));
+      await removeOwned(input.repositories.moderationHolds, (value) => subjectIds.has(value.subjectId));
+      await removeOwned(input.repositories.reviewCases, (value) => subjectIds.has(value.subjectId));
+      await removeOwned(input.repositories.usageEvents, (value) => value.accountId === creatorId);
+      await removeOwned(input.repositories.creditLots, (value) => value.accountId === creatorId);
+      await removeOwned(input.repositories.creditReservations, (value) => value.accountId === creatorId);
+      await removeOwned(input.repositories.balances, (value) => value.accountId === creatorId);
+      await removeOwned(input.repositories.exportManifests, (value) => value.creatorId === creatorId);
+      await removeOwned(input.repositories.importCheckpoints, (value) => value.creatorId === creatorId);
+      await removeOwned(input.repositories.integrationAccounts, (value) => value.creatorId === creatorId);
+      await removeOwned(input.repositories.assets, (value) => value.creatorId === creatorId);
+      await removeOwned(input.repositories.collections, (value) => value.creatorId === creatorId);
+      await removeOwned(input.repositories.works, (value) => value.creatorId === creatorId);
+      const creator = await input.repositories.creators.get(creatorId);
+      if (creator) await input.repositories.creators.remove(creator.id, creator.revision, { idempotencyKey: `migration-retire:${command.checkpoint.id}:creator` });
+      // Audit records are intentionally retained in the source cell. They are
+      // immutable operator evidence, and retention is disclosed by deployment
+      // policy rather than silently discarded during a data migration.
+      const eventId = `regional_migration.source_retired:${command.checkpoint.id}`;
+      if (!await input.repositories.auditEvents.get(eventId)) await input.repositories.auditEvents.create({ id: eventId, instanceId: input.instanceId, homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision, action: "regional_migration.source_retired", subjectId: creatorId, payload: { migrationId: command.checkpoint.id, auditRetention: "deployment_policy" } } as any, { idempotencyKey: eventId });
       return {};
     }
     if (command.operation !== "export") return {};

@@ -43,6 +43,11 @@ export class AwsServerlessSingleCellStack extends Stack {
     const routingDirectoryTableName = this.node.tryGetContext("routingDirectoryTableName") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME;
     const routingDirectoryTableArn = this.node.tryGetContext("routingDirectoryTableArn") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_ARN;
     const routingDirectoryRegion = this.node.tryGetContext("routingDirectoryRegion") || process.env.UBEEQ_ROUTING_DIRECTORY_REGION;
+    // A multi-cell operator may nominate exactly one control-plane worker role
+    // to invoke this otherwise private regional command endpoint.  This is a
+    // resource policy on the cell, not an implicit account-wide trust grant.
+    const migrationControlWorkerPrincipalArn = this.node.tryGetContext("migrationControlWorkerPrincipalArn") || process.env.UBEEQ_MIGRATION_CONTROL_WORKER_PRINCIPAL_ARN;
+    if (migrationControlWorkerPrincipalArn && !/^arn:aws(?:-us-gov|-cn)?:iam::\d{12}:role\/.+/.test(migrationControlWorkerPrincipalArn)) throw new Error("UBEEQ_MIGRATION_CONTROL_WORKER_PRINCIPAL_ARN must be an IAM role ARN.");
     if (routingDirectoryTableName && !routingDirectoryTableArn) throw new Error("UBEEQ_ROUTING_DIRECTORY_TABLE_ARN is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME so a cell can read a control-plane table in another region.");
     if (routingDirectoryTableName && !routingDirectoryRegion) throw new Error("UBEEQ_ROUTING_DIRECTORY_REGION is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME.");
     const runtimeEnvironment = { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_CELL_ID: cellId, UBEEQ_CELL_REGION: cellRegion, UBEEQ_CELL_OPERATOR: "self-hosted", UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials", ...(routingDirectoryTableName ? { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routingDirectoryTableName, UBEEQ_ROUTING_DIRECTORY_REGION: routingDirectoryRegion! } : {}) };
@@ -51,6 +56,7 @@ export class AwsServerlessSingleCellStack extends Stack {
     const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
+    if (migrationControlWorkerPrincipalArn) health.addPermission("MigrationControlWorkerInvoke", { action: "lambda:InvokeFunction", principal: new iam.ArnPrincipal(migrationControlWorkerPrincipalArn) });
     if (routingDirectoryTableName && routingDirectoryTableArn) {
       const routingDirectory = dynamodb.Table.fromTableArn(this, "RoutingDirectory", routingDirectoryTableArn);
       // Route resolution is read-only in each cell. Migration writes belong to
