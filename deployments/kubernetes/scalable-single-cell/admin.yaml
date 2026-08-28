@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ubeeq-admin
+  labels:
+    app.kubernetes.io/name: ubeeq-admin
+    app.kubernetes.io/part-of: ubeeq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ubeeq-admin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ubeeq-admin
+        app.kubernetes.io/part-of: ubeeq
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: admin
+          image: ghcr.io/ubeeq/ubeeq-reference
+          command: ["node", "apps/admin-reference/src/server.mjs"]
+          ports: [{ name: http, containerPort: 4174 }]
+          env:
+            - { name: PORT, value: "4174" }
+            - { name: UBEEQ_REFERENCE_API_URL, value: http://ubeeq-api }
+          readinessProbe: { httpGet: { path: /health, port: http }, initialDelaySeconds: 5, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /health, port: http }, initialDelaySeconds: 15, periodSeconds: 20 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ubeeq-admin
+spec:
+  selector:
+    app.kubernetes.io/name: ubeeq-admin
+  ports:
+    - { name: http, port: 80, targetPort: http }

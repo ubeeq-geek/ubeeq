@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ubeeq-api
+  annotations:
+    # Configure the cluster's TLS issuer/controller outside this neutral profile.
+    kubernetes.io/ingress.class: REPLACE_WITH_INGRESS_CLASS
+spec:
+  tls:
+    - hosts: [workspace.example.org, admin.workspace.example.org]
+      secretName: ubeeq-api-tls
+  rules:
+    - host: workspace.example.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: ubeeq-web, port: { name: http } }
+    - host: admin.workspace.example.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: ubeeq-admin, port: { name: http } }

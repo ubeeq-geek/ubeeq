@@ -20,7 +20,8 @@
     "test:landing": "node scripts/validate-landing.mjs",
     "test:compose-example": "node scripts/validate-compose-example.mjs",
     "test:machine-compact": "node scripts/smoke-machine-compact.mjs",
-    "test:machine-scalable": "node scripts/smoke-machine-scalable.mjs"
+    "test:machine-scalable": "node scripts/smoke-machine-scalable.mjs",
+    "test:kubernetes-scalable": "node scripts/validate-kubernetes-scalable.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

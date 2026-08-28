@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ubeeq-cell-config
+data:
+  UBEEQ_INSTANCE_ID: example-community
+  UBEEQ_CELL_ID: community-eu-west
+  UBEEQ_CELL_REGION: eu-west
+  UBEEQ_CELL_OPERATOR: Example Community
+  UBEEQ_PUBLIC_BASE_URL: https://workspace.example.org
+  UBEEQ_S3_REGION: us-east-1
+  UBEEQ_S3_FORCE_PATH_STYLE: "true"
+  UBEEQ_S3_DIRECT_UPLOADS: "false"
+  UBEEQ_LISTEN_HOST: 0.0.0.0

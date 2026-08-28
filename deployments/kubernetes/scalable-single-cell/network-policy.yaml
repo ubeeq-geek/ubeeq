@@ -1,0 +1,15 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ubeeq-api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ubeeq-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 4100
