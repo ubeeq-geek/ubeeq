@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { handler, migrationControlApi, migrationControlWorker, web, worker } from "../dist/lambda.js";
+import { handler, migrationCell, migrationControlApi, migrationControlWorker, web, worker } from "../dist/lambda.js";
 
 Object.assign(process.env, {
   UBEEQ_PUBLIC_BASE_URL: "https://reference.example",
@@ -12,6 +12,8 @@ Object.assign(process.env, {
   UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/test",
   UBEEQ_REFERENCE_WEB_API_URL: "https://api.example",
   UBEEQ_REFERENCE_WEB_MODULE_PATH: "../../web-reference/src/server.mjs",
+  UBEEQ_CELL_ID: "test-cell",
+  UBEEQ_CELL_REGION: "us-east-2",
   UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: "routing-control",
   UBEEQ_ROUTING_DIRECTORY_REGION: "us-east-2",
   UBEEQ_MIGRATION_COMMANDS_QUEUE_URL: "https://sqs.example/migrations",
@@ -47,6 +49,11 @@ test("migration control API rejects a request without its allow-listed IAM opera
 test("migration control API accepts an allow-listed principal at the transport boundary", async () => {
   const response = await migrationControlApi({ rawPath: "/not-a-route", requestContext: { http: { method: "GET" }, authorizer: { iam: { userArn: "arn:aws:iam::123456789012:role/ubeeq-operator" } } } });
   assert.equal(response.statusCode, 404);
+});
+
+test("private migration cell handler rejects a command for another cell before data access", async () => {
+  const result = await migrationCell({ operation: "export", checkpoint: { id: "move-1", creatorId: "creator-1", source: { homeCellId: "foreign-cell", homeRegion: "eu-central-1", endpoint: "https://foreign.example/", routingRevision: 1 }, destination: { cellId: "destination", region: "us-east-2", endpoint: "https://destination.example/" }, state: "source_hold", createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z" }, destinationBucket: "destination" });
+  assert.match(result.error?.message ?? "", /foreign cell/);
 });
 
 test("Lambda reference web serves the same neutral workspace at the edge", async () => {

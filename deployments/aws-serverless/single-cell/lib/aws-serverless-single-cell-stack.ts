@@ -94,6 +94,8 @@ export class AwsServerlessSingleCellStack extends Stack {
       new CfnOutput(this, "ReferenceApiCustomDomainUrl", { value: `https://${customDomainName}` });
     }
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
+    /** Private target registered with an operator multi-cell control plane. */
+    new CfnOutput(this, "MigrationCellFunctionArn", { value: health.functionArn });
     new CfnOutput(this, "CellId", { value: cellId });
     new CfnOutput(this, "CellRegion", { value: cellRegion });
     new CfnOutput(this, "ReferenceApiGatewayUrl", { value: api.apiEndpoint });

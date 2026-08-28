@@ -1,6 +1,7 @@
 import { Readable } from "node:stream";
 import { AwsMigrationControlWorker, createAwsAdapterSet, createAwsMigrationCommandQueue, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
 import { createReferenceApi, type ReferenceAdapterSet } from "./server.js";
+import { createMigrationCellEndpoint } from "./migration-cell.js";
 
 type FunctionUrlEvent = {
   rawPath?: string;
@@ -86,11 +87,27 @@ const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??
   ...(process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME ? { regionalControlPlane: createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME, region: required("UBEEQ_ROUTING_DIRECTORY_REGION") }) } : {}),
 });
 
+const awsCellAdapters = () => createAwsAdapterSet({
+  region: process.env.AWS_REGION,
+  cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
+  tableName: required("UBEEQ_RECORDS_TABLE"), objectBucket: required("UBEEQ_SOURCE_BUCKET"), queueUrl: required("UBEEQ_JOBS_QUEUE_URL"),
+  userPoolId: required("UBEEQ_USER_POOL_ID"), userPoolClientId: required("UBEEQ_USER_POOL_CLIENT_ID"), credentialSecretPrefix: required("UBEEQ_CREDENTIAL_SECRET_PREFIX"),
+});
+
 export const handler = async (event: FunctionUrlEvent): Promise<FunctionUrlResult> => {
   try { return await invokeApi(event); }
   catch (error) {
     return { statusCode: 503, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify({ error: { code: "runtime_unavailable", message: error instanceof Error ? error.message : "Reference API runtime is unavailable" } }) };
   }
+};
+
+/** Private Lambda-invocation endpoint used only by the registered migration worker. */
+export const migrationCell = async (command: import("@ubeeq/deployment-platform").MigrationCellCommand): Promise<{ result?: import("@ubeeq/deployment-platform").MigrationCellCommandResult; error?: { message: string } }> => {
+  try {
+    const adapters = awsCellAdapters();
+    const result = await createMigrationCellEndpoint({ cellId: required("UBEEQ_CELL_ID"), region: required("UBEEQ_CELL_REGION"), instanceId: process.env.UBEEQ_INSTANCE_ID ?? "aws-reference", repositories: adapters.repositories, storage: adapters.storage }).execute(command);
+    return { result };
+  } catch (error) { return { error: { message: error instanceof Error ? error.message : "Migration cell command failed" } }; }
 };
 
 /** SQS entry point for the same durable job service used by the local reference worker. */
