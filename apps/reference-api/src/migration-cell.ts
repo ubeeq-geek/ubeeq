@@ -35,7 +35,12 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       await put(input.repositories.creators, manifest.creator, "creator");
       for (const value of manifest.works) await put(input.repositories.works, value, "work");
       for (const value of manifest.collections) await put(input.repositories.collections, value, "collection");
-      for (const value of manifest.assets) await put(input.repositories.assets, value, "asset");
+      for (const value of manifest.assets) {
+        const object = command.checkpoint.objectInventory?.find((candidate) => candidate.id === value.id);
+        if (!object) throw new Error(`Migration object inventory is missing asset ${value.id}.`);
+        const asset = value as any;
+        await put(input.repositories.assets, { ...asset, storage: asset.storage ? { ...asset.storage, bucket: object.destination.bucket, key: object.destination.key, versionId: undefined } : asset.storage }, "asset");
+      }
       for (const value of manifest.publications) await put(input.repositories.publications, value, "publication");
       for (const value of manifest.publicationIntents) await put(input.repositories.publicationIntents, value, "publication-intent");
       for (const value of manifest.moderationEvidence) await put(input.repositories.moderationEvidence, value, "evidence");
