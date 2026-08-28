@@ -20,6 +20,7 @@
     "@aws-sdk/client-s3": "^3.1120.0",
     "@aws-sdk/s3-request-presigner": "^3.1120.0",
     "@ubeeq/jobs": "^0.1.0",
+    "@ubeeq/auth": "^0.1.0",
     "@ubeeq/persistence": "^0.1.0",
     "@ubeeq/storage": "^0.1.0",
     "pg": "^8.13.1"

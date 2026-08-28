@@ -2,7 +2,7 @@
  * Provider-neutral machine adapters. PostgreSQL is the canonical durable store
  * for a scalable machine cell; no application service imports this package.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
@@ -10,7 +10,8 @@ import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectComm
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
-import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
+import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const timestamp = (): string => new Date().toISOString();
 const limit = (value: number): number => Math.max(1, Math.min(100, value));
@@ -39,20 +40,21 @@ export class PostgresDatabase {
 
   async migrate(): Promise<void> {
     await this.pool.query("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL)");
-    const id = "001-core";
-    const applied = await this.pool.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1", [id]);
-    if (applied.rowCount) return;
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const again = await client.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1 FOR UPDATE", [id]);
-      if (!again.rowCount) {
-        await client.query(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8"));
-        await client.query("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES ($1, NOW())", [id]);
-      }
-      await client.query("COMMIT");
-    } catch (error) { await client.query("ROLLBACK"); throw error; }
-    finally { client.release(); }
+    for (const id of ["001-core", "002-identity"]) {
+      const applied = await this.pool.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1", [id]);
+      if (applied.rowCount) continue;
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const again = await client.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1 FOR UPDATE", [id]);
+        if (!again.rowCount) {
+          await client.query(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8"));
+          await client.query("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES ($1, NOW())", [id]);
+        }
+        await client.query("COMMIT");
+      } catch (error) { await client.query("ROLLBACK"); throw error; }
+      finally { client.release(); }
+    }
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
@@ -185,6 +187,41 @@ export const createPostgresAdapterSet = async (configuration: PostgresAdapterCon
   return { database, repositories: createPostgresRepositories(database), jobs: new PostgresJobQueue(database) };
 };
 
+const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+/** Password identity for self-hosted machine cells. Hosted deployments can supply an OIDC identity port instead. */
+export class PostgresPasswordIdentity implements PasswordIdentityAdapter {
+  constructor(private readonly database: PostgresDatabase, private readonly sessionTtlSeconds = 86_400) {}
+  async register(input: { email: string; password: string }): Promise<IdentityAccount> {
+    if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
+    const id = randomUUID(), createdAt = timestamp(), salt = randomBytes(16).toString("hex"), passwordHash = scryptSync(input.password, salt, 64).toString("hex");
+    await this.database.pool.query("INSERT INTO ubeeq_accounts (id, email, password_hash, salt, status, created_at, updated_at) VALUES ($1, $2, $3, $4, 'active', $5, $5)", [id, input.email.toLowerCase(), passwordHash, salt, createdAt]);
+    return { id, subjectId: id, status: "active", createdAt, updatedAt: createdAt };
+  }
+  async authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
+    const result = await this.database.pool.query<{ id: string; password_hash: string; salt: string; status: IdentityAccount["status"] }>("SELECT id, password_hash, salt, status FROM ubeeq_accounts WHERE email = $1", [input.email.toLowerCase()]);
+    const account = result.rows[0];
+    if (!account || account.status !== "active") throw new Error("Invalid local credentials.");
+    const supplied = scryptSync(input.password, account.salt, 64), expected = Buffer.from(account.password_hash, "hex");
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Invalid local credentials.");
+    const token = randomBytes(32).toString("base64url"), id = randomUUID(), issuedAt = timestamp(), expiresAt = new Date(Date.now() + this.sessionTtlSeconds * 1_000).toISOString();
+    await this.database.pool.query("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)", [id, account.id, digest(token), expiresAt, issuedAt]);
+    return { token, session: { id, subject: { id: account.id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt, expiresAt, authenticationMethod: "password" } };
+  }
+  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
+    const result = await this.database.pool.query<{ id: string; account_id: string; expires_at: Date | string }>("SELECT id, account_id, expires_at FROM ubeeq_sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()", [digest(input.credential)]);
+    const session = result.rows[0];
+    if (!session) return undefined;
+    return { id: session.id, subject: { id: session.account_id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: "", expiresAt: date(session.expires_at), authenticationMethod: "password" };
+  }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    const result = await this.database.pool.query<{ id: string; status: IdentityAccount["status"]; created_at: Date | string; updated_at: Date | string }>("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = $1", [subjectId]);
+    const account = result.rows[0]; return account ? { id: account.id, subjectId: account.id, status: account.status, createdAt: date(account.created_at), updatedAt: date(account.updated_at) } : undefined;
+  }
+  async listDelegations(): Promise<readonly []> { return []; }
+  async revokeSession(input: { sessionId: string }): Promise<void> { await this.database.pool.query("UPDATE ubeeq_sessions SET revoked_at = NOW() WHERE id = $1", [input.sessionId]); }
+}
+
 export interface S3CompatibleConfiguration {
   endpoint: string;
   region?: string;
@@ -192,22 +229,24 @@ export interface S3CompatibleConfiguration {
   accessKeyId?: string;
   secretAccessKey?: string;
   forcePathStyle?: boolean;
+  /** Enable only when the S3 endpoint is browser-routable and its CORS policy permits scoped PUTs. */
+  directUploads?: boolean;
   /** Omit only for adapter-level storage conformance; deployed cells must set it. */
   cellId?: string;
 }
 
 const s3Checksum = (checksum: string): string => /^[a-f0-9]{64}$/i.test(checksum) ? Buffer.from(checksum, "hex").toString("base64") : checksum;
-const encodeUpload = (object: StoredObject): string => Buffer.from(JSON.stringify(object)).toString("base64url");
-const decodeUpload = (value: string): StoredObject => {
+const encodeUpload = (object: StoredObject, expiresAt: string): string => Buffer.from(JSON.stringify({ object, expiresAt })).toString("base64url");
+const decodeUpload = (value: string): { object: StoredObject; expiresAt: string } => {
   try {
-    const object = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as StoredObject;
-    if (!object.bucket || !object.key || !object.contentType || !object.checksum) throw new Error("missing fields");
-    return object;
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as { object: StoredObject; expiresAt: string };
+    if (!decoded.object?.bucket || !decoded.object.key || !decoded.object.contentType || !decoded.object.checksum || Date.parse(decoded.expiresAt) <= Date.now()) throw new Error("missing fields");
+    return decoded;
   } catch { throw new Error("S3-compatible upload identifier is invalid."); }
 };
 
 /** S3 protocol adapter suitable for MinIO, Ceph RGW, and other compatible regional object stores. */
-export class S3CompatibleStorage implements ObjectStorage, UploadAdapter, DeliveryAdapter {
+export class S3CompatibleStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
   readonly client: S3Client;
   constructor(readonly configuration: S3CompatibleConfiguration, client?: S3Client) {
     if (!configuration.endpoint.startsWith("http") || !configuration.bucket.trim()) throw new Error("S3-compatible storage requires endpoint and bucket.");
@@ -234,15 +273,23 @@ export class S3CompatibleStorage implements ObjectStorage, UploadAdapter, Delive
     const object = { ...input.object, bucket: this.configuration.bucket };
     const expiresIn = Math.max(1, Math.min(900, Math.floor((Date.parse(input.expiresAt) - Date.now()) / 1_000)));
     const signedObject = { ...object, checksum };
+    if (!this.configuration.directUploads) return { uploadId: encodeUpload(signedObject, input.expiresAt), object: signedObject, expiresAt: input.expiresAt };
     const url = await getSignedUrl(this.client, new PutObjectCommand({ Bucket: this.configuration.bucket, Key: signedObject.key, ContentType: signedObject.contentType, ChecksumSHA256: s3Checksum(checksum), Metadata: { checksum, scope: signedObject.scope, byteLength: String(signedObject.byteLength) } }), { expiresIn, unhoistableHeaders: new Set(["x-amz-checksum-sha256", "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength"]) });
-    return { uploadId: encodeUpload(signedObject), object: signedObject, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], expiresAt: input.expiresAt };
+    return { uploadId: encodeUpload(signedObject, input.expiresAt), object: signedObject, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], expiresAt: input.expiresAt };
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
-    const object = decodeUpload(input.uploadId);
+    const { object } = decodeUpload(input.uploadId);
     this.local(object.key); requireCreatorScopedObject(object.key, input);
     const response = await this.client.send(new HeadObjectCommand({ Bucket: this.configuration.bucket, Key: object.key }));
     if (!response.VersionId || response.ContentLength !== input.byteLength || response.Metadata?.checksum !== input.checksum || (response.ChecksumSHA256 && response.ChecksumSHA256 !== s3Checksum(input.checksum))) throw new Error("S3-compatible upload completion did not match the signed object checksum, size, or version.");
     return { ...object, versionId: response.VersionId, contentType: response.ContentType ?? object.contentType, byteLength: response.ContentLength, checksum: input.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? object.scope };
+  }
+  async accept(input: UploadAcceptance): Promise<void> {
+    const { object } = decodeUpload(input.uploadId);
+    this.local(object.key); requireCreatorScopedObject(object.key, input);
+    const checksum = createHash("sha256").update(input.body).digest("hex");
+    if (object.checksum !== checksum || object.byteLength !== input.body.byteLength) throw new Error("S3-compatible proxy upload did not match its declared checksum or size.");
+    await this.put({ object, body: input.body });
   }
   async abort(_input: { uploadId: string; cellId: string; creatorId: string }): Promise<void> { /* A signed single-part PUT has no server-side session to abort. */ }
   async issue(input: Parameters<DeliveryAdapter["issue"]>[0]): Promise<{ url: string; expiresAt: string }> {
@@ -251,3 +298,18 @@ export class S3CompatibleStorage implements ObjectStorage, UploadAdapter, Delive
     return { url: await getSignedUrl(this.client, new GetObjectCommand({ Bucket: this.configuration.bucket, Key: input.object.key, VersionId: input.object.versionId, ResponseContentDisposition: input.disposition === "attachment" ? "attachment" : undefined }), { expiresIn }), expiresAt: input.expiresAt };
   }
 }
+
+export interface MachineAdapterConfiguration extends PostgresAdapterConfiguration {
+  storage: S3CompatibleConfiguration;
+  sessionTtlSeconds?: number;
+}
+
+/** Complete persistence, storage, upload, delivery, job, and password-identity composition for a machine cell. */
+export const createMachineAdapterSet = async (configuration: MachineAdapterConfiguration) => {
+  if (configuration.storage.cellId && configuration.storage.cellId !== configuration.cellId) throw new Error("Machine storage and PostgreSQL adapters must use the same cellId.");
+  const database = new PostgresDatabase(configuration);
+  await database.migrate();
+  const storage = new S3CompatibleStorage({ ...configuration.storage, cellId: configuration.cellId });
+  const identity = new PostgresPasswordIdentity(database, configuration.sessionTtlSeconds);
+  return { database, repositories: createPostgresRepositories(database), storage, uploads: storage, delivery: storage, jobs: new PostgresJobQueue(database), identity, localIdentity: identity };
+};

@@ -5,3 +5,4 @@ deployments/aws-serverless/single-cell/cdk.out/
 deployments/aws-serverless/multi-cell/cdk.out/
 apps/reference-api/lambda-package/
 examples/machine/compact/.env
+examples/machine/scalable-single-cell/.env

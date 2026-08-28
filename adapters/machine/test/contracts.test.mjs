@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { PostgresDatabase, PostgresJobQueue, S3CompatibleStorage, createPostgresRepositories } from "../dist/index.js";
+import { PostgresDatabase, PostgresJobQueue, PostgresPasswordIdentity, S3CompatibleStorage, createPostgresRepositories } from "../dist/index.js";
 import { verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
 import { verifyObjectStorageContract } from "@ubeeq/storage";
+import { verifyPasswordIdentityContract } from "@ubeeq/auth";
 
 const connectionString = process.env.UBEEQ_POSTGRES_TEST_URL;
 
@@ -13,12 +14,13 @@ test("PostgreSQL repositories and queue satisfy shared durable contracts", { ski
   await database.migrate();
   const repositories = createPostgresRepositories(database);
   try {
-    await database.pool.query("TRUNCATE ubeeq_idempotency, ubeeq_records, ubeeq_jobs");
+    await database.pool.query("TRUNCATE ubeeq_idempotency, ubeeq_records, ubeeq_jobs, ubeeq_sessions, ubeeq_accounts CASCADE");
     for (const [name, repository] of Object.entries(repositories).filter(([name]) => name !== "transaction")) {
       await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "machine", homeCellId: "cell-a", dataHomeRegion: "test", dataHomeAssignedAt: "2026-01-01T00:00:00.000Z", routingRevision: 1, contractValue: name }), change: () => ({ contractValue: `${name}-updated` }) });
       if (name !== "federationActors" && name !== "remotePublicationReferences") await verifyCellScopedRepositoryContract({ repository, unscopedRepository: repository.repository, cellId: "cell-a" });
     }
     await verifyJobQueueContract(new PostgresJobQueue(database), `postgres-contract-${randomUUID()}`);
+    await verifyPasswordIdentityContract(new PostgresPasswordIdentity(database));
   } finally { await database.close(); }
 });
 
