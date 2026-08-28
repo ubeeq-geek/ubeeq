@@ -26,6 +26,10 @@ export class LocalSqliteDatabase {
     mkdirSync(resolve(configuration.dataDirectory), { recursive: true });
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
     this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
+    // The compact profile has one API process and one worker process. WAL mode
+    // keeps readers independent while a bounded busy timeout lets short writes
+    // serialize instead of failing immediately under that expected contention.
+    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory"]) {

@@ -60,6 +60,22 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   diagnostics?: readonly DependencyDiagnostic[];
 }
 
+/** Shared process configuration for the reference API and its local worker. */
+export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.ProcessEnv = process.env): ReferenceApiConfiguration => {
+  const port = Number(environment.PORT ?? 4100);
+  const dataDirectory = environment.UBEEQ_DATA_DIRECTORY ?? "./var/reference";
+  return {
+    databasePath: environment.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`,
+    dataDirectory,
+    publicBaseUrl: environment.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`,
+    instanceId: environment.UBEEQ_INSTANCE_ID,
+    cellId: environment.UBEEQ_CELL_ID ?? "local-single-cell",
+    region: environment.UBEEQ_CELL_REGION ?? "local",
+    operator: environment.UBEEQ_CELL_OPERATOR ?? "self-hosted",
+    credentialEncryptionKey: environment.UBEEQ_CREDENTIAL_ENCRYPTION_KEY,
+  };
+};
+
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; close(): Promise<void> } => {
   const cellId = configuration.cellId ?? "local-single-cell";
   const region = configuration.region ?? "local";
@@ -341,8 +357,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 };
 
 if (process.argv[1] && process.argv[1].endsWith("server.js")) {
-  const port = Number(process.env.PORT ?? 4100); const dataDirectory = process.env.UBEEQ_DATA_DIRECTORY ?? "./var/reference";
-  const api = createReferenceApi({ databasePath: process.env.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`, dataDirectory, publicBaseUrl: process.env.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`, cellId: process.env.UBEEQ_CELL_ID ?? "local-single-cell", region: process.env.UBEEQ_CELL_REGION ?? "local", operator: process.env.UBEEQ_CELL_OPERATOR ?? "self-hosted" });
+  const port = Number(process.env.PORT ?? 4100);
+  const api = createReferenceApi(referenceApiConfigurationFromEnvironment());
   const host = process.env.UBEEQ_LISTEN_HOST ?? "127.0.0.1";
   api.server.listen(port, host, () => console.log(`Ubeeq reference API listening on http://${host}:${port}`));
 }

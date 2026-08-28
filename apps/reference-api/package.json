@@ -7,6 +7,7 @@
     "build": "tsc -p tsconfig.json",
     "package:lambda": "npm run build && node ../../scripts/package-reference-api-lambda.mjs",
     "start": "node dist/server.js",
+    "start:worker": "node dist/worker.js",
     "test": "npm run build && node --test test/*.test.mjs",
     "test:aws": "npm run build && node ../../examples/aws-serverless/single-cell/test-reference-api.mjs"
   },

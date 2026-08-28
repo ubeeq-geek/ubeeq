@@ -17,7 +17,8 @@
     "pack:verify": "npm run build && npm run check:publish-workflow && npm pack --dry-run --workspace @ubeeq/core && npm pack --dry-run --workspace @ubeeq/auth && npm pack --dry-run --workspace @ubeeq/extension-sdk && npm pack --dry-run --workspace @ubeeq/ui && npm pack --dry-run --workspace @ubeeq/integrations && npm pack --dry-run --workspace @ubeeq/connector-reference && npm pack --dry-run --workspace @ubeeq/moderation && npm pack --dry-run --workspace @ubeeq/processing && npm pack --dry-run --workspace @ubeeq/storage && npm pack --dry-run --workspace @ubeeq/jobs && npm pack --dry-run --workspace @ubeeq/persistence && npm pack --dry-run --workspace @ubeeq/portability && npm pack --dry-run --workspace @ubeeq/adapter-local && npm pack --dry-run --workspace @ubeeq/adapter-aws && npm pack --dry-run --workspace @ubeeq/billing && npm pack --dry-run --workspace @ubeeq/federation && npm pack --dry-run --workspace @ubeeq/deployment-platform && npm pack --dry-run --workspace @ubeeq/deployment-machine-compact && npm pack --dry-run --workspace @ubeeq/api",
     "test": "npm run --workspaces --if-present test && npm run test:landing && npm run test:compose-example",
     "test:landing": "node scripts/validate-landing.mjs",
-    "test:compose-example": "node scripts/validate-compose-example.mjs"
+    "test:compose-example": "node scripts/validate-compose-example.mjs",
+    "test:machine-compact": "node scripts/smoke-machine-compact.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"
