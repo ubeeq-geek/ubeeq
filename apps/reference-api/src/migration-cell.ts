@@ -23,6 +23,29 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       if (!exists) await input.repositories.moderationHolds.create({ id: `migration-hold:${command.checkpoint.id}`, instanceId: input.instanceId, homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision, subjectType: "creator", subjectId: command.checkpoint.creatorId, state: "active", reason: `migration:${command.checkpoint.id}` } as any, { idempotencyKey: `migration-hold:${command.checkpoint.id}` });
       return {};
     }
+    if (command.operation === "import") {
+      const manifestObject = command.checkpoint.objectInventory?.find((object) => object.id === "migration-manifest");
+      if (!manifestObject) throw new Error("Migration manifest object is missing from the verified inventory.");
+      const stored = await input.storage.get({ bucket: manifestObject.destination.bucket, key: manifestObject.destination.key });
+      const manifest = validateCreatorExport(JSON.parse(Buffer.from(stored.body).toString("utf8")));
+      if (manifest.creator.id !== command.checkpoint.creatorId) throw new Error("Migration manifest creator does not match its checkpoint.");
+      const home = { homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision + 1 };
+      const clean = (value: any) => { const { revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt, ...record } = value; return { ...record, instanceId: input.instanceId, ...home }; };
+      const put = async (repository: any, value: any, key: string) => { if (!await repository.get(value.id)) await repository.create(clean(value), { idempotencyKey: `migration:${command.checkpoint.id}:${key}:${value.id}` }); };
+      await put(input.repositories.creators, manifest.creator, "creator");
+      for (const value of manifest.works) await put(input.repositories.works, value, "work");
+      for (const value of manifest.collections) await put(input.repositories.collections, value, "collection");
+      for (const value of manifest.assets) await put(input.repositories.assets, value, "asset");
+      for (const value of manifest.publications) await put(input.repositories.publications, value, "publication");
+      for (const value of manifest.publicationIntents) await put(input.repositories.publicationIntents, value, "publication-intent");
+      for (const value of manifest.moderationEvidence) await put(input.repositories.moderationEvidence, value, "evidence");
+      for (const value of manifest.moderationHolds) await put(input.repositories.moderationHolds, value, "hold");
+      for (const value of manifest.reviewCases) await put(input.repositories.reviewCases, value, "review");
+      for (const value of manifest.auditEvents) await put(input.repositories.auditEvents, value, "audit");
+      for (const value of manifest.usageEvents) await put(input.repositories.usageEvents, value, "usage");
+      for (const value of manifest.integrationAccounts) await put(input.repositories.integrationAccounts, { ...value, health: "blocked", credentialReference: undefined }, "integration");
+      return {};
+    }
     if (command.operation !== "export") return {};
     const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
     if (!creator || creator.homeCellId !== input.cellId) throw new Error("Migration creator is not owned by this source cell.");
