@@ -18,6 +18,7 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/jobs` — durable queue, scheduling, leasing, retry, and recovery ports.
 - `@ubeeq/persistence` — durable repository, transaction, revision, pagination, and adapter conformance contracts.
 - `@ubeeq/adapter-local` — SQLite, filesystem storage/delivery, local password sessions, and durable local jobs.
+- `@ubeeq/adapter-machine` — PostgreSQL repositories and a durable multi-worker queue for scalable machine cells.
 - `@ubeeq/adapter-aws` — optional AWS provider implementations for DynamoDB, S3, SQS, Cognito, and related ports.
 - `@ubeeq/federation` — remote actor and publication-reference contracts.
 - `@ubeeq/deployment-machine-compact` — neutral configuration for a compact, single-cell machine deployment.
@@ -46,7 +47,8 @@ Ubeeq separates reusable provider adapters from runnable deployment models:
 - **Compact machine cell** — [`deployments/machine/compact`](deployments/machine/compact): a low-operations, cloud-free, single authoritative cell. [`examples/machine/compact`](examples/machine/compact) runs the reference API, creator workspace, and operations workspace with Compose.
 - **AWS serverless single-cell** — [`deployments/aws-serverless/single-cell`](deployments/aws-serverless/single-cell): Lambda/API Gateway, DynamoDB, S3, SQS, Cognito, and optional CloudFront for one scalable regional cell.
 - **AWS serverless multi-cell** — [`deployments/aws-serverless/multi-cell`](deployments/aws-serverless/multi-cell): optional routing/migration control-plane infrastructure that composes independent single cells; it does not create a global mutable data plane.
-- **Future profiles** — `deployments/machine/scalable-*` and `deployments/kubernetes/scalable-*` reserve provider-neutral scalable machine and Kubernetes paths.
+- **Scalable machine single-cell** — [`deployments/machine/scalable-single-cell`](deployments/machine/scalable-single-cell) composes PostgreSQL and an S3-compatible object store through `@ubeeq/adapter-machine`; its remaining identity and deployment composition work is tracked with that profile.
+- **Future profiles** — `deployments/machine/scalable-multi-cell` and `deployments/kubernetes/scalable-*` reserve provider-neutral multi-cell and Kubernetes paths.
 
 [`deployments/machine/compact/reference-config.json`](deployments/machine/compact/reference-config.json) is the product-neutral starting point for compact machine configuration. It contains neither hosted product settings nor credentials.
 

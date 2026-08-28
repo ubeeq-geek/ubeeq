@@ -1,0 +1,30 @@
+{
+  "name": "@ubeeq/adapter-machine",
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "migrations"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && rm -rf dist/migrations && cp -R migrations dist/migrations",
+    "test:contract": "npm run build && node --test test/contracts.test.mjs",
+    "test": "npm run test:contract"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1120.0",
+    "@aws-sdk/s3-request-presigner": "^3.1120.0",
+    "@ubeeq/jobs": "^0.1.0",
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/storage": "^0.1.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10"
+  }
+}

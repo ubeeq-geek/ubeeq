@@ -8,6 +8,9 @@ const protectedNames = ["eversally", "nightframe"];
 const violations = [];
 const cloudImport = /(?:from\s*["']|require\s*\(\s*["'])(?:@aws-sdk\/|@aws-cdk\/|aws-cdk-lib|constructs)/;
 const cloudAllowedPath = (path) => path.startsWith("adapters/aws/")
+  // The machine adapter uses the S3 protocol client for MinIO/Ceph-compatible
+  // stores. It remains an adapter boundary, never an application dependency.
+  || path.startsWith("adapters/machine/")
   || path.startsWith("examples/aws-serverless/")
   || path.startsWith("deployments/aws-serverless/");
 
@@ -23,7 +26,7 @@ const visit = (directory) => {
       const contents = rawContents.toLowerCase();
       for (const name of protectedNames) if (contents.includes(name)) violations.push(`${path}: contains protected hosted-product name \"${name}\"`);
       if (/\.(?:ts|tsx|js|mjs)$/i.test(path) && cloudImport.test(rawContents) && !cloudAllowedPath(path)) {
-        violations.push(`${path}: imports a cloud SDK outside an approved AWS adapter/example package`);
+        violations.push(`${path}: imports a cloud SDK outside an approved provider adapter/example package`);
       }
     }
   }
