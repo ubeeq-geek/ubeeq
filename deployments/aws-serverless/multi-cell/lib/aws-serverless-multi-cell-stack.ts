@@ -57,6 +57,7 @@ export class AwsServerlessMultiCellStack extends Stack {
     new CfnOutput(this, "RoutingDirectoryTableArn", { value: routes.tableArn });
     new CfnOutput(this, "MigrationCommandsQueueUrl", { value: commands.queueUrl });
     new CfnOutput(this, "MigrationControlWorkerArn", { value: worker.functionArn });
+    new CfnOutput(this, "MigrationControlWorkerRoleArn", { value: worker.role!.roleArn });
     new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM }).url });
   }
 }
