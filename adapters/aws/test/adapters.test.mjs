@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3ObjectStorage, SecretsManagerCredentialVault, createDynamoRoutingControlPlane } from "../dist/index.js";
+import { createHash } from "node:crypto";
+import { CognitoIdentity, DynamoRevisionedRepository, AwsJobQueue, S3DirectUploadAdapter, S3MigrationObjectTransfer, S3ObjectStorage, SecretsManagerCredentialVault, createDynamoRoutingControlPlane } from "../dist/index.js";
 import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, RoutingDirectoryConflictError } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, verifyCellScopedRepositoryContract, verifyRevisionedRepositoryContract } from "@ubeeq/persistence";
 import { verifyJobQueueContract } from "@ubeeq/jobs";
@@ -108,6 +109,29 @@ test("cell-configured S3 adapters reject objects from another regional cell", as
   await assert.rejects(() => storage.put({ object: { bucket: "objects", key: "cells/cell-b/creators/creator-b/originals/file", contentType: "image/png", byteLength: 0, scope: "private" }, body: new Uint8Array() }), /cell-a/);
   const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects", "cell-a");
   await assert.rejects(() => upload.initiate({ object: { bucket: "objects", key: "cells/cell-b/creators/creator-b/uploads/file", contentType: "image/png", byteLength: 1, checksum: "a".repeat(64), scope: "private" }, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() }), /cell-a/);
+});
+
+test("S3 migration transfer copies only declared cross-cell objects and verifies checksums", async () => {
+  const sourceObjects = new Map(), destinationObjects = new Map();
+  const source = { send: async (command) => {
+    const input = command.input; const object = sourceObjects.get(`${input.Bucket}/${input.Key}`);
+    if (command.constructor.name === "GetObjectCommand" && object) return { ContentType: object.contentType, Body: { transformToByteArray: async () => object.body } };
+    throw new Error("Source object was not found");
+  } };
+  const destination = { send: async (command) => {
+    const input = command.input; const key = `${input.Bucket}/${input.Key}`;
+    if (command.constructor.name === "PutObjectCommand") { destinationObjects.set(key, { body: input.Body, metadata: input.Metadata }); return {}; }
+    if (command.constructor.name === "HeadObjectCommand") { const object = destinationObjects.get(key); if (!object) throw new Error("Destination object was not found"); return { ContentLength: object.body.byteLength, Metadata: object.metadata }; }
+    throw new Error(`Unexpected ${command.constructor.name}`);
+  } };
+  const body = Buffer.from("migration-object"), checksum = createHash("sha256").update(body).digest("hex");
+  sourceObjects.set("source/cells/cell-a/creators/creator-1/originals/a", { body, contentType: "image/png" });
+  const checkpoint = { id: "move-1", creatorId: "creator-1", source: { homeCellId: "cell-a", homeRegion: "us-east-2", endpoint: "https://a.example/", routingRevision: 1 }, destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://b.example/" }, state: "exported", manifestChecksum: "a".repeat(64), objectCount: 1, createdAt: "2026-08-28T00:00:00.000Z", updatedAt: "2026-08-28T00:00:00.000Z" };
+  const inventory = [{ id: "asset-a", source: { bucket: "source", key: "cells/cell-a/creators/creator-1/originals/a" }, destination: { bucket: "destination", key: "cells/cell-b/creators/creator-1/originals/a" }, checksum, byteLength: body.byteLength }];
+  const transfer = new S3MigrationObjectTransfer(source, destination);
+  await transfer.transfer(checkpoint, inventory);
+  assert.deepEqual(await transfer.verify(checkpoint, inventory), { objectCount: 1, verifiedObjectCount: 1 });
+  await assert.rejects(() => transfer.transfer(checkpoint, [{ ...inventory[0], destination: { bucket: "destination", key: "cells/cell-c/creators/creator-1/originals/a" } }]), /undeclared cell/);
 });
 
 test("S3 direct upload binds a checksum and returns the immutable object version", async () => {

@@ -22,11 +22,28 @@ export interface MigrationCheckpoint {
   state: MigrationState;
   manifestChecksum?: string;
   objectCount?: number;
+  /** Explicit migration-only object inventory; never populated on normal upload paths. */
+  objectInventory?: readonly MigrationObjectInventoryEntry[];
   verifiedObjectCount?: number;
   rollbackUntil?: string;
   failureReason?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Immutable source/destination locations recorded only for an authorized migration. */
+export interface MigrationObjectInventoryEntry {
+  id: string;
+  source: { bucket: string; key: string; versionId?: string };
+  destination: { bucket: string; key: string };
+  checksum: string;
+  byteLength: number;
+}
+
+/** Provider adapter used only after a migration source hold and export checkpoint exist. */
+export interface MigrationObjectTransfer {
+  transfer(checkpoint: MigrationCheckpoint, objects: readonly MigrationObjectInventoryEntry[]): Promise<void>;
+  verify(checkpoint: MigrationCheckpoint, objects: readonly MigrationObjectInventoryEntry[]): Promise<{ objectCount: number; verifiedObjectCount: number }>;
 }
 
 /**
@@ -57,7 +74,7 @@ export class RoutingDirectoryConflictError extends Error {
 /** Provider-specific workers perform these idempotent operations; core owns only the lifecycle. */
 export interface MigrationExecutor {
   placeSourceHold(checkpoint: MigrationCheckpoint): Promise<void>;
-  exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number }>;
+  exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number; objectInventory?: readonly MigrationObjectInventoryEntry[] }>;
   transferObjects(checkpoint: MigrationCheckpoint): Promise<void>;
   importDestination(checkpoint: MigrationCheckpoint): Promise<void>;
   verifyDestination(checkpoint: MigrationCheckpoint): Promise<{ objectCount: number; verifiedObjectCount: number }>;
@@ -165,9 +182,10 @@ export const createMigrationCheckpoint = (input: Omit<MigrationCheckpoint, "stat
 };
 
 /** Advances only the documented migration lifecycle; terminal states cannot be reopened. */
-export const advanceMigration = (checkpoint: MigrationCheckpoint, state: MigrationState, input: { now: string; manifestChecksum?: string; objectCount?: number; verifiedObjectCount?: number; rollbackUntil?: string; failureReason?: string }): MigrationCheckpoint => {
+export const advanceMigration = (checkpoint: MigrationCheckpoint, state: MigrationState, input: { now: string; manifestChecksum?: string; objectCount?: number; objectInventory?: readonly MigrationObjectInventoryEntry[]; verifiedObjectCount?: number; rollbackUntil?: string; failureReason?: string }): MigrationCheckpoint => {
   if (!transition[checkpoint.state].includes(state)) throw new MigrationTransitionError(`Cannot move migration from ${checkpoint.state} to ${state}`);
   if (state === "exported" && !/^[a-f0-9]{64}$/i.test(input.manifestChecksum ?? "")) throw new MigrationTransitionError("An exported migration requires a manifest checksum");
+  if (input.objectInventory && (input.objectInventory.length !== input.objectCount || input.objectInventory.some((object) => !object.id.trim() || !object.source.bucket.trim() || !object.source.key.trim() || !object.destination.bucket.trim() || !object.destination.key.trim() || !/^[a-f0-9]{64}$/i.test(object.checksum) || !Number.isSafeInteger(object.byteLength) || object.byteLength < 0))) throw new MigrationTransitionError("Migration object inventory is invalid");
   if (state === "verified") {
     const objectCount = input.objectCount, verifiedObjectCount = input.verifiedObjectCount;
     if (objectCount === undefined || verifiedObjectCount === undefined || !Number.isSafeInteger(objectCount) || !Number.isSafeInteger(verifiedObjectCount) || objectCount < 0 || objectCount !== verifiedObjectCount) throw new MigrationTransitionError("Destination object verification must match the source inventory");
@@ -175,7 +193,7 @@ export const advanceMigration = (checkpoint: MigrationCheckpoint, state: Migrati
   if (state === "cutover" && (!input.rollbackUntil || Date.parse(input.rollbackUntil) <= Date.parse(input.now))) throw new MigrationTransitionError("Cutover requires a future rollback window");
   if (state === "rolled_back" && checkpoint.state !== "cutover") throw new MigrationTransitionError("Only a cut-over migration can roll back");
   if (state === "failed" && !input.failureReason?.trim()) throw new MigrationTransitionError("A failed migration requires an auditable reason");
-  return { ...checkpoint, state, manifestChecksum: input.manifestChecksum ?? checkpoint.manifestChecksum, objectCount: input.objectCount ?? checkpoint.objectCount, verifiedObjectCount: input.verifiedObjectCount ?? checkpoint.verifiedObjectCount, rollbackUntil: input.rollbackUntil ?? checkpoint.rollbackUntil, failureReason: input.failureReason, updatedAt: input.now };
+  return { ...checkpoint, state, manifestChecksum: input.manifestChecksum ?? checkpoint.manifestChecksum, objectCount: input.objectCount ?? checkpoint.objectCount, objectInventory: input.objectInventory ?? checkpoint.objectInventory, verifiedObjectCount: input.verifiedObjectCount ?? checkpoint.verifiedObjectCount, rollbackUntil: input.rollbackUntil ?? checkpoint.rollbackUntil, failureReason: input.failureReason, updatedAt: input.now };
 };
 
 /** Route cutover is an explicit compare-and-swap over the source routing revision. */

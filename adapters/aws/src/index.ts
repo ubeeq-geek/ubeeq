@@ -14,7 +14,7 @@ import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapt
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
-import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
+import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
 export type AwsFunctionUrlEvent = { rawPath?: string; requestContext?: { http?: { method?: string } } };
@@ -124,6 +124,38 @@ export class S3ObjectStorage implements ObjectStorage {
   async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { this.requireLocalKey(input.object.key); await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } })); }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { this.requireLocalKey(input.key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.requireLocalKey(input.key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
+}
+
+/**
+ * Explicit cross-cell transfer path for an authorized migration worker. It
+ * streams source bytes, verifies the exported SHA-256 inventory, writes only
+ * the declared destination key, and verifies the durable destination object.
+ * Normal Ubeeq uploads never instantiate or call this adapter.
+ */
+export class S3MigrationObjectTransfer implements MigrationObjectTransfer {
+  constructor(private readonly source: Pick<S3Client, "send">, private readonly destination: Pick<S3Client, "send">) {}
+  private validate(checkpoint: MigrationCheckpoint, object: MigrationObjectInventoryEntry): void {
+    if (!object.source.key.startsWith(`cells/${checkpoint.source.homeCellId}/`) || !object.destination.key.startsWith(`cells/${checkpoint.destination.cellId}/`)) throw new Error("Migration object inventory crosses an undeclared cell boundary.");
+  }
+  async transfer(checkpoint: MigrationCheckpoint, objects: readonly MigrationObjectInventoryEntry[]): Promise<void> {
+    for (const object of objects) {
+      this.validate(checkpoint, object);
+      const source = await this.source.send(new GetObjectCommand({ Bucket: object.source.bucket, Key: object.source.key, VersionId: object.source.versionId }));
+      const body = new Uint8Array(await source.Body!.transformToByteArray());
+      const checksum = createHash("sha256").update(body).digest("hex");
+      if (body.byteLength !== object.byteLength || checksum !== object.checksum) throw new Error(`Migration source object ${object.id} does not match its exported inventory.`);
+      await this.destination.send(new PutObjectCommand({ Bucket: object.destination.bucket, Key: object.destination.key, Body: body, ContentType: source.ContentType, Metadata: { checksum: object.checksum, byteLength: String(object.byteLength), migrationId: checkpoint.id } }));
+    }
+  }
+  async verify(checkpoint: MigrationCheckpoint, objects: readonly MigrationObjectInventoryEntry[]): Promise<{ objectCount: number; verifiedObjectCount: number }> {
+    let verifiedObjectCount = 0;
+    for (const object of objects) {
+      this.validate(checkpoint, object);
+      const destination = await this.destination.send(new HeadObjectCommand({ Bucket: object.destination.bucket, Key: object.destination.key }));
+      if (destination.ContentLength === object.byteLength && destination.Metadata?.checksum === object.checksum) verifiedObjectCount += 1;
+    }
+    return { objectCount: objects.length, verifiedObjectCount };
+  }
 }
 
 const checksumBase64 = (checksum: string): string => /^[a-f0-9]{64}$/i.test(checksum) ? Buffer.from(checksum, "hex").toString("base64") : checksum;
