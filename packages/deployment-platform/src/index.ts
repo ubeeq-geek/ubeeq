@@ -47,6 +47,51 @@ export interface MigrationObjectTransfer {
 }
 
 /**
+ * Non-secret registration held by an operator control plane. It identifies the
+ * explicitly approved migration endpoint and object store for a cell; it never
+ * contains credentials, creator data, or a route used by the public edge.
+ */
+export interface MigrationCellRegistration {
+  cellId: string;
+  region: string;
+  endpoint: string;
+  /** Private invocable endpoint identifier (for AWS, a Lambda function ARN). */
+  migrationEndpoint: string;
+  objectBucket: string;
+  state: "active" | "draining" | "disabled";
+  registeredAt: string;
+  updatedAt: string;
+}
+
+/** Separate from the public routing directory, and writable only by operators. */
+export interface MigrationCellRegistry {
+  get(cellId: string): Promise<MigrationCellRegistration | undefined>;
+  register(cell: MigrationCellRegistration): Promise<MigrationCellRegistration>;
+  list(input: { limit: number; cursor?: string }): Promise<{ items: readonly MigrationCellRegistration[]; nextCursor?: string }>;
+}
+
+export type MigrationCellOperation = "source_hold" | "export" | "import" | "enable" | "rollback" | "retire";
+export interface MigrationCellCommand {
+  operation: MigrationCellOperation;
+  checkpoint: MigrationCheckpoint;
+  /** The destination bucket is supplied only for a migration export. */
+  destinationBucket?: string;
+}
+export interface MigrationCellCommandResult {
+  manifestChecksum?: string;
+  objectInventory?: readonly MigrationObjectInventoryEntry[];
+}
+
+/**
+ * Authenticated private control channel from the operator worker to a cell.
+ * The transport (for example, cross-account Lambda invocation) is an adapter;
+ * normal creator HTTP traffic never exposes these commands.
+ */
+export interface MigrationCellEndpoint {
+  execute(command: MigrationCellCommand): Promise<MigrationCellCommandResult>;
+}
+
+/**
  * Optional managed-edge control plane.  Implementations retain routing and
  * migration metadata only; creator records, source objects, credentials, and
  * moderation data always remain in their regional home cell.
@@ -81,6 +126,35 @@ export interface MigrationExecutor {
   enableDestination(checkpoint: MigrationCheckpoint): Promise<void>;
   rollbackDestination(checkpoint: MigrationCheckpoint): Promise<void>;
   retireSource(checkpoint: MigrationCheckpoint): Promise<void>;
+}
+
+/**
+ * Composes a real migration executor from two private cell endpoints and an
+ * explicit transfer adapter. The coordinator remains responsible for durable
+ * checkpoint/routing transitions, while endpoints own their regional data.
+ */
+export class RemoteMigrationExecutor implements MigrationExecutor {
+  constructor(private readonly source: MigrationCellEndpoint, private readonly destination: MigrationCellEndpoint, private readonly transfer: MigrationObjectTransfer, private readonly destinationBucket: string) {}
+  async placeSourceHold(checkpoint: MigrationCheckpoint): Promise<void> { await this.source.execute({ operation: "source_hold", checkpoint }); }
+  async exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number; objectInventory?: readonly MigrationObjectInventoryEntry[] }> {
+    const result = await this.source.execute({ operation: "export", checkpoint, destinationBucket: this.destinationBucket });
+    if (!result.manifestChecksum || !result.objectInventory) throw new Error("Migration source did not return a manifest checksum and object inventory.");
+    return { manifestChecksum: result.manifestChecksum, objectCount: result.objectInventory.length, objectInventory: result.objectInventory };
+  }
+  async transferObjects(checkpoint: MigrationCheckpoint): Promise<void> {
+    if (!checkpoint.objectInventory) throw new Error("Migration object inventory is missing after export.");
+    await this.transfer.transfer(checkpoint, checkpoint.objectInventory);
+  }
+  async importDestination(checkpoint: MigrationCheckpoint): Promise<void> { await this.destination.execute({ operation: "import", checkpoint }); }
+  async verifyDestination(checkpoint: MigrationCheckpoint): Promise<{ objectCount: number; verifiedObjectCount: number }> {
+    if (!checkpoint.objectInventory) throw new Error("Migration object inventory is missing before verification.");
+    const verified = await this.transfer.verify(checkpoint, checkpoint.objectInventory);
+    if (verified.objectCount !== checkpoint.objectInventory.length || verified.verifiedObjectCount !== checkpoint.objectInventory.length) throw new Error("Migration destination object verification did not match the source inventory.");
+    return verified;
+  }
+  async enableDestination(checkpoint: MigrationCheckpoint): Promise<void> { await this.destination.execute({ operation: "enable", checkpoint }); }
+  async rollbackDestination(checkpoint: MigrationCheckpoint): Promise<void> { await this.destination.execute({ operation: "rollback", checkpoint }); }
+  async retireSource(checkpoint: MigrationCheckpoint): Promise<void> { await this.source.execute({ operation: "retire", checkpoint }); }
 }
 
 /**
@@ -167,6 +241,12 @@ const transition: Readonly<Record<MigrationState, readonly MigrationState[]>> = 
 export const validateCellRoute = (route: CellRoute): CellRoute => {
   if (!route.creatorId.trim() || !route.homeCellId.trim() || !route.homeRegion.trim() || !validEndpoint(route.endpoint) || !Number.isSafeInteger(route.routingRevision) || route.routingRevision < 1 || Number.isNaN(Date.parse(route.updatedAt))) throw new Error("Cell route is invalid");
   return route;
+};
+
+/** Validates the operator-only registry record without treating it as edge data. */
+export const validateMigrationCellRegistration = (cell: MigrationCellRegistration): MigrationCellRegistration => {
+  if (!cell.cellId.trim() || !cell.region.trim() || !validEndpoint(cell.endpoint) || !cell.migrationEndpoint.trim() || !cell.objectBucket.trim() || !["active", "draining", "disabled"].includes(cell.state) || Number.isNaN(Date.parse(cell.registeredAt)) || Number.isNaN(Date.parse(cell.updatedAt))) throw new Error("Migration cell registration is invalid");
+  return cell;
 };
 
 export const validateMigrationCheckpoint = (checkpoint: MigrationCheckpoint): MigrationCheckpoint => {

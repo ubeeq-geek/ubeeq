@@ -76,6 +76,10 @@ test("DynamoDB routing control-plane is separate and guards cutover/checkpoint c
   await control.routingDirectory.compareAndSwap({ route: destination, expectedRoutingRevision: 1 });
   await assert.rejects(() => control.routingDirectory.compareAndSwap({ route: { ...destination, routingRevision: 3, updatedAt: "2026-08-27T00:06:00.000Z" }, expectedRoutingRevision: 1 }), RoutingDirectoryConflictError);
   assert.equal((await control.routingDirectory.get(source.creatorId))?.endpoint, "https://cell-b.example/");
+  const cell = { cellId: "cell-a", region: "us-east-2", endpoint: "https://cell-a.example/", migrationEndpoint: "arn:aws:lambda:us-east-2:123456789012:function:cell-a-migration", objectBucket: "cell-a-objects", state: "active", registeredAt: timestamp, updatedAt: timestamp };
+  await control.migrationCells.register(cell);
+  assert.equal((await control.migrationCells.get("cell-a"))?.objectBucket, "cell-a-objects");
+  await assert.rejects(() => control.migrationCells.register(cell), RoutingDirectoryConflictError);
 });
 
 test("SQS-notified DynamoDB queue obeys the shared durable job contract", async () => {

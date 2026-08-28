@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, rollbackCellRoute, validateDeploymentArtifactManifest, validateRegionalDeploymentPlan, MigrationOrchestrator } from "../dist/index.js";
+import { advanceMigration, createMigrationCheckpoint, cutoverCellRoute, rollbackCellRoute, validateDeploymentArtifactManifest, validateRegionalDeploymentPlan, MigrationOrchestrator, RemoteMigrationExecutor } from "../dist/index.js";
 
 test("validates neutral artifact provenance and regional rollout contracts", () => {
   assert.equal(validateDeploymentArtifactManifest({ schemaVersion: 1, product: "example", revision: "a".repeat(40), artifacts: { api: { path: "api", fileCount: 1, sha256: "b".repeat(64) } } }, { product: "example", revision: "a".repeat(40), artifacts: ["api"] }).product, "example");
@@ -51,4 +51,23 @@ test("orchestrator resumes after an atomic route cutover before checkpoint persi
   const executor = { placeSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: "a".repeat(64), objectCount: 0 }), transferObjects: async () => {}, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 0, verifiedObjectCount: 0 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
   const resumed = await new MigrationOrchestrator(routes, store, executor, now).resume("move-resume");
   assert.equal(resumed.state, "cutover"); assert.equal(route.routingRevision, 2);
+});
+
+test("remote migration executor calls only private cell commands and verifies the declared inventory", async () => {
+  const now = "2026-08-28T00:00:00.000Z";
+  const checkpoint = { ...createMigrationCheckpoint({ id: "remote-move", creatorId: "creator-1", source: { creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "us-east-2", endpoint: "https://a.example/", routingRevision: 1, state: "active", updatedAt: now }, destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://b.example/" }, now }), state: "source_hold" };
+  const inventory = [{ id: "asset-1", source: { bucket: "source", key: "cells/cell-a/creators/creator-1/originals/a" }, destination: { bucket: "destination", key: "cells/cell-b/creators/creator-1/originals/a" }, checksum: "a".repeat(64), byteLength: 1 }];
+  const calls = [];
+  const source = { execute: async (command) => { calls.push(`source:${command.operation}`); return command.operation === "export" ? { manifestChecksum: "b".repeat(64), objectInventory: inventory } : {}; } };
+  const destination = { execute: async (command) => { calls.push(`destination:${command.operation}`); return {}; } };
+  const transfer = { transfer: async (_checkpoint, objects) => { calls.push(`transfer:${objects.length}`); }, verify: async (_checkpoint, objects) => { calls.push(`verify:${objects.length}`); return { objectCount: objects.length, verifiedObjectCount: objects.length }; } };
+  const executor = new RemoteMigrationExecutor(source, destination, transfer, "destination");
+  await executor.placeSourceHold(checkpoint);
+  const exported = await executor.exportSource(checkpoint);
+  const exportedCheckpoint = { ...checkpoint, state: "exported", manifestChecksum: exported.manifestChecksum, objectCount: exported.objectCount, objectInventory: exported.objectInventory };
+  await executor.transferObjects(exportedCheckpoint);
+  await executor.importDestination(exportedCheckpoint);
+  assert.deepEqual(await executor.verifyDestination(exportedCheckpoint), { objectCount: 1, verifiedObjectCount: 1 });
+  await executor.enableDestination(exportedCheckpoint); await executor.rollbackDestination(exportedCheckpoint); await executor.retireSource(exportedCheckpoint);
+  assert.deepEqual(calls, ["source:source_hold", "source:export", "transfer:1", "destination:import", "verify:1", "destination:enable", "destination:rollback", "source:retire"]);
 });

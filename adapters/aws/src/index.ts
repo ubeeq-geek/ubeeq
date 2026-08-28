@@ -14,7 +14,7 @@ import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapt
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
-import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
+import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCellRegistration, validateMigrationCheckpoint, type CellRoute, type MigrationCellRegistration, type MigrationCellRegistry, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
 export type AwsFunctionUrlEvent = { rawPath?: string; requestContext?: { http?: { method?: string } } };
@@ -110,8 +110,35 @@ export class DynamoMigrationCheckpoints implements MigrationCheckpointStore {
   }
 }
 
+/**
+ * Private operator registry for explicitly admitted cell migration endpoints.
+ * It lives beside (but is distinct from) route/checkpoint metadata and does
+ * not add resource locations to the viewer-facing routing directory.
+ */
+export class DynamoMigrationCellRegistry implements MigrationCellRegistry {
+  private readonly control: DynamoControlPlane;
+  constructor(dynamo: Dynamo, tableName: string) { this.control = new DynamoControlPlane(dynamo, tableName); }
+  async get(cellId: string): Promise<MigrationCellRegistration | undefined> {
+    const response = await this.control.dynamo.send(new GetCommand({ TableName: this.control.tableName, Key: { pk: "cell", sk: cellId } }));
+    return response.Item?.cell ? validateMigrationCellRegistration(response.Item.cell as MigrationCellRegistration) : undefined;
+  }
+  async register(cell: MigrationCellRegistration): Promise<MigrationCellRegistration> {
+    validateMigrationCellRegistration(cell);
+    const current = await this.get(cell.cellId);
+    if (current && cell.updatedAt <= current.updatedAt) throw new RoutingDirectoryConflictError(`Migration cell registration ${cell.cellId} has changed.`);
+    try {
+      await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "cell", sk: cell.cellId, cell, updatedAt: cell.updatedAt }, ...(current ? { ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": current.updatedAt } } : { ConditionExpression: "attribute_not_exists(pk)" }) }));
+      return cell;
+    } catch (error) { throw this.control.conflict(error, `Migration cell registration ${cell.cellId} has changed.`); }
+  }
+  async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly MigrationCellRegistration[]; nextCursor?: string }> {
+    const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "cell" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
+    return { items: (response.Items ?? []).map((item) => validateMigrationCellRegistration(item.cell as MigrationCellRegistration)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+  }
+}
+
 export const createDynamoRoutingControlPlane = (dynamo: Dynamo, tableName: string) => {
-  return { routingDirectory: new DynamoRoutingDirectory(dynamo, tableName), migrationCheckpoints: new DynamoMigrationCheckpoints(dynamo, tableName) };
+  return { routingDirectory: new DynamoRoutingDirectory(dynamo, tableName), migrationCheckpoints: new DynamoMigrationCheckpoints(dynamo, tableName), migrationCells: new DynamoMigrationCellRegistry(dynamo, tableName) };
 };
 
 /** Creates only managed-edge ports; it never shares a cell's DynamoDB client/table. */
