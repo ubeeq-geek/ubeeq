@@ -12,6 +12,6 @@
 
 ## Local implementation decision
 
-The reference local adapter will use SQLite with checked-in, ordered migrations and transactional writes. SQLite belongs in `@ubeeq/adapters-local`, not in this port package. The adapter must publish its schema/migration compatibility policy and run this package's conformance fixture.
+The reference local adapter will use SQLite with checked-in, ordered migrations and transactional writes. SQLite belongs in `@ubeeq/adapter-local`, not in this port package. The adapter must publish its schema/migration compatibility policy and run this package's conformance fixture.
 
-The optional DynamoDB implementation belongs in `@ubeeq/adapters-aws` and must satisfy the same contracts.
+The optional DynamoDB implementation belongs in `@ubeeq/adapter-aws` and must satisfy the same contracts.

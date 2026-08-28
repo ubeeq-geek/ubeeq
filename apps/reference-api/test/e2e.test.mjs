@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createReferenceApi } from "../dist/server.js";
-import { createLocalAdapterSet } from "@ubeeq/adapters-local";
+import { createLocalAdapterSet } from "@ubeeq/adapter-local";
 import { signFederationEnvelope } from "@ubeeq/federation";
 import { MigrationOrchestrator } from "@ubeeq/deployment-platform";
 

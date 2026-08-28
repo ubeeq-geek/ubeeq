@@ -7,7 +7,7 @@ import { Construct } from "constructs";
  * This table holds route/checkpoint metadata only and is deliberately not a
  * regional cell records table or a DynamoDB global table.
  */
-export class RegionalControlPlaneStack extends Stack {
+export class AwsServerlessMultiCellStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
     const routes = new dynamodb.Table(this, "RoutingDirectory", {

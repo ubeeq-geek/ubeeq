@@ -11,7 +11,7 @@ It is organized into parallel work streams with clear ownership boundaries. The 
 
 ## Current baseline
 
-Ubeeq already has neutral packages for core, authentication, storage, processing, moderation, integrations, federation, API composition, UI, deployment contracts, and self-hosting. It also has a minimal reference web application and an AWS-oriented self-host infrastructure package.
+Ubeeq already has neutral packages for core, authentication, storage, processing, moderation, integrations, federation, API composition, UI, deployment contracts, and compact machine deployment configuration. It also has a minimal reference web application and an AWS serverless single-cell deployment package.
 
 The principal gap is that the reference application is still an extension/health demonstration rather than a durable, end-to-end instance. Model contracts are present in several areas, but durable ports, local adapters, and application-service composition need to be established.
 
@@ -68,7 +68,7 @@ This is the highest-value implementation stream and should be prioritized immedi
   - Consistent error envelope and request IDs.
   - Health, readiness, and dependency diagnostics.
   - Thin transport handlers over application services.
-- Create `@ubeeq/adapters-local`.
+- Create `@ubeeq/adapter-local`.
   - SQLite repositories and migrations.
   - Filesystem object storage and development delivery URLs.
   - Local password-capable identity provider with local-only safeguards.
@@ -152,7 +152,7 @@ This stream consumes the stable Stream 1 API. It must not create backend behavio
 - Replace the placeholder admin reference with operations/reviewer screens.
   - Holds, reviews, job recovery, and diagnostics.
 - Keep `@ubeeq/ui` limited to accessible, unbranded primitives and tokens.
-- Create `examples/compose-self-host`.
+- Create `examples/machine/compact`.
   - API, local worker, SQLite volume, and filesystem object-store volume.
   - Environment/configuration reference, backup/restore guidance, and local identity setup.
 - Document product-neutral screenshots and operating guidance.
@@ -167,8 +167,8 @@ Start source assessment early, but defer implementation until the local contract
 
 ### Deliverables
 
-- Keep the optional CDK composition in `@ubeeq/aws-self-host-infra`, with deployment guidance under `examples/aws-self-host`.
-- Create `@ubeeq/adapters-aws`.
+- Keep the optional CDK composition in `@ubeeq/deployment-aws-serverless-single-cell`, with deployment guidance under `examples/aws-serverless/single-cell`.
+- Create `@ubeeq/adapter-aws`.
   - DynamoDB repositories.
   - S3 storage and optional CloudFront delivery.
   - SQS/EventBridge durable jobs.

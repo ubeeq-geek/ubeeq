@@ -1,4 +1,4 @@
-# Ubeeq Compose self-hosting example
+# Compact machine deployment example
 
 This cloud-free example runs the neutral reference API, creator workspace, and operations workspace with SQLite and filesystem object storage in a named Docker volume. It requires neither AWS credentials nor hosted-product modules.
 

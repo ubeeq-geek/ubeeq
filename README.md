@@ -17,9 +17,10 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 - `@ubeeq/storage` — object storage and delivery adapter interfaces.
 - `@ubeeq/jobs` — durable queue, scheduling, leasing, retry, and recovery ports.
 - `@ubeeq/persistence` — durable repository, transaction, revision, pagination, and adapter conformance contracts.
-- `@ubeeq/adapters-local` — SQLite, filesystem storage/delivery, local password sessions, and durable local jobs.
+- `@ubeeq/adapter-local` — SQLite, filesystem storage/delivery, local password sessions, and durable local jobs.
+- `@ubeeq/adapter-aws` — optional AWS provider implementations for DynamoDB, S3, SQS, Cognito, and related ports.
 - `@ubeeq/federation` — remote actor and publication-reference contracts.
-- `@ubeeq/self-host` — neutral self-host instance configuration validation and reference configuration.
+- `@ubeeq/deployment-machine-compact` — neutral configuration for a compact, single-cell machine deployment.
 - `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
 - `@ubeeq/api` — startup validation for extension compatibility.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
@@ -35,11 +36,19 @@ The SDK also defines platform-neutral integration capabilities, such as metadata
 
 Public Ubeeq code may provide reusable mechanisms such as storage, processing, audit, authorization hooks, federation protocols, and integration lifecycle contracts. Product policy, branding, commercial plans, discovery decisions, operational procedures, and credentials belong in private product repositories.
 
-## Self-hosting reference configuration
+## Deployment profiles
 
-[`packages/self-host/reference-config.json`](packages/self-host/reference-config.json) is a product-neutral starting point. Replace its example origin and local storage path, provide any desired extension manifests, and validate the resulting configuration with `@ubeeq/self-host`. It contains neither hosted product settings nor credentials.
+Ubeeq separates reusable provider adapters from runnable deployment models:
 
-For a cloud-free runnable deployment, see [`examples/compose-self-host`](examples/compose-self-host). It starts the reference API, creator workspace, and operations workspace with local SQLite/filesystem adapters.
+- **Local reference** — [`deployments/local`](deployments/local) composes the
+  reference API with `adapters/local`: SQLite, filesystem storage, local jobs,
+  and no cloud account.
+- **Compact machine cell** — [`deployments/machine/compact`](deployments/machine/compact): a low-operations, cloud-free, single authoritative cell. [`examples/machine/compact`](examples/machine/compact) runs the reference API, creator workspace, and operations workspace with Compose.
+- **AWS serverless single-cell** — [`deployments/aws-serverless/single-cell`](deployments/aws-serverless/single-cell): Lambda/API Gateway, DynamoDB, S3, SQS, Cognito, and optional CloudFront for one scalable regional cell.
+- **AWS serverless multi-cell** — [`deployments/aws-serverless/multi-cell`](deployments/aws-serverless/multi-cell): optional routing/migration control-plane infrastructure that composes independent single cells; it does not create a global mutable data plane.
+- **Future profiles** — `deployments/machine/scalable-*` and `deployments/kubernetes/scalable-*` reserve provider-neutral scalable machine and Kubernetes paths.
+
+[`deployments/machine/compact/reference-config.json`](deployments/machine/compact/reference-config.json) is the product-neutral starting point for compact machine configuration. It contains neither hosted product settings nor credentials.
 
 ## Portable reference-instance plan
 

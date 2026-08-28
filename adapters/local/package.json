@@ -1,5 +1,5 @@
 {
-  "name": "@ubeeq/adapters-local",
+  "name": "@ubeeq/adapter-local",
   "version": "0.1.0",
   "private": false,
   "publishConfig": { "access": "public" },

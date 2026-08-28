@@ -1,12 +1,11 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const packageDirectory = new URL("../packages", import.meta.url).pathname;
+const adapterDirectory = new URL("../adapters", import.meta.url).pathname;
 const violations = [];
 
-for (const entry of readdirSync(packageDirectory)) {
-  if (!entry.startsWith("adapters-")) continue;
-  const manifestPath = join(packageDirectory, entry, "package.json");
+for (const entry of readdirSync(adapterDirectory)) {
+  const manifestPath = join(adapterDirectory, entry, "package.json");
   if (!existsSync(manifestPath)) {
     violations.push(`${entry}: adapter package must include package.json`);
     continue;

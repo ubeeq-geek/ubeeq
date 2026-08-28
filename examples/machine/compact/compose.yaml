@@ -2,7 +2,7 @@ services:
   reference-api:
     build:
       context: ../..
-      dockerfile: examples/compose-self-host/Dockerfile
+      dockerfile: examples/machine/compact/Dockerfile
     command: node apps/reference-api/dist/server.js
     environment:
       PORT: "4100"
@@ -21,7 +21,7 @@ services:
   reference-web:
     build:
       context: ../..
-      dockerfile: examples/compose-self-host/Dockerfile
+      dockerfile: examples/machine/compact/Dockerfile
     command: node apps/web-reference/src/server.mjs
     environment:
       PORT: "4173"
@@ -34,7 +34,7 @@ services:
   reference-admin:
     build:
       context: ../..
-      dockerfile: examples/compose-self-host/Dockerfile
+      dockerfile: examples/machine/compact/Dockerfile
     command: node apps/admin-reference/src/server.mjs
     environment:
       PORT: "4174"

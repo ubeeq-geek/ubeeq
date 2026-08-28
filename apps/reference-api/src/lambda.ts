@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import { createAwsAdapterSet, createAwsRoutingControlPlane } from "@ubeeq/adapters-aws";
+import { createAwsAdapterSet, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
 import { createReferenceApi, type ReferenceAdapterSet } from "./server.js";
 
 type FunctionUrlEvent = {

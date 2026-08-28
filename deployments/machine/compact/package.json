@@ -1,5 +1,5 @@
 {
-  "name": "@ubeeq/self-host",
+  "name": "@ubeeq/deployment-machine-compact",
   "version": "0.1.0",
   "private": false,
   "publishConfig": { "access": "public" },

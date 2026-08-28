@@ -1,5 +1,6 @@
 node_modules/
 dist/
 .DS_Store
-packages/self-host-infra/cdk.out/
+deployments/aws-serverless/single-cell/cdk.out/
+deployments/aws-serverless/multi-cell/cdk.out/
 apps/reference-api/lambda-package/

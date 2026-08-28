@@ -8,11 +8,11 @@
     "package:lambda": "npm run build && node ../../scripts/package-reference-api-lambda.mjs",
     "start": "node dist/server.js",
     "test": "npm run build && node --test test/*.test.mjs",
-    "test:aws": "npm run build && node ../../examples/aws-self-host/test-reference-api.mjs"
+    "test:aws": "npm run build && node ../../examples/aws-serverless/single-cell/test-reference-api.mjs"
   },
   "dependencies": {
-    "@ubeeq/adapters-aws": "^0.1.0",
-    "@ubeeq/adapters-local": "^0.1.0",
+    "@ubeeq/adapter-aws": "^0.1.0",
+    "@ubeeq/adapter-local": "^0.1.0",
     "@ubeeq/auth": "^0.1.0",
     "@ubeeq/api": "^0.1.0",
     "@ubeeq/deployment-platform": "^0.1.0",

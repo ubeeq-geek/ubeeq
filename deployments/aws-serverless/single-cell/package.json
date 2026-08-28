@@ -1,0 +1,20 @@
+{
+  "name": "@ubeeq/deployment-aws-serverless-single-cell",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "synth": "cdk synth",
+    "deploy": "npm run package:lambda --workspace @ubeeq/reference-api && cdk deploy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.131.0",
+    "constructs": "^10.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "aws-cdk": "^2.1135.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/adapters-local";
+import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/adapter-local";
 import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";

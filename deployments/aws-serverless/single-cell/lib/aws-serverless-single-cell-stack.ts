@@ -17,8 +17,8 @@ import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
 
-/** Neutral, self-hostable foundation; product domains, policy, and credentials are intentionally absent. */
-export class SelfHostReferenceStack extends Stack {
+/** One scalable AWS serverless cell; product domains, policy, and credentials are intentionally absent. */
+export class AwsServerlessSingleCellStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
     // One stack is one authoritative regional cell. This value is deliberately
@@ -38,7 +38,7 @@ export class SelfHostReferenceStack extends Stack {
     const userPool = new cognito.UserPool(this, "Users", { selfSignUpEnabled: false, signInAliases: { email: true }, removalPolicy: RemovalPolicy.RETAIN, passwordPolicy: { minLength: 12, requireDigits: true, requireLowercase: true, requireUppercase: true, requireSymbols: false } });
     const userPoolClient = userPool.addClient("ReferenceApi", { authFlows: { userPassword: true, userSrp: true } });
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
-    const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../apps/reference-api/lambda-package");
+    const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../../apps/reference-api/lambda-package");
     const referenceApiPublicBaseUrl = this.node.tryGetContext("referenceApiPublicBaseUrl") || process.env.UBEEQ_REFERENCE_API_PUBLIC_BASE_URL || "https://reference.invalid";
     const routingDirectoryTableName = this.node.tryGetContext("routingDirectoryTableName") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME;
     const routingDirectoryTableArn = this.node.tryGetContext("routingDirectoryTableArn") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_ARN;

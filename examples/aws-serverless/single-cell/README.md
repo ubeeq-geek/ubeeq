@@ -1,16 +1,16 @@
-# Optional AWS self-host example
+# AWS serverless single-cell example
 
-The CDK composition in [`packages/aws-self-host-infra`](../../packages/aws-self-host-infra) is the optional AWS implementation of Ubeeq ports. It provisions encrypted/versioned S3 stores, DynamoDB with point-in-time recovery, SQS with a dead-letter queue, EventBridge recovery scheduling, Cognito, Secrets Manager, and a dead-letter alarm.
+The CDK composition in [`deployments/aws-serverless/single-cell`](../../../deployments/aws-serverless/single-cell) is the optional AWS serverless implementation of Ubeeq ports. It provisions encrypted/versioned S3 stores, DynamoDB with point-in-time recovery, SQS with a dead-letter queue, EventBridge recovery scheduling, Cognito, Secrets Manager, and a dead-letter alarm.
 
 It does not make AWS a Ubeeq requirement. Local and Compose reference deployments remain the default portable path. The deployment packages `apps/reference-api` with its Ubeeq and AWS runtime dependencies, then composes the same `/v1` API against DynamoDB, S3, SQS, Cognito, and Secrets Manager ports.
 
-To synthesize, run `npm run synth:aws-self-host-infra` from the repository root. Each deployment is one regional cell, so choose a stable cell identifier before deploying. To deploy, set `UBEEQ_REFERENCE_API_PUBLIC_BASE_URL` to the HTTPS URL users will reach (normally a custom domain) and run:
+To synthesize, run `npm run synth:aws-serverless-single-cell` from the repository root. Each deployment is one regional cell, so choose a stable cell identifier before deploying. To deploy, set `UBEEQ_REFERENCE_API_PUBLIC_BASE_URL` to the HTTPS URL users will reach (normally a custom domain) and run:
 
 ```sh
 UBEEQ_CELL_ID=community-us-east-2 \
 UBEEQ_CELL_REGION=us-east-2 \
 UBEEQ_REFERENCE_API_PUBLIC_BASE_URL=https://ubeeq.example \
-npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
+npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell -- --require-approval never
 ```
 
 To map the API Gateway edge to a delegated Route 53 zone, also provide a regional ACM certificate, zone name, and hosted-zone ID. The API hostname may be the zone apex or a subdomain such as `api.dev-demo.example`:
@@ -22,7 +22,7 @@ UBEEQ_REFERENCE_WEB_DOMAIN_NAME=dev-demo.example \
 UBEEQ_PUBLIC_HOSTED_ZONE_NAME=dev-demo.example \
 UBEEQ_PUBLIC_HOSTED_ZONE_ID=<delegated-public-zone-id> \
 UBEEQ_REFERENCE_API_CERTIFICATE_ARN=<regional-acm-certificate-arn> \
-npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
+npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell -- --require-approval never
 ```
 
 The stack creates separate regional API Gateway domains: the reference web at the hosted-zone apex and the API at the configured API hostname. It creates each `$default` mapping and its Route 53 alias record. A regional API Gateway certificate must be issued in the API’s region and cover both names.
@@ -44,7 +44,7 @@ UBEEQ_AWS_USER_POOL_ID=<UserPoolId> \
 UBEEQ_AWS_USER_POOL_CLIENT_ID=<UserPoolClientId> \
 UBEEQ_AWS_TEST_USERNAME=<disposable-user> \
 UBEEQ_AWS_TEST_PASSWORD=<disposable-password> \
-npm run test:live --workspace @ubeeq/adapters-aws
+npm run test:live --workspace @ubeeq/adapter-aws
 ```
 
 This gate creates and removes isolated contract records and objects, enqueues a contract job, and revokes the disposable user's session.

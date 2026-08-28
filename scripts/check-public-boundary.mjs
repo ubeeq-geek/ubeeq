@@ -7,9 +7,9 @@ const self = "scripts/check-public-boundary.mjs";
 const protectedNames = ["eversally", "nightframe"];
 const violations = [];
 const cloudImport = /(?:from\s*["']|require\s*\(\s*["'])(?:@aws-sdk\/|@aws-cdk\/|aws-cdk-lib|constructs)/;
-const cloudAllowedPath = (path) => path.startsWith("packages/adapters-aws/")
-  || path.startsWith("examples/aws-self-host/")
-  || path.startsWith("packages/aws-self-host-infra/");
+const cloudAllowedPath = (path) => path.startsWith("adapters/aws/")
+  || path.startsWith("examples/aws-serverless/")
+  || path.startsWith("deployments/aws-serverless/");
 
 const visit = (directory) => {
   for (const entry of readdirSync(directory)) {

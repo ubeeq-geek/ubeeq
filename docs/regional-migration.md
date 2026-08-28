@@ -14,7 +14,7 @@ An operator implementing `CellRoute` storage must use an atomic conditional writ
 
 ## Reference control-plane adapter
 
-`@ubeeq/adapters-local` supplies `LocalRoutingDirectory` and
+`@ubeeq/adapter-local` supplies `LocalRoutingDirectory` and
 `LocalMigrationCheckpoints`. They use SQLite tables separate from the regular
 creator repositories and implement creation plus optimistic compare-and-swap
 updates. The adapter is useful for local operator workflow development and
@@ -29,7 +29,7 @@ than placing routing records in any regional creator-data table.
 
 ## AWS managed control plane
 
-`@ubeeq/adapters-aws` provides `createAwsRoutingControlPlane`. It uses a
+`@ubeeq/adapter-aws` provides `createAwsRoutingControlPlane`. It uses a
 dedicated DynamoDB table with `route` and `migration` partitions and conditional
 writes for route revisions and checkpoint update times. It does not use DynamoDB
 Global Tables and does not access regional `Records` tables.
@@ -38,7 +38,7 @@ The optional `RegionalControlPlaneStack` creates that table in one declared
 operator control region:
 
 ```sh
-(cd packages/aws-self-host-infra && \
+(cd deployments/aws-serverless/multi-cell && \
   UBEEQ_CONTROL_PLANE_STACK_NAME=UbeeqRoutingControl \
   UBEEQ_CONTROL_PLANE_REGION=us-east-2 \
   npx cdk deploy UbeeqRoutingControl)

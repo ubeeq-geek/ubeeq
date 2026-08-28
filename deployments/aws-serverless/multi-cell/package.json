@@ -1,11 +1,11 @@
 {
-  "name": "@ubeeq/aws-self-host-infra",
+  "name": "@ubeeq/deployment-aws-serverless-multi-cell",
   "private": true,
   "version": "0.1.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "synth": "cdk synth",
-    "deploy": "npm run package:lambda --workspace @ubeeq/reference-api && cdk deploy"
+    "deploy": "cdk deploy"
   },
   "dependencies": {
     "aws-cdk-lib": "^2.131.0",

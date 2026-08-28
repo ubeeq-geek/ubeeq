@@ -1,4 +1,4 @@
-# AWS self-host backup and restore
+# AWS serverless single-cell backup and restore
 
 This is an operator runbook for the optional AWS composition. It covers instance data only; never put credentials or connector secrets in creator exports.
 

@@ -33,7 +33,7 @@ export interface InstanceConfiguration {
   extensions: readonly ExtensionManifest[];
   requiredExtensions: Readonly<Record<string, readonly ExtensionContract[]>>;
   localAdapter?: {
-    /** SQLite is the selected embedded reference implementation; this path is owned by adapters-local. */
+    /** SQLite is the selected embedded reference implementation; this path is owned by adapter-local. */
     sqliteDatabasePath: string;
     storageDirectory: string;
   };

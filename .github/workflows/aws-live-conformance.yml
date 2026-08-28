@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       role-to-assume:
-        description: IAM role ARN authorized only for an isolated Ubeeq self-host stack
+        description: IAM role ARN authorized only for an isolated Ubeeq AWS serverless single-cell stack
         required: true
         type: string
       region:
@@ -15,7 +15,7 @@ on:
       stack-name:
         description: Isolated CloudFormation stack name
         required: true
-        default: UbeeqSelfHostLive
+        default: UbeeqAwsServerlessSingleCellLive
         type: string
 
 permissions:
@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   conformance:
-    environment: aws-self-host-live
+    environment: aws-serverless-single-cell-live
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ inputs.region }}
@@ -43,8 +43,8 @@ jobs:
           aws-region: ${{ inputs.region }}
       - run: npm ci
       - run: npm run build
-      - name: Deploy isolated optional self-host stack
-        run: npm run deploy --workspace @ubeeq/aws-self-host-infra -- --require-approval never
+      - name: Deploy isolated AWS serverless single-cell stack
+        run: npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell -- --require-approval never
       - name: Read stack outputs
         run: |
           aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json > /tmp/ubeeq-outputs.json
@@ -55,7 +55,7 @@ jobs:
           aws cognito-idp admin-set-user-password --user-pool-id "$UserPoolId" --username "$TEST_USERNAME" --password "$TEST_PASSWORD" --permanent
       - name: Run AWS adapter conformance
         run: |
-          UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_JOBS_QUEUE_URL="$JobsQueueUrl" UBEEQ_AWS_USER_POOL_ID="$UserPoolId" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapters-aws
+          UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_JOBS_QUEUE_URL="$JobsQueueUrl" UBEEQ_AWS_USER_POOL_ID="$UserPoolId" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapter-aws
       - name: Run authenticated API upload, worker, publication, and delivery flow
         run: |
           UBEEQ_AWS_API_URL="$ReferenceApiGatewayUrl" UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
