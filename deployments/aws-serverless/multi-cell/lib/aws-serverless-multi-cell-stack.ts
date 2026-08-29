@@ -1,9 +1,11 @@
 import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import { resolve } from "node:path";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as logs from "aws-cdk-lib/aws-logs";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
 
@@ -44,6 +46,41 @@ export class AwsServerlessMultiCellStack extends Stack {
     routes.grantReadWriteData(worker);
     routes.grantReadData(operatorApi); commands.grantSendMessages(operatorApi);
     worker.addEventSource(new lambdaEventSources.SqsEventSource(commands, { batchSize: 1, reportBatchItemFailures: true }));
+    const workerLogs = logs.LogGroup.fromLogGroupName(this, "MigrationControlWorkerLogs", `/aws/lambda/${worker.functionName}`);
+    const transferMetric = new logs.MetricFilter(this, "MigrationTransferBytes", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.stringValue("$.event", "=", "ubeeq.migration.command.completed"),
+      metricNamespace: "Ubeeq/Migration",
+      metricName: "TransferBytes",
+      metricValue: "$.transferBytes",
+      defaultValue: 0,
+    });
+    const commandBacklogAlarm = new cloudwatch.Alarm(this, "MigrationCommandBacklogAlarm", {
+      metric: commands.metricApproximateNumberOfMessagesVisible({ period: Duration.minutes(5), statistic: "Maximum" }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      alarmDescription: "Ubeeq migration commands are waiting for a control-plane worker.",
+    });
+    const deadLetterAlarm = new cloudwatch.Alarm(this, "MigrationDeadLetterAlarm", {
+      metric: deadLetters.metricApproximateNumberOfMessagesVisible({ period: Duration.minutes(5), statistic: "Maximum" }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      alarmDescription: "Ubeeq migration commands require operator recovery.",
+    });
+    const workerErrorAlarm = new cloudwatch.Alarm(this, "MigrationControlWorkerErrorAlarm", {
+      metric: worker.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      alarmDescription: "Ubeeq migration control worker returned an error.",
+    });
+    const dashboard = new cloudwatch.Dashboard(this, "MigrationOperationsDashboard", {
+      dashboardName: `${this.stackName}-migration-operations`,
+      widgets: [
+        [new cloudwatch.GraphWidget({ title: "Migration command and dead-letter depth", left: [commands.metricApproximateNumberOfMessagesVisible({ statistic: "Maximum" }), deadLetters.metricApproximateNumberOfMessagesVisible({ statistic: "Maximum" })] })],
+        [new cloudwatch.GraphWidget({ title: "Migration worker errors and transferred bytes", left: [worker.metricErrors({ statistic: "Sum" })], right: [transferMetric.metric({ statistic: "Sum", period: Duration.hours(1) })] })],
+        [new cloudwatch.AlarmWidget({ title: "Migration alarms", alarm: commandBacklogAlarm }), new cloudwatch.AlarmWidget({ title: "Dead-letter alarm", alarm: deadLetterAlarm }), new cloudwatch.AlarmWidget({ title: "Worker error alarm", alarm: workerErrorAlarm })],
+      ],
+    });
     // The operator must opt in exact bucket ARNs for each admitted cell. There
     // is intentionally no wildcard S3 grant across accounts or cells.
     const migrationBucketArns = String(this.node.tryGetContext("migrationBucketArns") || process.env.UBEEQ_MIGRATION_BUCKET_ARNS || "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -59,5 +96,6 @@ export class AwsServerlessMultiCellStack extends Stack {
     new CfnOutput(this, "MigrationControlWorkerArn", { value: worker.functionArn });
     new CfnOutput(this, "MigrationControlWorkerRoleArn", { value: worker.role!.roleArn });
     new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM }).url });
+    new CfnOutput(this, "MigrationOperationsDashboardName", { value: dashboard.dashboardName });
   }
 }

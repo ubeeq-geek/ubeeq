@@ -1,0 +1,85 @@
+name: Protected AWS dev multi-cell live validation
+
+# This is deliberately never a push or pull-request workflow. It can run only
+# after an explicit dispatch confirmation in the protected dev environment.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm-dev-mutation:
+        description: Confirm disposable data creation and cleanup in the fixed Ubeeq development cells
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  live-validation:
+    if: inputs.confirm-dev-mutation == true
+    # Configure this protected environment with non-production values only:
+    # UBEEQ_DEV_LIVE_ROLE_ARN and UBEEQ_DEV_AWS_ACCOUNT_ID.
+    environment: ubeeq-dev-multi-cell-live
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REGION: us-east-2
+      SOURCE_STACK: UbeeqSelfHostDev
+      DESTINATION_REGION: eu-central-1
+      DESTINATION_STACK: UbeeqSelfHostDevEuCentral1
+      CONTROL_REGION: us-east-2
+      CONTROL_STACK: UbeeqMultiCellDev
+      SOURCE_TEST_USERNAME: ubeeq-live-${{ github.run_id }}-source@invalid.example
+      DESTINATION_TEST_USERNAME: ubeeq-live-${{ github.run_id }}-destination@invalid.example
+      TEST_PASSWORD: UbeeqDevLive${{ github.run_id }}Aa!
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
+          aws-region: us-east-2
+      - name: Require the protected development account
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}"
+      - run: npm ci
+      - run: npm run build
+      - name: Read fixed development stack outputs
+        run: |
+          aws cloudformation describe-stacks --region "$SOURCE_REGION" --stack-name "$SOURCE_STACK" --query 'Stacks[0].Outputs' --output json > /tmp/source-outputs.json
+          aws cloudformation describe-stacks --region "$DESTINATION_REGION" --stack-name "$DESTINATION_STACK" --query 'Stacks[0].Outputs' --output json > /tmp/destination-outputs.json
+          aws cloudformation describe-stacks --region "$CONTROL_REGION" --stack-name "$CONTROL_STACK" --query 'Stacks[0].Outputs' --output json > /tmp/control-outputs.json
+          node <<'NODE' >> "$GITHUB_ENV"
+          const fs = require("node:fs");
+          const outputs = (path) => Object.fromEntries(JSON.parse(fs.readFileSync(path, "utf8")).map(({ OutputKey, OutputValue }) => [OutputKey, OutputValue]));
+          const source = outputs("/tmp/source-outputs.json"), destination = outputs("/tmp/destination-outputs.json"), control = outputs("/tmp/control-outputs.json");
+          const required = (set, key) => { if (!set[key]) throw new Error(`Required CloudFormation output ${key} is missing.`); return set[key]; };
+          const values = {
+            SOURCE_API_URL: required(source, "ReferenceApiGatewayUrl"), SOURCE_RECORDS_TABLE: required(source, "RecordsTableName"), SOURCE_BUCKET: required(source, "SourceStoreName"), SOURCE_JOBS_QUEUE: required(source, "JobsQueueUrl"), SOURCE_USER_POOL: required(source, "UserPoolId"), SOURCE_USER_POOL_CLIENT: required(source, "UserPoolClientId"), SOURCE_CELL_ID: required(source, "CellId"),
+            DESTINATION_API_URL: required(destination, "ReferenceApiGatewayUrl"), DESTINATION_RECORDS_TABLE: required(destination, "RecordsTableName"), DESTINATION_BUCKET: required(destination, "SourceStoreName"), DESTINATION_JOBS_QUEUE: required(destination, "JobsQueueUrl"), DESTINATION_USER_POOL: required(destination, "UserPoolId"), DESTINATION_USER_POOL_CLIENT: required(destination, "UserPoolClientId"), DESTINATION_CELL_ID: required(destination, "CellId"),
+            ROUTING_TABLE: required(control, "RoutingDirectoryTableName"), MIGRATION_COMMANDS_QUEUE: required(control, "MigrationCommandsQueueUrl"),
+          };
+          for (const [key, value] of Object.entries(values)) console.log(`${key}=${value}`);
+          NODE
+      - name: Create disposable Cognito identities
+        run: |
+          aws cognito-idp admin-create-user --region "$SOURCE_REGION" --user-pool-id "$SOURCE_USER_POOL" --username "$SOURCE_TEST_USERNAME" --user-attributes Name=email,Value="$SOURCE_TEST_USERNAME" Name=email_verified,Value=true --message-action SUPPRESS
+          aws cognito-idp admin-set-user-password --region "$SOURCE_REGION" --user-pool-id "$SOURCE_USER_POOL" --username "$SOURCE_TEST_USERNAME" --password "$TEST_PASSWORD" --permanent
+          aws cognito-idp admin-create-user --region "$DESTINATION_REGION" --user-pool-id "$DESTINATION_USER_POOL" --username "$DESTINATION_TEST_USERNAME" --user-attributes Name=email,Value="$DESTINATION_TEST_USERNAME" Name=email_verified,Value=true --message-action SUPPRESS
+          aws cognito-idp admin-set-user-password --region "$DESTINATION_REGION" --user-pool-id "$DESTINATION_USER_POOL" --username "$DESTINATION_TEST_USERNAME" --password "$TEST_PASSWORD" --permanent
+      - name: Run AWS adapter and HTTP API suites in both cells
+        run: |
+          UBEEQ_AWS_REGION="$SOURCE_REGION" UBEEQ_AWS_RECORDS_TABLE="$SOURCE_RECORDS_TABLE" UBEEQ_AWS_OBJECT_BUCKET="$SOURCE_BUCKET" UBEEQ_AWS_JOBS_QUEUE_URL="$SOURCE_JOBS_QUEUE" UBEEQ_AWS_USER_POOL_ID="$SOURCE_USER_POOL" UBEEQ_AWS_USER_POOL_CLIENT_ID="$SOURCE_USER_POOL_CLIENT" UBEEQ_AWS_TEST_USERNAME="$SOURCE_TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapter-aws
+          UBEEQ_AWS_API_URL="$SOURCE_API_URL" UBEEQ_AWS_REGION="$SOURCE_REGION" UBEEQ_AWS_RECORDS_TABLE="$SOURCE_RECORDS_TABLE" UBEEQ_AWS_OBJECT_BUCKET="$SOURCE_BUCKET" UBEEQ_AWS_USER_POOL_CLIENT_ID="$SOURCE_USER_POOL_CLIENT" UBEEQ_AWS_TEST_USERNAME="$SOURCE_TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
+          UBEEQ_AWS_REGION="$DESTINATION_REGION" UBEEQ_AWS_RECORDS_TABLE="$DESTINATION_RECORDS_TABLE" UBEEQ_AWS_OBJECT_BUCKET="$DESTINATION_BUCKET" UBEEQ_AWS_JOBS_QUEUE_URL="$DESTINATION_JOBS_QUEUE" UBEEQ_AWS_USER_POOL_ID="$DESTINATION_USER_POOL" UBEEQ_AWS_USER_POOL_CLIENT_ID="$DESTINATION_USER_POOL_CLIENT" UBEEQ_AWS_TEST_USERNAME="$DESTINATION_TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapter-aws
+          UBEEQ_AWS_API_URL="$DESTINATION_API_URL" UBEEQ_AWS_REGION="$DESTINATION_REGION" UBEEQ_AWS_RECORDS_TABLE="$DESTINATION_RECORDS_TABLE" UBEEQ_AWS_OBJECT_BUCKET="$DESTINATION_BUCKET" UBEEQ_AWS_USER_POOL_CLIENT_ID="$DESTINATION_USER_POOL_CLIENT" UBEEQ_AWS_TEST_USERNAME="$DESTINATION_TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
+      - name: Run disposable cross-cell migration proof
+        run: |
+          UBEEQ_AWS_SOURCE_API_URL="$SOURCE_API_URL" UBEEQ_AWS_SOURCE_REGION="$SOURCE_REGION" UBEEQ_AWS_SOURCE_RECORDS_TABLE="$SOURCE_RECORDS_TABLE" UBEEQ_AWS_SOURCE_BUCKET="$SOURCE_BUCKET" UBEEQ_AWS_SOURCE_USER_POOL_ID="$SOURCE_USER_POOL" UBEEQ_AWS_SOURCE_USER_POOL_CLIENT_ID="$SOURCE_USER_POOL_CLIENT" UBEEQ_AWS_SOURCE_CELL_ID="$SOURCE_CELL_ID" UBEEQ_AWS_DESTINATION_API_URL="$DESTINATION_API_URL" UBEEQ_AWS_DESTINATION_REGION="$DESTINATION_REGION" UBEEQ_AWS_DESTINATION_RECORDS_TABLE="$DESTINATION_RECORDS_TABLE" UBEEQ_AWS_DESTINATION_BUCKET="$DESTINATION_BUCKET" UBEEQ_AWS_DESTINATION_CELL_ID="$DESTINATION_CELL_ID" UBEEQ_AWS_ROUTING_TABLE="$ROUTING_TABLE" UBEEQ_AWS_ROUTING_REGION="$CONTROL_REGION" UBEEQ_AWS_MIGRATION_QUEUE_URL="$MIGRATION_COMMANDS_QUEUE" node examples/aws-serverless/multi-cell/test-live-migration.mjs
+      - name: Delete disposable Cognito identities
+        if: always()
+        run: |
+          aws cognito-idp admin-delete-user --region "$SOURCE_REGION" --user-pool-id "$SOURCE_USER_POOL" --username "$SOURCE_TEST_USERNAME" || true
+          aws cognito-idp admin-delete-user --region "$DESTINATION_REGION" --user-pool-id "$DESTINATION_USER_POOL" --username "$DESTINATION_TEST_USERNAME" || true

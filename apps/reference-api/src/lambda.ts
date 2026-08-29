@@ -134,7 +134,19 @@ export const migrationControlWorker = async (event: MigrationSqsEvent): Promise<
     try {
       const command = JSON.parse(record.body) as { migrationId?: string; operation?: "resume" | "rollback" | "retire"; rollbackWindowSeconds?: number };
       if (!command.migrationId || !command.operation) throw new Error("Migration queue message is invalid.");
-      await worker.execute({ migrationId: command.migrationId, operation: command.operation, rollbackWindowSeconds: command.rollbackWindowSeconds });
+      const checkpoint = await worker.execute({ migrationId: command.migrationId, operation: command.operation, rollbackWindowSeconds: command.rollbackWindowSeconds });
+      // Structured, non-secret operational evidence. A Logs metric filter in
+      // the optional AWS control plane uses this to chart migration transfer
+      // volume; it never emits object keys, credentials, or creator data.
+      console.log(JSON.stringify({
+        event: "ubeeq.migration.command.completed",
+        migrationId: checkpoint.id,
+        operation: command.operation,
+        state: checkpoint.state,
+        sourceCellId: checkpoint.source.homeCellId,
+        destinationCellId: checkpoint.destination.cellId,
+        transferBytes: checkpoint.objectInventory?.reduce((total, object) => total + object.byteLength, 0) ?? 0,
+      }));
     } catch (error) {
       console.error("Ubeeq migration control command failed", { messageId: record.messageId, error: error instanceof Error ? error.message : String(error) });
       failures.push({ itemIdentifier: record.messageId });

@@ -20,3 +20,7 @@ npm run deploy --workspace @ubeeq/deployment-aws-serverless-multi-cell
 The worker has no wildcard S3 or Lambda permissions. For cross-account cells, each bucket policy must grant this worker role the listed object actions, and each cell migration Lambda must grant invocation to the worker role/account. Register only active cells after those permissions are in place. Public edge routing remains read-only and exposes only the cell HTTPS endpoint—not bucket names or Lambda ARNs.
 
 The stack also outputs an AWS-IAM Function URL for operator diagnostics and lifecycle commands. Its handler independently verifies `UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN`; without that explicit value, every operator request is denied. It can list routes, migrations, and redacted cell status, then queue `resume`, `rollback`, or `retire` for a checkpoint. It never returns the registered bucket or migration-function ARN.
+
+It also creates a migration operations dashboard and alarms for visible command backlog, dead-letter depth, and control-worker errors. Completed commands emit a non-secret transfer-byte metric for operational trend monitoring; it is not a billing ledger. Configure alarm actions in private operator infrastructure.
+
+See [`../../../docs/aws-multi-cell-operator-runbook.md`](../../../docs/aws-multi-cell-operator-runbook.md) for registration, region selection, backup/recovery disclosure, migration/rollback, and production-readiness procedures.

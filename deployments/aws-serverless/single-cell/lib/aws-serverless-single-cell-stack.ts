@@ -74,11 +74,22 @@ export class AwsServerlessSingleCellStack extends Stack {
     health.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
     worker.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
     worker.addEventSource(new lambdaEventSources.SqsEventSource(jobs, { batchSize: 1, reportBatchItemFailures: true }));
-    new cloudwatch.Alarm(this, "JobDeadLetterAlarm", { metric: deadLetters.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq durable jobs require manual recovery" });
+    const jobDeadLetterAlarm = new cloudwatch.Alarm(this, "JobDeadLetterAlarm", { metric: deadLetters.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq durable jobs require manual recovery" });
     const url = health.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
     const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });
     api.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiIntegration", health) });
     api.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiRootIntegration", health) });
+    const apiErrorAlarm = new cloudwatch.Alarm(this, "ReferenceApiErrorAlarm", { metric: health.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq cell API Lambda returned an error" });
+    const apiGatewayErrorAlarm = new cloudwatch.Alarm(this, "ReferenceApiGateway5xxAlarm", { metric: api.metricServerError({ period: Duration.minutes(5), statistic: "Sum" }), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq cell API Gateway returned a 5xx response" });
+    const migrationCellErrorAlarm = new cloudwatch.Alarm(this, "MigrationCellErrorAlarm", { metric: migrationCell.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq cell migration command handler returned an error" });
+    const dashboard = new cloudwatch.Dashboard(this, "CellOperationsDashboard", {
+      dashboardName: `${this.stackName}-cell-operations`,
+      widgets: [
+        [new cloudwatch.GraphWidget({ title: "Cell API health", left: [health.metricErrors({ statistic: "Sum" }), api.metricServerError({ statistic: "Sum" })] })],
+        [new cloudwatch.GraphWidget({ title: "Cell worker and migration health", left: [worker.metricErrors({ statistic: "Sum" }), migrationCell.metricErrors({ statistic: "Sum" }), deadLetters.metricApproximateNumberOfMessagesVisible({ statistic: "Maximum" })] })],
+        [new cloudwatch.AlarmWidget({ title: "Job dead letters", alarm: jobDeadLetterAlarm }), new cloudwatch.AlarmWidget({ title: "API failures", alarm: apiErrorAlarm }), new cloudwatch.AlarmWidget({ title: "API Gateway 5xx", alarm: apiGatewayErrorAlarm }), new cloudwatch.AlarmWidget({ title: "Migration handler failures", alarm: migrationCellErrorAlarm })],
+      ],
+    });
     const webApi = new apigwv2.HttpApi(this, "ReferenceWebGateway", { description: "Plain reference-web edge for the neutral Ubeeq reference API" });
     webApi.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceWebIntegration", web) });
     webApi.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceWebRootIntegration", web) });
@@ -121,5 +132,6 @@ export class AwsServerlessSingleCellStack extends Stack {
     new CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new CfnOutput(this, "UserPoolClientId", { value: userPoolClient.userPoolClientId });
     new CfnOutput(this, "CredentialSecretPrefix", { value: "ubeeq/credentials" });
+    new CfnOutput(this, "CellOperationsDashboardName", { value: dashboard.dashboardName });
   }
 }

@@ -40,7 +40,7 @@ The multi-cell worker still needs separately scoped IAM and bucket-policy permis
 
 The emitted Function URL is IAM-protected for operator diagnostics. The stack also emits `ReferenceApiGatewayUrl`, the HTTP API edge for the reference API; it passes requests to the API, whose protected routes validate Cognito bearer tokens through the identity port. Do not treat either generated hostname as a production public base URL. AWS uploads return a checksum-bound, time-limited S3 PUT URL; upload content goes directly to S3 and then `/v1/uploads/{uploadId}/complete` records the immutable object version. SQS invokes the bundled worker Lambda to process the completed asset.
 
-Keep production backup retention, alert routing, key management, domains, and network policy in your own deployment configuration. See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) for the operational runbook.
+Each cell stack emits a CloudWatch operations dashboard and alarms for API/API-Gateway failures, worker/migration-handler failures, and job dead letters. Keep alarm routing, backup retention, key management, domains, and network policy in your private deployment configuration. See [BACKUP_RESTORE.md](BACKUP_RESTORE.md) and the [multi-cell operator runbook](../../../docs/aws-multi-cell-operator-runbook.md).
 
 After deploying an isolated stack and creating a disposable Cognito test user, use its outputs to run the real-service adapter gate:
 
