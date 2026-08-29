@@ -127,6 +127,10 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
     const body = Buffer.from(JSON.stringify(manifest)), checksum = createHash("sha256").update(body).digest("hex"), manifestKey = `cells/${input.cellId}/migrations/${command.checkpoint.id}/creator-export.json`;
     const manifestObject: StoredObject = { bucket: input.cellId, key: manifestKey, contentType: "application/json", byteLength: body.byteLength, checksum, scope: "private" };
     await input.storage.put({ object: manifestObject, body });
+    // Storage adapters own the physical container name. Resolve the just-
+    // written object so the migration-only inventory records that provider
+    // location, never the portable logical cell identifier.
+    const storedManifest = await input.storage.get({ bucket: manifestObject.bucket, key: manifestObject.key, versionId: manifestObject.versionId });
     const inventoryEntry = (id: string, location: StoredLocation, asset: StoredAsset) => {
       if (!location.key) throw new Error(`Migration asset ${asset.id} has no stored object key.`);
       return {
@@ -143,7 +147,7 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       if (!asset.originalStorage || asset.originalStorage.key === asset.storage.key) return [active];
       return [active, inventoryEntry(`${asset.id}:original`, asset.originalStorage, asset)];
     });
-    const objects = [{ id: "migration-manifest", source: { bucket: input.cellId, key: manifestKey, versionId: manifestObject.versionId }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assetObjects];
+    const objects = [{ id: "migration-manifest", source: { bucket: storedManifest.object.bucket, key: manifestKey, versionId: storedManifest.object.versionId }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assetObjects];
     return { manifestChecksum: manifest.checksum, objectInventory: objects };
   }
 });

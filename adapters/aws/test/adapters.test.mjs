@@ -8,6 +8,8 @@ import { verifyJobQueueContract } from "@ubeeq/jobs";
 import { verifyObjectStorageContract } from "@ubeeq/storage";
 import { verifyIdentityAdapterContract } from "@ubeeq/auth";
 
+const hasUndefined = (value) => value === undefined || (Array.isArray(value) ? value.some(hasUndefined) : value && typeof value === "object" ? Object.values(value).some(hasUndefined) : false);
+
 class MemoryDynamo {
   values = new Map();
   async send(command) {
@@ -21,6 +23,7 @@ class MemoryDynamo {
       return { Items: items, ...(last && start + items.length < all.length ? { LastEvaluatedKey: { pk: last.pk, sk: last.sk } } : {}) };
     }
     if (command.constructor.name === "PutCommand") {
+      assert.ok(!hasUndefined(input.Item), "DynamoDB items must omit optional fields rather than serialize undefined values");
       const key = `${input.Item.pk}|${input.Item.sk}`;
       const current = this.values.get(key);
       if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }

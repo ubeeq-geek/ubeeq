@@ -57,9 +57,14 @@ export class AwsServerlessSingleCellStack extends Stack {
     const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     const web = new lambda.Function(this, "ReferenceWeb", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.web", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl } });
     const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
+    // This private handler is intentionally distinct from the HTTP API. Only
+    // the explicitly nominated multi-cell control worker may invoke it, and
+    // it receives regional migration commands rather than viewer traffic.
+    const migrationCell = new lambda.Function(this, "MigrationCell", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.migrationCell", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
-    if (migrationControlWorkerPrincipalArn) health.addPermission("MigrationControlWorkerInvoke", { action: "lambda:InvokeFunction", principal: new iam.ArnPrincipal(migrationControlWorkerPrincipalArn) });
+    records.grantReadWriteData(migrationCell); sourceStore.grantReadWrite(migrationCell);
+    if (migrationControlWorkerPrincipalArn) migrationCell.addPermission("MigrationControlWorkerInvoke", { action: "lambda:InvokeFunction", principal: new iam.ArnPrincipal(migrationControlWorkerPrincipalArn) });
     if (routingDirectoryTableName && routingDirectoryTableArn) {
       const routingDirectory = dynamodb.Table.fromTableArn(this, "RoutingDirectory", routingDirectoryTableArn);
       // Route resolution is read-only in each cell. Migration writes belong to
@@ -104,7 +109,7 @@ export class AwsServerlessSingleCellStack extends Stack {
     }
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
     /** Private target registered with an operator multi-cell control plane. */
-    new CfnOutput(this, "MigrationCellFunctionArn", { value: health.functionArn });
+    new CfnOutput(this, "MigrationCellFunctionArn", { value: migrationCell.functionArn });
     new CfnOutput(this, "CellId", { value: cellId });
     new CfnOutput(this, "CellRegion", { value: cellRegion });
     new CfnOutput(this, "ReferenceApiGatewayUrl", { value: api.apiEndpoint });

@@ -69,13 +69,13 @@ export class DynamoRoutingDirectory implements RoutingDirectory {
   }
   async create(route: CellRoute): Promise<CellRoute> {
     validateCellRoute(route);
-    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: route.creatorId, route, routingRevision: route.routingRevision }, ConditionExpression: "attribute_not_exists(pk)" })); return route; }
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: route.creatorId, route: withoutUndefined(route), routingRevision: route.routingRevision }, ConditionExpression: "attribute_not_exists(pk)" })); return route; }
     catch (error) { throw this.control.conflict(error, `A route already exists for creator ${route.creatorId}.`); }
   }
   async compareAndSwap(input: { route: CellRoute; expectedRoutingRevision: number }): Promise<CellRoute> {
     validateCellRoute(input.route);
     if (input.route.routingRevision !== input.expectedRoutingRevision + 1) throw new RoutingDirectoryConflictError("The replacement route must advance routingRevision by exactly one.");
-    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: input.route.creatorId, route: input.route, routingRevision: input.route.routingRevision }, ConditionExpression: "attribute_exists(pk) AND #routingRevision = :expected", ExpressionAttributeNames: { "#routingRevision": "routingRevision" }, ExpressionAttributeValues: { ":expected": input.expectedRoutingRevision } })); return input.route; }
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "route", sk: input.route.creatorId, route: withoutUndefined(input.route), routingRevision: input.route.routingRevision }, ConditionExpression: "attribute_exists(pk) AND #routingRevision = :expected", ExpressionAttributeNames: { "#routingRevision": "routingRevision" }, ExpressionAttributeValues: { ":expected": input.expectedRoutingRevision } })); return input.route; }
     catch (error) { throw this.control.conflict(error, `Route revision ${input.expectedRoutingRevision} is no longer current for creator ${input.route.creatorId}.`); }
   }
   async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }> {
@@ -93,13 +93,13 @@ export class DynamoMigrationCheckpoints implements MigrationCheckpointStore {
   }
   async create(checkpoint: MigrationCheckpoint): Promise<MigrationCheckpoint> {
     validateMigrationCheckpoint(checkpoint);
-    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: checkpoint.id, checkpoint, creatorId: checkpoint.creatorId, updatedAt: checkpoint.updatedAt }, ConditionExpression: "attribute_not_exists(pk)" })); return checkpoint; }
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: checkpoint.id, checkpoint: withoutUndefined(checkpoint), creatorId: checkpoint.creatorId, updatedAt: checkpoint.updatedAt }, ConditionExpression: "attribute_not_exists(pk)" })); return checkpoint; }
     catch (error) { throw this.control.conflict(error, `Migration checkpoint ${checkpoint.id} already exists.`); }
   }
   async compareAndSwap(input: { checkpoint: MigrationCheckpoint; expectedUpdatedAt: string }): Promise<MigrationCheckpoint> {
     validateMigrationCheckpoint(input.checkpoint);
     if (input.checkpoint.updatedAt === input.expectedUpdatedAt) throw new RoutingDirectoryConflictError("A migration update must advance updatedAt.");
-    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: input.checkpoint.id, checkpoint: input.checkpoint, creatorId: input.checkpoint.creatorId, updatedAt: input.checkpoint.updatedAt }, ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": input.expectedUpdatedAt } })); return input.checkpoint; }
+    try { await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "migration", sk: input.checkpoint.id, checkpoint: withoutUndefined(input.checkpoint), creatorId: input.checkpoint.creatorId, updatedAt: input.checkpoint.updatedAt }, ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": input.expectedUpdatedAt } })); return input.checkpoint; }
     catch (error) { throw this.control.conflict(error, `Migration checkpoint ${input.checkpoint.id} has changed.`); }
   }
   async list(input: { creatorId?: string; limit: number; cursor?: string }): Promise<{ items: readonly MigrationCheckpoint[]; nextCursor?: string }> {
@@ -128,7 +128,7 @@ export class DynamoMigrationCellRegistry implements MigrationCellRegistry {
     const current = await this.get(cell.cellId);
     if (current && cell.updatedAt <= current.updatedAt) throw new RoutingDirectoryConflictError(`Migration cell registration ${cell.cellId} has changed.`);
     try {
-      await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "cell", sk: cell.cellId, cell, updatedAt: cell.updatedAt }, ...(current ? { ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": current.updatedAt } } : { ConditionExpression: "attribute_not_exists(pk)" }) }));
+      await this.control.dynamo.send(new PutCommand({ TableName: this.control.tableName, Item: { pk: "cell", sk: cell.cellId, cell: withoutUndefined(cell), updatedAt: cell.updatedAt }, ...(current ? { ConditionExpression: "attribute_exists(pk) AND #updatedAt = :expected", ExpressionAttributeNames: { "#updatedAt": "updatedAt" }, ExpressionAttributeValues: { ":expected": current.updatedAt } } : { ConditionExpression: "attribute_not_exists(pk)" }) }));
       return cell;
     } catch (error) { throw this.control.conflict(error, `Migration cell registration ${cell.cellId} has changed.`); }
   }

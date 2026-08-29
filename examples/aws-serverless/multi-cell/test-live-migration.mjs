@@ -6,7 +6,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { AdminCreateUserCommand, AdminDeleteUserCommand, AdminSetUserPasswordCommand, CognitoIdentityProviderClient, InitiateAuthCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-import { DeleteObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
 import { createAwsMigrationCommandQueue, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
 import { MigrationOrchestrator } from "@ubeeq/deployment-platform";
 
@@ -67,7 +67,19 @@ if (missing.length) {
       const object = item[location];
       if (!object?.key) continue;
       const bucket = location === "source" ? source.bucket : destination.bucket;
-      await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId })).catch(() => undefined);
+      // The destination version is assigned by S3 during the copy and is not
+      // part of the source inventory. Remove every version/delete marker for
+      // this disposable key so the live proof does not leave noncurrent data.
+      let keyMarker;
+      let versionIdMarker;
+      do {
+        const page = await s3.send(new ListObjectVersionsCommand({ Bucket: bucket, Prefix: object.key, KeyMarker: keyMarker, VersionIdMarker: versionIdMarker })).catch(() => undefined);
+        for (const version of [...(page?.Versions ?? []), ...(page?.DeleteMarkers ?? [])]) {
+          if (version.Key === object.key && version.VersionId) await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: object.key, VersionId: version.VersionId })).catch(() => undefined);
+        }
+        keyMarker = page?.NextKeyMarker;
+        versionIdMarker = page?.NextVersionIdMarker;
+      } while (keyMarker);
     }
   };
   try {
