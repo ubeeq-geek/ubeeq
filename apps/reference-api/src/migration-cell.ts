@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { createCreatorExport, validateCreatorExport } from "@ubeeq/portability";
 import type { UbeeqRepositories } from "@ubeeq/persistence";
-import type { ObjectStorage } from "@ubeeq/storage";
+import type { ObjectStorage, StoredObject } from "@ubeeq/storage";
 import type { MigrationCellCommand, MigrationCellCommandResult, MigrationCellEndpoint } from "@ubeeq/deployment-platform";
 
 type StoredLocation = { bucket?: string; key?: string; versionId?: string; byteLength?: number };
@@ -17,13 +17,18 @@ const all = async <T>(repository: { list(input: { limit: number; cursor?: string
 export const createMigrationCellEndpoint = (input: { cellId: string; region: string; instanceId: string; repositories: UbeeqRepositories; storage: ObjectStorage }): MigrationCellEndpoint => ({
   async execute(command: MigrationCellCommand): Promise<MigrationCellCommandResult> {
     const source = command.checkpoint.source.homeCellId === input.cellId, destination = command.checkpoint.destination.cellId === input.cellId;
-    if ((["source_hold", "export", "retire"] as const).includes(command.operation as "source_hold") && !source) throw new Error("Migration source command was sent to a foreign cell.");
+    if ((["source_hold", "source_release", "export", "retire"] as const).includes(command.operation as "source_hold") && !source) throw new Error("Migration source command was sent to a foreign cell.");
     if ((["import", "enable", "rollback"] as const).includes(command.operation as "import") && !destination) throw new Error("Migration destination command was sent to a foreign cell.");
     if (command.operation === "source_hold") {
       const creator = (await all(input.repositories.creators)).find((value: any) => value.id === command.checkpoint.creatorId) as any;
       if (!creator || creator.homeCellId !== input.cellId) throw new Error("Migration creator is not owned by this source cell.");
       const exists = (await all(input.repositories.moderationHolds)).find((hold: any) => hold.subjectId === command.checkpoint.creatorId && hold.reason === `migration:${command.checkpoint.id}` && hold.state === "active");
       if (!exists) await input.repositories.moderationHolds.create({ id: `migration-hold:${command.checkpoint.id}`, instanceId: input.instanceId, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion, dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, subjectType: "creator", subjectId: command.checkpoint.creatorId, state: "active", reason: `migration:${command.checkpoint.id}` } as any, { idempotencyKey: `migration-hold:${command.checkpoint.id}` });
+      return {};
+    }
+    if (command.operation === "source_release") {
+      const hold = (await all(input.repositories.moderationHolds)).find((value: any) => value.subjectId === command.checkpoint.creatorId && value.reason === `migration:${command.checkpoint.id}`);
+      if (hold?.state === "active") await input.repositories.moderationHolds.update(hold.id, hold.revision, { state: "released" });
       return {};
     }
     if (command.operation === "import") {
@@ -40,9 +45,15 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       for (const value of manifest.collections) await put(input.repositories.collections, value, "collection");
       for (const value of manifest.assets) {
         const object = command.checkpoint.objectInventory?.find((candidate) => candidate.id === value.id);
+        const original = command.checkpoint.objectInventory?.find((candidate) => candidate.id === `${value.id}:original`);
         if (!object) throw new Error(`Migration object inventory is missing asset ${value.id}.`);
         const asset = value as any;
-        await put(input.repositories.assets, { ...asset, storage: asset.storage ? { ...asset.storage, bucket: object.destination.bucket, key: object.destination.key, versionId: undefined } : asset.storage }, "asset");
+        if (asset.originalStorage && !original) throw new Error(`Migration object inventory is missing the original for asset ${value.id}.`);
+        await put(input.repositories.assets, {
+          ...asset,
+          storage: asset.storage ? { ...asset.storage, bucket: object.destination.bucket, key: object.destination.key, versionId: undefined } : asset.storage,
+          originalStorage: asset.originalStorage ? { ...asset.originalStorage, bucket: original!.destination.bucket, key: original!.destination.key, versionId: undefined } : asset.originalStorage,
+        }, "asset");
       }
       for (const value of manifest.publications) await put(input.repositories.publications, value, "publication");
       for (const value of manifest.publicationIntents) await put(input.repositories.publicationIntents, value, "publication-intent");
@@ -114,8 +125,25 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
     const manifest = createCreatorExport(({ exportedAt: new Date().toISOString(), creator, works, assets: assets as any, collections, publications: await pick(input.repositories.publications, (value) => workIds.has(value.workId)), publicationIntents: await pick(input.repositories.publicationIntents, (value) => workIds.has(value.workId)), processing: assets.map((asset: any) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion, dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, state: asset.status })), moderationEvidence: await pick(input.repositories.moderationEvidence, (value) => subjectIds.has(value.subjectId)), moderationHolds: await pick(input.repositories.moderationHolds, (value) => subjectIds.has(value.subjectId)), reviewCases: await pick(input.repositories.reviewCases, (value) => subjectIds.has(value.subjectId)), auditEvents: await pick(input.repositories.auditEvents, (value) => subjectIds.has(value.subjectId)), usageEvents: await pick(input.repositories.usageEvents, (value) => value.accountId === creator.id), integrationAccounts: (await pick(input.repositories.integrationAccounts, (value) => value.creatorId === creator.id)).map(({ credentialReference: _secret, ...value }: any) => ({ ...value, credentialExcluded: true })), exportCheckpoints: await pick(input.repositories.exportManifests, (value) => value.creatorId === creator.id), importCheckpoints: await pick(input.repositories.importCheckpoints, (value) => value.creatorId === creator.id), objectInventory: assets.map((asset) => ({ assetId: asset.id, key: asset.storage?.key, versionId: asset.storage?.versionId ?? asset.objectVersion, checksum: asset.checksum, byteLength: asset.storage?.byteLength, transferState: "manifest_only" as const })) }) as any);
     validateCreatorExport(manifest);
     const body = Buffer.from(JSON.stringify(manifest)), checksum = createHash("sha256").update(body).digest("hex"), manifestKey = `cells/${input.cellId}/migrations/${command.checkpoint.id}/creator-export.json`;
-    await input.storage.put({ object: { bucket: input.cellId, key: manifestKey, contentType: "application/json", byteLength: body.byteLength, checksum, scope: "private" }, body });
-    const objects = [{ id: "migration-manifest", source: { bucket: input.cellId, key: manifestKey }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assets.map((asset) => ({ id: asset.id, source: { bucket: asset.storage?.bucket ?? input.cellId, key: asset.storage!.key!, versionId: asset.storage?.versionId }, destination: { bucket: command.destinationBucket!, key: asset.storage!.key!.replace(`cells/${input.cellId}/`, `cells/${command.checkpoint.destination.cellId}/`) }, checksum: asset.checksum, byteLength: asset.storage?.byteLength ?? 0 }))];
+    const manifestObject: StoredObject = { bucket: input.cellId, key: manifestKey, contentType: "application/json", byteLength: body.byteLength, checksum, scope: "private" };
+    await input.storage.put({ object: manifestObject, body });
+    const inventoryEntry = (id: string, location: StoredLocation, asset: StoredAsset) => {
+      if (!location.key) throw new Error(`Migration asset ${asset.id} has no stored object key.`);
+      return {
+        id,
+        source: { bucket: location.bucket ?? input.cellId, key: location.key, versionId: location.versionId },
+        destination: { bucket: command.destinationBucket!, key: location.key.replace(`cells/${input.cellId}/`, `cells/${command.checkpoint.destination.cellId}/`) },
+        checksum: asset.checksum,
+        byteLength: location.byteLength ?? 0,
+      };
+    };
+    const assetObjects = assets.flatMap((asset) => {
+      if (!asset.storage) throw new Error(`Migration asset ${asset.id} has no active storage location.`);
+      const active = inventoryEntry(asset.id, asset.storage, asset);
+      if (!asset.originalStorage || asset.originalStorage.key === asset.storage.key) return [active];
+      return [active, inventoryEntry(`${asset.id}:original`, asset.originalStorage, asset)];
+    });
+    const objects = [{ id: "migration-manifest", source: { bucket: input.cellId, key: manifestKey, versionId: manifestObject.versionId }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assetObjects];
     return { manifestChecksum: manifest.checksum, objectInventory: objects };
   }
 });

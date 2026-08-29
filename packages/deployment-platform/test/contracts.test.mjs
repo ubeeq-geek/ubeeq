@@ -29,12 +29,12 @@ test("orchestrator resumes a held migration, cuts over once, and preserves rollb
   const checkpoints = new Map(); const calls = [];
   const routes = { get: async () => route, create: async (value) => route = value, compareAndSwap: async ({ route: next, expectedRoutingRevision }) => { assert.equal(route.routingRevision, expectedRoutingRevision); route = next; return route; }, list: async () => ({ items: [route] }) };
   const store = { get: async (id) => checkpoints.get(id), create: async (value) => { checkpoints.set(value.id, value); return value; }, compareAndSwap: async ({ checkpoint, expectedUpdatedAt }) => { assert.equal(checkpoints.get(checkpoint.id).updatedAt, expectedUpdatedAt); checkpoints.set(checkpoint.id, checkpoint); return checkpoint; }, list: async () => ({ items: [...checkpoints.values()] }) };
-  const executor = { placeSourceHold: async () => calls.push("hold"), exportSource: async () => (calls.push("export"), { manifestChecksum: "a".repeat(64), objectCount: 2 }), transferObjects: async () => calls.push("transfer"), importDestination: async () => calls.push("import"), verifyDestination: async () => (calls.push("verify"), { objectCount: 2, verifiedObjectCount: 2 }), enableDestination: async () => calls.push("enable"), rollbackDestination: async () => calls.push("rollback"), retireSource: async () => calls.push("retire") };
+  const executor = { placeSourceHold: async () => calls.push("hold"), releaseSourceHold: async () => calls.push("release"), exportSource: async () => (calls.push("export"), { manifestChecksum: "a".repeat(64), objectCount: 2 }), transferObjects: async () => calls.push("transfer"), importDestination: async () => calls.push("import"), verifyDestination: async () => (calls.push("verify"), { objectCount: 2, verifiedObjectCount: 2 }), enableDestination: async () => calls.push("enable"), rollbackDestination: async () => calls.push("rollback"), retireSource: async () => calls.push("retire") };
   const orchestration = new MigrationOrchestrator(routes, store, executor, now);
   const requested = await orchestration.request({ id: "move-1", creatorId: "creator-1", destination: { cellId: "cell-b", region: "eu-central-1", endpoint: "https://b.example/" } });
   const completed = await orchestration.resume(requested.id, 60);
   assert.equal(completed.state, "cutover"); assert.equal(route.homeCellId, "cell-b"); assert.deepEqual(calls, ["hold", "export", "transfer", "import", "verify", "enable"]);
-  const rolledBack = await orchestration.rollback(completed.id); assert.equal(rolledBack.state, "rolled_back"); assert.equal(route.homeCellId, "cell-a");
+  const rolledBack = await orchestration.rollback(completed.id); assert.equal(rolledBack.state, "rolled_back"); assert.equal(route.homeCellId, "cell-a"); assert.deepEqual(calls, ["hold", "export", "transfer", "import", "verify", "enable", "rollback", "release"]);
 });
 
 test("orchestrator resumes after an atomic route cutover before checkpoint persistence", async () => {
@@ -48,7 +48,7 @@ test("orchestrator resumes after an atomic route cutover before checkpoint persi
   let route = cutoverCellRoute(source, checkpoint, now()); // checkpoint write intentionally has not happened yet
   const routes = { get: async () => route, create: async () => route, compareAndSwap: async () => { throw new Error("cutover must not repeat"); }, list: async () => ({ items: [route] }) };
   const store = { get: async () => checkpoint, create: async () => checkpoint, compareAndSwap: async ({ checkpoint: next }) => (checkpoint = next), list: async () => ({ items: [checkpoint] }) };
-  const executor = { placeSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: "a".repeat(64), objectCount: 0 }), transferObjects: async () => {}, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 0, verifiedObjectCount: 0 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
+  const executor = { placeSourceHold: async () => {}, releaseSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: "a".repeat(64), objectCount: 0 }), transferObjects: async () => {}, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 0, verifiedObjectCount: 0 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
   const resumed = await new MigrationOrchestrator(routes, store, executor, now).resume("move-resume");
   assert.equal(resumed.state, "cutover"); assert.equal(route.routingRevision, 2);
 });
@@ -68,6 +68,6 @@ test("remote migration executor calls only private cell commands and verifies th
   await executor.transferObjects(exportedCheckpoint);
   await executor.importDestination(exportedCheckpoint);
   assert.deepEqual(await executor.verifyDestination(exportedCheckpoint), { objectCount: 1, verifiedObjectCount: 1 });
-  await executor.enableDestination(exportedCheckpoint); await executor.rollbackDestination(exportedCheckpoint); await executor.retireSource(exportedCheckpoint);
-  assert.deepEqual(calls, ["source:source_hold", "source:export", "transfer:1", "destination:import", "verify:1", "destination:enable", "destination:rollback", "source:retire"]);
+  await executor.enableDestination(exportedCheckpoint); await executor.rollbackDestination(exportedCheckpoint); await executor.releaseSourceHold(exportedCheckpoint); await executor.retireSource(exportedCheckpoint);
+  assert.deepEqual(calls, ["source:source_hold", "source:export", "transfer:1", "destination:import", "verify:1", "destination:enable", "destination:rollback", "source:source_release", "source:retire"]);
 });

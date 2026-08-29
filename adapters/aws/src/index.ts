@@ -178,15 +178,15 @@ export const createAwsMigrationCommandQueue = (configuration: { queueUrl: string
  * record table or participates in normal creator request handling.
  */
 export class AwsMigrationControlWorker {
-  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: Pick<LambdaClient, "send">; s3ForRegion?: (region: string) => Pick<S3Client, "send">; clock?: () => string }) {}
+  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: Pick<LambdaClient, "send">; lambdaForRegion?: (region: string) => Pick<LambdaClient, "send">; s3ForRegion?: (region: string) => Pick<S3Client, "send">; clock?: () => string }) {}
   async execute(command: AwsMigrationCommand): Promise<MigrationCheckpoint> {
     if (!command.migrationId.trim() || !["resume", "rollback", "retire"].includes(command.operation)) throw new Error("Migration command is invalid.");
     const checkpoint = await this.input.checkpoints.get(command.migrationId);
     if (!checkpoint) throw new Error(`Migration checkpoint ${command.migrationId} was not found.`);
     const [source, destination] = await Promise.all([this.requiredCell(checkpoint.source.homeCellId), this.requiredCell(checkpoint.destination.cellId)]);
-    const lambda = this.input.lambda ?? new LambdaClient({});
+    const lambdaForRegion = this.input.lambdaForRegion ?? ((region: string) => this.input.lambda ?? new LambdaClient({ region }));
     const s3ForRegion = this.input.s3ForRegion ?? ((region: string) => new S3Client({ region }));
-    const executor = new RemoteMigrationExecutor(new LambdaMigrationCellEndpoint(lambda, source.migrationEndpoint), new LambdaMigrationCellEndpoint(lambda, destination.migrationEndpoint), new S3MigrationObjectTransfer(s3ForRegion(source.region), s3ForRegion(destination.region)), destination.objectBucket);
+    const executor = new RemoteMigrationExecutor(new LambdaMigrationCellEndpoint(lambdaForRegion(source.region), source.migrationEndpoint), new LambdaMigrationCellEndpoint(lambdaForRegion(destination.region), destination.migrationEndpoint), new S3MigrationObjectTransfer(s3ForRegion(source.region), s3ForRegion(destination.region)), destination.objectBucket);
     const orchestrator = new MigrationOrchestrator(this.input.routingDirectory, this.input.checkpoints, executor, this.input.clock);
     if (command.operation === "rollback") return orchestrator.rollback(command.migrationId);
     if (command.operation === "retire") return orchestrator.retire(command.migrationId);
@@ -202,7 +202,14 @@ export class AwsMigrationControlWorker {
 export class S3ObjectStorage implements ObjectStorage {
   constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string) {}
   private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }
-  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> { this.requireLocalKey(input.object.key); await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } })); }
+  async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> {
+    this.requireLocalKey(input.object.key);
+    const response = await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } }));
+    // S3 assigns an immutable object version. Preserve it on the supplied
+    // object so the application records and later delivery grants address the
+    // exact rendition that was written, rather than a local placeholder.
+    if (response.VersionId) input.object.versionId = response.VersionId;
+  }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { this.requireLocalKey(input.key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.requireLocalKey(input.key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
 }

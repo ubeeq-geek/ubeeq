@@ -25,9 +25,11 @@ if (missing.length) {
   const repositoryConfiguration = { tableName: process.env.UBEEQ_AWS_RECORDS_TABLE };
   const key = `aws-live-contract-${Date.now()}`;
   const jobId = `job-${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
+  const directCellId = `live-${Date.now()}`;
+  const directCreatorId = `creator-${Date.now()}`;
   const directBody = new TextEncoder().encode("ubeeq-direct-upload-contract");
   const directChecksum = createHash("sha256").update(directBody).digest("hex");
-  const directObject = { bucket: process.env.UBEEQ_AWS_OBJECT_BUCKET, key: `contracts/direct/${Date.now()}`, contentType: "text/plain", byteLength: directBody.byteLength, checksum: directChecksum, scope: "private" };
+  const directObject = { bucket: process.env.UBEEQ_AWS_OBJECT_BUCKET, key: `cells/${directCellId}/creators/${directCreatorId}/uploads/${Date.now()}`, contentType: "text/plain", byteLength: directBody.byteLength, checksum: directChecksum, scope: "private" };
   const directStorage = new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET);
   let directCompleted;
   try {
@@ -37,7 +39,7 @@ if (missing.length) {
     const initiated = await direct.initiate({ object: directObject, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() });
     const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: { "content-type": directObject.contentType, "x-amz-checksum-sha256": Buffer.from(directChecksum, "hex").toString("base64"), "x-amz-meta-checksum": directChecksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(directBody.byteLength) }, body: directBody });
     if (!put.ok) throw new Error(`Direct S3 upload failed with ${put.status}: ${await put.text()}`);
-    directCompleted = await direct.complete({ uploadId: initiated.uploadId, checksum: directChecksum, byteLength: directBody.byteLength });
+    directCompleted = await direct.complete({ uploadId: initiated.uploadId, cellId: directCellId, creatorId: directCreatorId, checksum: directChecksum, byteLength: directBody.byteLength });
     if (!directCompleted.versionId) throw new Error("Direct S3 upload did not return an immutable version.");
     await verifyJobQueueContract(new AwsJobQueue(dynamo, repositoryConfiguration, new SQSClient({ region }), process.env.UBEEQ_AWS_JOBS_QUEUE_URL), key);
     const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region }), process.env.UBEEQ_AWS_USER_POOL_ID, process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID);

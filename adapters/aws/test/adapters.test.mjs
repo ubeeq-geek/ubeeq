@@ -95,15 +95,17 @@ test("SQS-notified DynamoDB queue obeys the shared durable job contract", async 
 test("S3 adapter obeys the shared storage contract without prescribing a delivery provider", async () => {
   const values = new Map(); let put;
   const storage = new S3ObjectStorage({ send: async (command) => {
-    if (command.constructor.name === "PutObjectCommand") { put = command.input; values.set(command.input.Key, command.input); return {}; }
+    if (command.constructor.name === "PutObjectCommand") { put = command.input; values.set(command.input.Key, command.input); return { VersionId: "written-version" }; }
     if (command.constructor.name === "GetObjectCommand") { const value = values.get(command.input.Key); if (!value) throw new Error("NoSuchKey"); return { VersionId: "v1", ContentType: value.ContentType, Metadata: value.Metadata, Body: { transformToByteArray: async () => value.Body } }; }
     if (command.constructor.name === "DeleteObjectCommand") { values.delete(command.input.Key); return {}; }
     return {};
   } }, "objects");
   await verifyObjectStorageContract(storage);
-  await storage.put({ object: { bucket: "ignored", key: "source/a", contentType: "image/png", byteLength: 5, checksum: "abc", scope: "private" }, body: Buffer.from("image") });
+  const written = { bucket: "ignored", key: "source/a", contentType: "image/png", byteLength: 5, checksum: "abc", scope: "private" };
+  await storage.put({ object: written, body: Buffer.from("image") });
   const loaded = await storage.get({ bucket: "ignored", key: "source/a" });
   assert.equal(put.Bucket, "objects");
+  assert.equal(written.versionId, "written-version");
   assert.equal(loaded.object.checksum, "abc");
   assert.equal(Buffer.from(loaded.body).toString(), "image");
 });

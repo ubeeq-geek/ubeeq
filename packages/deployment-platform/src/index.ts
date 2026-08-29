@@ -70,7 +70,7 @@ export interface MigrationCellRegistry {
   list(input: { limit: number; cursor?: string }): Promise<{ items: readonly MigrationCellRegistration[]; nextCursor?: string }>;
 }
 
-export type MigrationCellOperation = "source_hold" | "export" | "import" | "enable" | "rollback" | "retire";
+export type MigrationCellOperation = "source_hold" | "source_release" | "export" | "import" | "enable" | "rollback" | "retire";
 export interface MigrationCellCommand {
   operation: MigrationCellOperation;
   checkpoint: MigrationCheckpoint;
@@ -119,6 +119,7 @@ export class RoutingDirectoryConflictError extends Error {
 /** Provider-specific workers perform these idempotent operations; core owns only the lifecycle. */
 export interface MigrationExecutor {
   placeSourceHold(checkpoint: MigrationCheckpoint): Promise<void>;
+  releaseSourceHold(checkpoint: MigrationCheckpoint): Promise<void>;
   exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number; objectInventory?: readonly MigrationObjectInventoryEntry[] }>;
   transferObjects(checkpoint: MigrationCheckpoint): Promise<void>;
   importDestination(checkpoint: MigrationCheckpoint): Promise<void>;
@@ -136,6 +137,7 @@ export interface MigrationExecutor {
 export class RemoteMigrationExecutor implements MigrationExecutor {
   constructor(private readonly source: MigrationCellEndpoint, private readonly destination: MigrationCellEndpoint, private readonly transfer: MigrationObjectTransfer, private readonly destinationBucket: string) {}
   async placeSourceHold(checkpoint: MigrationCheckpoint): Promise<void> { await this.source.execute({ operation: "source_hold", checkpoint }); }
+  async releaseSourceHold(checkpoint: MigrationCheckpoint): Promise<void> { await this.source.execute({ operation: "source_release", checkpoint }); }
   async exportSource(checkpoint: MigrationCheckpoint): Promise<{ manifestChecksum: string; objectCount: number; objectInventory?: readonly MigrationObjectInventoryEntry[] }> {
     const result = await this.source.execute({ operation: "export", checkpoint, destinationBucket: this.destinationBucket });
     if (!result.manifestChecksum || !result.objectInventory) throw new Error("Migration source did not return a manifest checksum and object inventory.");
@@ -195,9 +197,16 @@ export class MigrationOrchestrator {
     if (checkpoint.state !== "cutover") throw new MigrationTransitionError("Only a cut-over migration can roll back.");
     const route = await this.routes.get(checkpoint.creatorId);
     if (!route) throw new Error(`No routing entry exists for creator ${checkpoint.creatorId}.`);
-    await this.executor.rollbackDestination(checkpoint);
-    const restored = rollbackCellRoute(route, checkpoint, this.now());
-    await this.routes.compareAndSwap({ route: restored, expectedRoutingRevision: route.routingRevision });
+    const alreadyRestored = route.homeCellId === checkpoint.source.homeCellId && route.homeRegion === checkpoint.source.homeRegion && route.endpoint === checkpoint.source.endpoint && route.routingRevision === checkpoint.source.routingRevision + 2 && route.state === "active";
+    if (!alreadyRestored) {
+      await this.executor.rollbackDestination(checkpoint);
+      const restored = rollbackCellRoute(route, checkpoint, this.now());
+      await this.routes.compareAndSwap({ route: restored, expectedRoutingRevision: route.routingRevision });
+    }
+    // Restore write authority only after the edge route has atomically returned
+    // to the source. A failed release therefore remains safely held and can be
+    // retried without moving the route again.
+    await this.executor.releaseSourceHold(checkpoint);
     return this.advance(checkpoint, "rolled_back");
   }
   async retire(id: string): Promise<MigrationCheckpoint> {

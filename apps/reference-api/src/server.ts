@@ -173,7 +173,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const source = await adapters.storage.get(storage);
       if (source.object.checksum !== processing.checksum || source.object.byteLength <= 0) throw new Error("Processing source object failed checksum or metadata verification.");
       const processingResult = await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
-      const rendition = { bucket: cellId, key: cellScopedObjectKey({ cellId, creatorId: processing.creatorId, kind: "renditions", objectId: processing.id }), versionId: randomUUID(), contentType: processing.mimeType, byteLength: source.body.byteLength, checksum: processing.checksum, scope: "public" as const };
+      // Keep the physical object-store location from the verified source. For a
+      // local cell this is its logical cell store; for S3 it is the actual
+      // regional bucket required by the explicit migration transfer adapter.
+      const rendition = { bucket: source.object.bucket, key: cellScopedObjectKey({ cellId, creatorId: processing.creatorId, kind: "renditions", objectId: processing.id }), versionId: randomUUID(), contentType: processing.mimeType, byteLength: source.body.byteLength, checksum: processing.checksum, scope: "public" as const };
       await adapters.storage.put({ object: rendition, body: source.body });
       const processed = await repositories.transaction(async (transaction) => {
         const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready", storage: rendition, originalStorage: storage } as Partial<AssetRecord>, { transaction });

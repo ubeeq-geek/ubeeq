@@ -114,7 +114,7 @@ test("accepts policy-approved signed federation reference updates and withdrawal
 test("uses an explicit control plane for creator migration requests, operator cutover, and edge redirects", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-regional-api-"));
   const adapters = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a" });
-  const executor = { placeSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: "a".repeat(64), objectCount: 0 }), transferObjects: async () => {}, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 0, verifiedObjectCount: 0 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
+  const executor = { placeSourceHold: async () => {}, releaseSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: "a".repeat(64), objectCount: 0 }), transferObjects: async () => {}, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 0, verifiedObjectCount: 0 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
   const orchestrator = new MigrationOrchestrator(adapters.routingDirectory, adapters.migrationCheckpoints, executor);
   const api = createReferenceApi({ publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a", adapters: { repositories: adapters.repositories, storage: adapters.storage, uploads: adapters.storage, delivery: adapters.storage, jobs: adapters.jobs, identity: adapters.identity, localIdentity: adapters.identity, federation: adapters.federation }, regionalControlPlane: { routingDirectory: adapters.routingDirectory, migrationCheckpoints: adapters.migrationCheckpoints, orchestrator }, operatorAuthorization: { anyRoles: ["creator"] } });
   await new Promise((resolve) => api.server.listen(0, "127.0.0.1", resolve)); const base = `http://127.0.0.1:${api.server.address().port}`;
@@ -147,7 +147,7 @@ test("moves original objects only through an explicit migration executor, never 
     await assert.rejects(() => destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/source" }));
     const route = { creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: new Date().toISOString() };
     await source.routingDirectory.create(route);
-    const executor = { placeSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: object.checksum, objectCount: 1 }), transferObjects: async () => { const copied = await source.storage.get(object); await destination.storage.put({ object: { ...object, bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/source" }, body: copied.body }); }, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 1, verifiedObjectCount: 1 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
+    const executor = { placeSourceHold: async () => {}, releaseSourceHold: async () => {}, exportSource: async () => ({ manifestChecksum: object.checksum, objectCount: 1 }), transferObjects: async () => { const copied = await source.storage.get(object); await destination.storage.put({ object: { ...object, bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/source" }, body: copied.body }); }, importDestination: async () => {}, verifyDestination: async () => ({ objectCount: 1, verifiedObjectCount: 1 }), enableDestination: async () => {}, rollbackDestination: async () => {}, retireSource: async () => {} };
     const migration = new MigrationOrchestrator(source.routingDirectory, source.migrationCheckpoints, executor);
     const checkpoint = await migration.request({ id: "move-object", creatorId: route.creatorId, destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } }); await migration.resume(checkpoint.id);
     const transferred = await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/source", versionId: "v1" }); assert.equal(Buffer.from(transferred.body).toString(), "data");
@@ -165,12 +165,14 @@ test("migrates a creator through real source and destination cell endpoints", as
   const bytes = Buffer.from("creator-original");
   const checksum = createHash("sha256").update(bytes).digest("hex");
   const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
+  const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "public" };
   let clock = Date.parse(assignedAt);
   try {
     await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
     await source.repositories.works.create({ id: "work-1", instanceId: "source", ...dataHome, creatorId: "creator-1", title: "Migrating work", status: "ready" });
     await source.storage.put({ object: original, body: bytes });
-    await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: original });
+    await source.storage.put({ object: rendition, body: bytes });
+    await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: rendition, originalStorage: original });
     await source.repositories.integrationAccounts.create({ id: "integration-1", instanceId: "source", ...dataHome, creatorId: "creator-1", connectorId: "reference", health: "healthy", credentialReference: "must-not-migrate" });
     await source.routingDirectory.create({ creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: assignedAt });
     const sourceEndpoint = createMigrationCellEndpoint({ cellId: "cell-a", region: "region-a", instanceId: "source", repositories: source.repositories, storage: source.storage });
@@ -202,9 +204,11 @@ test("migrates a creator through real source and destination cell endpoints", as
     const importedAsset = await destination.repositories.assets.get("asset-1");
     const importedIntegration = await destination.repositories.integrationAccounts.get("integration-1");
     assert.equal(importedCreator?.homeCellId, "cell-b"); assert.equal(importedCreator?.routingRevision, 2);
-    assert.equal(importedAsset?.homeCellId, "cell-b"); assert.equal(importedAsset?.storage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
+    assert.equal(importedAsset?.homeCellId, "cell-b"); assert.equal(importedAsset?.storage.key, "cells/cell-b/creators/creator-1/renditions/asset-1");
+    assert.equal(importedAsset?.originalStorage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
     assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
     assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
+    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), bytes);
     const rolledBack = await migration.rollback(requested.id);
     assert.equal(rolledBack.state, "rolled_back"); assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-a");
     const second = await migration.request({ id: "migration-2", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });

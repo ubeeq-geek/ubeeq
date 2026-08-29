@@ -135,7 +135,10 @@ export const migrationControlWorker = async (event: MigrationSqsEvent): Promise<
       const command = JSON.parse(record.body) as { migrationId?: string; operation?: "resume" | "rollback" | "retire"; rollbackWindowSeconds?: number };
       if (!command.migrationId || !command.operation) throw new Error("Migration queue message is invalid.");
       await worker.execute({ migrationId: command.migrationId, operation: command.operation, rollbackWindowSeconds: command.rollbackWindowSeconds });
-    } catch { failures.push({ itemIdentifier: record.messageId }); }
+    } catch (error) {
+      console.error("Ubeeq migration control command failed", { messageId: record.messageId, error: error instanceof Error ? error.message : String(error) });
+      failures.push({ itemIdentifier: record.messageId });
+    }
   }
   return { batchItemFailures: failures };
 };
