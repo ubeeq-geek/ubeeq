@@ -52,6 +52,10 @@ Ubeeq separates reusable provider adapters from runnable deployment models:
 
 [`deployments/machine/compact/reference-config.json`](deployments/machine/compact/reference-config.json) is the product-neutral starting point for compact machine configuration. It contains neither hosted product settings nor credentials.
 
+For AWS serverless regional planning, including the separate optional
+Rekognition Image moderation-label and face-age-range capabilities, see
+[`docs/aws-regional-capabilities.md`](docs/aws-regional-capabilities.md).
+
 ## Portable reference-instance plan
 
 The staged implementation plan for the local reference instance, durable adapters, optional AWS composition, and compatibility gates is in [`docs/portable-reference-instance-implementation-plan.md`](docs/portable-reference-instance-implementation-plan.md).
