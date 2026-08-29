@@ -12,12 +12,16 @@ region where those services meet the deployment's required features, quotas,
 data-residency commitments, and pricing. The cell stays authoritative for its
 own creator data; CDN caching does not make another region a write target.
 
-The current development cells have been deployed and health-checked in:
+The following cells have been deployed and health-checked. The two regional
+smoke checks are isolated stacks with no custom domain or product data; they
+exist to validate the same serverless composition in additional regions.
 
-| Region | Cell ID | Status |
+| Region | Cell ID | Purpose | Status |
 | --- | --- | --- |
-| `us-east-2` | `ubeeq-dev-us-east-2` | Healthy |
-| `eu-central-1` | `ubeeq-dev-eu-central-1` | Healthy |
+| `us-east-2` | `ubeeq-dev-us-east-2` | Development cell | Healthy |
+| `eu-central-1` | `ubeeq-dev-eu-central-1` | Development cell | Healthy |
+| `ca-central-1` | `ubeeq-smoke-ca-central-1` | Regional smoke check | Healthy |
+| `eu-west-1` | `ubeeq-smoke-eu-west-1` | Regional smoke check | Healthy |
 
 This is a deployment smoke check, not a claim that these are the only regions
 where the serverless profile can run.
