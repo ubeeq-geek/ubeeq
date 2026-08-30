@@ -8,6 +8,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@ubeeq/extension-sdk": "file:../../packages/extension-sdk"
+    "@ubeeq/extension-sdk": "file:../../packages/extension-sdk",
+    "@ubeeq/ui": "file:../../packages/ui"
   }
 }
