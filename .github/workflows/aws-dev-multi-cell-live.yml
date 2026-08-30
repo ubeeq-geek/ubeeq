@@ -53,13 +53,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Inspect GitHub OIDC claims
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const token = await core.getIDToken("sts.amazonaws.com");
-            const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8"));
-            core.info(JSON.stringify({ aud: claims.aud, sub: claims.sub, repository: claims.repository, ref: claims.ref, workflow_ref: claims.job_workflow_ref }, null, 2));
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
