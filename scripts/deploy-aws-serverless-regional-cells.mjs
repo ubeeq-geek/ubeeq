@@ -16,6 +16,10 @@ const destinationStack = required("UBEEQ_DESTINATION_STACK");
 const controlStack = required("UBEEQ_CONTROL_STACK");
 const operator = required("UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN");
 
+// The control plane and cells share the reference API Lambda asset. Package it
+// before the first CDK synthesis so the control-plane deployment can stage it.
+execFileSync("npm", ["run", "package:lambda", "--workspace", "@ubeeq/reference-api"], { stdio: "inherit", env: process.env });
+
 run("@ubeeq/deployment-aws-serverless-multi-cell", {
   STACK_NAME: controlStack,
   UBEEQ_CONTROL_PLANE_REGION: controlRegion,
