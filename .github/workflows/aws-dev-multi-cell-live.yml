@@ -1,15 +1,31 @@
-name: Protected AWS dev multi-cell live validation
+name: AWS dev multi-cell live validation
 
-# This is deliberately never a push or pull-request workflow. It can run only
-# after an explicit dispatch confirmation in the protected dev environment.
+# This validates the fixed, disposable Ubeeq development cells after relevant
+# changes merge to main. Production deployment remains a separate manual flow.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/aws-dev-multi-cell-live.yml
+      - apps/reference-api/**
+      - examples/aws-serverless/**
+      - packages/adapters-aws/**
+      - packages/auth/**
+      - packages/core/**
+      - packages/deployment-platform/**
+      - packages/federation/**
+      - packages/integrations/**
+      - packages/jobs/**
+      - packages/moderation/**
+      - packages/persistence/**
+      - packages/portability/**
+      - packages/processing/**
+      - packages/storage/**
+      - package.json
+      - package-lock.json
+      - tsconfig*.json
   workflow_dispatch:
-    inputs:
-      confirm-dev-mutation:
-        description: Confirm disposable data creation and cleanup in the fixed Ubeeq development cells
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -17,8 +33,7 @@ permissions:
 
 jobs:
   live-validation:
-    if: inputs.confirm-dev-mutation == true
-    # Configure this protected environment with non-production values only:
+    # This environment contains non-production values only:
     # UBEEQ_DEV_LIVE_ROLE_ARN and UBEEQ_DEV_AWS_ACCOUNT_ID.
     environment: ubeeq-dev-multi-cell-live
     runs-on: ubuntu-latest
