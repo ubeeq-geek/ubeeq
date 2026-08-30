@@ -9,6 +9,7 @@ on:
     paths:
       - .github/workflows/aws-dev-multi-cell-live.yml
       - apps/reference-api/**
+      - adapters/aws/**
       - examples/aws-serverless/**
       - packages/adapters-aws/**
       - packages/auth/**
