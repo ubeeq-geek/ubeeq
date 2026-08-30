@@ -78,6 +78,20 @@ jobs:
           };
           for (const [key, value] of Object.entries(values)) console.log(`${key}=${value}`);
           NODE
+      - name: Update fixed development cells
+        run: |
+          UBEEQ_SOURCE_REGION="$SOURCE_REGION" \
+          UBEEQ_DESTINATION_REGION="$DESTINATION_REGION" \
+          UBEEQ_CONTROL_REGION="$CONTROL_REGION" \
+          UBEEQ_SOURCE_STACK="$SOURCE_STACK" \
+          UBEEQ_DESTINATION_STACK="$DESTINATION_STACK" \
+          UBEEQ_CONTROL_STACK="$CONTROL_STACK" \
+          UBEEQ_SOURCE_CELL_ID="$SOURCE_CELL_ID" \
+          UBEEQ_DESTINATION_CELL_ID="$DESTINATION_CELL_ID" \
+          UBEEQ_SOURCE_BASE_URL="$SOURCE_API_URL" \
+          UBEEQ_DESTINATION_BASE_URL="$DESTINATION_API_URL" \
+          UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN="arn:aws:iam::${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}:role/UbeeqDevMultiCellLiveGithubActions" \
+          node scripts/deploy-aws-serverless-regional-cells.mjs
       - name: Create disposable Cognito identities
         run: |
           aws cognito-idp admin-create-user --region "$SOURCE_REGION" --user-pool-id "$SOURCE_USER_POOL" --username "$SOURCE_TEST_USERNAME" --user-attributes Name=email,Value="$SOURCE_TEST_USERNAME" Name=email_verified,Value=true --message-action SUPPRESS
