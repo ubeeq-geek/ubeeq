@@ -22,6 +22,7 @@ on:
       - packages/portability/**
       - packages/processing/**
       - packages/storage/**
+      - scripts/deploy-aws-serverless-regional-cells.mjs
       - package.json
       - package-lock.json
       - tsconfig*.json
