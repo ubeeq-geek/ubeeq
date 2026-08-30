@@ -200,9 +200,11 @@ export class AwsMigrationControlWorker {
 }
 
 export class S3ObjectStorage implements ObjectStorage {
-  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string) {}
+  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
+  private objectKey(key: string): string { return this.keyPrefix && !key.startsWith(`${this.keyPrefix}/`) ? `${this.keyPrefix}/${key}` : key; }
   private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }
   async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> {
+    input.object.key = this.objectKey(input.object.key);
     this.requireLocalKey(input.object.key);
     const response = await this.s3.send(new PutObjectCommand({ Bucket: this.bucket, Key: input.object.key, Body: input.body, ContentType: input.object.contentType, Metadata: { scope: input.object.scope, ...(input.object.checksum ? { checksum: input.object.checksum } : {}), byteLength: String(input.object.byteLength) } }));
     // S3 assigns an immutable object version. Preserve it on the supplied
@@ -210,8 +212,8 @@ export class S3ObjectStorage implements ObjectStorage {
     // exact rendition that was written, rather than a local placeholder.
     if (response.VersionId) input.object.versionId = response.VersionId;
   }
-  async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { this.requireLocalKey(input.key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
-  async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.requireLocalKey(input.key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: input.key, VersionId: input.versionId })); }
+  async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const key = this.objectKey(input.key); this.requireLocalKey(key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
+  async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const key = this.objectKey(input.key); this.requireLocalKey(key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); }
 }
 
 /**

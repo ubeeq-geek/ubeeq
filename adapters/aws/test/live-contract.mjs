@@ -25,7 +25,7 @@ if (missing.length) {
   const repositoryConfiguration = { tableName: process.env.UBEEQ_AWS_RECORDS_TABLE };
   const key = `aws-live-contract-${Date.now()}`;
   const jobId = `job-${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
-  const directCellId = `live-${Date.now()}`;
+  const directCellId = key;
   const directCreatorId = `creator-${Date.now()}`;
   const directBody = new TextEncoder().encode("ubeeq-direct-upload-contract");
   const directChecksum = createHash("sha256").update(directBody).digest("hex");
@@ -34,7 +34,7 @@ if (missing.length) {
   let directCompleted;
   try {
     await verifyRevisionedRepositoryContract({ repository: new DynamoRevisionedRepository(dynamo, repositoryConfiguration, "liveContractCreators"), createRecord: (id) => ({ id, instanceId: "aws-live", handle: id, displayName: "AWS live contract" }), change: () => ({ displayName: "AWS updated" }) });
-    await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET));
+    await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET, undefined, `cells/${key}`));
     const direct = new S3DirectUploadAdapter(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET);
     const initiated = await direct.initiate({ object: directObject, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() });
     const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: { "content-type": directObject.contentType, "x-amz-checksum-sha256": Buffer.from(directChecksum, "hex").toString("base64"), "x-amz-meta-checksum": directChecksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(directBody.byteLength) }, body: directBody });
