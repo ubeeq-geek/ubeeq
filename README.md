@@ -8,7 +8,13 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 
 The reference instance runs entirely on the local machine: SQLite state,
 filesystem objects, local password sessions, and a local durable job queue. It
-requires Node 22 but no AWS credentials or external services.
+requires Node 22.5 or newer but no AWS credentials or external services. The
+local adapter relies on Node's experimental built-in `node:sqlite` module.
+
+```sh
+nvm install 22
+nvm use 22
+```
 
 ```sh
 npm ci

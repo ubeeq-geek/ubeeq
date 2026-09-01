@@ -2,12 +2,16 @@
   "name": "ubeeq",
   "private": true,
   "version": "0.1.0",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "workspaces": ["packages/*", "adapters/*", "deployments/*/*", "apps/*"],
   "scripts": {
     "build": "npm run check:public-boundary && npm run check:adapter-contracts && npm run build --workspace @ubeeq/core && npm run build --workspace @ubeeq/auth && npm run build --workspace @ubeeq/extension-sdk && npm run build --workspace @ubeeq/ui && npm run build --workspace @ubeeq/integrations && npm run build --workspace @ubeeq/moderation && npm run build --workspace @ubeeq/processing && npm run build --workspace @ubeeq/storage && npm run build --workspace @ubeeq/jobs && npm run build --workspace @ubeeq/connector-reference && npm run build --workspace @ubeeq/persistence && npm run build --workspace @ubeeq/portability && npm run build --workspace @ubeeq/billing && npm run build --workspace @ubeeq/federation && npm run build --workspace @ubeeq/deployment-platform && npm run build --workspace @ubeeq/deployment-machine-compact && npm run build --workspace @ubeeq/api && npm run build --workspace @ubeeq/adapter-local && npm run build --workspace @ubeeq/adapter-machine && npm run build --workspace @ubeeq/adapter-aws && npm run build --workspace @ubeeq/deployment-aws-serverless-single-cell && npm run build --workspace @ubeeq/deployment-aws-serverless-multi-cell && npm run build --workspace @ubeeq/deployment-aws-serverless-production-promotion && npm run build --workspace @ubeeq/reference-api",
     "check:public-boundary": "node scripts/check-public-boundary.mjs",
     "check:adapter-contracts": "node scripts/check-adapter-contracts.mjs",
     "check:publish-workflow": "node scripts/check-publish-workflow.mjs",
+    "predev:api": "node scripts/require-local-node-runtime.mjs",
     "dev:api": "npm run build && npm run start --workspace @ubeeq/reference-api",
     "dev:web": "npm run start --workspace @ubeeq/web-reference",
     "dev:admin": "npm run start --workspace @ubeeq/admin-reference",
