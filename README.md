@@ -4,6 +4,42 @@ Ubeeq is a brand-neutral, self-hostable platform for creator work, assets, integ
 
 Hosted products consume Ubeeq through versioned packages and extension contracts. This repository intentionally contains no hosted-product branding, pricing, policy decisions, credentials, or operational runbooks.
 
+## Local development
+
+The reference instance runs entirely on the local machine: SQLite state,
+filesystem objects, local password sessions, and a local durable job queue. It
+requires Node 22 but no AWS credentials or external services.
+
+```sh
+npm ci
+```
+
+Start the API in one terminal:
+
+```sh
+npm run dev:api
+```
+
+Then start the creator workspace in a second terminal:
+
+```sh
+npm run dev:web
+```
+
+Open `http://127.0.0.1:4173`. The workspace proxies API requests to
+`http://127.0.0.1:4100`; set `UBEEQ_REFERENCE_API_URL` before starting the web
+server to use another API address. State and uploaded objects are stored in
+`var/reference` and can be removed when a fresh local instance is wanted.
+
+The optional operations UI follows the same pattern:
+
+```sh
+npm run dev:admin
+```
+
+It listens on `http://127.0.0.1:4174`. The older `dev:reference*` script names
+remain as backward-compatible aliases.
+
 ## Packages
 
 - `@ubeeq/core` — neutral domain entities and lifecycle contracts.
