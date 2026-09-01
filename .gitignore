@@ -4,6 +4,7 @@ dist/
 deployments/aws-serverless/single-cell/cdk.out/
 deployments/aws-serverless/multi-cell/cdk.out/
 apps/reference-api/lambda-package/
+apps/reference-api/var/
 examples/machine/compact/.env
 examples/machine/scalable-single-cell/.env
 

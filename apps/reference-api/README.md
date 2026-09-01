@@ -14,4 +14,5 @@ npm run dev:reference-api
 
 It listens on `http://127.0.0.1:4100` by default and stores SQLite state plus filesystem objects under `./var/reference`. No cloud credentials or network service are required.
 
-`node:sqlite` is currently experimental in Node 22; use the repository's supported Node 22 runtime for this reference implementation.
+`node:sqlite` is currently experimental in Node 22; use Node 22.5 or newer for
+this reference implementation. With nvm, run `nvm install 22 && nvm use 22`.
