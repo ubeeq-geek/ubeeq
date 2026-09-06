@@ -2,6 +2,47 @@ import type { ContentBlock, ContentBlockType, EntityId } from "./index.js";
 
 const supported = new Set(["section", "heading", "paragraph", "image", "video", "audio", "quote", "divider", "embed", "file", "link", "credit", "grouping", "carousel", "pdf_preview", "html_fragment"]);
 
+export interface ContentBlockParseOptions {
+  unbounded?: boolean;
+  /** JSON container depth, including block arrays and metadata. */
+  maxDepth?: number;
+  /** Total input values, including ignored fields and unsupported blocks. */
+  maxNodes?: number;
+}
+
+export class ContentBlockInputError extends Error {
+  readonly code = "invalid_content_structure";
+}
+
+/** Iterative preflight runs before recursive parsing or metadata cloning. */
+const checkStructure = (value: unknown, options: ContentBlockParseOptions): void => {
+  const maxDepth = options.maxDepth ?? 64, maxNodes = options.maxNodes ?? 10000;
+  if (!Number.isSafeInteger(maxDepth) || maxDepth < 1 || maxDepth > 128 ||
+      !Number.isSafeInteger(maxNodes) || maxNodes < 1) {
+    throw new ContentBlockInputError("Content limits require a depth of 1–128 and a positive node budget.");
+  }
+  const active = new Set<object>();
+  let remaining = maxNodes;
+  const visit = (input: unknown, depth: number): Iterator<unknown> | undefined => {
+    if (--remaining < 0) throw new ContentBlockInputError("Content node budget exceeded.");
+    if (!input || typeof input !== "object") return;
+    if (depth > maxDepth) throw new ContentBlockInputError("Content nesting limit exceeded.");
+    if (active.has(input)) throw new ContentBlockInputError("Content cannot contain cycles.");
+    active.add(input);
+    return (function* () {
+      for (const key in input) if (Object.hasOwn(input, key)) yield (input as Record<string, unknown>)[key];
+    })();
+  };
+  const first = visit(value, 1);
+  const stack = first ? [{ object: value as object, values: first, depth: 1 }] : [];
+  while (stack.length) {
+    const frame = stack[stack.length - 1], next = frame.values.next();
+    if (next.done) { active.delete(frame.object); stack.pop(); continue; }
+    const values = visit(next.value, frame.depth + 1);
+    if (values) stack.push({ object: next.value as object, values, depth: frame.depth + 1 });
+  }
+};
+
 /** Existing stored keys remain available while consumers migrate to portable blocks. */
 export interface StoredPostBlock extends Omit<ContentBlock, "id" | "assetId" | "fileId" | "data" | "children"> {
   blockId: string;
@@ -16,7 +57,8 @@ export interface StoredPostBlock extends Omit<ContentBlock, "id" | "assetId" | "
  * URL or embed sanitization: renderers and product policy must enforce those rules.
  * Unknown block types are omitted, matching the existing editor import contract.
  */
-export const parseContentBlocks = (value: unknown, options: { unbounded?: boolean } = {}): ContentBlock[] => {
+export const parseContentBlocks = (value: unknown, options: ContentBlockParseOptions = {}): ContentBlock[] => {
+  checkStructure(value, options);
   const parse = (input: unknown, parent = ""): ContentBlock[] => {
     if (!Array.isArray(input)) return [];
     return input.flatMap((item, index): ContentBlock[] => {
@@ -58,5 +100,5 @@ export const toStoredPostBlocks = (blocks: readonly ContentBlock[]): StoredPostB
     ...(children ? { blocks: toStoredPostBlocks(children) } : {}) };
 });
 
-export const parseStoredPostBlocks = (value: unknown, options: { unbounded?: boolean } = {}): StoredPostBlock[] =>
+export const parseStoredPostBlocks = (value: unknown, options: ContentBlockParseOptions = {}): StoredPostBlock[] =>
   toStoredPostBlocks(parseContentBlocks(value, options));
