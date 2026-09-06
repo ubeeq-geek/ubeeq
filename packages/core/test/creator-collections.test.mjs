@@ -1,0 +1,104 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { CreatorCollectionService } from "../dist/index.js";
+
+const scope = { tenantId: "tenant", creatorId: "creator" };
+const collection = (id, slug = id) => ({ ...scope, collectionId: id, slug, slugHistory: [slug], status: "draft", updatedAt: "before", productMetadata: { preserved: true } });
+const work = (id, extra = {}) => ({ ...scope, workId: id, status: "draft", ...extra });
+
+function fixture(allowed = true) {
+  const collections = new Map();
+  const works = new Map();
+  const memberships = new Map();
+  const calls = [];
+  let writes = 0;
+  const store = {
+    async listCreatorCollections(tenantId, creatorId) { return [...collections.values()].filter((c) => c.tenantId === tenantId && c.creatorId === creatorId && c.status !== "deleted"); },
+    async getCreatorCollection(tenantId, id) { const c = collections.get(id); return c?.tenantId === tenantId ? c : null; },
+    async createCreatorCollection(c) { writes++; collections.set(c.collectionId, c); },
+    async updateCreatorCollection(c) { writes++; collections.set(c.collectionId, c); },
+    async listCollectionWorks(tenantId, id) { return memberships.get(id) || []; },
+    async replaceCollectionWorks(tenantId, id, items) { writes++; memberships.set(id, items); },
+    async getWork(tenantId, id) { const w = works.get(id); return w?.tenantId === tenantId ? w : null; }
+  };
+  const service = new CreatorCollectionService(store, async (requested) => { calls.push(requested); return allowed; }, () => "now");
+  return { service, store, collections, works, memberships, calls, writes: () => writes };
+}
+
+test('conditional ordering fails closed when the adapter does not support it', async () => {
+  const f = fixture();
+  await f.service.create(collection('one'));
+  const before = f.writes();
+  await assert.rejects(f.service.replaceWorks('tenant', 'one', [], []), { code: 'invalid_works' });
+  assert.equal(f.writes(), before);
+});
+
+test("collection lifecycle preserves product fields, slug history, ordered membership and soft deletion", async () => {
+  const f = fixture();
+  assert.deepEqual((await f.service.create(collection("one"))).workIds, []);
+  f.works.set("a", work("a")); f.works.set("b", work("b"));
+  const result = await f.service.replaceWorks("tenant", "one", [" b ", "a", "b", ""]);
+  assert.deepEqual(result.workIds, ["b", "a"]);
+  assert.deepEqual(f.memberships.get("one"), [
+    { collectionId: "one", workId: "b", position: 0, addedAt: "now" },
+    { collectionId: "one", workId: "a", position: 1, addedAt: "now" }
+  ]);
+  const renamed = await f.service.update({ ...result, slug: "renamed", slugHistory: [] });
+  assert.deepEqual(renamed.slugHistory, ["one", "renamed"]);
+  assert.deepEqual(renamed.productMetadata, { preserved: true });
+  assert.deepEqual((await f.service.list(scope))[0].workIds, ["b", "a"]);
+  await f.service.replaceWorks("tenant", "one", []);
+  assert.deepEqual(f.memberships.get("one"), []);
+  await f.service.remove("tenant", "one");
+  assert.equal(f.collections.get("one").deletedAt, "now");
+  assert.deepEqual(await f.service.list(scope), []);
+  await assert.rejects(f.service.replaceWorks("tenant", "one", []), { code: "not_found" });
+  assert.ok(f.calls.every((requested) => JSON.stringify(requested) === JSON.stringify(scope)));
+});
+
+test("all collection entry points require creator authorization before exposing data or writing", async () => {
+  const f = fixture(false);
+  f.collections.set("one", collection("one"));
+  for (const operation of [
+    () => f.service.get("tenant", "one"), () => f.service.list(scope),
+    () => f.service.create(collection("two")), () => f.service.update(collection("one")),
+    () => f.service.remove("tenant", "one"), () => f.service.replaceWorks("tenant", "one", [])
+  ]) await assert.rejects(operation(), { code: "access_denied" });
+  assert.equal(f.writes(), 0);
+});
+
+test("collection renames cannot reuse another collection's current or historical slug", async () => {
+  const f = fixture();
+  await f.service.create(collection("one"));
+  await f.service.update({ ...collection("one"), slug: "renamed" });
+  await f.service.create(collection("two"));
+  for (const slug of ["one", "renamed"]) {
+    await assert.rejects(f.service.create(collection("new", slug)), { code: "slug_conflict" });
+    await assert.rejects(f.service.update({ ...collection("two"), slug }), { code: "slug_conflict" });
+  }
+  assert.equal(f.collections.get("two").slug, "two");
+  await f.service.update({ ...f.collections.get("one"), slug: "one" });
+});
+
+test("invalid, foreign and deleted Works never replace the existing membership", async () => {
+  const f = fixture();
+  f.collections.set("one", collection("one"));
+  f.works.set("valid", work("valid"));
+  f.works.set("foreign-creator", work("foreign-creator", { creatorId: "other" }));
+  f.works.set("foreign-tenant", work("foreign-tenant", { tenantId: "other" }));
+  f.works.set("deleted", work("deleted", { status: "deleted" }));
+  await f.service.replaceWorks("tenant", "one", ["valid"]);
+  for (const id of ["missing", "foreign-creator", "foreign-tenant", "deleted"]) {
+    await assert.rejects(f.service.replaceWorks("tenant", "one", ["valid", id]), { code: "invalid_works" });
+    assert.deepEqual(f.memberships.get("one").map((item) => item.workId), ["valid"]);
+  }
+  assert.equal(f.writes(), 1);
+});
+
+test("collection lookup is tenant-scoped and ownership cannot be reassigned", async () => {
+  const f = fixture();
+  f.collections.set("one", collection("one"));
+  await assert.rejects(f.service.get("other", "one"), { code: "not_found" });
+  await assert.rejects(f.service.update({ ...collection("one"), creatorId: "other" }), { code: "immutable_owner" });
+  assert.equal(f.writes(), 0);
+});

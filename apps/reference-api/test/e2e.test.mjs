@@ -18,7 +18,8 @@ const request = async (base, path, options = {}) => {
 
 test("runs the portable signed-in upload, publish, delivery, and export workflow", async () => {
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-reference-e2e-"));
-  const api = createReferenceApi({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a" });
+  // This workflow fixture explicitly grants its creator operational rights; default composition does not.
+  const api = createReferenceApi({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1:0", cellId: "cell-a", operatorAuthorization: { anyRoles: ['creator'] } });
   await new Promise((resolve) => api.server.listen(0, "127.0.0.1", resolve));
   const address = api.server.address(); const base = `http://127.0.0.1:${address.port}`;
   try {
@@ -32,6 +33,9 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.equal((await request(base, "/v1/operations/review-cases", { method: "POST", body: JSON.stringify({ subjectId: "unknown" }) })).response.status, 401);
     const creator = await request(base, "/v1/creators", { method: "POST", headers, body: JSON.stringify({ handle: "creator", displayName: "Creator" }) });
     assert.equal(creator.response.status, 201);
+    const duplicateCreator = await request(base, "/v1/creators", { method: "POST", headers, body: JSON.stringify({ handle: "creator", displayName: "Duplicate" }) });
+    assert.equal(duplicateCreator.response.status, 409);
+    assert.equal(duplicateCreator.body.error.code, 'handle_conflict');
     const collection = await request(base, "/v1/collections", { method: "POST", headers, body: JSON.stringify({ title: "A local collection", visibility: "public" }) });
     assert.equal(collection.response.status, 201);
     const work = await request(base, "/v1/works", { method: "POST", headers, body: JSON.stringify({ title: "A local work" }) });

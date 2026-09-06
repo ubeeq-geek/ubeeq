@@ -2,12 +2,14 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPa
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { AsyncLocalStorage } from 'node:async_hooks';
+export { LocalCreatorLibraryStore } from "./creator-library.js";
 import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import { requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
@@ -20,41 +22,97 @@ export interface LocalAdapterConfiguration { databasePath: string; dataDirectory
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
-  private transactionDepth = 0;
+  private readonly transactionContext = new AsyncLocalStorage<{ id: string; active: boolean; rollbackOnly: boolean }>();
+  private owner?: { id: string; active: boolean; rollbackOnly: boolean };
+  private transactionTail: Promise<void> = Promise.resolve();
 
   constructor(readonly configuration: LocalAdapterConfiguration) {
     mkdirSync(resolve(configuration.dataDirectory), { recursive: true });
     mkdirSync(resolve(configuration.databasePath, ".."), { recursive: true });
-    this.database = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
+    const raw = new DatabaseSync(configuration.databasePath) as SqliteDatabase;
+    const assertOwner = () => {
+      const context = this.transactionContext.getStore();
+      if (context && !context.active) throw new Error('SQLite transaction context has ended.');
+      if (this.owner && context !== this.owner) throw new Error('SQLite connection is owned by another transaction.');
+    };
+    // Also guard standalone repository calls and previously prepared statements:
+    // they must never join an unrelated transaction or observe uncommitted data.
+    this.database = new Proxy(raw, { get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => {
+        assertOwner();
+        const result = value.apply(target, args);
+        if (property !== 'prepare') return result;
+        return new Proxy(result, { get(statement, key) {
+          const method = Reflect.get(statement, key, statement);
+          return typeof method === 'function' ? (...parameters: unknown[]) => { assertOwner(); return method.apply(statement, parameters); } : method;
+        } });
+      };
+    } });
     // The compact profile has one API process and one worker process. WAL mode
     // keeps readers independent while a bounded busy timeout lets short writes
     // serialize instead of failing immediately under that expected contention.
     this.database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
-    const root = this.transactionDepth === 0;
-    if (root) this.database.exec("BEGIN IMMEDIATE");
-    this.transactionDepth += 1;
+    const inherited = this.transactionContext.getStore();
+    if (inherited) {
+      if (!inherited.active || this.owner !== inherited) throw new Error('SQLite transaction context has ended.');
+      try { return await operation({ id: inherited.id }); }
+      catch (error) { inherited.rollbackOnly = true; throw error; }
+    }
+    let release!: () => void;
+    const previous = this.transactionTail;
+    this.transactionTail = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    const context = { id: `sqlite-${randomUUID()}`, active: true, rollbackOnly: false };
+    this.owner = context;
     try {
-      const result = await operation({ id: `sqlite-${this.transactionDepth}` });
-      if (root) this.database.exec("COMMIT");
-      return result;
-    } catch (error) {
-      if (root) this.database.exec("ROLLBACK");
-      throw error;
-    } finally { this.transactionDepth -= 1; }
+      return await this.transactionContext.run(context, async () => {
+        this.database.exec('BEGIN IMMEDIATE');
+        try {
+          const result = await operation({ id: context.id });
+          if (context.rollbackOnly) throw new Error('SQLite transaction is rollback-only after a nested failure.');
+          this.database.exec('COMMIT');
+          return result;
+        } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+      });
+    } finally { context.active = false; this.owner = undefined; release(); }
   }
 }
 
 class SqliteRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
+
+  private write(operation: () => { changes: number }): { changes: number } {
+    try { return operation(); }
+    catch (error) {
+      if (this.repository === 'creators' && error instanceof Error && (error.message.includes("UNIQUE constraint failed: index 'ubeeq_creator_current_handle'") || error.message.includes('UNIQUE constraint failed: ubeeq_creator_handle_aliases.instance_id, ubeeq_creator_handle_aliases.handle'))) {
+        throw new UniqueConstraintError({ name: 'creator_current_handle', values: {} });
+      }
+      throw error;
+    }
+  }
+
+  private retainHandleHistory(value: T, previous?: T): T {
+    if (this.repository !== 'creators') return value;
+    const next = value as T & { instanceId?: string; handle?: string; handleHistory?: readonly string[] };
+    const old = previous as typeof next | undefined;
+    if (old && next.instanceId !== old.instanceId) throw new Error('Creator instance is immutable outside migration.');
+    for (const history of [old?.handleHistory, next.handleHistory]) {
+      if (history !== undefined && (!Array.isArray(history) || history.some(item => typeof item !== 'string' || !item))) throw new Error('Creator handle history is invalid.');
+    }
+    if (typeof next.handle !== 'string') return value;
+    return { ...value, handleHistory: [...new Set([...(old?.handleHistory || []), ...(old?.handle ? [old.handle] : []), ...(next.handleHistory || []), next.handle])] };
+  }
 
   async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string }): Promise<T> {
     if (options?.idempotencyKey) {
@@ -64,8 +122,8 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     const existing = await this.get(record.id);
     if (existing) throw new Error(`Record ${record.id} already exists.`);
     const timestamp = now();
-    const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T;
-    this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp);
+    const value = this.retainHandleHistory({ ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T);
+    this.write(() => this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp));
     if (options?.idempotencyKey) this.local.database.prepare("INSERT INTO ubeeq_idempotency (repository, idempotency_key, record_id, created_at) VALUES (?, ?, ?, ?)").run(this.repository, options.idempotencyKey, value.id, timestamp);
     return value;
   }
@@ -87,8 +145,8 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> {
     const current = await this.get(id);
     if (!current || current.revision !== expectedRevision) throw new OptimisticConcurrencyError(id, expectedRevision);
-    const value = { ...current, ...change, revision: current.revision + 1, updatedAt: now() } as T;
-    const result = this.local.database.prepare("UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?").run(value.revision, json(value), value.updatedAt, this.repository, id, expectedRevision);
+    const value = this.retainHandleHistory({ ...current, ...change, revision: current.revision + 1, updatedAt: now() } as T, current);
+    const result = this.write(() => this.local.database.prepare("UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?").run(value.revision, json(value), value.updatedAt, this.repository, id, expectedRevision));
     if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
     return value;
   }
@@ -214,18 +272,37 @@ export class LocalFederationKey implements FederationSigner, FederationSignature
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
+    return this.enqueueSync(input);
+  }
+  /** Joins an already-owned synchronous SQLite transaction without yielding. */
+  enqueueSync<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): DurableJob<T> {
     const storedIdempotencyKey = `${input.cellId}:${input.idempotencyKey}`;
     const existing = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?").get(input.cellId, storedIdempotencyKey) as Record<string, unknown> | undefined; if (existing) return this.row(existing) as DurableJob<T>;
     const timestamp = now(), job: DurableJob<T> = { id: randomUUID(), cellId: input.cellId, type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, state: "queued", attempt: 0, maxAttempts: input.maxAttempts, availableAt: input.availableAt ?? timestamp, createdAt: timestamp, updatedAt: timestamp, correlationId: input.correlationId };
-    this.write(job, undefined, storedIdempotencyKey); return job;
+    try { this.write(job, undefined, storedIdempotencyKey); return job; }
+    catch (error) {
+      // Another process may win the unique idempotency key after our first read.
+      const concurrent = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?").get(input.cellId, storedIdempotencyKey) as Record<string, unknown> | undefined;
+      if (concurrent) return this.row(concurrent) as DurableJob<T>;
+      throw error;
+    }
   }
   async lease<T>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<T> | undefined> {
-    // A crashed worker's expired lease becomes recoverable work before another worker claims it.
-    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE state = 'leased' AND lease_expires_at <= ?").run(now(), now(), now());
+    if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
+    const timestamp = now();
+    // Recovery is scoped to this worker's cell. Crashed attempts consume the same
+    // retry budget as reported failures, rather than being reclaimed forever.
+    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'dead_lettered', lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ? AND attempt >= max_attempts")
+      .run(json({ code: "lease_attempts_exhausted", message: "Worker leases expired through the configured attempt budget." }), timestamp, input.cellId, timestamp);
+    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ?")
+      .run(timestamp, timestamp, input.cellId, timestamp);
     const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
-    const row = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1`).get(input.cellId, now(), ...(input.types ?? [])) as Record<string, unknown> | undefined; if (!row) return undefined;
-    const job = this.row(row) as DurableJob<T>;
-    const leaseToken = randomUUID(); job.state = "leased"; job.attempt += 1; job.leaseExpiresAt = new Date(Date.now() + input.leaseDurationSeconds * 1000).toISOString(); job.updatedAt = now(); this.write(job, leaseToken); return { job, leaseToken };
+    const leaseToken = randomUUID(), expiresAt = new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString();
+    const row = this.local.database.prepare(`UPDATE ubeeq_jobs SET state = 'leased', attempt = attempt + 1, lease_token = ?, lease_expires_at = ?, updated_at = ?
+      WHERE id = (SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1)
+      AND state IN ('queued', 'retry_scheduled') RETURNING *`)
+      .get(leaseToken, expiresAt, timestamp, input.cellId, timestamp, ...(input.types ?? [])) as Record<string, unknown> | undefined;
+    return row ? { job: this.row(row) as DurableJob<T>, leaseToken } : undefined;
   }
   async complete(input: { id: string; leaseToken: string }): Promise<void> { this.transition(input.id, input.leaseToken, "completed"); }
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt); }
@@ -238,7 +315,12 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`); }
   private row(row: Record<string, unknown>): DurableJob { const cellId = String(row.cell_id); const storedKey = String(row.idempotency_key); return { id: String(row.id), cellId, type: String(row.type), payload: parse(String(row.payload)), idempotencyKey: storedKey.startsWith(`${cellId}:`) ? storedKey.slice(cellId.length + 1) : storedKey, state: row.state as DurableJob["state"], attempt: Number(row.attempt), maxAttempts: Number(row.max_attempts), availableAt: String(row.available_at), leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined, createdAt: String(row.created_at), updatedAt: String(row.updated_at), correlationId: row.correlation_id ? String(row.correlation_id) : undefined, lastError: row.last_error ? parse(String(row.last_error)) : undefined }; }
   private write(job: DurableJob, leaseToken?: string, storedIdempotencyKey = `${job.cellId}:${job.idempotencyKey}`): void { this.local.database.prepare("INSERT INTO ubeeq_jobs (id,cell_id,type,payload,idempotency_key,state,attempt,max_attempts,available_at,lease_token,lease_expires_at,created_at,updated_at,correlation_id,last_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, attempt=excluded.attempt, available_at=excluded.available_at, lease_token=excluded.lease_token, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at, last_error=excluded.last_error").run(job.id, job.cellId, job.type, json(job.payload), storedIdempotencyKey, job.state, job.attempt, job.maxAttempts, job.availableAt, leaseToken ?? null, job.leaseExpiresAt ?? null, job.createdAt, job.updatedAt, job.correlationId ?? null, job.lastError ? json(job.lastError) : null); }
-  private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void { const result = this.local.database.prepare("UPDATE ubeeq_jobs SET state = ?, last_error = ?, available_at = COALESCE(?, available_at), lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'leased' AND lease_token = ?").run(state, error ? json(error) : null, availableAt ?? null, now(), id, leaseToken); if (result.changes !== 1) throw new Error("Job lease is no longer valid."); }
+  private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void {
+    const timestamp = now();
+    const result = this.local.database.prepare("UPDATE ubeeq_jobs SET state = ?, last_error = ?, available_at = COALESCE(?, available_at), lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state = 'leased' AND lease_token = ? AND lease_expires_at > ?")
+      .run(state, error ? json(error) : null, availableAt ?? null, timestamp, id, leaseToken, timestamp);
+    if (result.changes !== 1) throw new Error("Job lease is no longer valid.");
+  }
 }
 
 /**
@@ -312,6 +394,7 @@ export class LocalMigrationCheckpoints implements MigrationCheckpointStore {
   }
 }
 
+export * from './creator-members.js';
 export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) => {
   const database = new LocalSqliteDatabase(configuration);
   const storage = new LocalFilesystemStorage(database);
