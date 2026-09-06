@@ -7,6 +7,7 @@ export interface CreatorCollectionRecord {
   slugHistory: string[];
   status: string;
   updatedAt: string;
+  revision?: number;
 }
 
 export interface CreatorCollectionScope { tenantId: string; creatorId: string }
@@ -22,10 +23,11 @@ export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
   /** Set only when expected order is compared atomically with membership replacement. */
   readonly supportsExpectedCollectionOrder?: boolean;
   readonly supportsExpectedCollectionStatus?: boolean;
+  readonly supportsExpectedCollectionRevision?: boolean;
   listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null>;
   createCreatorCollection(collection: C): Promise<void>;
-  updateCreatorCollection(collection: C, expectedStatus?: string): Promise<void>;
+  updateCreatorCollection(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<void>;
   listCollectionWorks(tenantId: string, collectionId: string): Promise<CreatorCollectionMembership[]>;
   replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[]): Promise<void>;
   getWork(tenantId: string, workId: string): Promise<{
@@ -95,7 +97,8 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     return { ...created, workIds: [] };
   }
 
-  async update(collection: C, expectedStatus?: string): Promise<C & { workIds: string[] }> {
+  async update(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<C & { workIds: string[] }> {
+    this.requireRevisionSupport(expectedRevision);
     if (expectedStatus !== undefined && !this.store.supportsExpectedCollectionStatus) {
       throw new CreatorCollectionError('revision_conflict', 'Conditional collection lifecycle writes are unavailable in this adapter.');
     }
@@ -105,14 +108,24 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     }
     await this.requireAvailableSlug(collection);
     const updated = { ...collection, slugHistory: [...new Set([...(previous.slugHistory || []), previous.slug, collection.slug])] };
-    await this.store.updateCreatorCollection(updated, expectedStatus);
-    return this.view(updated);
+    await this.store.updateCreatorCollection(updated, expectedStatus, expectedRevision);
+    return this.view(expectedRevision === undefined && this.store.supportsExpectedCollectionRevision
+      ? await this.get(collection.tenantId, collection.collectionId)
+      : expectedRevision === undefined ? updated : { ...updated, revision: expectedRevision + 1 });
   }
 
-  async remove(tenantId: string, collectionId: string): Promise<void> {
+  private requireRevisionSupport(expectedRevision?: number): void {
+    if (expectedRevision !== undefined && (!this.store.supportsExpectedCollectionRevision ||
+      !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER)) {
+      throw new CreatorCollectionError('revision_conflict', 'A supported, valid collection revision is required.');
+    }
+  }
+
+  async remove(tenantId: string, collectionId: string, expectedRevision?: number): Promise<void> {
+    this.requireRevisionSupport(expectedRevision);
     const collection = await this.get(tenantId, collectionId);
     const now = this.now();
-    await this.store.updateCreatorCollection({ ...collection, status: "deleted", deletedAt: now, updatedAt: now });
+    await this.store.updateCreatorCollection({ ...collection, status: "deleted", deletedAt: now, updatedAt: now }, undefined, expectedRevision);
   }
 
   async replaceWorks(tenantId: string, collectionId: string, requestedWorkIds: readonly string[], expectedWorkIds?: readonly string[]): Promise<C & { workIds: string[] }> {

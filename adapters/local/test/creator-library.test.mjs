@@ -6,6 +6,40 @@ import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService } from "@ubeeq/core";
 
+test('collection revisions fence competing writers, legacy rows and status ABA changes', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-revisions-'));
+  const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  const first = new LocalSqliteDatabase(configuration), second = new LocalSqliteDatabase(configuration);
+  try {
+    const a = new LocalCreatorLibraryStore(first), b = new LocalCreatorLibraryStore(second);
+    const record = { tenantId: 'tenant', creatorId: 'creator', collectionId: 'collection', slug: 'original', slugHistory: ['original'], status: 'draft', updatedAt: 'before' };
+    await a.createCreatorCollection(record); // Historical records need no migration to acquire revision 1.
+    const results = await Promise.allSettled([
+      a.updateCreatorCollection({ ...record, title: 'A' }, 'draft', 0),
+      b.updateCreatorCollection({ ...record, title: 'B' }, 'draft', 0)
+    ]);
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(results.find(result => result.status === 'rejected').reason.code, 'revision_conflict');
+    const winner = await a.getCreatorCollection('tenant', 'collection');
+    assert.equal(winner.revision, 1);
+    await b.updateCreatorCollection({ ...winner, status: 'archived' }, 'draft', 1);
+    await b.updateCreatorCollection({ ...winner, status: 'draft' }, 'archived', 2);
+    await assert.rejects(a.updateCreatorCollection({ ...winner, title: 'Stale edit' }, 'draft', 1), { code: 'revision_conflict' });
+    await assert.rejects(a.updateCreatorCollection({ ...winner, status: 'deleted' }, undefined, 1), { code: 'revision_conflict' });
+    const current = await a.getCreatorCollection('tenant', 'collection');
+    assert.equal(current.revision, 3);
+    assert.equal(current.title, winner.title);
+    for (const revision of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+      await assert.rejects(a.updateCreatorCollection(current, undefined, revision), { code: 'revision_conflict' });
+    }
+    // Compatibility writes also advance the counter; they cannot reset it using payload fields.
+    await b.updateCreatorCollection({ ...current, revision: 0 });
+    assert.equal((await a.getCreatorCollection('tenant', 'collection')).revision, 4);
+  } finally {
+    first.database.close(); second.database.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('a stale collection edit cannot revive a deletion committed by another connection', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-tombstone-'));
   const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
@@ -19,7 +53,7 @@ test('a stale collection edit cannot revive a deletion committed by another conn
     await remover.updateCreatorCollection(deleted);
     for (const status of ['draft', 'archived', 'published']) {
       await assert.rejects(editor.updateCreatorCollection({ ...stale, status, updatedAt: 'after' }, stale.status), { code: 'revision_conflict' });
-      assert.deepEqual(await editor.getCreatorCollection('tenant', 'collection'), deleted);
+      assert.deepEqual(await editor.getCreatorCollection('tenant', 'collection'), { ...deleted, revision: 1 });
     }
     assert.deepEqual(await editor.listCreatorCollections('tenant', 'creator'), []);
   } finally {

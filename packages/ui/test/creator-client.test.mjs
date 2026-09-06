@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection edits, lifecycle changes and deletion forward explicit revisions', async () => {
+  const bodies = [];
+  const client = new CreatorClient(async (_url, options) => { bodies.push(JSON.parse(options.body)); return Response.json({}); });
+  await client.updateCollection('id', 'Title', { expectedRevision: 4 });
+  await client.setCollectionArchived('id', true, 5);
+  await client.deleteCollection('id', 6);
+  assert.deepEqual(bodies, [{ title: 'Title', expectedRevision: 4 }, { status: 'archived', expectedRevision: 5 }, { expectedRevision: 6 }]);
+});
 test('collection archive and restore send only lifecycle state with authenticated encoded IDs', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => {

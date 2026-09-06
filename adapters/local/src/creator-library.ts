@@ -163,12 +163,15 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
   }
   async createCreatorCollection(collection: C): Promise<void> { this.create("collection", collection.collectionId, collection); }
   readonly supportsExpectedCollectionStatus = true;
-  async updateCreatorCollection(collection: C, expectedStatus?: string): Promise<void> {
-    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'collection' AND id = ? AND creator_id = ? AND (? IS NULL OR json_extract(payload, '$.status') = ?) AND ${availableSlug}`)
-      .run(JSON.stringify(collection), this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, expectedStatus ?? null, expectedStatus ?? null, ...this.slugParameters("collection", collection.collectionId, collection));
+  readonly supportsExpectedCollectionRevision = true;
+  async updateCreatorCollection(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<void> {
+    if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER)) throw new CreatorCollectionError('revision_conflict', 'Invalid collection revision.');
+    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = json_set(?, '$.revision', COALESCE(json_extract(payload, '$.revision'), 0) + 1) WHERE cell_id = ? AND tenant_id = ? AND kind = 'collection' AND id = ? AND creator_id = ? AND (? IS NULL OR json_extract(payload, '$.status') = ?) AND (? IS NULL OR COALESCE(json_extract(payload, '$.revision'), 0) = ?) AND ${availableSlug}`)
+      .run(JSON.stringify(collection), this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, expectedStatus ?? null, expectedStatus ?? null, expectedRevision ?? null, expectedRevision ?? null, ...this.slugParameters("collection", collection.collectionId, collection));
     if (result.changes !== 1) {
       const current = this.get<C>(collection.tenantId, "collection", collection.collectionId);
       if (!current || current.creatorId !== collection.creatorId) throw new CreatorCollectionError("not_found", "Collection not found.");
+      if (expectedRevision !== undefined && (current.revision ?? 0) !== expectedRevision) throw new CreatorCollectionError('revision_conflict', 'Collection changed; refresh before saving.');
       if (expectedStatus !== undefined && current.status !== expectedStatus) throw new CreatorCollectionError('revision_conflict', 'Collection status changed; refresh before saving.');
       throw this.slugConflict("collection");
     }

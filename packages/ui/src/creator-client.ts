@@ -44,12 +44,12 @@ export class CreatorClient {
   createCollection(creatorId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string } = {}) {
     return this.call('/studio/collections', 'POST', { creatorId, title, type: metadata.type, slug: metadata.slug, description: metadata.description });
   }
-  updateCollection(collectionId: string, title: string, metadata: { slug?: string; description?: string } = {}) {
-    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title, slug: metadata.slug, description: metadata.description });
+  updateCollection(collectionId: string, title: string, metadata: { slug?: string; description?: string; expectedRevision?: number } = {}) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title, slug: metadata.slug, description: metadata.description, expectedRevision: metadata.expectedRevision });
   }
-  deleteCollection(collectionId: string) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'DELETE'); }
-  setCollectionArchived(collectionId: string, archived: boolean) {
-    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { status: archived ? 'archived' : 'draft' });
+  deleteCollection(collectionId: string, expectedRevision?: number) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'DELETE', expectedRevision === undefined ? undefined : { expectedRevision }); }
+  setCollectionArchived(collectionId: string, archived: boolean, expectedRevision?: number) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { status: archived ? 'archived' : 'draft', expectedRevision });
   }
   replaceCollectionWorks(collectionId: string, workIds: string[], expectedWorkIds?: string[]) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}/works`, 'PUT', { workIds, expectedWorkIds }); }
   updateWork(workId: string, revision: number, title: string, description: string, tags?: string[]) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }) }); }

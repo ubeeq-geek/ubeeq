@@ -338,8 +338,13 @@ remain outside SQLite atomicity, and cloud transaction parity is still pending.
 
 The creator client supports archiving collections and restoring them to draft.
 Consumers select admission and visibility rules. The local collection adapter
-supports expected-status writes to reject stale lifecycle snapshots atomically;
-it does not yet provide general collection metadata revision conflict detection.
+supports expected-status and expected-revision writes to reject stale metadata and
+lifecycle snapshots atomically. Every local metadata/lifecycle write increments
+the persisted revision, even compatibility writes without preconditions; legacy
+rows start at revision zero. Conditional update/removal fails closed in adapters
+without revision support. Work order retains its separate expected-order check.
+Consumers must send the displayed revision to protect forms from lost updates;
+omitting it does not offer that guarantee. Cloud parity remains unqualified.
 
 Retry delay calculation is available in `@ubeeq/jobs` as
 `equalJitterRetryDelaySeconds`, with caller-selected base, cap and exponent limit.
