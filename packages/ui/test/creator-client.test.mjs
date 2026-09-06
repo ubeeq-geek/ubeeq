@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection metadata is optional, explicit and supports clearing descriptions', async () => {
+  const bodies = [];
+  const client = new CreatorClient(async (_url, options) => { bodies.push(JSON.parse(options.body)); return Response.json({}); });
+  await client.createCollection('owner', 'Title');
+  assert.deepEqual(bodies.at(-1), { creatorId: 'owner', title: 'Title' });
+  await client.createCollection('owner', 'Playlist', { type: 'playlist', slug: 'list', description: 'Description', creatorId: 'forged', status: 'published' });
+  assert.deepEqual(bodies.at(-1), { creatorId: 'owner', title: 'Playlist', type: 'playlist', slug: 'list', description: 'Description' });
+  await client.updateCollection('id', 'Renamed');
+  assert.deepEqual(bodies.at(-1), { title: 'Renamed' });
+  await client.updateCollection('id', 'Renamed', { slug: 'renamed', description: '', type: 'gallery' });
+  assert.deepEqual(bodies.at(-1), { title: 'Renamed', slug: 'renamed', description: '' });
+});
 test('collection removal encodes the ID, sends credentials and accepts an empty response', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => {
