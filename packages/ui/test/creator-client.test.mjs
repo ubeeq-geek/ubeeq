@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('Work metadata edits forward only an explicit slug and preserve legacy request bodies', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
+  await client.updateWork('id/space here', 2, 'Title', 'Description');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 2, title: 'Title', description: 'Description' });
+  await client.updateWork('id/space here', 3, 'Title', 'Description', ['tag'], { slug: 'new-slug', creatorId: 'forged', revision: 99, status: 'published' });
+  assert.equal(calls.at(-1).url, '/api/studio/works/id%2Fspace%20here');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 3, title: 'Title', description: 'Description', tags: ['tag'], slug: 'new-slug' });
+});
 test('collection covers use revisioned writes and authenticated JPEG-only reads', async () => {
   const calls = [];
   let response = () => new Response(new Uint8Array([255, 216, 255]), { headers: { 'content-type': 'image/jpeg' } });
