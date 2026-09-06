@@ -11,5 +11,5 @@ export const assetEditorOptions = (assets: readonly EditorAsset[], thumbnails: R
     const thumbnail = thumbnails[asset.assetId];
     return [{ mediaId: asset.assetId, label: asset.originalFilename || asset.assetId,
       assetType: kind as 'image' | 'video' | 'audio' | 'file', mimeType: asset.mimeType,
-      ...(kind === 'image' && thumbnail?.startsWith('blob:') ? { thumbnailUrl: thumbnail } : {}) }];
+      ...(['image', 'video'].includes(kind) && thumbnail?.startsWith('blob:') ? { thumbnailUrl: thumbnail } : {}) }];
   });

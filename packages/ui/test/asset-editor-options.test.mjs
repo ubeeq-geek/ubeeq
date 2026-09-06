@@ -15,6 +15,7 @@ test('editor choices retain attachment IDs and only accept caller-owned blob thu
   assert.deepEqual(options[0], { mediaId: 'image', label: 'Private image', assetType: 'image', mimeType: 'image/png', thumbnailUrl: 'blob:private-preview' });
   assert.deepEqual(options[3], { mediaId: 'html', label: 'html', assetType: 'file', mimeType: 'text/html' });
   assert.equal(options[1].thumbnailUrl, undefined);
+  assert.equal(assetEditorOptions(assets, { video: 'blob:private-poster' })[1].thumbnailUrl, 'blob:private-poster');
   for (const url of ['https://storage.test/private', 'data:image/svg+xml,unsafe', 'javascript:alert(1)']) {
     assert.equal(assetEditorOptions(assets, { image: url })[0].thumbnailUrl, undefined);
   }
