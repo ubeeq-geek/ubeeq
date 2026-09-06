@@ -22,7 +22,7 @@ const escapeHtml = (text = '') => text.replace(/&/g, '&amp;').replace(/</g, '&lt
 /** The only route from canonical blocks to WordPress HTML; raw HTML and arbitrary embeds are rejected. */
 export type WordPressRenderPolicy = { approvedEmbedHosts?: readonly string[]; format?: 'blocks' | 'classic' };
 
-export const renderWordPressContent = (blocks: readonly WordPressRenderBlock[] = [], policy: WordPressRenderPolicy = {}): string => blocks.map((block) => {
+export const renderWordPressContent = <T extends WordPressRenderBlock>(blocks: readonly T[] = [], policy: WordPressRenderPolicy = {}): string => blocks.map((block) => {
   if (block.type === 'paragraph') return `<p>${escapeHtml(block.text)}</p>`;
   if (block.type === 'heading') return `<h${Math.min(6, Math.max(2, block.level || 2))}>${escapeHtml(block.text)}</h${Math.min(6, Math.max(2, block.level || 2))}>`;
   if (block.type === 'quote') return `<blockquote><p>${escapeHtml(block.quote || block.text)}</p></blockquote>`;

@@ -1,6 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { renderWordPressContent } from '../dist/index.js';
+
+test('WordPress renderer declarations accept canonical metadata without weakening rendered fields', () => {
+  const filename = fileURLToPath(new URL('./wordpress-types.fixture.mts', import.meta.url));
+  const source = `
+    import { renderWordPressContent } from '../dist/index.js';
+    renderWordPressContent([{ blockId: 'p', type: 'paragraph', text: 'Text', payload: { custom: true } }]);
+    renderWordPressContent([{ blockId: 's', type: 'section', blocks: [{ blockId: 'c', type: 'paragraph' }] }]);
+    interface Stored { blockId: string; type: string; text?: string; blocks?: Stored[]; }
+    const stored: Stored[] = [{ blockId: 'p', type: 'paragraph' }];
+    renderWordPressContent(stored);
+    renderWordPressContent([{ type: 'embed', url: 'https://example.com' }] as const, { approvedEmbedHosts: ['example.com'] as const });
+    // @ts-expect-error rendered fields retain their types
+    renderWordPressContent([{ type: 'link', url: 42 }]);
+  `;
+  const options = { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.NodeNext, moduleResolution: ts.ModuleResolutionKind.NodeNext, types: ['node'] };
+  const host = ts.createCompilerHost(options);
+  const original = host.getSourceFile.bind(host);
+  host.getSourceFile = (name, version, ...args) => name === filename
+    ? ts.createSourceFile(name, source, version, true)
+    : original(name, version, ...args);
+  const diagnostics = ts.getPreEmitDiagnostics(ts.createProgram([filename], options, host));
+  assert.deepEqual(diagnostics.map(d => ts.flattenDiagnosticMessageText(d.messageText, '\n')), []);
+});
 
 test('WordPress rendering preserves canonical semantic output without mutating input', () => {
   const blocks = [
