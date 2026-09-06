@@ -1,6 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection covers use revisioned writes and authenticated JPEG-only reads', async () => {
+  const calls = [];
+  let response = () => new Response(new Uint8Array([255, 216, 255]), { headers: { 'content-type': 'image/jpeg' } });
+  const client = new CreatorClient(async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('sign-in')) return Response.json({ token: 'session' });
+    return url.endsWith('/cover') ? response() : Response.json({});
+  });
+  await client.signIn('owner@example.test', 'password');
+  await client.setCollectionCover('id/space here', 'asset', 3);
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { coverAssetId: 'asset', expectedRevision: 3 });
+  await client.setCollectionCover('id/space here', '', 4);
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { coverAssetId: '', expectedRevision: 4 });
+  assert.equal((await client.collectionCover('id/space here')).type, 'image/jpeg');
+  assert.equal(calls.at(-1).url, '/api/studio/collections/id%2Fspace%20here/cover');
+  assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+  response = () => new Response('<svg/>', { headers: { 'content-type': 'image/svg+xml' } });
+  await assert.rejects(client.collectionCover('id'), /Unexpected/);
+  response = () => new Response(null, { status: 401 });
+  await assert.rejects(client.collectionCover('id'), /unavailable/);
+  await assert.rejects(client.collectionCover('id'), /unavailable/);
+  assert.equal(calls.at(-1).options.headers.authorization, undefined);
+});
 test('collection edits, lifecycle changes and deletion forward explicit revisions', async () => {
   const bodies = [];
   const client = new CreatorClient(async (_url, options) => { bodies.push(JSON.parse(options.body)); return Response.json({}); });

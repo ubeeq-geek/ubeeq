@@ -357,7 +357,10 @@ clear the reference without deleting assets. Collection soft deletion is not
 blocked by a missing historical cover. This is a write-time reference guarantee,
 not a guarantee that an asset cannot later be deleted, an attachment to a specific
 Work, a content-safety decision, or authorization to publish/render the asset.
-Consumer cover selectors and rendering remain separate migration work.
+The creator client supplies revisioned cover assignment/clearing and authenticated
+JPEG-only preview reads. Consumer routes must independently authorize and validate
+the asset/rendition before reading bytes; a client MIME check is not a server-side
+security boundary. Public cover rendering remains separate migration work.
 
 Retry delay calculation is available in `@ubeeq/jobs` as
 `equalJitterRetryDelaySeconds`, with caller-selected base, cap and exponent limit.
