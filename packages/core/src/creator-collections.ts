@@ -88,9 +88,12 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
   }
 
   private async requireAvailableSlug(collection: C): Promise<void> {
+    if (collection.status === 'deleted') return;
     const existing = await this.store.listCreatorCollections(collection.tenantId, collection.creatorId);
-    if (existing.some((other) => other.collectionId !== collection.collectionId &&
-      (other.slug === collection.slug || other.slugHistory?.includes(collection.slug)))) {
+    const requested = new Set([collection.slug, ...(collection.slugHistory || [])]);
+    if (existing.some((other) => other.collectionId !== collection.collectionId && other.tenantId === collection.tenantId &&
+      other.creatorId === collection.creatorId && other.status !== 'deleted' &&
+      [other.slug, ...(other.slugHistory || [])].some(alias => requested.has(alias)))) {
       throw new CreatorCollectionError("slug_conflict", "Collection slug is already in use.");
     }
   }
@@ -98,8 +101,8 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
   async create(collection: C): Promise<C & { workIds: string[] }> {
     await this.requireAccess(collection);
     await this.requireValidCover(collection);
-    await this.requireAvailableSlug(collection);
     const created = { ...collection, slugHistory: [...new Set([...collection.slugHistory, collection.slug])] };
+    await this.requireAvailableSlug(created);
     await this.store.createCreatorCollection(created);
     return { ...created, workIds: [] };
   }
@@ -114,8 +117,10 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
       throw new CreatorCollectionError("immutable_owner", "Collection ownership cannot be changed.");
     }
     await this.requireValidCover(collection);
-    await this.requireAvailableSlug(collection);
     const updated = { ...collection, slugHistory: [...new Set([...(previous.slugHistory || []), previous.slug, collection.slug])] };
+    // Validate the aliases actually being persisted, not caller-supplied history.
+    // Adapters still need an atomic reservation check to close concurrent races.
+    await this.requireAvailableSlug(updated);
     await this.store.updateCreatorCollection(updated, expectedStatus, expectedRevision);
     return this.view(expectedRevision === undefined && this.store.supportsExpectedCollectionRevision
       ? await this.get(collection.tenantId, collection.collectionId)
