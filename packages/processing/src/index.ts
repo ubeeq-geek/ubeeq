@@ -1,4 +1,5 @@
 /** Mechanisms for media processing and measurement; products decide entitlement and price. */
+export * from "./video.js";
 export type UsageMeter = "storage_bytes" | "delivery_bytes" | "processing_units" | "transcode_seconds";
 
 export interface ProcessingRequest {
