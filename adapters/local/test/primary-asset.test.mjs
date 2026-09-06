@@ -38,14 +38,28 @@ test('primary selection commits pointer and roles together, preserves order, and
     assert.equal(ordered.revision, 5); assert.equal(ordered.primaryAssetId, 'b');
     assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'work')).map(item => [item.assetId, item.attachment.role, item.attachment.position]), [['b', 'primary', 0], ['a', 'content', 1]]);
     await assert.rejects(ordering.replace('tenant', 'work', ['a', 'b'], 4), { code: 'revision_conflict' });
+    for (const fields of [
+      { body: [{ id: 'missing', type: 'image', assetId: 'missing' }] },
+      { media: [{ assetId: 'b', comparison: { item: { assetId: 'missing' } } }] }
+    ]) {
+      await assert.rejects(store.commitWorkRevision({ ...ordered, ...fields, revision: 6 }, 5), { code: 'invalid_asset' });
+      assert.deepEqual(await store.getWork('tenant', 'work'), ordered);
+    }
+    await assert.rejects(store.createWork({ ...ordered, workId: 'another', slug: 'another', slugHistory: [], body: [{ id: 'foreign', type: 'image', assetId: 'b' }] }), { code: 'invalid_asset' });
+    const referenced = { ...ordered, body: [{ id: 'nested', type: 'section', children: [{ id: 'image', type: 'image', assetId: 'b' }] }], revision: 6 };
+    await store.commitWorkRevision(referenced, 5);
     const original = store.listCanonicalAssetsByWork.bind(store);
     store.listCanonicalAssetsByWork = async (...args) => {
       const rows = await original(...args);
       db.database.prepare("UPDATE ubeeq_creator_library SET payload = json_set(payload, '$.status', 'deleted') WHERE kind = 'asset' AND id = 'a'").run();
       return rows;
     };
-    await assert.rejects(service.select('tenant', 'work', 'a', 5), { code: 'invalid_asset' });
-    assert.deepEqual(await store.getWork('tenant', 'work'), ordered);
+    await assert.rejects(service.select('tenant', 'work', 'a', 6), { code: 'invalid_asset' });
+    assert.deepEqual(await store.getWork('tenant', 'work'), referenced);
     assert.deepEqual((await original('tenant', 'work')).map(item => item.attachment.role), ['primary', 'content']);
+    const otherWork = { ...ordered, workId: 'other-work', slug: 'other-work', slugHistory: [], revision: 1 };
+    await store.createWork(otherWork);
+    await assert.rejects(store.commitWorkRevision({ ...otherWork, revision: 2, body: referenced.body }, 1), { code: 'invalid_asset' });
+    assert.deepEqual(await store.getWork('tenant', 'other-work'), otherWork);
   } finally { db.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
