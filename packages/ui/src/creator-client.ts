@@ -44,7 +44,10 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, status: 'draft' });
   }
   createWork(creatorId: string, title: string, description: string, tags?: string[], kind?: WorkKind) { return this.call('/studio/works', 'POST', { creatorId, title, description, ...(tags === undefined ? {} : { tags }), ...(kind === undefined ? {} : { kind }) }); }
-  collections(creatorId: string) { return this.call(`/studio/collections?creatorId=${encodeURIComponent(creatorId)}`); }
+  collections(creatorId: string, options: { includeDeleted?: boolean } = {}) { return this.call(`/studio/collections?creatorId=${encodeURIComponent(creatorId)}${options.includeDeleted === true ? '&includeDeleted=true' : ''}`); }
+  restoreCollection(collectionId: string, expectedRevision: number) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { status: 'draft', expectedRevision });
+  }
   createCollection(creatorId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string } = {}) {
     return this.call('/studio/collections', 'POST', { creatorId, title, type: metadata.type, slug: metadata.slug, description: metadata.description });
   }

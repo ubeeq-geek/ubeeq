@@ -165,8 +165,8 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
     await this.updateWork(work);
   }
   async getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null> { return this.get(tenantId, "collection", collectionId); }
-  async listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]> {
-    return this.list<C & { title?: string }>(tenantId, "collection", creatorId).filter((collection) => collection.status !== "deleted")
+  async listCreatorCollections(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<C[]> {
+    return this.list<C & { title?: string }>(tenantId, "collection", creatorId).filter((collection) => options.includeDeleted === true || collection.status !== "deleted")
       .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
   }
   readonly supportsCollectionCoverValidation = true;

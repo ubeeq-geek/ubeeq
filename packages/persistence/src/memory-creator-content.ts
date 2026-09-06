@@ -131,9 +131,9 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
     this.publicationIntents = this.publicationIntents.filter((intent) => !(intent.tenantId === tenantId && intent.publicationIntentId === publicationIntentId));
   }
 
-  async listCreatorCollections(tenantId: string, creatorId: string): Promise<M['collection'][]> {
+  async listCreatorCollections(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<M['collection'][]> {
     return this.creatorCollections
-      .filter((collection) => collection.tenantId === tenantId && collection.creatorId === creatorId && collection.status !== 'deleted')
+      .filter((collection) => collection.tenantId === tenantId && collection.creatorId === creatorId && (options.includeDeleted === true || collection.status !== 'deleted'))
       .sort((a, b) => a.title.localeCompare(b.title));
   }
 
