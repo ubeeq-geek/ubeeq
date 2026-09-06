@@ -18,7 +18,7 @@ export interface CreatorContentRecords {
  */
 export interface CreatorContentStore<M extends CreatorContentRecords = CreatorContentRecords> {
   commitAssetAttachment(input: CreatorContentAssetCommit<M>): Promise<void>;
-  listWorksByCreator(tenantId: string, creatorId: string): Promise<M['work'][]>;
+  listWorksByCreator(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<M['work'][]>;
   getWork(tenantId: string, workId: string): Promise<M['work'] | null>;
   createWork(work: M['work']): Promise<void>;
   updateWork(work: M['work']): Promise<void>;

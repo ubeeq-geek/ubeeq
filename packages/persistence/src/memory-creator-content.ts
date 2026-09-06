@@ -36,9 +36,9 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
     this.canonicalAssets = nextAssets;
     this.workAssets = nextAttachments;
   }
-  async listWorksByCreator(tenantId: string, creatorId: string): Promise<M['work'][]> {
+  async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<M['work'][]> {
     return this.works
-      .filter((work) => work.tenantId === tenantId && work.creatorId === creatorId && work.status !== 'deleted')
+      .filter((work) => work.tenantId === tenantId && work.creatorId === creatorId && (options.includeDeleted === true || work.status !== 'deleted'))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 

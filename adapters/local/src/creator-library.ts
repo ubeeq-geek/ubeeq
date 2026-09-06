@@ -145,8 +145,8 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
   }
-  async listWorksByCreator(tenantId: string, creatorId: string): Promise<W[]> {
-    return this.list<W>(tenantId, "work", creatorId).filter((work) => work.status !== "deleted").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<W[]> {
+    return this.list<W>(tenantId, "work", creatorId).filter((work) => options.includeDeleted === true || work.status !== "deleted").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   async createWork(work: W): Promise<void> { this.create("work", work.workId, work); }
   async updateWork(work: W): Promise<void> {

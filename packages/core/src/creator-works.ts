@@ -16,7 +16,7 @@ export interface CreatorWorkRecord extends CreatorWorkScope {
 }
 
 export interface CreatorWorkPort<W extends CreatorWorkRecord> {
-  listWorksByCreator(tenantId: string, creatorId: string): Promise<W[]>;
+  listWorksByCreator(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<W[]>;
   getWork(tenantId: string, workId: string): Promise<W | null>;
   createWork(work: W): Promise<void>;
   updateWork(work: W): Promise<void>;
@@ -59,11 +59,11 @@ export class CreatorWorkService<W extends CreatorWorkRecord> {
     return work;
   }
 
-  async list(scope: CreatorWorkScope, query = ""): Promise<W[]> {
+  async list(scope: CreatorWorkScope, query = "", options: { includeDeleted?: boolean } = {}): Promise<W[]> {
     await this.requireAccess(scope);
     const normalizedQuery = query.trim().toLowerCase();
-    return (await this.store.listWorksByCreator(scope.tenantId, scope.creatorId)).filter((work) =>
-      work.tenantId === scope.tenantId && work.creatorId === scope.creatorId && work.status !== "deleted" &&
+    return (await this.store.listWorksByCreator(scope.tenantId, scope.creatorId, options)).filter((work) =>
+      work.tenantId === scope.tenantId && work.creatorId === scope.creatorId && (options.includeDeleted === true || work.status !== "deleted") &&
       (!normalizedQuery || [work.title, work.description || "", ...work.tags].some((value) => value.toLowerCase().includes(normalizedQuery))));
   }
 

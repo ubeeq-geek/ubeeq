@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('removed-Work recovery opts into listing and restores only to a revisioned draft', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
+  await client.works('creator/one', 'a & b');
+  assert.equal(calls.at(-1).url, '/api/studio/works?creatorId=creator%2Fone&query=a%20%26%20b');
+  await client.works('creator/one', 'a & b', { includeDeleted: true });
+  assert.equal(calls.at(-1).url, '/api/studio/works?creatorId=creator%2Fone&query=a%20%26%20b&includeDeleted=true');
+  await client.restoreWork('work/one', 8);
+  assert.equal(calls.at(-1).url, '/api/studio/works/work%2Fone');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 8, status: 'draft' });
+});
 test('Work removal is an authenticated revisioned soft-delete with an encoded ID', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
