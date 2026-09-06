@@ -336,6 +336,13 @@ remain outside SQLite atomicity, and cloud transaction parity is still pending.
 
 ## Remaining slices
 
+Retry delay calculation is available in `@ubeeq/jobs` as
+`equalJitterRetryDelaySeconds`, with caller-selected base, cap and exponent limit.
+It validates integer scheduling inputs and accepts injected randomness for tests.
+Retry eligibility, ambiguous-submission budgets, provider Retry-After handling,
+and durable scheduling remain consumer responsibilities; jitter alone does not
+provide idempotent delivery or an atomic outbox.
+
 Creator content and membership, durable media processing, collections and
 publication, optional provider connectors, community mechanisms, safety and
 provenance, accounting, regional adapters and reusable UI must each reach behavior

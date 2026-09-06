@@ -1,4 +1,5 @@
 /** Durable scheduling and queue ports. In-process execution is an adapter choice, not a production default. */
+export * from "./retry-backoff.js";
 export type JobState = "queued" | "leased" | "completed" | "retry_scheduled" | "dead_lettered" | "cancelled";
 export interface DurableJob<TPayload = unknown> { id: string; cellId: string; type: string; payload: TPayload; idempotencyKey: string; state: JobState; attempt: number; maxAttempts: number; availableAt: string; leaseExpiresAt?: string; createdAt: string; updatedAt: string; correlationId?: string; lastError?: { code: string; message: string }; }
 export interface JobLease<TPayload = unknown> { job: DurableJob<TPayload>; leaseToken: string; }
