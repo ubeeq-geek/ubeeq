@@ -2,6 +2,12 @@
 
 The reference API is a neutral, local-first implementation of the creator profile, Work, Asset, Collection, upload, publication, delivery, and export flow.
 
+`PublicationService` in `@ubeeq/api` owns the canonical publication mechanism.
+Consumers supply an authenticated Work-authorization callback and an explicit
+publication-admission callback; there is no default allow policy. The reference
+route composes those callbacks with its ownership and moderation checks. The
+service requires canonical repository ports and does not dispatch to providers.
+
 Publication writes the intent, live publication, Work revision and audit record in
 one repository transaction. Local failure-injection tests verify rollback at each
 later write boundary. Publication requests with a non-empty `Idempotency-Key` of
