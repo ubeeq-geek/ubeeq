@@ -1,6 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { observeReconciliationSnapshots } from '../dist/index.js';
+import { observeReconciliationSnapshots, resolveReconciliation } from '../dist/index.js';
+
+test('confirmed resolutions own their nested values without carrying excluded copy identities', () => {
+  for (const action of ['accept_remote', 'keep_local', 'create_detached_copy']) {
+    const local = { tags: ['local'], details: { title: 'Local' } };
+    const remote = { tags: ['remote'], details: { title: 'Remote' }, remoteId: 'external' };
+    const originals = structuredClone({ local, remote });
+    assert.throws(() => resolveReconciliation(local, remote, { action, confirmed: false }), /confirmation/);
+    const result = resolveReconciliation(local, remote, { action, confirmed: true }, { detachedCopyExcludedKeys: ['remoteId'] });
+    result.local.tags.push('result-only'); result.local.details.title = 'Result';
+    if (result.detachedCopy) {
+      assert.equal(result.detachedCopy.remoteId, undefined);
+      result.detachedCopy.tags.push('copy-only'); result.detachedCopy.details.title = 'Copy';
+      assert.equal(result.local.details.title, 'Result');
+    }
+    assert.deepEqual({ local, remote }, originals);
+  }
+});
 
 test('observations initialize from remote and retain a divergent baseline across later observations', () => {
   const first = observeReconciliationSnapshots(undefined, { title: 'Original' }, { title: 'Original' }, 'first');
