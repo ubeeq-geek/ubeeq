@@ -19,12 +19,23 @@ test("SQLite jobs retain idempotency and support retry, recovery, and cancellati
     assert.equal(foreignLease?.job.id, otherCell.id);
     const lease = await jobs.lease({ cellId: "cell-a", types: ["asset.process"], leaseDurationSeconds: 60, workerId: "test-worker" });
     assert.ok(lease);
+    await assert.rejects(jobs.recover({ id: created.id }), { code: 'job_not_recoverable' });
+    assert.equal((await jobs.get(created.id)).state, 'leased');
     await jobs.retry({ id: created.id, leaseToken: lease.leaseToken, error: { code: "temporary", message: "retry me" }, retryAt: new Date(Date.now() - 1_000).toISOString() });
     assert.equal((await jobs.get(created.id))?.state, "retry_scheduled");
     const recovered = await jobs.recover({ id: created.id });
     assert.equal(recovered.state, "queued");
+    await assert.rejects(jobs.recover({ id: created.id }), { code: 'job_not_recoverable' });
     await jobs.cancel({ id: created.id, reason: "manual recovery test" });
     assert.equal((await jobs.get(created.id))?.state, "cancelled");
+    await assert.rejects(jobs.recover({ id: created.id }), { code: 'job_not_recoverable' });
+    assert.equal((await jobs.get(created.id)).state, 'cancelled');
+    const failed = await jobs.enqueue({ cellId: 'cell-a', type: 'asset.process', payload: {}, idempotencyKey: 'failed', maxAttempts: 1 });
+    const failedLease = await jobs.lease({ cellId: 'cell-a', workerId: 'test-worker', leaseDurationSeconds: 60 });
+    await jobs.deadLetter({ id: failed.id, leaseToken: failedLease.leaseToken, error: { code: 'failed', message: 'test' } });
+    const recovery = await Promise.allSettled([jobs.recover({ id: failed.id }), jobs.recover({ id: failed.id })]);
+    assert.equal(recovery.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(recovery.filter(result => result.status === 'rejected').length, 1);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 

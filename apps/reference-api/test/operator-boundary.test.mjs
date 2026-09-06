@@ -26,6 +26,12 @@ test('every operations route requires configured operator authority before reads
           assert.equal(response.status, requirement?.anyRoles ? 403 : 404, path);
         }
         if (requirement?.anyRoles) {
+          const cancelled = await local.jobs.enqueue({ cellId: 'cell', type: 'test', payload: {}, idempotencyKey: 'cancelled', maxAttempts: 1 });
+          await local.jobs.cancel({ id: cancelled.id });
+          const recovery = await fetch(`${base}/v1/operations/jobs/${cancelled.id}/recover`, { method: 'POST', headers: { authorization: 'Bearer operator', 'content-type': 'application/json' }, body: '{}' });
+          assert.equal(recovery.status, 409);
+          assert.equal((await recovery.json()).error.code, 'job_not_recoverable');
+          assert.equal((await local.jobs.get(cancelled.id)).state, 'cancelled');
           assert.equal((await fetch(`${base}/v1/operations/holds`)).status, 401);
           const created = await fetch(`${base}/v1/operations/holds`, { method: 'POST', headers: { authorization: 'Bearer operator', 'content-type': 'application/json' }, body: JSON.stringify({ subjectType: 'work', subjectId: 'work' }) });
           assert.equal(created.status, 201);

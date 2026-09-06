@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export { LocalCreatorLibraryStore } from "./creator-library.js";
 import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
+import { JobRecoveryError } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
@@ -308,7 +309,12 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { this.transition(input.id, input.leaseToken, "dead_lettered", input.error); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id); }
-  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(input.id) as Record<string, unknown> | undefined; if (!row) throw new Error("Unknown job."); const job = this.row(row); job.state = "queued"; job.availableAt = input.availableAt ?? now(); job.lastError = undefined; job.updatedAt = now(); this.write(job); return job; }
+  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> {
+    const row = this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'queued', available_at = ?, lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state IN ('retry_scheduled', 'dead_lettered') RETURNING *")
+      .get(input.availableAt ?? now(), now(), input.id) as Record<string, unknown> | undefined;
+    if (!row) throw new JobRecoveryError();
+    return this.row(row);
+  }
   async get(id: string): Promise<DurableJob | undefined> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined; }
   async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row)); }
   async schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }
