@@ -44,8 +44,8 @@ export class CreatorClient {
   createCollection(creatorId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string } = {}) {
     return this.call('/studio/collections', 'POST', { creatorId, title, type: metadata.type, slug: metadata.slug, description: metadata.description });
   }
-  updateCollection(collectionId: string, title: string, metadata: { slug?: string; description?: string; expectedRevision?: number } = {}) {
-    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title, slug: metadata.slug, description: metadata.description, expectedRevision: metadata.expectedRevision });
+  updateCollection(collectionId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string; expectedRevision?: number } = {}) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title, type: metadata.type, slug: metadata.slug, description: metadata.description, expectedRevision: metadata.expectedRevision });
   }
   deleteCollection(collectionId: string, expectedRevision?: number) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'DELETE', expectedRevision === undefined ? undefined : { expectedRevision }); }
   setCollectionArchived(collectionId: string, archived: boolean, expectedRevision?: number) {

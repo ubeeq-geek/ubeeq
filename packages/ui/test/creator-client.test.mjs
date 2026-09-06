@@ -34,8 +34,12 @@ test('collection metadata is optional, explicit and supports clearing descriptio
   assert.deepEqual(bodies.at(-1), { creatorId: 'owner', title: 'Playlist', type: 'playlist', slug: 'list', description: 'Description' });
   await client.updateCollection('id', 'Renamed');
   assert.deepEqual(bodies.at(-1), { title: 'Renamed' });
-  await client.updateCollection('id', 'Renamed', { slug: 'renamed', description: '', type: 'gallery' });
+  await client.updateCollection('id', 'Renamed', { slug: 'renamed', description: '', status: 'published' });
   assert.deepEqual(bodies.at(-1), { title: 'Renamed', slug: 'renamed', description: '' });
+  for (const type of ['collection', 'gallery', 'series', 'playlist']) {
+    await client.updateCollection('id', 'Renamed', { type, expectedRevision: 4, creatorId: 'forged', visibility: 'public' });
+    assert.deepEqual(bodies.at(-1), { title: 'Renamed', type, expectedRevision: 4 });
+  }
 });
 test('collection removal encodes the ID, sends credentials and accepts an empty response', async () => {
   const calls = [];
