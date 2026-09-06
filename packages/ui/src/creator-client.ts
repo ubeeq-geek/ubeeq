@@ -81,6 +81,9 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }
   assets(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/assets`); }
+  setPrimaryAsset(workId: string, assetId: string, expectedRevision: number) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}/primary-asset`, 'PUT', { assetId, expectedRevision });
+  }
   async downloadOriginal(workId: string, assetId: string): Promise<Blob> {
     const response = await this.request(`${this.base}/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}/content`,
       { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });

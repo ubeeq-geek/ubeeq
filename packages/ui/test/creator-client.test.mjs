@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('primary selection sends an authenticated revisioned request with an encoded Work ID', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
+  await client.signIn('owner@example.test', 'password');
+  await client.setPrimaryAsset('work/one', 'asset-two', 3);
+  assert.equal(calls.at(-1).url, '/api/studio/works/work%2Fone/primary-asset');
+  assert.equal(calls.at(-1).options.method, 'PUT');
+  assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { assetId: 'asset-two', expectedRevision: 3 });
+});
 test('collection recovery uses opt-in listing and an explicit revisioned draft request', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
