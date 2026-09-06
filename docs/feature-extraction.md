@@ -128,7 +128,7 @@ non-cyclic references are permitted. The existing `unbounded` option only disabl
 per-field text truncation, not these structural limits. Failures raise
 `ContentBlockInputError` with code `invalid_content_structure`; transports must
 map that error to invalid input before advancing their shared-package pin.
-Nightframe's existing normalization boundary maps rejection to HTTP 400 and its
+The local consumer's normalization boundary maps rejection to HTTP 400 and its
 integration test verifies that rejected edits leave content and revision intact.
 This is not a request-byte limit, renderer sanitizer, or total processing deadline.
 
