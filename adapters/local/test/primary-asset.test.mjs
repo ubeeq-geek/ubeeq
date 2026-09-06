@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalSqliteDatabase, LocalCreatorLibraryStore } from '../dist/index.js';
-import { CreatorAssetService, CreatorPrimaryAssetService } from '@ubeeq/core';
+import { CreatorAssetService, CreatorPrimaryAssetService, CreatorAssetOrderService } from '@ubeeq/core';
 
 test('primary selection commits pointer and roles together, preserves order, and rejects stale or invalid membership', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-primary-'));
@@ -27,14 +27,25 @@ test('primary selection commits pointer and roles together, preserves order, and
     assert.equal(next.title, 'Keep title'); assert.deepEqual(next.slugHistory, ['old', 'work']);
     assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'work')).map(item => [item.assetId, item.attachment.role, item.attachment.position]), [['a', 'content', 0], ['b', 'primary', 1]]);
     await assert.rejects(service.select('tenant', 'work', 'a', 3), { code: 'revision_conflict' });
+    const ordering = new CreatorAssetOrderService(store, async () => true, () => 'ordered');
+    await assert.rejects(new CreatorAssetOrderService(store, async () => false).replace('tenant', 'work', ['b', 'a'], 4), { code: 'access_denied' });
+    for (const ids of [['a'], ['a', 'a'], ['a', 'missing']]) {
+      await assert.rejects(ordering.replace('tenant', 'work', ids, 4), { code: 'invalid_asset' });
+      await assert.rejects(store.commitAssetOrder({ tenantId: 'tenant', creatorId: 'creator', workId: 'work', assetIds: ids, expectedRevision: 4, updatedAt: 'bad' }), { code: 'invalid_asset' });
+      assert.deepEqual(await store.getWork('tenant', 'work'), next);
+    }
+    const ordered = await ordering.replace('tenant', 'work', ['b', 'a'], 4);
+    assert.equal(ordered.revision, 5); assert.equal(ordered.primaryAssetId, 'b');
+    assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'work')).map(item => [item.assetId, item.attachment.role, item.attachment.position]), [['b', 'primary', 0], ['a', 'content', 1]]);
+    await assert.rejects(ordering.replace('tenant', 'work', ['a', 'b'], 4), { code: 'revision_conflict' });
     const original = store.listCanonicalAssetsByWork.bind(store);
     store.listCanonicalAssetsByWork = async (...args) => {
       const rows = await original(...args);
       db.database.prepare("UPDATE ubeeq_creator_library SET payload = json_set(payload, '$.status', 'deleted') WHERE kind = 'asset' AND id = 'a'").run();
       return rows;
     };
-    await assert.rejects(service.select('tenant', 'work', 'a', 4), { code: 'invalid_asset' });
-    assert.deepEqual(await store.getWork('tenant', 'work'), next);
-    assert.deepEqual((await original('tenant', 'work')).map(item => item.attachment.role), ['content', 'primary']);
+    await assert.rejects(service.select('tenant', 'work', 'a', 5), { code: 'invalid_asset' });
+    assert.deepEqual(await store.getWork('tenant', 'work'), ordered);
+    assert.deepEqual((await original('tenant', 'work')).map(item => item.attachment.role), ['primary', 'content']);
   } finally { db.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });

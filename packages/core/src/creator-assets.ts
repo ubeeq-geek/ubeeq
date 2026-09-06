@@ -40,6 +40,36 @@ export interface CreatorAssetMembership { workId: string; assetId: string; role:
 export interface CreatorPrimaryAssetCommit extends CreatorWorkScope {
   workId: string; assetId: string; expectedRevision: number; updatedAt: string;
 }
+export interface CreatorAssetOrderCommit extends CreatorWorkScope {
+  workId: string; assetIds: string[]; expectedRevision: number; updatedAt: string;
+}
+export interface CreatorAssetOrderPort<W extends CreatorAssetWork, A extends CreatorAssetIdentity> extends CreatorWorkPort<W> {
+  listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<A & { attachment: CreatorAssetMembership }>>;
+  /** Atomically require the exact existing membership and revision; preserve primary selection and unrelated fields. */
+  commitAssetOrder(input: CreatorAssetOrderCommit): Promise<W>;
+}
+export class CreatorAssetOrderService<W extends CreatorAssetWork, A extends CreatorAssetIdentity> {
+  private readonly works: CreatorWorkService<W>;
+  constructor(private readonly store: CreatorAssetOrderPort<W, A>, authorize: (scope: CreatorWorkScope) => Promise<boolean>,
+    private readonly now: () => string = () => new Date().toISOString()) {
+    this.works = new CreatorWorkService(store, authorize, now);
+  }
+  async replace(tenantId: string, workId: string, assetIds: string[], expectedRevision: number): Promise<W> {
+    const ids = Array.isArray(assetIds) ? [...assetIds] : [];
+    const work = await this.works.get(tenantId, workId);
+    if (work.status === 'deleted') throw new CreatorAssetError('not_found', 'Work not found.');
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision !== work.revision) {
+      throw new CreatorWorkError('revision_conflict', 'Work changed; refresh before reordering assets.');
+    }
+    const assets = await this.store.listCanonicalAssetsByWork(tenantId, workId);
+    if (!Array.isArray(assetIds) || new Set(ids).size !== ids.length || new Set(assets.map(item => item.assetId)).size !== assets.length || ids.length !== assets.length ||
+      ids.some(id => typeof id !== 'string' || !id) || assets.some(item => item.tenantId !== tenantId || item.creatorId !== work.creatorId ||
+        item.attachment.workId !== workId || item.attachment.assetId !== item.assetId || !ids.includes(item.assetId))) {
+      throw new CreatorAssetError('invalid_asset', 'Supply every attached asset exactly once.');
+    }
+    return structuredClone(await this.store.commitAssetOrder({ tenantId, creatorId: work.creatorId, workId, assetIds: ids, expectedRevision, updatedAt: this.now() }));
+  }
+}
 export interface CreatorPrimaryAssetPort<W extends CreatorAssetWork, A extends CreatorAssetIdentity> extends CreatorWorkPort<W> {
   listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<A & { attachment: CreatorAssetMembership }>>;
   /** Atomically check revision and live membership, update primary pointer and all roles; preserve order and other Work fields. */

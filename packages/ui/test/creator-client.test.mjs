@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('asset ordering sends the complete ordered IDs and revision with an encoded Work ID', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
+  await client.setAssetOrder('work/one', ['b', 'a'], 4);
+  assert.equal(calls[0].url, '/api/studio/works/work%2Fone/asset-order');
+  assert.equal(calls[0].options.method, 'PUT');
+  assert.deepEqual(JSON.parse(calls[0].options.body), { assetIds: ['b', 'a'], expectedRevision: 4 });
+});
 test('primary selection sends an authenticated revisioned request with an encoded Work ID', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
