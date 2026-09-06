@@ -4,6 +4,7 @@ export * from "./account-health.js";
 export * from "./publication-preflight.js";
 export * from "./announcement-publication.js";
 export * from "./credential-envelope.js";
+export * from './oauth-state.js';
 export const INTEGRATION_CAPABILITIES = [
   "connect", "catalogue_import", "source_migration", "publish", "remote_update",
   "remote_delete", "engagement_read", "engagement_write", "webhook_receive", "reconcile"
