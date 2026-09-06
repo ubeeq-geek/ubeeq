@@ -6,14 +6,21 @@ Publication writes the intent, live publication, Work revision and audit record 
 one repository transaction. Local failure-injection tests verify rollback at each
 later write boundary. This is not full publication qualification: repeated request
 idempotency, indexed asset/admission queries, concurrent policy changes,
-and withdrawal/revocation of issued delivery URLs still need work. The destination
+and external-provider/CDN withdrawal and revocation still need work. The destination
 field is metadata here, not confirmation of delivery to an external provider.
 
 Publication admission walks every asset and moderation-hold page; a failed or
 repeating cursor aborts the request. Only matching records are retained, but the
 scan still grows with cell data and is not a transactionally consistent snapshot.
-Other list paths, including public viewing and exports, still need a separate
-pagination audit.
+Public viewing also walks all asset/publication/hold pages and requires a live
+publication. The local delivery gateway rechecks current Work publication, ready
+asset membership, exact stored object version and holds before reading bytes.
+Both responses use `private, no-store`. Tests revoke already-issued local URLs via
+work/creator/asset holds, withdrawal, version replacement and readiness changes.
+This cannot revoke previously downloaded bytes or pre-existing cache entries, and
+external delivery providers do not automatically inherit the local gateway check.
+Exports and other list paths still need a separate pagination audit; an indexed,
+consistent admission design is required before production-scale qualification.
 
 These routes use the canonical `repositories.works/assets/publications` records.
 They do not automatically consume `LocalCreatorLibraryStore` compatibility records.

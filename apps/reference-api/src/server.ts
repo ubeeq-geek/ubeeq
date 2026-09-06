@@ -160,6 +160,23 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     requireAdmission(subjectIds.map((subjectId) => ({ subjectId })), holds, operation);
   };
   const existingImportIds = async () => ({ publication: (await repositories.publications.list({ limit: 100 })).items.map(({ id }) => id), publicationIntent: (await repositories.publicationIntents.list({ limit: 100 })).items.map(({ id }) => id), moderationEvidence: (await repositories.moderationEvidence.list({ limit: 100 })).items.map(({ id }) => id), moderationHold: (await repositories.moderationHolds.list({ limit: 100 })).items.map(({ id }) => id), reviewCase: (await repositories.reviewCases.list({ limit: 100 })).items.map(({ id }) => id), auditEvent: (await repositories.auditEvents.list({ limit: 100 })).items.map(({ id }) => id), usageEvent: (await repositories.usageEvents.list({ limit: 100 })).items.map(({ id }) => id), integrationAccount: (await repositories.integrationAccounts.list({ limit: 100 })).items.map(({ id }) => id) });
+  const currentPublicWork = async (workId: string) => {
+    const denied = () => new HttpError(404, 'work_not_found', 'Published work was not found');
+    const work = await repositories.works.get(workId);
+    if (!work || work.status !== 'published' || !await repositories.creators.get(work.creatorId)) throw denied();
+    const assets: AssetRecord[] = [];
+    for await (const asset of repositoryItems(request => repositories.assets.list(request))) {
+      if (asset.workId === work.id && asset.creatorId === work.creatorId && asset.status === 'ready') assets.push(asset);
+    }
+    const publications = [];
+    for await (const publication of repositoryItems(request => repositories.publications.list(request))) {
+      if (publication.workId === work.id && publication.status === 'live') publications.push(publication);
+    }
+    if (!assets.length || !publications.length) throw denied();
+    try { await requireClearAdmission('Public viewing', [work.id, work.creatorId, ...assets.map(asset => asset.id)]); }
+    catch (error) { if (error instanceof AdmissionBlockedError) throw denied(); throw error; }
+    return { work, assets, publications };
+  };
   const runNextJob = async (workerId: string) => {
     const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: 60, workerId });
     if (!lease) return undefined;
@@ -333,9 +350,40 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         return json(response, 201, { ...result, requestId }, requestId);
       }
       const publicMatch = url.pathname.match(/^\/v1\/public\/works\/([^/]+)$/);
-      if (method === "GET" && publicMatch) { const work = await repositories.works.get(publicMatch[1]); if (!work || work.status !== "published") throw new HttpError(404, "work_not_found", "Published work was not found"); const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.workId === work.id && asset.status === "ready"); const publications = (await repositories.publications.list({ limit: 100 })).items.filter((publication) => publication.workId === work.id && publication.status === "live"); const delivered = await Promise.all(assets.map(async (asset) => { const storage = (asset as AssetRecord & { storage: { key: string; versionId?: string } }).storage; return { ...asset, delivery: await adapters.delivery.issue({ object: { bucket: cellId, key: storage.key, versionId: storage.versionId, scope: "public" }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) }; })); return json(response, 200, { work, assets: delivered, publications, requestId }, requestId); }
+      if (method === "GET" && publicMatch) {
+        response.setHeader('cache-control', 'private, no-store');
+        const { work, assets, publications } = await currentPublicWork(publicMatch[1]);
+        const delivered = await Promise.all(assets.map(async asset => {
+          const storage = (asset as AssetRecord & { storage: { key: string; versionId?: string } }).storage;
+          return { ...asset, delivery: await adapters.delivery.issue({ object: { bucket: cellId, key: storage.key, versionId: storage.versionId, scope: 'public' }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) };
+        }));
+        return json(response, 200, { work, assets: delivered, publications, requestId }, requestId);
+      }
       const deliveryMatch = url.pathname.match(/^\/v1\/delivery\/([^/]+)$/);
-      if (method === "GET" && deliveryMatch) { const developmentStorage = adapters.storage as ObjectStorage & { verifyDeliveryToken(token: string): { bucket: string; key: string; versionId?: string; scope: string; disposition?: string } }; if (typeof developmentStorage.verifyDeliveryToken !== "function") throw new HttpError(404, "delivery_not_found", "This delivery URL is served by the configured delivery provider"); let object; try { object = developmentStorage.verifyDeliveryToken(deliveryMatch[1]); } catch { throw new HttpError(403, "delivery_denied", "Delivery token is invalid or expired"); } if (object.scope !== "public") throw new HttpError(403, "delivery_denied", "This development delivery URL is not public"); const found = await adapters.storage.get(object); response.statusCode = 200; response.setHeader("content-type", found.object.contentType); if (object.disposition) response.setHeader("content-disposition", object.disposition); response.setHeader("cache-control", "public, max-age=300, s-maxage=3600"); response.setHeader("x-request-id", requestId); response.end(found.body); return; }
+      if (method === "GET" && deliveryMatch) {
+        response.setHeader('cache-control', 'private, no-store');
+        const developmentStorage = adapters.storage as ObjectStorage & { verifyDeliveryToken(token: string): { bucket: string; key: string; versionId?: string; scope: string; disposition?: string } };
+        if (typeof developmentStorage.verifyDeliveryToken !== 'function') throw new HttpError(404, 'delivery_not_found', 'This delivery URL is served by the configured delivery provider');
+        let object;
+        try { object = developmentStorage.verifyDeliveryToken(deliveryMatch[1]); } catch { throw new HttpError(403, 'delivery_denied', 'Delivery token is invalid or expired'); }
+        if (object.scope !== 'public') throw new HttpError(403, 'delivery_denied', 'This development delivery URL is not public');
+        const matchesObject = (asset: AssetRecord) => {
+          const storage = (asset as AssetRecord & { storage?: { bucket: string; key: string; versionId?: string } }).storage;
+          return Boolean(object.versionId && storage?.bucket === object.bucket && storage.key === object.key && storage.versionId === object.versionId);
+        };
+        let matched: AssetRecord | undefined;
+        for await (const asset of repositoryItems(request => repositories.assets.list(request))) {
+          if (matchesObject(asset)) { matched = asset; break; }
+        }
+        if (!matched?.workId) throw new HttpError(404, 'delivery_not_found', 'Current published asset was not found');
+        const current = await currentPublicWork(matched.workId);
+        if (!current.assets.some(asset => asset.id === matched.id && matchesObject(asset))) throw new HttpError(404, 'delivery_not_found', 'Current published asset was not found');
+        const found = await adapters.storage.get(object);
+        response.statusCode = 200;
+        response.setHeader('content-type', found.object.contentType);
+        if (object.disposition) response.setHeader('content-disposition', object.disposition);
+        response.setHeader('x-request-id', requestId); response.end(found.body); return;
+      }
       if (method === "GET" && url.pathname === "/v1/exports/me") {
         const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
         const works = (await repositories.works.list({ limit: 100 })).items.filter((record) => record.creatorId === creator.id); const workIds = new Set(works.map(({ id }) => id));
