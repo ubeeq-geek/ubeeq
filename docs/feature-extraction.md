@@ -21,6 +21,15 @@ Features are complete only when a consuming application executes the shared impl
 
 ## Initial integration slice
 
+`projectIntegrationAccountHealth` now projects token expiry, active cooldowns,
+durable connection state, sync timestamps and issue metadata from a credential-free
+port. Callers supply their expiry warning window and may inject a clock. Provider
+catalogues, native state mappings, recommended actions and remediation policy stay
+in consumers. Projection never verifies credentials, refreshes tokens, schedules
+retries or changes durable state. The first consumer invokes it for both legacy
+accounts and its existing native connector health adapters; independent connector
+implementations and the other consumer's connector UI remain migration work.
+
 `@ubeeq/integrations` supplies normalized reconciliation, failure recovery, and
 sync checkpoint advancement. Optional connectors supply provider identifiers and
 normalized observations. Product adapters map legacy publication records and
