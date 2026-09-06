@@ -1,6 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('asset detachment sends an explicit revision and encoded Work and asset IDs', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
+  await client.detachAsset('work/one', 'asset/two', 6);
+  assert.equal(calls[0].url, '/api/studio/works/work%2Fone/assets/asset%2Ftwo');
+  assert.equal(calls[0].options.method, 'DELETE');
+  assert.deepEqual(JSON.parse(calls[0].options.body), { expectedRevision: 6 });
+});
 test('asset ordering sends the complete ordered IDs and revision with an encoded Work ID', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });

@@ -1,6 +1,6 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
 import { CreatorWorkError, CreatorCollectionError, CreatorAssetError, contentAssetReferences } from "@ubeeq/core";
-import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit } from "@ubeeq/core";
+import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit, CreatorAssetDetachmentCommit } from "@ubeeq/core";
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
 import { LocalSqliteJobQueue } from "./index.js";
@@ -149,6 +149,37 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
         .run(JSON.stringify(roles), cell, input.tenantId, input.workId);
       db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
         .run(JSON.stringify(next), cell, input.tenantId, input.workId);
+      db.exec('COMMIT');
+      return next;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  async commitAssetDetachment(input: CreatorAssetDetachmentCommit): Promise<W> {
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const previous = this.get<W & { body?: unknown; media?: unknown; primaryAssetId?: string }>(input.tenantId, 'work', input.workId);
+      if (!previous || previous.creatorId !== input.creatorId || previous.status === 'deleted' ||
+        !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1 || previous.revision !== input.expectedRevision) {
+        throw new CreatorWorkError('revision_conflict', 'Work changed before asset removal.');
+      }
+      const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
+      if (!attachments.some(item => item.workId === input.workId && item.assetId === input.assetId)) throw new CreatorAssetError('not_found', 'Attached asset not found.');
+      if (contentAssetReferences(previous.body, previous.media).includes(input.assetId)) {
+        throw new CreatorAssetError('asset_in_use', 'Remove this asset from the saved Work content before detaching it.');
+      }
+      const remaining = attachments.filter(item => item.assetId !== input.assetId).sort((a, b) => a.position - b.position);
+      const primaryAssetId = remaining.some(item => item.assetId === previous.primaryAssetId) ? previous.primaryAssetId : remaining[0]?.assetId;
+      const next = { ...previous, primaryAssetId, revision: previous.revision + 1, updatedAt: input.updatedAt };
+      const ordered = remaining.map((item, position) => ({ ...item, position, role: item.assetId === primaryAssetId ? 'primary' : 'content' }));
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work_assets' AND id = ?")
+        .run(JSON.stringify(ordered), cell, input.tenantId, input.workId);
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
+        .run(JSON.stringify(next), cell, input.tenantId, input.workId);
+      db.prepare(`UPDATE ubeeq_jobs SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL, updated_at = ?, last_error = ?
+        WHERE cell_id = ? AND type = 'creator-asset.process' AND state IN ('queued', 'leased', 'retry_scheduled')
+          AND json_extract(payload, '$.tenantId') = ? AND json_extract(payload, '$.creatorId') = ?
+          AND json_extract(payload, '$.workId') = ? AND json_extract(payload, '$.assetId') = ?`)
+        .run(input.updatedAt, JSON.stringify({ code: 'asset_detached', message: 'Asset detached from Work; stored files retained.' }), cell, input.tenantId, input.creatorId, input.workId, input.assetId);
       db.exec('COMMIT');
       return next;
     } catch (error) { db.exec('ROLLBACK'); throw error; }
