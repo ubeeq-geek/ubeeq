@@ -238,6 +238,37 @@ export const reconciliationStatus = (diffs: readonly ReconciliationFieldDiff[]):
   return localChanged && remoteChanged ? "non_conflicting_changes" : localChanged ? "local_newer" : remoteChanged ? "remote_newer" : "in_sync";
 };
 
+export interface ReconciliationObservation {
+  baseline: ReconciliationSnapshot;
+  remote: ReconciliationSnapshot;
+  status: ReconciliationStatus;
+  fields: ReconciliationFieldDiff[];
+  updatedAt: string;
+}
+
+/**
+ * Track normalized observations without advancing a divergent baseline.
+ * Own all nested values: later adapter/caller mutations must not rewrite history.
+ * Persistence, concurrency fencing and confirmed resolution remain caller-owned.
+ */
+export const observeReconciliationSnapshots = (
+  baseline: ReconciliationSnapshot | undefined,
+  local: ReconciliationSnapshot,
+  remote: ReconciliationSnapshot,
+  updatedAt: string
+): ReconciliationObservation => {
+  const previous = baseline ?? remote;
+  const fields = diffReconciliationSnapshots(previous, local, remote);
+  const status = reconciliationStatus(fields);
+  return {
+    baseline: structuredClone(status === 'in_sync' ? remote : previous),
+    remote: structuredClone(remote),
+    status,
+    fields: structuredClone(fields),
+    updatedAt
+  };
+};
+
 /** Destructive or duplicating reconciliation choices require an explicit acknowledgement. */
 export const resolveReconciliation = (
   local: ReconciliationSnapshot,
