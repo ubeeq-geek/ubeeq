@@ -3,9 +3,9 @@ import type { WorkKind } from '@ubeeq/core';
 export class CreatorClient {
   private token?: string;
   constructor(private readonly request: typeof fetch = fetch, private readonly base = '/api') {}
-  async call(path: string, method = 'GET', body?: unknown): Promise<any> {
+  async call(path: string, method = 'GET', body?: unknown, options?: { idempotencyKey: string }): Promise<any> {
     const response = await this.request(`${this.base}${path}`, { method,
-      headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) },
+      headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(this.token ? { authorization: `Bearer ${this.token}` } : {}), ...(options ? { 'idempotency-key': options.idempotencyKey } : {}) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = response.status === 204 ? undefined : await response.json();
     if (!response.ok) {
@@ -24,6 +24,13 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  publications(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`); }
+  publishWork(workId: string, expectedRevision: number, idempotencyKey: string) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`, 'POST', { expectedRevision }, { idempotencyKey });
+  }
+  withdrawPublication(workId: string, publicationId: string, expectedRevision: number) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}/publications/${encodeURIComponent(publicationId)}`, 'DELETE', { expectedRevision });
+  }
   creatorMembers(creatorId: string) { return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/members`); }
   addCreatorMember(creatorId: string, userId: string, role: string) {
     return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/members`, 'POST', { userId, role });
