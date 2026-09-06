@@ -43,6 +43,7 @@ export class CreatorClient {
   collections(creatorId: string) { return this.call(`/studio/collections?creatorId=${encodeURIComponent(creatorId)}`); }
   createCollection(creatorId: string, title: string) { return this.call('/studio/collections', 'POST', { creatorId, title }); }
   updateCollection(collectionId: string, title: string) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title }); }
+  deleteCollection(collectionId: string) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'DELETE'); }
   replaceCollectionWorks(collectionId: string, workIds: string[], expectedWorkIds?: string[]) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}/works`, 'PUT', { workIds, expectedWorkIds }); }
   updateWork(workId: string, revision: number, title: string, description: string, tags?: string[]) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }) }); }
   setWorkArchived(workId: string, revision: number, archived: boolean) {
