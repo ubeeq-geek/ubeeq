@@ -13,6 +13,14 @@ Existing SQLite compatibility-library consumers can supply those ports using the
 This preserves their stored identities without copying Work and asset records;
 it does not automatically connect the reference public routes to that library.
 
+`PublicationWithdrawalService` provides an explicitly authorized/admitted local
+receipt withdrawal. It atomically changes one live publication to `removed` and
+writes its audit event, using the expected publication revision. Repeated removal
+is idempotent but still requires authorization and withdrawal admission. It leaves
+the Work, files and other destinations unchanged. Consumers must supply a separate
+withdrawal policy and transport; publication eligibility is not implicitly reused.
+This service does not dispatch external provider removal or cancel queued jobs.
+
 Publication writes the intent, live publication, Work revision and audit record in
 one repository transaction. Local failure-injection tests verify rollback at each
 later write boundary. Publication requests with a non-empty `Idempotency-Key` of
