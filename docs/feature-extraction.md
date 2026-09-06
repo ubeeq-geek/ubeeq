@@ -21,6 +21,16 @@ Features are complete only when a consuming application executes the shared impl
 
 ## Initial integration slice
 
+The integrations package now supplies the existing `v1` AES-256-GCM credential
+envelope with an explicitly supplied 32-byte key. Its random 12-byte nonce and
+16-byte authentication tag preserve the legacy wire format; tests prove old/new
+interoperability using synthetic credentials. Parsing now rejects extra fields,
+noncanonical encoding and malformed nonce/tag lengths, and never returns partial
+plaintext after authentication failure. Empty plaintext can round-trip as well.
+Products retain secret configuration and legacy key derivation. This primitive
+does not provide key custody/rotation, per-record associated-data binding, vault
+authorization or a password KDF, and does not replace those production requirements.
+
 Announcement publication identity and snapshot guards now live in integrations.
 The shared factory preserves the legacy provider/connection/target/idempotency
 tuple hash and clones the supplied content. Replacement guards protect content,
