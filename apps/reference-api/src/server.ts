@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/adapter-local";
 import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
@@ -332,22 +332,48 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && publicationMatch) {
         const identity = await session(request);
         const work = await ownedWork(publicationMatch[1], identity.subject.id);
+        const body = await parseBody(request);
+        const destination = requireString(body.destination, 'destination');
+        const header = request.headers['idempotency-key'];
+        if (header !== undefined && (typeof header !== 'string' || !header.trim() || header.length > 200)) throw new HttpError(400, 'invalid_idempotency_key', 'Use a non-empty idempotency key of at most 200 characters');
+        const requestKey = typeof header === 'string' ? header.trim() : randomUUID();
+        // Routing location is not request identity; moving a Work must not change its receipt ID.
+        const digest = createHash('sha256').update(JSON.stringify([work.instanceId, work.creatorId, work.id, requestKey])).digest('hex');
+        const intentId = `publication-request-${digest}`, publicationId = `publication-${digest}`;
+        const replay = async () => {
+          const intent = await repositories.publicationIntents.get(intentId);
+          if (!intent) return undefined;
+          if (intent.workId !== work.id || intent.destination !== destination || intent.idempotencyKey !== requestKey) throw new HttpError(409, 'idempotency_conflict', 'The idempotency key was already used for a different publication request');
+          const publication = await repositories.publications.get(publicationId);
+          if (!publication || publication.workId !== work.id || publication.destination !== destination) throw new HttpError(409, 'publication_receipt_invalid', 'The stored publication request is incomplete');
+          return { intent, publication, work: await ownedWork(work.id, identity.subject.id) };
+        };
+        const previous = await replay();
+        if (previous) return json(response, 200, { ...previous, idempotent: true, requestId }, requestId);
         const assets: AssetRecord[] = [];
         for await (const asset of repositoryItems(request => repositories.assets.list(request))) {
           if (asset.workId === work.id) assets.push(asset);
         }
         if (!assets.length || assets.some((asset) => asset.status !== "ready")) throw new HttpError(409, "processing_incomplete", "All Work assets must finish processing before publication");
         await requireClearAdmission("Publication", [work.id, work.creatorId, ...assets.map((asset) => asset.id)]);
-        const body = await parseBody(request);
-        const destination = requireString(body.destination, "destination");
-        const result = await repositories.transaction(async transaction => {
-          const intent = await repositories.publicationIntents.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), workId: work.id, destination, idempotencyKey: request.headers["idempotency-key"]?.toString() || randomUUID() }, { transaction });
-          const publication = await repositories.publications.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), workId: work.id, destination, status: "live" }, { transaction });
+        const commit = async () => repositories.transaction(async transaction => {
+          const existing = await replay();
+          if (existing) return { ...existing, idempotent: true };
+          const intent = await repositories.publicationIntents.create({ id: intentId, instanceId: work.instanceId, ...dataHomeOf(work), workId: work.id, destination, idempotencyKey: requestKey }, { transaction });
+          const publication = await repositories.publications.create({ id: publicationId, instanceId: work.instanceId, ...dataHomeOf(work), workId: work.id, destination, status: "live" }, { transaction });
           const publishedWork = await repositories.works.update(work.id, work.revision, { status: "published" }, { transaction });
           await repositories.auditEvents.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), action: 'work.published', actorId: identity.subject.id, subjectId: work.id, payload: { publicationId: publication.id, destination } }, { transaction });
-          return { intent, publication, work: publishedWork };
+          return { intent, publication, work: publishedWork, idempotent: false };
         });
-        return json(response, 201, { ...result, requestId }, requestId);
+        let result;
+        try { result = await commit(); }
+        catch (error) {
+          // A competing transaction may have committed the same durable receipt.
+          const existing = await replay();
+          if (!existing) throw error;
+          result = { ...existing, idempotent: true };
+        }
+        return json(response, result.idempotent ? 200 : 201, { ...result, requestId }, requestId);
       }
       const publicMatch = url.pathname.match(/^\/v1\/public\/works\/([^/]+)$/);
       if (method === "GET" && publicMatch) {

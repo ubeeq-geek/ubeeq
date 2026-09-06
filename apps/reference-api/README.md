@@ -4,8 +4,17 @@ The reference API is a neutral, local-first implementation of the creator profil
 
 Publication writes the intent, live publication, Work revision and audit record in
 one repository transaction. Local failure-injection tests verify rollback at each
-later write boundary. This is not full publication qualification: repeated request
-idempotency, indexed asset/admission queries, concurrent policy changes,
+later write boundary. Publication requests with a non-empty `Idempotency-Key` of
+at most 200 characters use stable intent/publication IDs scoped to the instance,
+Creator and Work (not its routing cell). Retries return HTTP 200 with
+`idempotent: true` and the current stored records; they do not increment the Work
+revision, add an audit event, or republish a removed record. Reusing the key with
+a different destination returns 409. Missing keys identify independent requests.
+This is not byte-for-byte historical response replay, and does not retrofit
+deduplication onto older randomly identified publication intents. Receipts must
+be retained and moved with publication records during migration.
+
+This is not full publication qualification: indexed asset/admission queries, concurrent policy changes,
 and external-provider/CDN withdrawal and revocation still need work. The destination
 field is metadata here, not confirmation of delivery to an external provider.
 
