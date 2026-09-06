@@ -336,6 +336,11 @@ remain outside SQLite atomicity, and cloud transaction parity is still pending.
 
 ## Remaining slices
 
+The creator client supports archiving collections and restoring them to draft.
+Consumers select admission and visibility rules. The local collection adapter
+supports expected-status writes to reject stale lifecycle snapshots atomically;
+it does not yet provide general collection metadata revision conflict detection.
+
 Retry delay calculation is available in `@ubeeq/jobs` as
 `equalJitterRetryDelaySeconds`, with caller-selected base, cap and exponent limit.
 It validates integer scheduling inputs and accepts injected randomness for tests.

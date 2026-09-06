@@ -1,6 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection archive and restore send only lifecycle state with authenticated encoded IDs', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => {
+    calls.push({ url, options });
+    return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {});
+  });
+  await client.signIn('owner@example.test', 'password');
+  for (const archived of [true, false]) {
+    await client.setCollectionArchived('id/space here', archived);
+    const { url, options } = calls.at(-1);
+    assert.equal(url, '/api/studio/collections/id%2Fspace%20here');
+    assert.equal(options.method, 'PATCH');
+    assert.equal(options.headers.authorization, 'Bearer session');
+    assert.deepEqual(JSON.parse(options.body), { status: archived ? 'archived' : 'draft' });
+  }
+});
 test('collection metadata is optional, explicit and supports clearing descriptions', async () => {
   const bodies = [];
   const client = new CreatorClient(async (_url, options) => { bodies.push(JSON.parse(options.body)); return Response.json({}); });

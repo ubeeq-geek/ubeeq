@@ -6,6 +6,27 @@ import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService } from "@ubeeq/core";
 
+test('a stale collection edit cannot revive a deletion committed by another connection', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-tombstone-'));
+  const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  const first = new LocalSqliteDatabase(configuration), second = new LocalSqliteDatabase(configuration);
+  try {
+    const editor = new LocalCreatorLibraryStore(first), remover = new LocalCreatorLibraryStore(second);
+    const record = { tenantId: 'tenant', creatorId: 'creator', collectionId: 'collection', slug: 'original', slugHistory: ['original'], status: 'archived', updatedAt: 'before' };
+    await editor.createCreatorCollection(record);
+    const stale = await editor.getCreatorCollection('tenant', 'collection');
+    const deleted = { ...record, status: 'deleted', deletedAt: 'deleted', updatedAt: 'deleted' };
+    await remover.updateCreatorCollection(deleted);
+    for (const status of ['draft', 'archived', 'published']) {
+      await assert.rejects(editor.updateCreatorCollection({ ...stale, status, updatedAt: 'after' }, stale.status), { code: 'revision_conflict' });
+      assert.deepEqual(await editor.getCreatorCollection('tenant', 'collection'), deleted);
+    }
+    assert.deepEqual(await editor.listCreatorCollections('tenant', 'creator'), []);
+  } finally {
+    first.database.close(); second.database.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("image attachment and processing job are atomic and survive reopening", async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-image-job-'));
   const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };

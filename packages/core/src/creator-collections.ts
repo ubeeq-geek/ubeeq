@@ -21,10 +21,11 @@ export interface CreatorCollectionMembership {
 export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
   /** Set only when expected order is compared atomically with membership replacement. */
   readonly supportsExpectedCollectionOrder?: boolean;
+  readonly supportsExpectedCollectionStatus?: boolean;
   listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null>;
   createCreatorCollection(collection: C): Promise<void>;
-  updateCreatorCollection(collection: C): Promise<void>;
+  updateCreatorCollection(collection: C, expectedStatus?: string): Promise<void>;
   listCollectionWorks(tenantId: string, collectionId: string): Promise<CreatorCollectionMembership[]>;
   replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[]): Promise<void>;
   getWork(tenantId: string, workId: string): Promise<{
@@ -94,14 +95,17 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     return { ...created, workIds: [] };
   }
 
-  async update(collection: C): Promise<C & { workIds: string[] }> {
+  async update(collection: C, expectedStatus?: string): Promise<C & { workIds: string[] }> {
+    if (expectedStatus !== undefined && !this.store.supportsExpectedCollectionStatus) {
+      throw new CreatorCollectionError('revision_conflict', 'Conditional collection lifecycle writes are unavailable in this adapter.');
+    }
     const previous = await this.get(collection.tenantId, collection.collectionId);
     if (previous.creatorId !== collection.creatorId) {
       throw new CreatorCollectionError("immutable_owner", "Collection ownership cannot be changed.");
     }
     await this.requireAvailableSlug(collection);
     const updated = { ...collection, slugHistory: [...new Set([...(previous.slugHistory || []), previous.slug, collection.slug])] };
-    await this.store.updateCreatorCollection(updated);
+    await this.store.updateCreatorCollection(updated, expectedStatus);
     return this.view(updated);
   }
 

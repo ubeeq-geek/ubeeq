@@ -33,6 +33,20 @@ test('conditional ordering fails closed when the adapter does not support it', a
   assert.equal(f.writes(), before);
 });
 
+test('conditional lifecycle updates require adapter support and forward the expected status', async () => {
+  const f = fixture();
+  await f.service.create(collection('one'));
+  const before = f.writes();
+  await assert.rejects(f.service.update({ ...collection('one'), status: 'archived' }, 'draft'), { code: 'revision_conflict' });
+  assert.equal(f.writes(), before);
+  f.store.supportsExpectedCollectionStatus = true;
+  let expected;
+  const update = f.store.updateCreatorCollection;
+  f.store.updateCreatorCollection = async (record, status) => { expected = status; await update(record); };
+  assert.equal((await f.service.update({ ...collection('one'), status: 'archived' }, 'draft')).status, 'archived');
+  assert.equal(expected, 'draft');
+});
+
 test("collection lifecycle preserves product fields, slug history, ordered membership and soft deletion", async () => {
   const f = fixture();
   assert.deepEqual((await f.service.create(collection("one"))).workIds, []);
