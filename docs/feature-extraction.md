@@ -348,6 +348,17 @@ without revision support. Work order retains its separate expected-order check.
 Consumers must send the displayed revision to protect forms from lost updates;
 omitting it does not offer that guarantee. Cloud parity remains unqualified.
 
+Collection cover references now require an active private asset owned by the same
+creator and tenant. The shared service fails closed unless the adapter declares
+atomic cover validation; SQLite checks asset ownership/state inside both create
+and update statements. A two-connection regression deletes the asset after the
+service reads it and verifies that no cover or revision is changed. Empty covers
+clear the reference without deleting assets. Collection soft deletion is not
+blocked by a missing historical cover. This is a write-time reference guarantee,
+not a guarantee that an asset cannot later be deleted, an attachment to a specific
+Work, a content-safety decision, or authorization to publish/render the asset.
+Consumer cover selectors and rendering remain separate migration work.
+
 Retry delay calculation is available in `@ubeeq/jobs` as
 `equalJitterRetryDelaySeconds`, with caller-selected base, cap and exponent limit.
 It validates integer scheduling inputs and accepts injected randomness for tests.

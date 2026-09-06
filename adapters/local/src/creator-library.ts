@@ -19,6 +19,14 @@ const availableSlug = `NOT EXISTS (
     )
 )`;
 
+const validCollectionCover = `(? = '' OR EXISTS (
+  SELECT 1 FROM ubeeq_creator_library AS cover
+  WHERE cover.cell_id = ? AND cover.tenant_id = ? AND cover.kind = 'asset'
+    AND cover.creator_id = ? AND cover.id = ?
+    AND json_extract(cover.payload, '$.status') <> 'deleted'
+    AND json_extract(cover.payload, '$.storage.scope') = 'private'
+))`;
+
 /** Durable compatibility library; it does not replace the cell-owned repositories. */
 export class LocalCreatorLibraryStore<W extends CreatorWorkRecord, C extends CreatorCollectionRecord>
 implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingPort {
@@ -161,18 +169,34 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
     return this.list<C & { title?: string }>(tenantId, "collection", creatorId).filter((collection) => collection.status !== "deleted")
       .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
   }
-  async createCreatorCollection(collection: C): Promise<void> { this.create("collection", collection.collectionId, collection); }
+  readonly supportsCollectionCoverValidation = true;
+  private coverParameters(collection: C): string[] {
+    const cover = collection.status === 'deleted' ? '' : collection.coverAssetId || '';
+    return [cover, this.local.configuration.cellId, collection.tenantId, collection.creatorId, cover];
+  }
+  private requireStoredCover(collection: C): void {
+    const valid = this.local.database.prepare(`SELECT ${validCollectionCover} AS valid`).get(...this.coverParameters(collection)) as { valid: number };
+    if (!valid.valid) throw new CreatorCollectionError('invalid_cover', 'Choose an active private asset owned by this Creator.');
+  }
+  async createCreatorCollection(collection: C): Promise<void> {
+    const result = this.local.database.prepare(`INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload)
+      SELECT ?, ?, 'collection', ?, ?, ? WHERE ${availableSlug} AND ${validCollectionCover}`)
+      .run(this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, JSON.stringify(collection),
+        ...this.slugParameters('collection', collection.collectionId, collection), ...this.coverParameters(collection));
+    if (result.changes !== 1) { this.requireStoredCover(collection); throw this.slugConflict('collection'); }
+  }
   readonly supportsExpectedCollectionStatus = true;
   readonly supportsExpectedCollectionRevision = true;
   async updateCreatorCollection(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<void> {
     if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER)) throw new CreatorCollectionError('revision_conflict', 'Invalid collection revision.');
-    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = json_set(?, '$.revision', COALESCE(json_extract(payload, '$.revision'), 0) + 1) WHERE cell_id = ? AND tenant_id = ? AND kind = 'collection' AND id = ? AND creator_id = ? AND (? IS NULL OR json_extract(payload, '$.status') = ?) AND (? IS NULL OR COALESCE(json_extract(payload, '$.revision'), 0) = ?) AND ${availableSlug}`)
-      .run(JSON.stringify(collection), this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, expectedStatus ?? null, expectedStatus ?? null, expectedRevision ?? null, expectedRevision ?? null, ...this.slugParameters("collection", collection.collectionId, collection));
+    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = json_set(?, '$.revision', COALESCE(json_extract(payload, '$.revision'), 0) + 1) WHERE cell_id = ? AND tenant_id = ? AND kind = 'collection' AND id = ? AND creator_id = ? AND (? IS NULL OR json_extract(payload, '$.status') = ?) AND (? IS NULL OR COALESCE(json_extract(payload, '$.revision'), 0) = ?) AND ${availableSlug} AND ${validCollectionCover}`)
+      .run(JSON.stringify(collection), this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, expectedStatus ?? null, expectedStatus ?? null, expectedRevision ?? null, expectedRevision ?? null, ...this.slugParameters("collection", collection.collectionId, collection), ...this.coverParameters(collection));
     if (result.changes !== 1) {
       const current = this.get<C>(collection.tenantId, "collection", collection.collectionId);
       if (!current || current.creatorId !== collection.creatorId) throw new CreatorCollectionError("not_found", "Collection not found.");
       if (expectedRevision !== undefined && (current.revision ?? 0) !== expectedRevision) throw new CreatorCollectionError('revision_conflict', 'Collection changed; refresh before saving.');
       if (expectedStatus !== undefined && current.status !== expectedStatus) throw new CreatorCollectionError('revision_conflict', 'Collection status changed; refresh before saving.');
+      this.requireStoredCover(collection);
       throw this.slugConflict("collection");
     }
   }
