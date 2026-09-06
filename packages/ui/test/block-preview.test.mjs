@@ -5,6 +5,30 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { BlockPreview } from '../dist/react.js';
 
 const render = (value, mediaOptions = []) => renderToStaticMarkup(createElement(BlockPreview, { value, mediaOptions }));
+test('explicit media renderer resolves admitted identities without receiving stored URLs', () => {
+  const value = [
+    { blockId: 'section', type: 'section', blocks: [
+      { blockId: 'image', type: 'image', assetId: 'admitted', caption: '<script>caption</script>', url: 'https://private.invalid/original' },
+      { blockId: 'missing', type: 'image', assetId: 'unavailable' }
+    ] },
+    { blockId: 'text', type: 'paragraph', html: '<strong>Published</strong><script>alert(1)</script>' }
+  ];
+  const before = structuredClone(value), inputs = [];
+  const html = renderToStaticMarkup(createElement(BlockPreview, { value, label: 'Published content', renderMedia: input => {
+    inputs.push(input);
+    if (input.assetId !== 'admitted') return undefined;
+    return createElement('img', { src: '/public/works/work/assets/admitted/version', alt: input.caption });
+  } }));
+  assert.match(html, /aria-label="Published content"/);
+  assert.match(html, /src="\/public\/works\/work\/assets\/admitted\/version"/);
+  assert.match(html, /&lt;script&gt;caption&lt;\/script&gt;/);
+  assert.match(html, /Media unavailable/);
+  // Without a DOM, the sanitizer deliberately escapes inline markup.
+  assert.match(html, /&lt;strong&gt;Published&lt;\/strong&gt;/);
+  assert.doesNotMatch(html, /<script|private.invalid/);
+  assert.equal(inputs.length, 2); assert.ok(inputs.every(input => !('url' in input)));
+  assert.deepEqual(value, before);
+});
 test('read-only body preview renders structured text without editing or mutating the draft', () => {
   const value = [{ blockId: 'section', type: 'section', title: 'Chapter', blocks: [
     { blockId: 'heading', type: 'heading', level: 3, text: 'Heading' },

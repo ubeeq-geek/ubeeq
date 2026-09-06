@@ -9,6 +9,14 @@ export interface BlockPreviewMedia {
   thumbnailUrl?: string;
 }
 
+/** The caller authorizes delivery and owns its React output. Raw stored URLs are
+ * deliberately excluded; resolve these identities against an admitted media set.
+ * Return undefined to keep the default private-preview/unavailable rendering.
+ */
+export type BlockMediaRenderer = (media: Readonly<{
+  type: ContentBlock['type']; assetId?: string; fileId?: string; caption?: string;
+}>) => ReactNode | undefined;
+
 const safeLink = (url?: string): string | undefined => {
   if (!url) return;
   try { return ['https:', 'http:', 'mailto:'].includes(new URL(url).protocol) ? url : undefined; }
@@ -16,10 +24,11 @@ const safeLink = (url?: string): string | undefined => {
 };
 
 /** Read-only draft preview. Does not authorize publication or embed remote content. */
-export function BlockPreview({ value, mediaOptions = [], label = 'Content preview' }: {
+export function BlockPreview({ value, mediaOptions = [], label = 'Content preview', renderMedia }: {
   value: readonly StoredPostBlock[];
   mediaOptions?: readonly BlockPreviewMedia[];
   label?: string;
+  renderMedia?: BlockMediaRenderer;
 }) {
   let blocks: ContentBlock[];
   try { blocks = parseContentBlocks(value, { unbounded: true }); }
@@ -43,6 +52,8 @@ export function BlockPreview({ value, mediaOptions = [], label = 'Content previe
       case 'link': content = <p>{link(block)}</p>; break;
       case 'credit': content = <p>{block.author && <strong>{block.author}: </strong>}{block.text}{block.url && <> — {link(block)}</>}</p>; break;
       case 'image': case 'video': case 'audio': case 'file': case 'pdf_preview': {
+        const authorized = renderMedia?.({ type: block.type, assetId: block.assetId, fileId: block.fileId, caption: block.caption });
+        if (authorized !== undefined) { content = authorized; break; }
         const media = mediaOptions.find(item => item.mediaId === (block.assetId || block.fileId));
         // Only use object URLs the caller created after authenticated delivery.
         const thumbnail = media?.thumbnailUrl?.startsWith('blob:') ? media.thumbnailUrl : undefined;
