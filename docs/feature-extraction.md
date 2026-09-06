@@ -345,6 +345,14 @@ checks. PKCE accepts the existing key and domain separator to preserve in-flight
 flow compatibility. This does not add replay persistence or qualify live OAuth
 provider integrations.
 
+`claimVerifiedOAuthState` supplies a one-time callback claim after signature and
+provider/actor validation. It checks expiry, hashes namespace plus nonce, and
+requires an atomic insert-if-absent store. It propagates storage failures; callers
+must complete the claim before external side effects. A claim is not rolled back
+after a provider failure: the user starts a fresh flow. A memory implementation is
+only suitable for local development; durable retention/TTL and all live callback
+paths still require deployment qualification.
+
 The creator client supports archiving collections and restoring them to draft.
 Its metadata update also supports changing among the four collection kinds,
 without sending product visibility or ownership fields.
