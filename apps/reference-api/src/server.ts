@@ -9,7 +9,7 @@ import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
-import { CellOwnershipError, type AssetRecord, type CreatorRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
+import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
 import { cellScopedObjectKey, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
 import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
@@ -116,7 +116,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     return verified;
   };
   const operatorSession = async (request: IncomingMessage) => {
-    if (!configuration.operatorAuthorization) throw new HttpError(404, "operations_unavailable", "Regional operator operations are not configured");
+    if (!configuration.operatorAuthorization || !Object.values(configuration.operatorAuthorization).some(values => values?.length)) throw new HttpError(404, "operations_unavailable", "Operator operations are not configured");
     const authenticated = await session(request);
     requireAuthorization(authenticated.subject, configuration.operatorAuthorization);
     return authenticated;
@@ -201,6 +201,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     try {
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
+      // Fail closed for the entire operations namespace, including future routes.
+      // Product/deployment composition must explicitly define operator authority.
+      if (url.pathname === '/v1/operations' || url.pathname.startsWith('/v1/operations/')) await operatorSession(request);
       if (method === "GET" && url.pathname === "/health") return json(response, 200, { ok: true, requestId }, requestId);
       if (method === "GET" && url.pathname === "/.well-known/ubeeq") { const publicUrl = new URL(configuration.publicBaseUrl); const enabled = publicUrl.protocol === "https:" && !!adapters.federation; return json(response, 200, { protocolVersion: "1", instanceId: configuration.instanceId ?? "local-reference", federationEnabled: enabled, ...(enabled ? { instanceUrl: publicUrl.toString(), actorDocumentUrl: new URL("/v1/federation/actors", publicUrl).toString(), publicationInboxUrl: new URL("/v1/federation/inbox", publicUrl).toString(), signingKeyId: adapters.federation!.keyId, signingPublicKey: adapters.federation!.publicKey, capabilities: ["publication-reference", "withdrawal"] } : {}), requestId }, requestId); }
       if ((method === "GET" && url.pathname === "/ready") || (method === "GET" && url.pathname === "/diagnostics")) {
@@ -354,6 +357,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if (error instanceof UniqueConstraintError && error.constraint.name === 'creator_current_handle') {
+        return json(response, 409, { error: { code: 'handle_conflict', message: 'Creator handle is already in use.', requestId } }, requestId);
+      }
       const status = error instanceof HttpError ? error.status : error instanceof AuthorizationDeniedError ? 403 : error instanceof AdmissionBlockedError ? 409 : error instanceof CellRoutingError || error instanceof CellOwnershipError ? 409 : 500;
       const code = error instanceof HttpError ? error.code : error instanceof AuthorizationDeniedError ? "authorization_denied" : error instanceof AdmissionBlockedError ? "admission_blocked" : error instanceof CellRoutingError || error instanceof CellOwnershipError ? "foreign_cell" : "internal_error";
       const message = error instanceof Error ? error.message : "Unexpected error";

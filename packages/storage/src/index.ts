@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+export * from './object-key-scope.js';
 
 /** Storage and delivery ports with no product-specific retention or access policy. */
 export type ObjectAccessScope = "private" | "restricted" | "public";
