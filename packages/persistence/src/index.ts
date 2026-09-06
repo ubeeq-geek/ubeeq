@@ -21,6 +21,21 @@ export class CellOwnershipError extends Error {
 
 export interface PageRequest { cursor?: string; limit: number; }
 export interface Page<T> { items: readonly T[]; nextCursor?: string; }
+/** Visit every page without retaining unrelated records. A repeated cursor is an adapter failure, never successful completion. */
+export async function* repositoryItems<T>(list: (request: PageRequest) => Promise<Page<T>>, limit = 100): AsyncGenerator<T> {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Page size must be a positive integer.');
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  do {
+    const page = await list({ limit, ...(cursor ? { cursor } : {}) });
+    for (const item of page.items) yield item;
+    cursor = page.nextCursor;
+    if (cursor) {
+      if (seen.has(cursor)) throw new Error('Repository pagination repeated a cursor.');
+      seen.add(cursor);
+    }
+  } while (cursor);
+}
 export interface UniqueConstraint { name: string; values: Readonly<Record<string, string>>; }
 
 export class OptimisticConcurrencyError extends Error {
