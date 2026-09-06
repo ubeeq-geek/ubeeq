@@ -348,6 +348,8 @@ provider integrations.
 `claimVerifiedOAuthState` supplies a one-time callback claim after signature and
 provider/actor validation. It checks expiry, hashes namespace plus nonce, and
 requires an atomic insert-if-absent store. It propagates storage failures; callers
+can distinguish typed `invalid_state`/`already_used` failures from infrastructure
+errors without matching message text. Callers
 must complete the claim before external side effects. A claim is not rolled back
 after a provider failure: the user starts a fresh flow. A memory implementation is
 only suitable for local development; durable retention/TTL and all live callback
