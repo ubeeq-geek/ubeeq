@@ -1,4 +1,5 @@
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
+import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
 
 export type DescriptionBlockType = 'paragraph' | 'heading' | 'quote' | 'divider';
 
@@ -28,43 +29,45 @@ const isSafeLink = (value: string): boolean => {
   }
 };
 
-const sanitizeInlineNode = (node: Node): string => {
-  if (node.nodeType === Node.TEXT_NODE) return escapeHtml(node.textContent || '');
-  if (!(node instanceof HTMLElement)) return '';
-
-  const tag = node.tagName.toLowerCase();
-  const children = Array.from(node.childNodes).map(sanitizeInlineNode).join('');
-  if (tag === 'br') return '<br>';
-  if (tag === 'strong' || tag === 'b') return `<strong>${children}</strong>`;
-  if (tag === 'em' || tag === 'i') return `<em>${children}</em>`;
-  if (tag === 'u') return `<u>${children}</u>`;
-  if (tag === 's' || tag === 'strike') return `<s>${children}</s>`;
-  if (tag === 'code') return `<code>${children}</code>`;
-  if (tag === 'div' || tag === 'p') return `${children}<br>`;
-  if (tag === 'li') return `• ${children}<br>`;
-  if (tag === 'a') {
-    const href = node.getAttribute('href') || '';
-    return isSafeLink(href)
-      ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${children}</a>`
-      : children;
+/** One inert HTML parser for server and browser. Reconstruct only the inline allowlist;
+ * never serialize source nodes or attributes. Input and visited-node budgets fail closed.
+ */
+const inlineContent = (value: string, plainText: boolean): string => {
+  if (!value) return '';
+  if (value.length > 1_048_576) throw new Error('Inline content exceeds its input budget.');
+  const root = parseFragment(value);
+  const stack: Array<DefaultTreeAdapterMap['node'] | string> = [...root.childNodes].reverse();
+  const output: string[] = [];
+  let visited = 0;
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (typeof node === 'string') { output.push(node); continue; }
+    if (++visited > 50_000) throw new Error('Inline content exceeds its structure budget.');
+    if (node.nodeName === '#text' && 'value' in node) { output.push(plainText ? node.value : escapeHtml(node.value)); continue; }
+    if (!('tagName' in node) || node.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
+    const tag = node.tagName;
+    if (['script', 'style', 'template', 'iframe', 'object', 'embed', 'noscript'].includes(tag)) continue;
+    if (tag === 'br') { output.push(plainText ? '\n' : '<br>'); continue; }
+    let start = '', end = '';
+    if (!plainText) {
+      const normalized = ({ b: 'strong', strong: 'strong', i: 'em', em: 'em', u: 'u', s: 's', strike: 's', code: 'code' } as Record<string, string>)[tag];
+      if (normalized) { start = '<' + normalized + '>'; end = '</' + normalized + '>'; }
+      else if (tag === 'div' || tag === 'p') end = '<br>';
+      else if (tag === 'li') { start = '• '; end = '<br>'; }
+      else if (tag === 'a') {
+        const href = node.attrs.find(attribute => attribute.name === 'href')?.value || '';
+        if (isSafeLink(href)) { start = '<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">'; end = '</a>'; }
+      }
+    }
+    output.push(start);
+    if (end) stack.push(end);
+    for (let index = node.childNodes.length - 1; index >= 0; index--) stack.push(node.childNodes[index]);
   }
-  return children;
+  return output.join('');
 };
 
-export const sanitizeInlineHtml = (value: string): string => {
-  if (!value) return '';
-  if (typeof DOMParser === 'undefined') return escapeHtml(value);
-  const document = new DOMParser().parseFromString(`<body>${value}</body>`, 'text/html');
-  return Array.from(document.body.childNodes).map(sanitizeInlineNode).join('');
-};
-
-export const inlineHtmlToText = (value: string): string => {
-  if (!value) return '';
-  if (typeof DOMParser === 'undefined') return value.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]*>/g, '');
-  const document = new DOMParser().parseFromString(`<body>${value}</body>`, 'text/html');
-  document.body.querySelectorAll('br').forEach((node) => node.replaceWith('\n'));
-  return document.body.textContent || '';
-};
+export const sanitizeInlineHtml = (value: string): string => inlineContent(value, false);
+export const inlineHtmlToText = (value: string): string => inlineContent(value, true);
 
 export const textToInlineHtml = (value: string): string => escapeHtml(value).replace(/\r?\n/g, '<br>');
 

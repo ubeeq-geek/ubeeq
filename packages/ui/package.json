@@ -14,6 +14,6 @@
   "peerDependencies": { "react": ">=18 <20" },
   "peerDependenciesMeta": { "react": { "optional": true } },
   "devDependencies": { "react": "18.3.1", "react-dom": "18.3.1", "@types/react": "18.3.31" },
-  "dependencies": { "@ubeeq/core": "0.1.0" },
+  "dependencies": { "@ubeeq/core": "0.1.0", "parse5": "^7.3.0" },
   "scripts": { "build": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json", "test": "npm run build && node --test test/*.test.mjs" }
 }
