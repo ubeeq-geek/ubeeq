@@ -7,5 +7,5 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": { "build": "tsc -p tsconfig.json", "test:contract": "npm run build && node --test test/*.test.mjs", "test": "npm run test:contract" },
-  "dependencies": { "@ubeeq/processing": "^0.1.0", "sharp": "^0.34.5" }
+  "dependencies": { "@ubeeq/processing": "^0.1.0", "sharp": "^0.35.4" }
 }
