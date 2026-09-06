@@ -254,3 +254,4 @@ export const resolveReconciliation = (
   }
   throw new Error("Unsupported reconciliation action.");
 };
+export { ghostReconciliationSnapshot, ghostPublicationHash, type GhostEditablePublication } from './ghost-snapshots.js';
