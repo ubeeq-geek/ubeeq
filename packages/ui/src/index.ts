@@ -1,3 +1,6 @@
+export { CreatorClient } from './creator-client.js';
+export * from './block-content.js';
+export * from './asset-editor-options.js';
 export interface LocalizedText { defaultLocale: string; translations: Readonly<Record<string, string>>; }
 export interface AccessibleAction { id: string; label: LocalizedText; description?: LocalizedText; }
 export type UiTokens = Readonly<Record<string, string>>;

@@ -1,4 +1,11 @@
 /** Stable, product-neutral domain identifiers. */
+export * from "./publication-history.js";
+export * from "./creator-collections.js";
+export * from "./creator-works.js";
+export * from "./content-blocks.js";
+export * from "./creator-assets.js";
+export * from "./content-media.js";
+export * from "./creator-members.js";
 export type EntityId = string & { readonly __entityId: unique symbol };
 
 /** The single authoritative regional cell for creator-owned mutable data. */
@@ -41,7 +48,8 @@ export interface UsageRecord extends CellOwned {
 }
 
 /** Stable, product-neutral content lifecycle contracts. */
-export type WorkKind = "image" | "gallery" | "video" | "audio" | "literature" | "article" | "animation" | "mixed";
+export const WORK_KINDS = ["image", "gallery", "video", "audio", "literature", "article", "animation", "mixed"] as const;
+export type WorkKind = typeof WORK_KINDS[number];
 export type WorkStatus = "draft" | "ready" | "archived" | "deleted";
 export type WorkOriginType = "local" | "import";
 export type AssetKind = "image" | "video" | "audio" | "document" | "archive" | "other";
@@ -121,7 +129,10 @@ export type WorkWithAssets = Work & {
 };
 
 /** Derives delivery availability without imposing a product retention or visibility policy. */
-export const contentAvailabilityFor = (work: Pick<Work, "origin">, assets: WorkWithAssets["assets"]): ContentAvailability => {
+export const contentAvailabilityFor = (
+  work: { origin: Pick<WorkOrigin, "type" | "remoteId"> },
+  assets: readonly Pick<Asset, "status" | "storage" | "metadata">[]
+): ContentAvailability => {
   if (!assets.length) return work.origin.type === "import" && work.origin.remoteId ? "external_reference" : "metadata_only";
   const hosted = assets.filter((asset) => asset.storage.mode === "hosted" && asset.status === "ready");
   if (hosted.some((asset) => asset.metadata?.sourceCopyQuality !== "display_copy")) return "original_hosted";
@@ -300,3 +311,7 @@ export const validateContentBlocks = (blocks: readonly ContentBlock[]): void => 
   };
   visit(blocks);
 };
+export * from './creator-profile';
+export * from './profile-content';
+export * from './content-slugs';
+export * from './creator-handle';

@@ -53,7 +53,12 @@ test("local delivery tokens are signed, expiring, and cell scoped", async () => 
     const { storage } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1", cellId: "cell-a", deliverySigningKeys: { old: "old-key", current: "current-key" }, activeDeliveryKeyId: "current" });
     const delivery = await storage.issue({ object: { bucket: "cell-a", key: "cells/cell-a/creators/creator-a/renditions/rendition-a", versionId: "v1", scope: "public" }, expiresAt: new Date(Date.now() + 60_000).toISOString() });
     const token = delivery.url.split("/").at(-1); assert.equal(storage.verifyDeliveryToken(token).creatorId, "creator-a");
-    await assert.rejects(async () => storage.verifyDeliveryToken(`${token.slice(0, -1)}x`), /signature/);
+    const [payload, signature] = token.split(".");
+    const tamperedSignature = Buffer.from(signature, "base64url");
+    // A textual change to the last character can alter only unused padding bits.
+    // Flip a decoded byte so this always changes the authenticated signature.
+    tamperedSignature[0] ^= 1;
+    assert.throws(() => storage.verifyDeliveryToken(`${payload}.${tamperedSignature.toString("base64url")}`), /signature/);
     assert.throws(() => storage.verifyDeliveryToken("malformed"), /malformed/);
     await assert.rejects(() => storage.issue({ object: { bucket: "cell-a", key: "cells/cell-a/creators/creator-a/uploads/source", scope: "public" }, expiresAt: new Date(Date.now() + 60_000).toISOString() }), /rendition/);
     const foreignDirectory = mkdtempSync(join(tmpdir(), "ubeeq-local-delivery-foreign-")); const foreign = createLocalAdapterSet({ databasePath: join(foreignDirectory, "state.sqlite"), dataDirectory: foreignDirectory, publicBaseUrl: "http://127.0.0.1", cellId: "cell-b", deliverySigningKeys: { current: "current-key" }, activeDeliveryKeyId: "current" }).storage;

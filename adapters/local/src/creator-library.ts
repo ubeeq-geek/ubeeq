@@ -1,0 +1,198 @@
+import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
+import { CreatorWorkError, CreatorCollectionError } from "@ubeeq/core";
+import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
+import type { LocalSqliteDatabase } from "./index.js";
+import { LocalSqliteJobQueue } from "./index.js";
+
+// Kept inside the mutation statement so concurrent requests cannot both reserve
+// the same current/historical slug. Deleted records follow compatibility semantics
+// and release their slugs; restoration must acquire the slug again.
+const availableSlug = `NOT EXISTS (
+  SELECT 1 FROM ubeeq_creator_library AS existing
+  WHERE existing.cell_id = ? AND existing.tenant_id = ? AND existing.kind = ?
+    AND existing.creator_id = ? AND existing.id <> ?
+    AND coalesce(json_extract(existing.payload, '$.status'), '') <> 'deleted'
+    AND EXISTS (SELECT 1 FROM json_each(?) AS candidate WHERE
+      json_extract(existing.payload, '$.slug') = candidate.value OR EXISTS (
+        SELECT 1 FROM json_each(existing.payload, '$.slugHistory') AS history WHERE history.value = candidate.value
+      )
+    )
+)`;
+
+/** Durable compatibility library; it does not replace the cell-owned repositories. */
+export class LocalCreatorLibraryStore<W extends CreatorWorkRecord, C extends CreatorCollectionRecord>
+implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingPort {
+  readonly supportsExpectedCollectionOrder = true;
+  constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean } = {}) {}
+
+  private get<T>(tenantId: string, kind: string, id: string): T | null {
+    const row = this.local.database.prepare("SELECT payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = ? AND id = ?")
+      .get(this.local.configuration.cellId, tenantId, kind, id) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as T : null;
+  }
+
+  private list<T>(tenantId: string, kind: string, creatorId: string): T[] {
+    const rows = this.local.database.prepare("SELECT payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = ? AND creator_id = ? ORDER BY id")
+      .all(this.local.configuration.cellId, tenantId, kind, creatorId) as { payload: string }[];
+    return rows.map((row) => JSON.parse(row.payload) as T);
+  }
+
+  private slugParameters(kind: string, id: string, record: { tenantId: string; creatorId: string; slug: string; slugHistory?: string[]; status?: string }): string[] {
+    return [this.local.configuration.cellId, record.tenantId, kind, record.creatorId, id,
+      JSON.stringify(record.status === "deleted" ? [] : [...new Set([record.slug, ...(record.slugHistory || [])])])];
+  }
+
+  private slugConflict(kind: string): Error {
+    return kind === "work"
+      ? new CreatorWorkError("slug_conflict", "Work slug is already in use for this Creator.")
+      : new CreatorCollectionError("slug_conflict", "Collection slug is already in use.");
+  }
+
+  private create(kind: string, id: string, record: { tenantId: string; creatorId: string; slug: string }): void {
+    const result = this.local.database.prepare(`INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload)
+      SELECT ?, ?, ?, ?, ?, ? WHERE ${availableSlug}`)
+      .run(this.local.configuration.cellId, record.tenantId, kind, id, record.creatorId, JSON.stringify(record), ...this.slugParameters(kind, id, record));
+    if (result.changes !== 1) throw this.slugConflict(kind);
+  }
+
+  async getWork(tenantId: string, workId: string): Promise<W | null> { return this.get(tenantId, "work", workId); }
+  async getProcessingAsset(tenantId: string, assetId: string): Promise<CreatorAssetRecord | null> { return this.get(tenantId, "asset", assetId); }
+  async commitAssetProcessing(input: CreatorAssetProcessingCommit): Promise<void> {
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const timestamp = new Date().toISOString();
+      const job = db.prepare("SELECT payload FROM ubeeq_jobs WHERE id = ? AND cell_id = ? AND type = 'creator-asset.process' AND state = 'leased' AND lease_token = ? AND lease_expires_at > ?")
+        .get(input.jobId, cell, input.leaseToken, timestamp) as { payload: string } | undefined;
+      if (!job) throw new Error("Processing lease is not current.");
+      const payload = JSON.parse(job.payload);
+      for (const key of ["tenantId", "creatorId", "workId", "assetId", "sourceVersionId"] as const) {
+        if (!input[key] || payload[key] !== input[key]) throw new Error("Processing job scope does not match result.");
+      }
+      const asset = this.get<CreatorAssetRecord>(input.tenantId, "asset", input.assetId);
+      const work = this.get<W>(input.tenantId, "work", input.workId);
+      const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, "work_assets", input.workId) || [];
+      if (!asset || asset.creatorId !== input.creatorId || asset.storage.versionId !== input.sourceVersionId || asset.status === "deleted" ||
+        !work || work.creatorId !== input.creatorId || work.status === "deleted" || !attachments.some((item) => item.assetId === input.assetId)) {
+        throw new Error("Processing source or ownership changed.");
+      }
+      if (!input.renditions.length || new Set(input.renditions.map((item) => item.id)).size !== input.renditions.length) throw new Error("Processing requires uniquely identified renditions.");
+      const renditions = input.renditions.map((item) => {
+        const object = item.storage;
+        if (!item.id || item.sourceVersionId !== input.sourceVersionId || !["preview", "poster"].includes(item.role) ||
+          !object || object.scope !== "private" || !object.bucket || !object.key || !object.versionId || !object.contentType ||
+          !Number.isSafeInteger(object.byteLength) || object.byteLength <= 0 || !/^[a-f0-9]{64}$/.test(object.checksum)) throw new Error("Invalid stored rendition.");
+        // Persist only references, never transient bytes or arbitrary object fields.
+        return { id: item.id, sourceVersionId: item.sourceVersionId, role: item.role,
+          storage: { bucket: object.bucket, key: object.key, versionId: object.versionId, contentType: object.contentType,
+            byteLength: object.byteLength, checksum: object.checksum, scope: "private" as const } };
+      });
+      if (Object.values(input.metadata).some((value) => !["string", "number", "boolean"].includes(typeof value) || (typeof value === "number" && !Number.isFinite(value)))) throw new Error("Invalid processing metadata.");
+      const next = { ...asset, updatedAt: timestamp, processing: { state: "completed" as const, sourceVersionId: input.sourceVersionId, completedAt: timestamp, metadata: input.metadata, renditions } };
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'asset' AND id = ?")
+        .run(JSON.stringify(next), cell, input.tenantId, input.assetId);
+      const completed = db.prepare("UPDATE ubeeq_jobs SET state = 'completed', lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND cell_id = ? AND state = 'leased' AND lease_token = ? AND lease_expires_at > ?")
+        .run(timestamp, input.jobId, cell, input.leaseToken, new Date().toISOString());
+      if (completed.changes !== 1) throw new Error("Processing lease expired before commit.");
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  }
+  async listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<CreatorAssetRecord & { attachment: CreatorAssetAttachment }>> {
+    const attachments = this.get<CreatorAssetAttachment[]>(tenantId, "work_assets", workId) || [];
+    return attachments.map((attachment) => {
+      const asset = this.get<CreatorAssetRecord>(tenantId, "asset", attachment.assetId);
+      if (!asset) throw new Error("Stored Work attachment has no asset.");
+      return { ...asset, attachment };
+    });
+  }
+  async commitAssetAttachment(input: { previousRevision: number; work: W; asset: CreatorAssetRecord; attachment: CreatorAssetAttachment }): Promise<void> {
+    const { work, asset, attachment } = input;
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    // No await inside this synchronous transaction: unrelated requests cannot
+    // enter the connection between its statements. BEGIN fails if already owned.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.get<W>(work.tenantId, "work", work.workId);
+      if (!previous || previous.revision !== input.previousRevision || work.revision !== input.previousRevision + 1 ||
+        previous.creatorId !== work.creatorId || previous.status === "deleted") {
+        throw new CreatorWorkError("revision_conflict", "Work changed before the asset could be attached.");
+      }
+      const attachments = this.get<CreatorAssetAttachment[]>(work.tenantId, "work_assets", work.workId) || [];
+      if (asset.tenantId !== work.tenantId || asset.creatorId !== work.creatorId || attachment.workId !== work.workId ||
+        attachment.assetId !== asset.assetId || attachment.position !== attachments.length) throw new Error("Invalid asset attachment scope or position.");
+      db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'asset', ?, ?, ?)")
+        .run(cell, asset.tenantId, asset.assetId, asset.creatorId, JSON.stringify(asset));
+      db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'work_assets', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
+        .run(cell, work.tenantId, work.workId, work.creatorId, JSON.stringify([...attachments, attachment]));
+      // This operation edits only media membership, not titles or slug history.
+      const next = { ...previous, primaryAssetId: (previous as W & { primaryAssetId?: string }).primaryAssetId || asset.assetId, revision: work.revision, updatedAt: work.updatedAt };
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
+        .run(JSON.stringify(next), cell, work.tenantId, work.workId);
+      if (asset.status === "pending" && ((this.options.enqueueImageProcessing && asset.mimeType.startsWith("image/")) ||
+        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith("video/")))) {
+        new LocalSqliteJobQueue(this.local).enqueueSync({ cellId: cell, type: "creator-asset.process",
+          payload: { tenantId: asset.tenantId, creatorId: asset.creatorId, workId: work.workId, assetId: asset.assetId, sourceVersionId: asset.storage.versionId },
+          idempotencyKey: JSON.stringify(["creator-asset.process", asset.tenantId, asset.assetId, asset.storage.versionId]), maxAttempts: 3 });
+      }
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  }
+  async listWorksByCreator(tenantId: string, creatorId: string): Promise<W[]> {
+    return this.list<W>(tenantId, "work", creatorId).filter((work) => work.status !== "deleted").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  async createWork(work: W): Promise<void> { this.create("work", work.workId, work); }
+  async updateWork(work: W): Promise<void> {
+    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ? AND creator_id = ? AND json_extract(payload, '$.revision') = ? AND ${availableSlug}`)
+      .run(JSON.stringify(work), this.local.configuration.cellId, work.tenantId, work.workId, work.creatorId, work.revision - 1, ...this.slugParameters("work", work.workId, work));
+    if (result.changes !== 1) {
+      const current = this.get<W>(work.tenantId, "work", work.workId);
+      if (!current || current.creatorId !== work.creatorId || current.revision !== work.revision - 1) {
+        throw new CreatorWorkError("revision_conflict", "Work revision conflict or record not found.");
+      }
+      throw this.slugConflict("work");
+    }
+  }
+  async commitWorkRevision(work: W, expectedRevision: number): Promise<void> {
+    if (work.revision !== expectedRevision + 1) throw new CreatorWorkError("revision_conflict", "Invalid Work revision increment.");
+    await this.updateWork(work);
+  }
+  async getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null> { return this.get(tenantId, "collection", collectionId); }
+  async listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]> {
+    return this.list<C & { title?: string }>(tenantId, "collection", creatorId).filter((collection) => collection.status !== "deleted")
+      .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  }
+  async createCreatorCollection(collection: C): Promise<void> { this.create("collection", collection.collectionId, collection); }
+  async updateCreatorCollection(collection: C): Promise<void> {
+    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'collection' AND id = ? AND creator_id = ? AND ${availableSlug}`)
+      .run(JSON.stringify(collection), this.local.configuration.cellId, collection.tenantId, collection.collectionId, collection.creatorId, ...this.slugParameters("collection", collection.collectionId, collection));
+    if (result.changes !== 1) {
+      const current = this.get<C>(collection.tenantId, "collection", collection.collectionId);
+      if (!current || current.creatorId !== collection.creatorId) throw new CreatorCollectionError("not_found", "Collection not found.");
+      throw this.slugConflict("collection");
+    }
+  }
+  async listCollectionWorks(tenantId: string, collectionId: string): Promise<CreatorCollectionMembership[]> {
+    return this.get(tenantId, "membership", collectionId) ?? [];
+  }
+  async replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[]): Promise<void> {
+    const db = this.local.database;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const collection = this.get<C>(tenantId, 'collection', collectionId);
+      if (!collection || collection.status === 'deleted') throw new CreatorCollectionError('not_found', 'Collection not found.');
+      const current = this.get<CreatorCollectionMembership[]>(tenantId, 'membership', collectionId) || [];
+      if (expectedWorkIds !== undefined && (current.length !== expectedWorkIds.length || current.some((item, index) => item.workId !== expectedWorkIds[index]))) {
+        throw new CreatorCollectionError('revision_conflict', 'Collection order changed; refresh before saving.');
+      }
+      if (new Set(works.map(work => work.workId)).size !== works.length || works.some((membership, position) => {
+        const work = this.get<W>(tenantId, 'work', membership.workId);
+        return membership.collectionId !== collectionId || membership.position !== position || !work || work.status === 'deleted' ||
+          work.creatorId !== collection.creatorId || work.tenantId !== tenantId;
+      })) throw new CreatorCollectionError('invalid_works', 'Choose Works owned by this Creator.');
+      // Validate and replace without yielding or permitting another writer between them.
+      db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'membership', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
+        .run(this.local.configuration.cellId, tenantId, collectionId, collection.creatorId, JSON.stringify(works));
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+}

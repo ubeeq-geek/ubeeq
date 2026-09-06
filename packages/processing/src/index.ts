@@ -1,4 +1,7 @@
 /** Mechanisms for media processing and measurement; products decide entitlement and price. */
+export * from "./content-credentials.js";
+export * from "./creator-asset-worker.js";
+export * from "./image-crops.js";
 export * from "./video.js";
 export type UsageMeter = "storage_bytes" | "delivery_bytes" | "processing_units" | "transcode_seconds";
 
@@ -22,7 +25,10 @@ export interface ProcessingResult {
 }
 
 /** Every output carries the immutable source version it was derived from. */
-export interface ProcessedRendition { id: string; sourceVersionId: string; contentType: string; byteLength: number; role: "source" | "preview" | "poster"; }
+export interface ProcessedRendition { id: string; sourceVersionId: string; contentType: string; byteLength: number; role: "source" | "preview" | "poster";
+  /** Transient output bytes: workers persist these to object storage, not job/asset JSON. */
+  body?: Uint8Array;
+}
 export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
 
 /** Selects product-installed processors without teaching the application about vendors or codecs. */

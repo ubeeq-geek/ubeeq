@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+export { assembleCreatorContentExport } from './content-export.js';
 import type { AssetRecord, AuditEventRecord, CollectionRecord, CreatorRecord, ExportManifestRecord, ImportCheckpointRecord, IntegrationAccountRecord, ModerationEvidenceRecord, ModerationHoldRecord, PublicationIntentRecord, PublicationRecord, ReviewCaseRecord, UsageEventRecord, WorkRecord } from "@ubeeq/persistence";
 
 export const CREATOR_EXPORT_SCHEMA_VERSION = "2" as const;

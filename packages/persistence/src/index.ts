@@ -1,4 +1,6 @@
 /** Provider-neutral durable persistence contracts. Provider implementations belong in adapter packages. */
+export * from "./creator-content.js";
+export * from "./memory-creator-content.js";
 
 export interface RevisionedRecord {
   id: string;
@@ -96,7 +98,7 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   }
 }
 
-export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; handle: string; displayName: string; subjectId?: string; }
+export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
 export interface WorkRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; status: "draft" | "ready" | "published" | "archived" | "deleted"; }
 export interface AssetRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; workId?: string; mimeType: string; checksum: string; objectVersion: string; status: "pending" | "processing" | "ready" | "failed" | "deleted"; }
 export interface CollectionRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; visibility: "private" | "unlisted" | "public"; }

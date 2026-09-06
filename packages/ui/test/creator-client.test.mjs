@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { CreatorClient } from '../dist/index.js';
+test('client clears expired credentials and failed sign-out credentials', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => {
+    calls.push({ url, options });
+    if (url.endsWith('sign-in')) return Response.json({ token: 'session' });
+    if (url.endsWith('sign-out')) throw new Error('offline');
+    return Response.json({ message: 'Authentication required' }, { status: 401 });
+  });
+  await client.signIn('local@example.test', 'password');
+  await assert.rejects(client.creators(), /Authentication/);
+  assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+  await assert.rejects(client.creators(), /Authentication/);
+  assert.equal(calls.at(-1).options.headers.authorization, undefined);
+  await client.signIn('local@example.test', 'password');
+  await assert.rejects(client.signOut(), /offline/);
+  await assert.rejects(client.creators(), /Authentication/);
+  assert.equal(calls.at(-1).options.headers.authorization, undefined);
+});
