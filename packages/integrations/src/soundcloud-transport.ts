@@ -2,6 +2,7 @@ import { ExternalProviderError, parseRetryAfterSeconds } from './provider-errors
 import { readBoundedResponseText } from './bounded-response-text.js';
 export interface SoundCloudTransportLimits { timeoutMs?: number; maxResponseBytes?: number }
 export interface SoundCloudCredentials { clientId: string; clientSecret: string; redirectUri: string; enabled?: boolean }
+export interface SoundCloudPkce { codeChallenge: string; codeVerifier: string }
 export interface SoundCloudRequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; body?: URLSearchParams; emptyResponse?: boolean; ignoreNotFound?: boolean;
 }
@@ -39,6 +40,25 @@ export class SoundCloudTransport {
   }
   isConfigured(): boolean { return this.credentials?.enabled !== false && Boolean(this.credentials?.clientId && this.credentials.clientSecret && this.credentials.redirectUri); }
   private admit(): void { if (!this.isConfigured()) throw new ExternalProviderError('SoundCloud is disabled or OAuth is not configured', 'unsupported'); }
+  createAuthorizationUrl(state: string, pkce?: SoundCloudPkce): string {
+    this.admit();
+    if (!pkce) throw new ExternalProviderError('SoundCloud OAuth requires PKCE', 'unsupported');
+    const url = new URL('https://secure.soundcloud.com/authorize');
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', this.credentials!.clientId);
+    url.searchParams.set('redirect_uri', this.credentials!.redirectUri);
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', pkce.codeChallenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+    return url.toString();
+  }
+  exchangeAuthorizationCode(code: string, pkce?: SoundCloudPkce): Promise<{ accessToken: string; refreshToken?: string; expiresAt?: string }> {
+    if (!pkce) return Promise.reject(new ExternalProviderError('SoundCloud OAuth requires PKCE', 'unsupported', undefined, 'token_exchange'));
+    return this.exchangeToken({ grant_type: 'authorization_code', code, code_verifier: pkce.codeVerifier, redirect_uri: this.credentials?.redirectUri || '' });
+  }
+  refreshAuthentication(refreshToken: string): Promise<{ accessToken: string; refreshToken?: string; expiresAt?: string }> {
+    return this.exchangeToken({ grant_type: 'refresh_token', refresh_token: refreshToken });
+  }
   private async fetchResponse(url: string, options: RequestInit): Promise<Response> {
     try { return await this.fetcher(url, options); }
     catch {

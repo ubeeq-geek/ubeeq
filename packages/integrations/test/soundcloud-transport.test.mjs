@@ -2,6 +2,43 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SoundCloudTransport, soundCloudResponseError } from '../dist/index.js';
 const credentials = { clientId: 'synthetic-client', clientSecret: 'synthetic-secret', redirectUri: 'https://example.test/callback' };
+test('OAuth request construction preserves PKCE, opaque values and configured redirect without leaking secrets', async () => {
+  const calls = [];
+  const transport = new SoundCloudTransport(credentials, async (url, options) => {
+    calls.push([url, options]); return Response.json({ access_token: 'synthetic-access' });
+  });
+  const pkce = { codeChallenge: 'challenge+with/symbols=', codeVerifier: 'opaque-verifier' };
+  const state = 'opaque+state&return=private';
+  const url = new URL(transport.createAuthorizationUrl(state, pkce));
+  assert.equal(url.origin + url.pathname, 'https://secure.soundcloud.com/authorize');
+  assert.deepEqual(Object.fromEntries(url.searchParams), { response_type: 'code', client_id: credentials.clientId,
+    redirect_uri: credentials.redirectUri, state, code_challenge: pkce.codeChallenge, code_challenge_method: 'S256' });
+  assert.equal(url.toString().includes(credentials.clientSecret), false);
+  assert.equal(url.toString().includes(pkce.codeVerifier), false);
+  assert.equal(calls.length, 0);
+  await transport.exchangeAuthorizationCode('opaque+code&x=y', pkce);
+  await transport.refreshAuthentication('opaque+refresh&x=y');
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(calls[0][1].body)), { grant_type: 'authorization_code', code: 'opaque+code&x=y',
+    code_verifier: pkce.codeVerifier, redirect_uri: credentials.redirectUri, client_id: credentials.clientId, client_secret: credentials.clientSecret });
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(calls[1][1].body)), { grant_type: 'refresh_token', refresh_token: 'opaque+refresh&x=y',
+    client_id: credentials.clientId, client_secret: credentials.clientSecret });
+  for (const [endpoint, options] of calls) {
+    assert.equal(endpoint, 'https://secure.soundcloud.com/oauth/token'); assert.equal(options.redirect, 'error');
+  }
+});
+test('OAuth helpers reject missing PKCE and disabled configuration before fetch', async () => {
+  let calls = 0;
+  const fetcher = async () => { calls++; return Response.json({}); };
+  const transport = new SoundCloudTransport(credentials, fetcher);
+  assert.throws(() => transport.createAuthorizationUrl('state'), { code: 'unsupported' });
+  await assert.rejects(transport.exchangeAuthorizationCode('code'), { code: 'unsupported', operation: 'token_exchange' });
+  const disabled = new SoundCloudTransport({ ...credentials, enabled: false }, fetcher);
+  const pkce = { codeChallenge: 'challenge', codeVerifier: 'verifier' };
+  assert.throws(() => disabled.createAuthorizationUrl('state', pkce), { code: 'unsupported' });
+  await assert.rejects(disabled.exchangeAuthorizationCode('code', pkce), { code: 'unsupported' });
+  await assert.rejects(disabled.refreshAuthentication('refresh'), { code: 'unsupported' });
+  assert.equal(calls, 0);
+});
 test('transport failure before response headers preserves uncertainty for token and write operations', async () => {
   const transport = new SoundCloudTransport(credentials, async () => { throw new Error('connection lost'); });
   await assert.rejects(transport.exchangeToken({}), { code: 'ambiguous_submission' });
