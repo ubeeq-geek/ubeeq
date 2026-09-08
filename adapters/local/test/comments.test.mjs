@@ -6,6 +6,29 @@ import { join } from 'node:path';
 import { LocalCommentStore, LocalSqliteDatabase } from '../dist/index.js';
 import { CommentModerationService, CommentService } from '@ubeeq/core';
 
+test('comment erasure clears text, preserves scoped identity across restart and cannot be restored or recreated', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-erasure-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCommentStore(local, 'tenant');
+    const record = { commentId: 'id', userId: 'author', targetType: 'work', targetId: 'work', body: 'Private text', hidden: false, createdAt: '2026-01-01' };
+    await store.createComment(record);
+    await new LocalCommentStore(local, 'other').createComment(record);
+    assert.equal(await store.eraseComment('work', 'foreign', 'id', '2026-01-02'), false);
+    assert.equal(await store.eraseComment('work', 'work', 'id', '2026-01-02'), true);
+    assert.equal(await store.eraseComment('work', 'work', 'id', '2026-01-03'), false);
+    await store.updateCommentVisibility('id', false);
+    assert.deepEqual(await store.listComments('work', 'work'), []);
+    assert.deepEqual((await store.listCommentPage('work', 'work', { limit: 1, includeHidden: true })).items, []);
+    assert.equal((await new LocalCommentStore(local, 'other').getComment('work', 'work', 'id')).body, 'Private text');
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCommentStore(local, 'tenant');
+    assert.deepEqual(await store.getComment('work', 'work', 'id'), { ...record, body: '', hidden: true, deletedAt: '2026-01-02' });
+    await assert.rejects(store.createComment(record));
+    await assert.rejects(store.createComment({ ...record, commentId: 'new', deletedAt: '2026-01-02' }), /Invalid comment record/);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('comment keyset pages bound results, filter hidden records before paging and retain target scope', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-pages-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };

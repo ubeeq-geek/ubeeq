@@ -6,6 +6,13 @@ export interface CommentRecord {
   body: string;
   hidden: boolean;
   createdAt: string;
+  deletedAt?: string;
+}
+/** Clears the standard body while retaining identity to prevent create replay.
+ * Product admission is required. Extensions must not store comment text elsewhere.
+ */
+export interface CommentErasurePort {
+  eraseComment(targetType: string, targetId: string, commentId: string, deletedAt: string): Promise<boolean>;
 }
 export interface CommentPort<C extends CommentRecord> {
   listComments(targetType: C['targetType'], targetId: string): Promise<C[]>;
@@ -64,7 +71,7 @@ export class CommentService<C extends CommentRecord> {
   async list(targetType: C['targetType'], targetId: string): Promise<C[]> {
     if (!await this.authorize('list', { targetType, targetId })) throw new CommentError('access_denied', 'Comment access denied.');
     return (await this.store.listComments(targetType, targetId))
-      .filter(comment => comment.targetType === targetType && comment.targetId === targetId && comment.hidden === false)
+      .filter(comment => comment.targetType === targetType && comment.targetId === targetId && comment.hidden === false && !comment.deletedAt)
       .map(comment => structuredClone(comment));
   }
   async create(userId: string, record: C): Promise<C> {
@@ -72,7 +79,7 @@ export class CommentService<C extends CommentRecord> {
     const target = { targetType: comment.targetType, targetId: comment.targetId };
     if (!userId.trim() || !await this.authorize('create', target, userId)) throw new CommentError('access_denied', 'Comment access denied.');
     if (comment.userId !== userId || !comment.commentId.trim() || !comment.targetType.trim() ||
-      !comment.targetId.trim() || !comment.body.trim() || !comment.createdAt || typeof comment.hidden !== 'boolean') {
+      !comment.targetId.trim() || !comment.body.trim() || !comment.createdAt || typeof comment.hidden !== 'boolean' || comment.deletedAt !== undefined) {
       throw new CommentError('invalid_comment', 'Invalid comment.');
     }
     await this.store.createComment(comment);
