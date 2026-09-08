@@ -68,6 +68,23 @@ export class LocalSqliteDatabase {
     }
   }
 
+  /** Atomic synchronous work must not yield while holding SQLite's write lock. */
+  transactionSync<T>(operation: () => T): T {
+    const inherited = this.transactionContext.getStore();
+    if (inherited) {
+      if (!inherited.active || this.owner !== inherited) throw new Error('SQLite transaction context has ended.');
+      try { return operation(); }
+      catch (error) { inherited.rollbackOnly = true; throw error; }
+    }
+    if (this.owner) throw new Error('SQLite connection is owned by another transaction.');
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const result = operation();
+      this.database.exec('COMMIT');
+      return result;
+    } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
+
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
     const inherited = this.transactionContext.getStore();
     if (inherited) {
@@ -121,20 +138,26 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
   }
 
   async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string }): Promise<T> {
-    if (options?.idempotencyKey) {
-      const existing = this.local.database.prepare("SELECT record_id FROM ubeeq_idempotency WHERE repository = ? AND idempotency_key = ?").get(this.repository, options.idempotencyKey) as { record_id?: string } | undefined;
-      if (existing?.record_id) return (await this.get(existing.record_id))!;
-    }
-    const existing = await this.get(record.id);
-    if (existing) throw new Error(`Record ${record.id} already exists.`);
-    const timestamp = now();
-    const value = this.retainHandleHistory({ ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T);
-    this.write(() => this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp));
-    if (options?.idempotencyKey) this.local.database.prepare("INSERT INTO ubeeq_idempotency (repository, idempotency_key, record_id, created_at) VALUES (?, ?, ?, ?)").run(this.repository, options.idempotencyKey, value.id, timestamp);
-    return value;
+    return this.local.transactionSync(() => {
+      if (options?.idempotencyKey) {
+        const existing = this.local.database.prepare("SELECT record_id FROM ubeeq_idempotency WHERE repository = ? AND idempotency_key = ?").get(this.repository, options.idempotencyKey) as { record_id?: string } | undefined;
+        if (existing?.record_id) return this.read(existing.record_id)!;
+      }
+      const existing = this.read(record.id);
+      if (existing) throw new Error(`Record ${record.id} already exists.`);
+      const timestamp = now();
+      const value = this.retainHandleHistory({ ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T);
+      this.write(() => this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp));
+      if (options?.idempotencyKey) this.local.database.prepare("INSERT INTO ubeeq_idempotency (repository, idempotency_key, record_id, created_at) VALUES (?, ?, ?, ?)").run(this.repository, options.idempotencyKey, value.id, timestamp);
+      return value;
+    });
   }
 
   async get(id: string): Promise<T | undefined> {
+    return this.read(id);
+  }
+
+  private read(id: string): T | undefined {
     const row = this.local.database.prepare("SELECT payload FROM ubeeq_records WHERE repository = ? AND id = ?").get(this.repository, id) as { payload?: string } | undefined;
     return row?.payload ? parse<T>(row.payload) : undefined;
   }
