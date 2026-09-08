@@ -88,6 +88,10 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }
   assets(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/assets`); }
+  regenerateAsset(workId: string, assetId: string, expectedRevision: number, sourceVersionId: string, idempotencyKey: string) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}/regenerate`,
+      'POST', { expectedRevision, sourceVersionId }, { idempotencyKey });
+  }
   detachAsset(workId: string, assetId: string, expectedRevision: number) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}`, 'DELETE', { expectedRevision });
   }
