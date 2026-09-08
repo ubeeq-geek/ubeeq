@@ -1,3 +1,5 @@
+import { ExternalProviderError } from './provider-errors.js';
+
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const string = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined;
 const identifier = (value: unknown): string | undefined => string(value) ?? (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined);
@@ -48,6 +50,9 @@ export const normalizeSoundCloudActivity = (value: unknown) => {
   const user = Object.keys(record(event.user)).length ? record(event.user) : record(origin.user);
   const eventId = string(event.urn) || identifier(event.id), trackId = string(track.urn) || identifier(track.id), actorId = string(user.urn) || identifier(user.id);
   const type = string(event.type) || 'activity', occurredAt = date(event.created_at) || date(event.createdAt);
+  if (!eventId && (!string(event.type) || !actorId || !trackId || !occurredAt)) {
+    throw new ExternalProviderError('SoundCloud activity lacks a provider ID or complete fallback identity', 'invalid_response');
+  }
   const stableId = eventId || [type, actorId, trackId, occurredAt].filter(Boolean).join(':');
   if (!stableId) return null;
   return {
