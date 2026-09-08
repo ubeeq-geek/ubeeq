@@ -8,7 +8,10 @@ loop immediately; resumption must query the provider again.
 
 Chunks default to 8 MiB and may be configured up to 64 MiB. This bounds individual
 source reads, not whole-job runtime: the helper transfers the remaining source.
-The caller still needs execution budgeting and durable job scheduling for large
+An optional positive `maxChunks` budget yields the last checkpointed offset;
+callers compare it with source size and schedule continuation when incomplete.
+Omitting this budget retains whole-source transfer behavior. The caller still
+needs wall-clock budgeting and durable job scheduling for large
 sources, upload URL admission, creator/source authorization, ticket persistence,
 worker coordination and uncertain-creation reconciliation. No remote creation,
 metadata changes, or implicit retries occur in the helper.
