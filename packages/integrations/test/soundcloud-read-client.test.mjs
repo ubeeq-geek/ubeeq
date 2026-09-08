@@ -9,6 +9,28 @@ const fixture = responder => {
   }));
   return { client, calls };
 };
+test('single-page methods reject missing arrays and unidentified entries without returning partial pages', async () => {
+  const reads = [client => client.listContent('token'), client => client.listCollectionContent('token', '1'),
+    client => client.listComments('token', '1'), client => client.listFavourites('token', '1'), client => client.listFeed('token')];
+  const valid = { id: 1, username: 'Artist', type: 'activity' };
+  for (const read of reads) {
+    for (const payload of [{}, { collection: null }, { collection: {} }, { collection: 'invalid' },
+      { collection: [valid, {}], next_href: 'https://api.soundcloud.com/next' }]) {
+      const run = fixture(() => payload);
+      await assert.rejects(read(run.client), { code: 'invalid_response' });
+      assert.equal(run.calls.length, 1);
+    }
+    assert.deepEqual(await read(fixture(() => ({ collection: [] })).client), { items: [], nextCursor: undefined });
+  }
+});
+test('playlist members accept explicit tracks arrays but never hide malformed collection arrays behind fallback', async () => {
+  const read = payload => fixture(() => payload).client.listCollectionContent('token', '1');
+  assert.deepEqual(await read({ tracks: [] }), { items: [], nextCursor: undefined });
+  assert.equal((await read({ tracks: [{ id: 1 }] })).items.length, 1);
+  for (const payload of [{ tracks: null }, { tracks: [{}] }, { collection: null, tracks: [] }, { collection: {}, tracks: [{ id: 1 }] }]) {
+    await assert.rejects(read(payload), { code: 'invalid_response' });
+  }
+});
 test('read client selects encoded endpoints and executes shared mapping through real bounded transport', async () => {
   const payloads = [{ id: 1, username: 'Artist' }, { full_name: ' Name ' }, { id: 2, title: 'Track' },
     { tracks: [{ id: 2 }] }, { collection: [{ id: 3, body: 'Comment' }] }, { collection: [{ id: 4, username: 'Fan' }] },

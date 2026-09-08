@@ -3,8 +3,15 @@ import { ExternalProviderError } from './provider-errors.js';
 import { normalizeSoundCloudAccount, normalizeSoundCloudProfile, normalizeSoundCloudPlaylist, normalizeSoundCloudFavouriteUser,
   normalizeSoundCloudTrack, normalizeSoundCloudComment, normalizeSoundCloudActivity } from './soundcloud-normalization.js';
 
-const present = <T>(value: T | null): value is T => value !== null;
-const collection = (payload: Record<string, unknown>): unknown[] => Array.isArray(payload.collection) ? payload.collection : [];
+const collection = (payload: Record<string, unknown>, key = 'collection'): unknown[] => {
+  if (!Array.isArray(payload[key])) throw new ExternalProviderError('SoundCloud page collection was missing or malformed', 'invalid_response');
+  return payload[key];
+};
+const normalizePage = <T>(items: unknown[], normalize: (value: unknown) => T | null): T[] => items.map(value => {
+  const result = normalize(value);
+  if (result === null) throw new ExternalProviderError('SoundCloud page contained an entry without required identity', 'invalid_response');
+  return result;
+});
 
 /** Provider reads only. Persistence, admission, scheduling and reconciliation belong to the caller. */
 export class SoundCloudReadClient {
@@ -19,7 +26,7 @@ export class SoundCloudReadClient {
   async listContent(accessToken: string, options: { cursor?: string; limit?: number } = {}) {
     const path = options.cursor || `/me/tracks?linked_partitioning=true&limit=${Math.max(1, Math.min(200, options.limit || 50))}`;
     const payload = await this.transport.request(path, accessToken);
-    return { items: collection(payload).map(normalizeSoundCloudTrack).filter(present), nextCursor: this.transport.safeNextHref(payload.next_href) };
+    return { items: normalizePage(collection(payload), normalizeSoundCloudTrack), nextCursor: this.transport.safeNextHref(payload.next_href) };
   }
   async getContent(accessToken: string, trackUrn: string) {
     const result = normalizeSoundCloudTrack(await this.transport.request(`/tracks/${encodeURIComponent(trackUrn)}`, accessToken));
@@ -48,19 +55,19 @@ export class SoundCloudReadClient {
   }
   async listCollectionContent(accessToken: string, playlistUrn: string, cursor?: string) {
     const payload = await this.transport.request(cursor || `/playlists/${encodeURIComponent(playlistUrn)}`, accessToken);
-    const tracks = Array.isArray(payload.collection) ? payload.collection : Array.isArray(payload.tracks) ? payload.tracks : [];
-    return { items: tracks.map(normalizeSoundCloudTrack).filter(present), nextCursor: this.transport.safeNextHref(payload.next_href) };
+    const tracks = collection(payload, Object.hasOwn(payload, 'collection') ? 'collection' : 'tracks');
+    return { items: normalizePage(tracks, normalizeSoundCloudTrack), nextCursor: this.transport.safeNextHref(payload.next_href) };
   }
   async listComments(accessToken: string, trackUrn: string, cursor?: string) {
     const payload = await this.transport.request(cursor || `/tracks/${encodeURIComponent(trackUrn)}/comments?linked_partitioning=true&limit=100`, accessToken);
-    return { items: collection(payload).map(normalizeSoundCloudComment).filter(present), nextCursor: this.transport.safeNextHref(payload.next_href) };
+    return { items: normalizePage(collection(payload), normalizeSoundCloudComment), nextCursor: this.transport.safeNextHref(payload.next_href) };
   }
   async listFavourites(accessToken: string, trackUrn: string, cursor?: string) {
     const payload = await this.transport.request(cursor || `/tracks/${encodeURIComponent(trackUrn)}/favoriters?linked_partitioning=true&limit=100`, accessToken);
-    return { items: collection(payload).map(normalizeSoundCloudFavouriteUser).filter(present), nextCursor: this.transport.safeNextHref(payload.next_href) };
+    return { items: normalizePage(collection(payload), normalizeSoundCloudFavouriteUser), nextCursor: this.transport.safeNextHref(payload.next_href) };
   }
   async listFeed(accessToken: string, cursor?: string) {
     const payload = await this.transport.request(cursor || '/me/feed?linked_partitioning=true&limit=50', accessToken);
-    return { items: collection(payload).map(normalizeSoundCloudActivity).filter(present), nextCursor: this.transport.safeNextHref(payload.next_href) };
+    return { items: normalizePage(collection(payload), normalizeSoundCloudActivity), nextCursor: this.transport.safeNextHref(payload.next_href) };
   }
 }
