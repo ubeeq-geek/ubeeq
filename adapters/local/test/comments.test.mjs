@@ -6,6 +6,29 @@ import { join } from 'node:path';
 import { LocalCommentStore, LocalSqliteDatabase } from '../dist/index.js';
 import { CommentModerationService, CommentService } from '@ubeeq/core';
 
+test('exact comment lookup is scoped, includes hidden retry records and survives restart', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-lookup-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCommentStore(local, 'tenant');
+    const comment = { commentId: 'id', userId: 'author', targetType: 'work', targetId: 'work', body: 'Retained', hidden: true, createdAt: 'now' };
+    await store.createComment(comment);
+    assert.deepEqual(await store.getComment('work', 'work', 'id'), comment);
+    for (const args of [['work', 'other', 'id'], ['post', 'work', 'id'], ['work', 'work', 'missing']]) assert.equal(await store.getComment(...args), null);
+    assert.equal(await new LocalCommentStore(local, 'other').getComment('work', 'work', 'id'), null);
+    for (const args of [['', 'work', 'id'], ['work', '', 'id'], ['work', 'work', ' ']]) await assert.rejects(store.getComment(...args), /Invalid comment lookup/);
+    const result = await store.getComment('work', 'work', 'id'); result.body = 'Changed';
+    assert.equal((await store.getComment('work', 'work', 'id')).body, 'Retained');
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCommentStore(local, 'tenant');
+    assert.deepEqual(await store.getComment('work', 'work', 'id'), comment);
+    local.database.prepare("UPDATE ubeeq_comments SET payload = json_set(payload, '$.targetId', 'wrong') WHERE comment_id = 'id'").run();
+    await assert.rejects(store.getComment('work', 'work', 'id'), /Invalid stored comment identity/);
+    local.database.close(); local = new LocalSqliteDatabase({ ...config, cellId: 'other-cell' });
+    assert.equal(await new LocalCommentStore(local, 'tenant').getComment('work', 'work', 'id'), null);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('local comment moderation is scoped, durable, non-resurrecting and participates in rollback', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-moderation-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };

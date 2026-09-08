@@ -1,13 +1,23 @@
-import type { CommentModerationPort, CommentPort, CommentRecord } from '@ubeeq/core';
+import type { CommentLookupPort, CommentModerationPort, CommentPort, CommentRecord } from '@ubeeq/core';
 import { UniqueConstraintError } from '@ubeeq/persistence';
 import type { LocalSqliteDatabase } from './index.js';
 
 /** Persistence only: product admission and rendering remain caller responsibilities. */
-export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort {
+export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort, CommentLookupPort<C> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly tenantId: string) {
     if (!tenantId.trim()) throw new Error('Comment tenant is required.');
   }
   private scope() { return [this.local.configuration.cellId, this.tenantId]; }
+  async getComment(targetType: C['targetType'], targetId: string, commentId: string): Promise<C | null> {
+    if (![targetType, targetId, commentId].every(value => typeof value === 'string' && Boolean(value.trim()))) throw new Error('Invalid comment lookup.');
+    const row = this.local.database.prepare(`SELECT payload FROM ubeeq_comments
+      WHERE cell_id = ? AND tenant_id = ? AND comment_id = ? AND target_type = ? AND target_id = ?`)
+      .get(...this.scope(), commentId, targetType, targetId) as { payload: string } | undefined;
+    if (!row) return null;
+    const value = JSON.parse(row.payload) as C;
+    if (value.commentId !== commentId || value.targetType !== targetType || value.targetId !== targetId || typeof value.hidden !== 'boolean') throw new Error('Invalid stored comment identity.');
+    return value;
+  }
   async updateCommentVisibility(commentId: string, hidden: boolean): Promise<void> {
     if (typeof commentId !== 'string' || !commentId.trim() || typeof hidden !== 'boolean') throw new Error('Invalid comment moderation request.');
     this.local.database.prepare(`UPDATE ubeeq_comments SET payload = json_set(payload, '$.hidden', json(?))
