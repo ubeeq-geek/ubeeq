@@ -303,3 +303,4 @@ export { VimeoOAuthClient, type VimeoTokens, type VimeoCodeExchange } from './vi
 export { VimeoUploadClient, type VimeoUploadTicket } from './vimeo-upload-client.js';
 export { transferVimeoUpload, type VimeoUploadSource, type VimeoUploadTransferPort } from './vimeo-upload-transfer.js';
 export { FlickrClient, type FlickrOAuthCredentials, type FlickrInventoryPage, type FlickrRequestLimits } from './flickr-client.js';
+export { normalizeFlickrPhoto, normalizeFlickrProviderPhoto, flickrTextContent, type FlickrManifestPhoto } from './flickr-metadata.js';
