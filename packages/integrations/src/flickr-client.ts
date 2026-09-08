@@ -1,7 +1,9 @@
 import { createHmac, randomBytes } from 'crypto';
+import { readBoundedResponseText } from './bounded-response-text.js';
 
 type FetchLike = typeof fetch;
 export type FlickrOAuthCredentials = { token: string; tokenSecret: string };
+export interface FlickrRequestLimits { timeoutMs?: number; maxResponseBytes?: number }
 
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 
@@ -39,7 +41,26 @@ export class FlickrClient {
   private requestGate: Promise<void> = Promise.resolve();
   private nextRequestAt = 0;
 
-  constructor(private apiKey: string, private apiSecret: string, private fetcher: FetchLike = fetch, private minimumIntervalMs = 0) {}
+  private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
+
+  constructor(private apiKey: string, private apiSecret: string, private fetcher: FetchLike = fetch, private minimumIntervalMs = 0, limits: FlickrRequestLimits = {}) {
+    this.timeoutMs = limits.timeoutMs ?? 30_000;
+    this.maxResponseBytes = limits.maxResponseBytes ?? 4 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 300_000
+      || !Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1 || this.maxResponseBytes > 16 * 1024 * 1024) throw new Error('Invalid Flickr request limits');
+  }
+
+  private async request(url: string, init: RequestInit = {}) {
+    const response = await this.fetcher(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs) });
+    let body = '';
+    try { body = await readBoundedResponseText(response, this.maxResponseBytes); }
+    catch (error) {
+      if (response.ok) throw error;
+      // Preserve HTTP status/retry classification even when an error body is oversized.
+    }
+    return new Response(body || null, { status: response.status, statusText: response.statusText, headers: response.headers });
+  }
 
   private async pace() {
     const previous = this.requestGate;
@@ -54,7 +75,7 @@ export class FlickrClient {
 
   private async tokenRequest(url: string, extra: Record<string, string>, credentials?: FlickrOAuthCredentials) {
     const parameters = signedParameters('POST', url, { ...oauthParameters(this.apiKey, credentials?.token), ...extra }, this.apiSecret, credentials?.tokenSecret);
-    const response = await this.fetcher(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form(parameters) });
+    const response = await this.request(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form(parameters) });
     if (!response.ok) throw new Error(`Flickr OAuth request failed (${response.status})`);
     const result = new URLSearchParams(await response.text());
     if (!result.get('oauth_token') || !result.get('oauth_token_secret')) throw new Error('Flickr OAuth response was incomplete');
@@ -73,7 +94,7 @@ export class FlickrClient {
     let response: Response | undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await this.pace();
-      response = await this.fetcher(`${this.restUrl}?${form(parameters)}`);
+      response = await this.request(`${this.restUrl}?${form(parameters)}`);
       if (response.ok) break;
       if (response.status !== 429 && response.status < 500) throw new Error(`Flickr API request failed (${response.status})`);
       if (attempt < 2) {
