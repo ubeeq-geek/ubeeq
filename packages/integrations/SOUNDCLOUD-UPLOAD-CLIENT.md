@@ -1,0 +1,7 @@
+# SoundCloud upload client
+
+SoundCloudUploadClient accepts a configured transport for admission, an optional injected fetch implementation, caller-admitted ordered fields and a lazy source opener. It opens and streams one track asset through the shared multipart encoder, disallows redirects, supplies a five-minute fetch deadline, closes request/source streams after fetch settles and bounds receipts to 4 MiB. Transport JSON limit overrides do not alter these upload-specific limits. A compliant fetch must honor the abort signal through receipt consumption.
+
+Construction never opens a source or submits a request. Disabled configuration rejects before opening. Multipart header validation rejects before fetch and closes an opened source. Successful receipts require a string URN/ID or nonnegative safe numeric ID; unknown outcomes, malformed/oversized receipts and missing identities are ambiguous_submission. Known HTTP failures retain shared status mapping. No automatic retry occurs: reconcile uncertain publication before attempting another upload.
+
+Callers own authorization, source selection, metadata/field capability admission, source-byte quotas and durable publication intent. This does not validate arbitrary provider fields or stream size, establish exactly-once publication, or implement asset storage. Metadata buffering, source-opener behavior and cleanup failures remain caller/runtime considerations. Tests use synthetic byte streams and injected responses; no live uploads or provider qualification are performed.

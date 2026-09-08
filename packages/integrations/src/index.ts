@@ -294,3 +294,4 @@ export const resolveReconciliation = (
 export { ghostReconciliationSnapshot, ghostPublicationHash, type GhostEditablePublication } from './ghost-snapshots.js';
 export { SoundCloudReadClient } from './soundcloud-read-client.js';
 export { SoundCloudWriteClient, type SoundCloudTrackUpdate } from './soundcloud-write-client.js';
+export { SoundCloudUploadClient, type SoundCloudUploadSource } from './soundcloud-upload-client.js';
