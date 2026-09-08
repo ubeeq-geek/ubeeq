@@ -113,6 +113,7 @@ export class SmugMugHttpGateway implements SmugMugGateway {
       if (albumUri) queue.push(`${albumUri}!images`);
       else if (childUri && childUri !== path) queue.push(`${childUri}!children`);
     }
+    queue = queue.map(value => this.apiPath(value));
     const nextCursor = queue.length ? this.encodeCursor(queue) : undefined;
     return { collections, images: mappedImages, ...(nextCursor ? { nextCursor } : {}) };
   }
@@ -154,7 +155,7 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     if (!input.remoteUri.startsWith('/api/v2/')) throw new Error('SmugMug image URI is invalid.');
     const credential = await this.requiredCredential(credentialRef);
     const body = Buffer.from(JSON.stringify({ Image: { Title: input.title, Caption: input.caption || '', Keywords: input.keywords.join(',') } }));
-    const response = await this.signedFetch('PATCH', `${this.apiOrigin}${input.remoteUri}`, credential, { Accept: 'application/json', 'Content-Type': 'application/json', 'Content-Length': String(body.byteLength) }, body);
+    const response = await this.signedFetch('PATCH', `${this.apiOrigin}${this.apiPath(input.remoteUri)}`, credential, { Accept: 'application/json', 'Content-Type': 'application/json', 'Content-Length': String(body.byteLength) }, body);
     if (!response.ok) throw new Error(`SmugMug metadata update failed (${response.status}).`);
   }
 
@@ -191,7 +192,7 @@ export class SmugMugHttpGateway implements SmugMugGateway {
   }
 
   private async apiGet(path: string, credential: SmugMugOAuthCredential) {
-    const url = path.startsWith('http') ? path : `${this.apiOrigin}${path}`;
+    const url = `${this.apiOrigin}${this.apiPath(path)}`;
     const response = await this.signedFetch('GET', url, credential, { Accept: 'application/json' });
     if (!response.ok) throw new Error(`SmugMug API request failed (${response.status}).`);
     return await response.json() as Record<string, unknown>;
@@ -201,12 +202,19 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     return `smugmug:v1:${Buffer.from(JSON.stringify(queue), 'utf8').toString('base64url')}`;
   }
 
+  private apiPath(value: string): string {
+    const url = new URL(value, `${this.apiOrigin}/`);
+    if (url.origin !== new URL(this.apiOrigin).origin || url.username || url.password || url.hash
+      || !/^\/api\/v2(?:[\/!]|$)/.test(url.pathname)) throw new Error('SmugMug API destination is invalid.');
+    return url.pathname + url.search;
+  }
+
   private decodeCursor(cursor: string): string[] {
     if (!cursor.startsWith('smugmug:v1:')) throw new Error('SmugMug inventory cursor is invalid.');
     try {
       const parsed = JSON.parse(Buffer.from(cursor.slice('smugmug:v1:'.length), 'base64url').toString('utf8'));
-      if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string' || !item.startsWith('/api/v2'))) throw new Error();
-      return parsed;
+      if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string')) throw new Error();
+      return parsed.map(item => this.apiPath(item));
     } catch {
       throw new Error('SmugMug inventory cursor is invalid.');
     }
@@ -218,12 +226,12 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     parsed.search = '';
     const oauth = this.oauthParameters(credential.token);
     const requestBody = body ? body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer : undefined;
-    return this.request(url, { method, headers: { ...headers, Authorization: oauthHeader(method, parsed.toString(), this.options.apiSecret, credential.tokenSecret, { ...query, ...oauth }) }, body: requestBody });
+    return this.request(url, { method, redirect: 'error', headers: { ...headers, Authorization: oauthHeader(method, parsed.toString(), this.options.apiSecret, credential.tokenSecret, { ...query, ...oauth }) }, body: requestBody });
   }
 
   private async oauthRequest(method: string, url: string, credential?: SmugMugOAuthCredential, extra: Record<string, string> = {}, json = true) {
     const oauth = { ...this.oauthParameters(credential?.token), ...extra };
-    const response = await this.request(url, { method, headers: { Authorization: oauthHeader(method, url, this.options.apiSecret, credential?.tokenSecret || '', oauth), ...(json ? { Accept: 'application/json' } : {}) } });
+    const response = await this.request(url, { method, redirect: 'error', headers: { Authorization: oauthHeader(method, url, this.options.apiSecret, credential?.tokenSecret || '', oauth), ...(json ? { Accept: 'application/json' } : {}) } });
     if (!response.ok) throw new Error(`SmugMug OAuth request failed (${response.status}).`);
     return new URLSearchParams(await response.text());
   }
