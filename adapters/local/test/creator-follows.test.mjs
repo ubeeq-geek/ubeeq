@@ -6,6 +6,29 @@ import { join } from 'node:path';
 import { LocalCreatorFollowStore, LocalSqliteDatabase } from '../dist/index.js';
 import { CreatorFollowService } from '@ubeeq/core';
 
+test('follow pages use scoped keysets and resume after deleting the cursor record', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-follow-pages-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCreatorFollowStore(local, 'tenant');
+    const record = { followId: 'follow', followerUserId: 'user', creatorId: 'a', insertedDate: 'before', notificationsEnabled: false };
+    for (const creatorId of ['e', 'a', 'c', 'b', 'd']) await store.followCreator({ ...record, creatorId });
+    await new LocalCreatorFollowStore(local, 'foreign').followCreator({ ...record, creatorId: 'aa' });
+    await store.followCreator({ ...record, followerUserId: 'other', creatorId: 'aa' });
+    const service = new CreatorFollowService(store, async () => true);
+    const first = await service.listPage('user', { limit: 2 });
+    assert.deepEqual(first.items.map(item => item.creatorId), ['a', 'b']); assert.equal(first.nextCreatorId, 'b');
+    await store.unfollowCreator('user', 'b');
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCreatorFollowStore(local, 'tenant');
+    const next = await store.listFollowPage('user', { limit: 2, afterCreatorId: 'b' });
+    assert.deepEqual(next.items.map(item => item.creatorId), ['c', 'd']); assert.equal(next.nextCreatorId, 'd');
+    assert.deepEqual((await store.listFollowPage('user', { limit: 2, afterCreatorId: 'd' })).items.map(item => item.creatorId), ['e']);
+    for (const limit of [0, 101, 1.5, Infinity]) await assert.rejects(store.listFollowPage('user', { limit }));
+    await assert.rejects(new CreatorFollowService(store, async () => false).listPage('user', { limit: 2 }), { code: 'access_denied' });
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('follow point reads are scoped, detached, restart-safe and fail closed on corrupt identity', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-follow-lookup-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
