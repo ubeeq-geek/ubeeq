@@ -10,6 +10,33 @@ import { verifyIdentityAdapterContract } from "@ubeeq/auth";
 
 const hasUndefined = (value) => value === undefined || (Array.isArray(value) ? value.some(hasUndefined) : value && typeof value === "object" ? Object.values(value).some(hasUndefined) : false);
 
+test('create retry hints do not turn transport or service failures into existing-record success', async () => {
+  for (const name of ['TimeoutError', 'InternalServerError', 'AccessDeniedException', 'TransactionCanceledException']) {
+    const failure = Object.assign(new Error('synthetic failure'), { name }), calls = [];
+    const repository = new DynamoRevisionedRepository({ send: async command => {
+      calls.push(command.constructor.name);
+      if (command.constructor.name === 'PutCommand') throw failure;
+      return { Item: { value: { id: 'existing', revision: 1, label: 'Unrelated prior record' } } };
+    } }, { tableName: 'records', cellId: 'cell' }, 'test');
+    await assert.rejects(repository.create({ id: 'existing', label: 'Requested record' }, { idempotencyKey: 'retry' }), error => error === failure);
+    assert.deepEqual(calls, ['PutCommand']);
+  }
+});
+
+test('legacy existing-record fallback remains restricted to conditional conflicts with an explicit hint', async () => {
+  const failure = Object.assign(new Error('exists'), { name: 'ConditionalCheckFailedException' });
+  const existing = { id: 'existing', revision: 1 }; let found = true, reads = 0;
+  const repository = new DynamoRevisionedRepository({ send: async command => {
+    if (command.constructor.name === 'PutCommand') throw failure;
+    reads++; return { Item: found ? { value: existing } : undefined };
+  } }, { tableName: 'records', cellId: 'cell' }, 'test');
+  await assert.rejects(repository.create({ id: 'existing' }), error => error === failure); assert.equal(reads, 0);
+  assert.deepEqual(await repository.create({ id: 'existing' }, { idempotencyKey: 'hint' }), existing);
+  found = false;
+  await assert.rejects(repository.create({ id: 'existing' }, { idempotencyKey: 'hint' }), error => error === failure);
+  assert.equal(reads, 2);
+});
+
 class MemoryDynamo {
   values = new Map();
   async send(command) {

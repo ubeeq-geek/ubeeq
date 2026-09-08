@@ -30,3 +30,12 @@ typed conflict is returned without introducing transaction state. This does not
 make reads serializable, cover every caller-side validation error, or qualify
 live AWS behavior; durable idempotency and external-effect coordination remain
 separate acceptance work.
+
+The standalone create retry-hint fallback may read an existing record only after
+an explicit ConditionalCheckFailedException. Timeouts, service/access failures,
+transaction cancellations and other errors propagate unchanged, even when an
+idempotencyKey was supplied; they cannot be treated as success by reading an
+unrelated existing ID. The retained conditional-conflict fallback is legacy
+compatibility, not durable request-bound idempotency: it does not persist or
+compare request keys/payloads or retain an immutable create receipt. That broader
+contract remains an acceptance gap and must not be assumed from this fix.
