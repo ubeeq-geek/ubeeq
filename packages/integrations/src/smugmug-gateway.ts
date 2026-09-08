@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'crypto';
+import { readBoundedResponseText } from './bounded-response-text.js';
 import type { SmugMugCapabilities, SmugMugGateway, SmugMugInventoryPage, SmugMugRemoteCollection, SmugMugRemoteImage } from './smugmug-contracts.js';
 
 export interface SmugMugOAuthCredential { token: string; tokenSecret: string; }
@@ -20,6 +21,8 @@ export interface SmugMugHttpGatewayOptions {
   fetch?: typeof fetch;
   apiOrigin?: string;
   oauthOrigin?: string;
+  requestTimeoutMs?: number;
+  maxMetadataBytes?: number;
 }
 
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -39,8 +42,14 @@ export class SmugMugHttpGateway implements SmugMugGateway {
   private readonly request: typeof fetch;
   private readonly apiOrigin: string;
   private readonly oauthOrigin: string;
+  private readonly requestTimeoutMs: number;
+  private readonly maxMetadataBytes: number;
 
   constructor(private readonly options: SmugMugHttpGatewayOptions) {
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.maxMetadataBytes = options.maxMetadataBytes ?? 4 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.requestTimeoutMs) || this.requestTimeoutMs < 1 || this.requestTimeoutMs > 300_000
+      || !Number.isSafeInteger(this.maxMetadataBytes) || this.maxMetadataBytes < 1 || this.maxMetadataBytes > 16 * 1024 * 1024) throw new Error('Invalid SmugMug request limits.');
     this.request = options.fetch || fetch;
     this.apiOrigin = (options.apiOrigin || 'https://api.smugmug.com').replace(/\/$/, '');
     this.oauthOrigin = (options.oauthOrigin || 'https://api.smugmug.com/services/oauth/1.0a').replace(/\/$/, '');
@@ -124,7 +133,7 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     if (!image.originalAvailable || !image.sourceUrl) throw new Error('The SmugMug original is unavailable.');
     const credential = await this.requiredCredential(credentialRef);
     const response = await this.signedFetch('GET', image.sourceUrl, credential);
-    if (!response.ok) throw new Error(`SmugMug source download failed (${response.status}).`);
+    await this.requireOk(response, 'source download');
     const contentLength = Number(response.headers.get('content-length') || 0);
     if (image.byteSize && contentLength && contentLength !== image.byteSize) throw new Error('SmugMug source download was partial.');
     return { body: Buffer.from(await response.arrayBuffer()), mimeType: response.headers.get('content-type')?.split(';')[0] || image.mimeType || 'application/octet-stream' };
@@ -144,8 +153,8 @@ export class SmugMugHttpGateway implements SmugMugGateway {
       ...(input.caption ? { 'X-Smug-Caption': input.caption } : {}),
       ...(input.keywords.length ? { 'X-Smug-Keywords': input.keywords.join(',') } : {})
     }, input.body);
-    if (!response.ok) throw new Error(`SmugMug upload failed (${response.status}).`);
-    const payload = await response.json() as Record<string, unknown>;
+    await this.requireOk(response, 'upload');
+    const payload = JSON.parse(await readBoundedResponseText(response, this.maxMetadataBytes)) as Record<string, unknown>;
     const responseBody = record(payload.Response);
     const image = record(responseBody.Image || payload.Image);
     const remoteId = scalar(image.ImageKey) || scalar(image.Uri);
@@ -158,7 +167,8 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     const credential = await this.requiredCredential(credentialRef);
     const body = Buffer.from(JSON.stringify({ Image: { Title: input.title, Caption: input.caption || '', Keywords: input.keywords.join(',') } }));
     const response = await this.signedFetch('PATCH', `${this.apiOrigin}${this.apiPath(input.remoteUri)}`, credential, { Accept: 'application/json', 'Content-Type': 'application/json', 'Content-Length': String(body.byteLength) }, body);
-    if (!response.ok) throw new Error(`SmugMug metadata update failed (${response.status}).`);
+    await this.requireOk(response, 'metadata update');
+    try { await response.body?.cancel(); } catch { /* The successful response body is unused. */ }
   }
 
   deleteCredential(reference: string) { return this.options.vault.delete(reference); }
@@ -196,8 +206,14 @@ export class SmugMugHttpGateway implements SmugMugGateway {
   private async apiGet(path: string, credential: SmugMugOAuthCredential) {
     const url = `${this.apiOrigin}${this.apiPath(path)}`;
     const response = await this.signedFetch('GET', url, credential, { Accept: 'application/json' });
-    if (!response.ok) throw new Error(`SmugMug API request failed (${response.status}).`);
-    return await response.json() as Record<string, unknown>;
+    await this.requireOk(response, 'API request');
+    return JSON.parse(await readBoundedResponseText(response, this.maxMetadataBytes)) as Record<string, unknown>;
+  }
+
+  private async requireOk(response: Response, operation: string): Promise<void> {
+    if (response.ok) return;
+    try { await response.body?.cancel(); } catch { /* Preserve HTTP failure classification. */ }
+    throw new Error(`SmugMug ${operation} failed (${response.status}).`);
   }
 
   private encodeCursor(queue: string[]) {
@@ -228,14 +244,14 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     parsed.search = '';
     const oauth = this.oauthParameters(credential.token);
     const requestBody = body ? body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer : undefined;
-    return this.request(url, { method, redirect: 'error', headers: { ...headers, Authorization: oauthHeader(method, parsed.toString(), this.options.apiSecret, credential.tokenSecret, { ...query, ...oauth }) }, body: requestBody });
+    return this.request(url, { method, redirect: 'error', signal: AbortSignal.timeout(this.requestTimeoutMs), headers: { ...headers, Authorization: oauthHeader(method, parsed.toString(), this.options.apiSecret, credential.tokenSecret, { ...query, ...oauth }) }, body: requestBody });
   }
 
   private async oauthRequest(method: string, url: string, credential?: SmugMugOAuthCredential, extra: Record<string, string> = {}, json = true) {
     const oauth = { ...this.oauthParameters(credential?.token), ...extra };
-    const response = await this.request(url, { method, redirect: 'error', headers: { Authorization: oauthHeader(method, url, this.options.apiSecret, credential?.tokenSecret || '', oauth), ...(json ? { Accept: 'application/json' } : {}) } });
-    if (!response.ok) throw new Error(`SmugMug OAuth request failed (${response.status}).`);
-    return new URLSearchParams(await response.text());
+    const response = await this.request(url, { method, redirect: 'error', signal: AbortSignal.timeout(this.requestTimeoutMs), headers: { Authorization: oauthHeader(method, url, this.options.apiSecret, credential?.tokenSecret || '', oauth), ...(json ? { Accept: 'application/json' } : {}) } });
+    await this.requireOk(response, 'OAuth request');
+    return new URLSearchParams(await readBoundedResponseText(response, this.maxMetadataBytes));
   }
 
   private oauthParameters(token?: string): Record<string, string> {

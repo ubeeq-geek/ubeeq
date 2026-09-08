@@ -11,8 +11,7 @@ product registration is bundled.
 The extracted behavior retains existing constructor/method contracts and cursor
 encoding. Authorization currently requests Read permission; presence of write
 methods is not proof those credentials permit uploads.
-Permissive provider parsing, unbounded buffered responses/downloads, missing
-request deadlines, and original-source URL admission remain known
+Permissive provider parsing, unbounded binary downloads, and original-source URL admission remain known
 qualification gaps. Do not treat a cursor, source URL or gallery URI as an access
 grant. Callers must not expose tokens or source capabilities in browser responses.
 
@@ -29,6 +28,15 @@ instead of inventing a random account. Display-name fallback is retained. The
 exchanged credential is still saved before reading account metadata, so a failed
 identity read leaves it in the caller-owned vault for recovery. This does not make
 OAuth exchanges retryable or provide that recovery workflow automatically.
+
+All requests receive a 30-second abort signal. OAuth/API/upload metadata is read
+through the bounded text reader with a default 4 MiB limit. `requestTimeoutMs`
+(1–300000) and `maxMetadataBytes` (1–16777216) may be supplied in options and are
+validated/copied at construction. Error bodies and unused update bodies are
+cancelled. Injected fetch must honor abort during request and body consumption.
+No automatic retries are added, especially after uncertain writes. These are
+per-request bounds, not whole-job deadlines; binary download byte limits remain
+separate work.
 
 Tests use injected provider fixtures. This extraction does not publish media,
 contact providers, deploy infrastructure or claim hosted readiness.
