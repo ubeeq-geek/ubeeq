@@ -12,7 +12,7 @@ import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
-import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
+import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
 import { cellScopedObjectKey, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
 import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
@@ -393,17 +393,25 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && url.pathname === "/v1/imports") {
         const identity = await session(request); const body = await parseBody(request); let manifest;
         try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); }
-        const creator = await creatorFor(identity.subject.id); await requireCreatorWritable(creator);
-        const importId = typeof body.importId === "string" && body.importId.trim() ? body.importId.trim() : randomUUID();
+        const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
+        if (body.importId !== undefined && (typeof body.importId !== 'string' || !body.importId.trim() || body.importId.length > 200)) throw new HttpError(400, 'invalid_import_id', 'Import ID must be a non-empty string of at most 200 characters.');
+        const importId = typeof body.importId === 'string' ? body.importId.trim() : randomUUID();
+        const requireMatchingCheckpoint = (checkpoint: ImportCheckpointRecord) => {
+          if (checkpoint.creatorId !== creator.id || checkpoint.instanceId !== creator.instanceId || checkpoint.importId !== importId ||
+            JSON.stringify(dataHomeOf(checkpoint)) !== JSON.stringify(dataHomeOf(creator))) throw new HttpError(409, 'import_id_conflict', 'Import ID is unavailable for this creator.');
+          if (checkpoint.cursor !== manifest.checksum) throw new HttpError(409, 'import_manifest_conflict', 'Import ID is already bound to a different manifest.');
+        };
         const existing = await repositories.importCheckpoints.get(importId);
+        if (existing) requireMatchingCheckpoint(existing);
         if (existing?.state === "completed") return json(response, 200, { importId, checkpoint: existing, idempotent: true, requestId }, requestId);
         const allWorks = (await allRecords(repositories.works)), allAssets = (await allRecords(repositories.assets)), allCollections = (await allRecords(repositories.collections));
         const plan = planCreatorImport(manifest, { targetCreatorId: creator.id, existingWorkIds: allWorks.map(({ id }) => id), existingAssetIds: allAssets.map(({ id }) => id), existingCollectionIds: allCollections.map(({ id }) => id), existingIds: await existingImportIds() });
         if (body.dryRun !== false || !plan.valid) return json(response, 200, { dryRun: true, plan, requestId }, requestId);
         const checkpoint = existing ?? await repositories.importCheckpoints.create({ id: importId, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, importId, state: "planned", cursor: manifest.checksum }, { idempotencyKey: `import:${importId}` });
+        requireMatchingCheckpoint(checkpoint);
         const running = await repositories.importCheckpoints.update(checkpoint.id, checkpoint.revision, { state: "running", cursor: manifest.checksum });
         try {
-          await repositories.transaction(async (transaction) => {
+          const completed = await repositories.transaction(async (transaction) => {
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
             for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
@@ -415,11 +423,20 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             for (const event of manifest.auditEvents) await repositories.auditEvents.create({ ...event, instanceId: creator.instanceId, ...dataHomeOf(creator), actorId: undefined }, { transaction, idempotencyKey: `import:${importId}:audit:${event.id}` });
             for (const event of manifest.usageEvents) await repositories.usageEvents.create({ ...event, instanceId: creator.instanceId, ...dataHomeOf(creator), accountId: creator.id }, { transaction, idempotencyKey: `import:${importId}:usage:${event.id}` });
             for (const account of manifest.integrationAccounts) { const { credentialExcluded: _credentialExcluded, ...portableAccount } = account; await repositories.integrationAccounts.create({ ...portableAccount, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, health: "blocked", credentialReference: undefined }, { transaction, idempotencyKey: `import:${importId}:integration:${account.id}` }); }
+            const completed = await repositories.importCheckpoints.update(running.id, running.revision, { state: 'completed', cursor: manifest.checksum }, { transaction });
+            await repositories.auditEvents.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), action: 'creator.import_completed', actorId: identity.subject.id,
+              subjectId: creator.id, payload: { importId, checksum: manifest.checksum, plan: plan.itemCounts, originalFilesTransferred: false } }, { transaction });
+            return completed;
           });
-          const completed = await repositories.importCheckpoints.update(running.id, running.revision, { state: "completed", cursor: manifest.checksum });
-          await audit({ action: "creator.import_completed", actorId: identity.subject.id, subjectId: creator.id, payload: { importId, checksum: manifest.checksum, plan: plan.itemCounts, originalFilesTransferred: false } });
           return json(response, 201, { importId, checkpoint: completed, plan, originalFilesTransferred: false, requestId }, requestId);
-        } catch (error) { await repositories.importCheckpoints.update(running.id, running.revision, { state: "failed", cursor: manifest.checksum }).catch(() => undefined); throw error; }
+        } catch (error) {
+          const committed = await repositories.importCheckpoints.get(importId);
+          if (committed?.state === 'completed') {
+            requireMatchingCheckpoint(committed);
+            return json(response, 200, { importId, checkpoint: committed, idempotent: true, originalFilesTransferred: false, requestId }, requestId);
+          }
+          await repositories.importCheckpoints.update(running.id, running.revision, { state: "failed", cursor: manifest.checksum }).catch(() => undefined); throw error;
+        }
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
