@@ -28,3 +28,12 @@ cleanup and reconciliation belong to the caller. Retrying generates a new key,
 not an idempotent resume. A complete restore must separately validate product
 fields and conflicts and atomically commit domain references only after all
 required objects are verified. This helper alone does not authorize a restore.
+
+For local development, `LocalFilesystemStorage.writePrivateVersion` can be bound
+as `writeDestination`. It validates the local cell bucket, canonical creator key,
+private scope, and content integrity, then assigns a physical UUID version and
+writes exclusive owner-readable files. This is a filesystem provider version,
+not an S3 version. Authorization still belongs to `admit`. Byte and metadata files
+are separate writes: failures may leave an orphan, and this does not promise
+crash-atomic storage or durable import checkpoints. Integration tests verify a
+cross-cell copy and reopen the destination database/storage before reading it.
