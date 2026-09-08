@@ -63,3 +63,18 @@ test('incomplete activity identity fails the page instead of generating collidin
   assert.equal(activity({ id: 7 }).sourceMessageId, '7');
   assert.equal(activity({ urn: 'event:7' }).sourceMessageId, 'event:7');
 });
+
+test('invalid provider dates never throw raw coercion or date-range errors and cannot supply fallback identity', () => {
+  const event = { type: 'track-like', user: { id: 3 }, track: { id: 2 } };
+  for (const value of [8_640_000_000_000_001, '8640000000000001', Number.MAX_VALUE, -Number.MAX_VALUE, Infinity, NaN,
+    {}, { toString: 1, valueOf: 1 }, [], null, 'invalid']) {
+    assert.equal(track({ id: 1, created_at: value, last_modified: value }).publishedAt, undefined);
+    assert.equal(comment({ id: 1, created_at: value }).createdAt, undefined);
+    assert.equal(activity({ ...event, id: 7, created_at: value }).occurredAt, undefined);
+    assert.throws(() => activity({ ...event, created_at: value }), { name: 'ExternalProviderError', code: 'invalid_response' });
+  }
+  for (const value of [1700000000, '1700000000', 1700000000000, '2023-11-14T22:13:20Z']) {
+    assert.equal(track({ id: 1, created_at: value }).publishedAt, '2023-11-14T22:13:20.000Z');
+  }
+  assert.equal(track({ id: 1, created_at: 8_640_000_000_000_000 }).publishedAt, '+275760-09-13T00:00:00.000Z');
+});

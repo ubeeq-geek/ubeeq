@@ -5,11 +5,12 @@ const string = (value: unknown): string | undefined => typeof value === 'string'
 const identifier = (value: unknown): string | undefined => string(value) ?? (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined);
 const number = (value: unknown): number | undefined => Number.isFinite(Number(value)) ? Number(value) : undefined;
 const date = (value: unknown): string | undefined => {
-  const numeric = number(value);
   if (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim()))) {
-    if (!numeric) return undefined;
+    const numeric = Number(value);
+    if (!numeric || !Number.isFinite(numeric)) return undefined;
     const milliseconds = numeric > 10_000_000_000 ? numeric : numeric * 1000;
-    return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : undefined;
+    const parsed = new Date(milliseconds);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : undefined;
   }
   const raw = string(value); if (!raw) return undefined;
   const parsed = Date.parse(raw); return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
