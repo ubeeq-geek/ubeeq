@@ -12,6 +12,12 @@ export interface CommentPort<C extends CommentRecord> {
   createComment(comment: C): Promise<void>;
 }
 export interface CommentTarget { targetType: string; targetId: string }
+export interface CommentCursor { createdAt: string; commentId: string }
+export interface CommentPageOptions { limit: number; after?: CommentCursor; includeHidden?: boolean }
+/** Bound to tenant/cell. Callers authorize the target and any hidden-record access. */
+export interface CommentPagePort<C extends CommentRecord> {
+  listCommentPage(targetType: C['targetType'], targetId: string, options: CommentPageOptions): Promise<{ items: C[]; nextCursor?: CommentCursor }>;
+}
 /** Raw tenant/cell-bound lookup, including hidden records. Product admission is required. */
 export interface CommentLookupPort<C extends CommentRecord> {
   getComment(targetType: C['targetType'], targetId: string, commentId: string): Promise<C | null>;

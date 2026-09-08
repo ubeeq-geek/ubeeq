@@ -1,13 +1,34 @@
-import type { CommentLookupPort, CommentModerationPort, CommentPort, CommentRecord } from '@ubeeq/core';
+import type { CommentLookupPort, CommentModerationPort, CommentPageOptions, CommentPagePort, CommentPort, CommentRecord } from '@ubeeq/core';
 import { UniqueConstraintError } from '@ubeeq/persistence';
 import type { LocalSqliteDatabase } from './index.js';
 
 /** Persistence only: product admission and rendering remain caller responsibilities. */
-export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort, CommentLookupPort<C> {
+export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort, CommentLookupPort<C>, CommentPagePort<C> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly tenantId: string) {
     if (!tenantId.trim()) throw new Error('Comment tenant is required.');
   }
   private scope() { return [this.local.configuration.cellId, this.tenantId]; }
+  async listCommentPage(targetType: C['targetType'], targetId: string, options: CommentPageOptions) {
+    if (![targetType, targetId].every(value => typeof value === 'string' && Boolean(value.trim())) ||
+      !options || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100 ||
+      (options.includeHidden !== undefined && typeof options.includeHidden !== 'boolean') ||
+      (options.after !== undefined && (!options.after || ![options.after.createdAt, options.after.commentId].every(value => typeof value === 'string' && Boolean(value.trim()))))) throw new Error('Invalid comment page request.');
+    const rows = this.local.database.prepare(`SELECT comment_id, created_at, payload FROM ubeeq_comments
+      WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ?
+      ${options.includeHidden ? '' : "AND json_extract(payload, '$.hidden') = 0"}
+      ${options.after ? 'AND (created_at, comment_id) > (?, ?)' : ''}
+      ORDER BY created_at, comment_id LIMIT ?`)
+      .all(...this.scope(), targetType, targetId, ...(options.after ? [options.after.createdAt, options.after.commentId] : []), options.limit + 1) as Array<{ comment_id: string; created_at: string; payload: string }>;
+    const selected = rows.slice(0, options.limit);
+    const items = selected.map(row => {
+      const value = JSON.parse(row.payload) as C;
+      if (value.commentId !== row.comment_id || value.createdAt !== row.created_at || value.targetType !== targetType || value.targetId !== targetId ||
+        typeof value.hidden !== 'boolean' || (!options.includeHidden && value.hidden)) throw new Error('Invalid stored comment identity.');
+      return value;
+    });
+    const last = selected[selected.length - 1];
+    return { items, ...(rows.length > options.limit && last ? { nextCursor: { createdAt: last.created_at, commentId: last.comment_id } } : {}) };
+  }
   async getComment(targetType: C['targetType'], targetId: string, commentId: string): Promise<C | null> {
     if (![targetType, targetId, commentId].every(value => typeof value === 'string' && Boolean(value.trim()))) throw new Error('Invalid comment lookup.');
     const row = this.local.database.prepare(`SELECT payload FROM ubeeq_comments
