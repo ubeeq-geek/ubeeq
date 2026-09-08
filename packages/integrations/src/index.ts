@@ -298,3 +298,4 @@ export { SoundCloudUploadClient, type SoundCloudUploadSource } from './soundclou
 export { normalizeVimeoAccount, normalizeVimeoVideo, normalizeVimeoVideoPage, type VimeoAccount, type VimeoRemoteVideo } from './vimeo-metadata.js';
 export { requestVimeo, VimeoApiError } from './vimeo-request.js';
 export { VimeoReadClient } from './vimeo-read-client.js';
+export { VimeoWriteClient, type VimeoPrivacyUpdate, type VimeoVideoUpdate } from './vimeo-write-client.js';
