@@ -9,6 +9,26 @@ const vaultFor = () => {
 };
 const gatewayFor = (vault, fetch) => new SmugMugHttpGateway({ apiKey: 'fixture-key', apiSecret: 'fixture-secret', callbackUrl: 'https://app.example/callback', vault, fetch });
 
+test('SmugMug authorization cannot invent account identities from malformed provider metadata', async () => {
+  for (const payload of [null, {}, { Response: {} }, { Response: { User: [] } }, { Response: { User: { UserID: '', Uri: ' ' } } }]) {
+    const vault = vaultFor(); await vault.put({ token: 'request', tokenSecret: 'request-secret' }); let calls = 0;
+    const gateway = gatewayFor(vault, async () => ++calls === 1 ? new Response('oauth_token=access&oauth_token_secret=access-secret') : Response.json(payload));
+    await assert.rejects(gateway.completeAuthorization('ref', 'verifier'), /stable account identity/);
+    assert.equal(calls, 2);
+    // Retain the exchanged credential for application-owned recovery; no invented account is returned.
+    assert.deepEqual(await vault.get('ref'), { token: 'access', tokenSecret: 'access-secret' });
+  }
+});
+
+test('SmugMug authorization preserves provider UserID precedence and URI fallback', async () => {
+  for (const user of [{ UserID: 'account', Uri: '/api/v2/user/account' }, { Uri: '/api/v2/user/account' }]) {
+    const vault = vaultFor(); await vault.put({ token: 'request', tokenSecret: 'request-secret' }); let calls = 0;
+    const gateway = gatewayFor(vault, async () => ++calls === 1 ? new Response('oauth_token=access&oauth_token_secret=access-secret') : Response.json({ Response: { User: user } }));
+    const result = await gateway.completeAuthorization('ref', 'verifier');
+    assert.equal(result.accountId, user.UserID || user.Uri); assert.equal(result.accountName, 'SmugMug creator');
+  }
+});
+
 test('shared SmugMug authorization, vault replacement and resumable inventory preserve metadata', async () => {
   const vault = vaultFor(), calls = [], responses = [
     new Response('oauth_token=request&oauth_token_secret=request-secret'),

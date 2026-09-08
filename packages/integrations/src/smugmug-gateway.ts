@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, randomUUID } from 'crypto';
+import { createHmac, randomBytes } from 'crypto';
 import type { SmugMugCapabilities, SmugMugGateway, SmugMugInventoryPage, SmugMugRemoteCollection, SmugMugRemoteImage } from './smugmug-contracts.js';
 
 export interface SmugMugOAuthCredential { token: string; tokenSecret: string; }
@@ -67,8 +67,10 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     if (!token || !tokenSecret) throw new Error('SmugMug returned an invalid access token.');
     const nextReference = await this.options.vault.replace(credentialRef, { token, tokenSecret });
     const authUser = await this.apiGet('/api/v2!authuser', { token, tokenSecret });
-    const response = record(authUser.Response);
+    const response = record(record(authUser).Response);
     const user = record(response.User);
+    const accountId = scalar(user.UserID) || scalar(user.Uri);
+    if (!accountId) throw new Error('SmugMug did not return a stable account identity.');
     const capabilities: SmugMugCapabilities = {
       inventory: true,
       // OAuth alone does not prove that originals are retrievable. Inventory
@@ -79,7 +81,7 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     };
     return {
       credentialRef: nextReference,
-      accountId: scalar(user.UserID) || scalar(user.Uri) || randomUUID(),
+      accountId,
       accountName: scalar(user.NickName) || scalar(user.Name) || 'SmugMug creator',
       capabilities
     };
