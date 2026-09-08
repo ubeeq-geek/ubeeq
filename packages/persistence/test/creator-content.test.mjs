@@ -4,6 +4,20 @@ import { MemoryCreatorContentStore } from "../dist/index.js";
 
 const work = (tenantId, workId, extra = {}) => ({ tenantId, workId, creatorId: "creator", status: "draft", updatedAt: "2026-09-04T00:00:00Z", ...extra });
 
+test('creator asset inventory includes detached records beyond a first page without leaking scope or mutable state', async () => {
+  const store = new MemoryCreatorContentStore();
+  for (let i = 0; i < 102; i++) await store.createCanonicalAsset({ tenantId: 'one', creatorId: 'creator', assetId: `asset-${i}`, storage: { key: `original-${i}` } });
+  await store.createCanonicalAsset({ tenantId: 'two', creatorId: 'creator', assetId: 'foreign' });
+  await store.createCanonicalAsset({ tenantId: 'one', creatorId: 'other', assetId: 'other' });
+  await store.attachAssetToWork('one', { workId: 'work', assetId: 'asset-0', position: 0 });
+  await store.detachAssetFromWork('one', 'work', 'asset-0');
+  const inventory = await store.listCanonicalAssetsByCreator('one', 'creator');
+  assert.equal(inventory.length, 102);
+  assert.equal(inventory[101].assetId, 'asset-101');
+  inventory[0].storage.key = 'mutated';
+  assert.equal((await store.getCanonicalAsset('one', 'asset-0')).storage.key, 'original-0');
+});
+
 test('memory collection recovery remains opt-in and tenant/creator scoped', async () => {
   const store = new MemoryCreatorContentStore();
   for (const [id, tenantId, creatorId, status] of [['active', 'one', 'creator', 'draft'], ['removed', 'one', 'creator', 'deleted'], ['foreign', 'two', 'creator', 'deleted'], ['other', 'one', 'other', 'deleted']]) {
