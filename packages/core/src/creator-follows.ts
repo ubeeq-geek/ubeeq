@@ -10,6 +10,10 @@ export interface CreatorFollowPort<F extends CreatorFollowRecord> {
   followCreator(follow: F): Promise<void>;
   unfollowCreator(userId: string, creatorId: string): Promise<void>;
 }
+/** Optional point-read port; the adapter remains bound to one tenant/cell. */
+export interface CreatorFollowLookupPort<F extends CreatorFollowRecord> {
+  getFollow(userId: string, creatorId: string): Promise<F | null>;
+}
 export class CreatorFollowError extends Error {
   constructor(readonly code: 'access_denied' | 'invalid_follow', message: string) {
     super(message); this.name = 'CreatorFollowError';
