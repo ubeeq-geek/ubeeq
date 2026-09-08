@@ -4,6 +4,7 @@ export * from "./creator-collections.js";
 export * from "./creator-works.js";
 export * from "./content-blocks.js";
 export * from "./creator-assets.js";
+export * from "./creator-asset-regeneration.js";
 export * from "./content-asset-references.js";
 export * from "./content-media.js";
 export * from "./creator-members.js";

@@ -11,6 +11,8 @@ export interface CreatorAssetRecord extends CreatorAssetIdentity {
   storage: { bucket: string; key: string; versionId: string; contentType: string; byteLength: number; checksum: string; scope: "private" };
   createdAt: string;
   updatedAt: string;
+  /** Latest explicitly admitted processing job; fences older recovered attempts. */
+  processingJobId?: string;
   processing?: { state: "completed"; sourceVersionId: string; completedAt: string; metadata: Record<string, string | number | boolean>; renditions: CreatorAssetRendition[] };
 }
 export interface CreatorAssetRendition {
