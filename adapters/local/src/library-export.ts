@@ -1,5 +1,6 @@
 import type { CreatorWorkRecord, CreatorAssetRecord, CreatorAssetAttachment, CreatorCollectionRecord, CreatorCollectionMembership } from '@ubeeq/core';
 import type { LocalSqliteDatabase } from './index.js';
+import type { FavoriteRecord } from '@ubeeq/core';
 
 export interface CreatorLibrarySnapshot {
   works: CreatorWorkRecord[];
@@ -7,6 +8,7 @@ export interface CreatorLibrarySnapshot {
   attachments: CreatorAssetAttachment[];
   collections: CreatorCollectionRecord[];
   memberships: CreatorCollectionMembership[];
+  favorites: FavoriteRecord[];
 }
 
 /** Consistent metadata snapshot, not an authorized export endpoint. The caller
@@ -22,10 +24,21 @@ export const readCreatorLibrarySnapshot = (local: LocalSqliteDatabase,
   try {
     const size = db.prepare(`SELECT count(*) AS rows, coalesce(sum(length(CAST(payload AS BLOB))), 0) AS bytes
       FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND creator_id = ?`).get(...parameters) as { rows: number; bytes: number };
-    if (size.rows > maxRows || size.bytes > maxBytes) throw new Error('Creator library exceeds snapshot budget; no partial export was produced.');
+    const favoriteSize = db.prepare(`SELECT count(*) AS rows, coalesce(sum(length(CAST(payload AS BLOB))), 0) AS bytes
+      FROM ubeeq_favorites WHERE cell_id = ? AND tenant_id = ? AND profile_type = 'creator' AND profile_id = ?`).get(...parameters) as { rows: number; bytes: number };
+    if (size.rows + favoriteSize.rows > maxRows || size.bytes + favoriteSize.bytes > maxBytes) throw new Error('Creator library exceeds snapshot budget; no partial export was produced.');
     const rows = db.prepare('SELECT kind, id, payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND creator_id = ? ORDER BY kind, id')
       .all(...parameters) as Array<{ kind: string; id: string; payload: string }>;
-    const snapshot: CreatorLibrarySnapshot = { works: [], assets: [], attachments: [], collections: [], memberships: [] };
+    const snapshot: CreatorLibrarySnapshot = { works: [], assets: [], attachments: [], collections: [], memberships: [], favorites: [] };
+    const favoriteRows = db.prepare(`SELECT target_type, target_id, payload FROM ubeeq_favorites
+      WHERE cell_id = ? AND tenant_id = ? AND profile_type = 'creator' AND profile_id = ? ORDER BY target_type, target_id`).all(...parameters) as Array<{ target_type: string; target_id: string; payload: string }>;
+    for (const row of favoriteRows) {
+      const value = JSON.parse(row.payload);
+      if (!value || value.ownerProfileType !== 'creator' || value.ownerProfileId !== scope.creatorId ||
+        value.targetType !== row.target_type || value.targetId !== row.target_id || !['public', 'private'].includes(value.visibility) ||
+        typeof value.userId !== 'string' || !value.userId.trim() || typeof value.createdAt !== 'string' || !value.createdAt) throw new Error('Invalid favorite snapshot scope or record.');
+      snapshot.favorites.push(value);
+    }
     for (const row of rows) {
       const value = JSON.parse(row.payload);
       if (row.kind === 'work_assets' || row.kind === 'membership') {
