@@ -25,6 +25,16 @@ export class LocalFavoriteStore<F extends FavoriteRecord = FavoriteRecord> imple
       AND profile_type = ? AND profile_id = ? ORDER BY target_type, target_id`).all(...this.scope(), profileType, profileId) as Array<{ payload: string }>;
     return rows.map(row => JSON.parse(row.payload) as F);
   }
+  /** Exact scoped identity lookup; does not confer profile or target access. */
+  async getFavorite(profileType: string, profileId: string, targetType: string, targetId: string): Promise<F | undefined> {
+    if (![profileType, profileId, targetType, targetId].every(value => typeof value === 'string' && Boolean(value.trim()))) throw new Error('Invalid favorite lookup.');
+    const row = this.local.database.prepare(`SELECT payload FROM ubeeq_favorites WHERE cell_id = ? AND tenant_id = ?
+      AND profile_type = ? AND profile_id = ? AND target_type = ? AND target_id = ?`).get(...this.scope(), profileType, profileId, targetType, targetId) as { payload: string } | undefined;
+    if (!row) return undefined;
+    const favorite = JSON.parse(row.payload) as F;
+    if (favorite.ownerProfileType !== profileType || favorite.ownerProfileId !== profileId || favorite.targetType !== targetType || favorite.targetId !== targetId) throw new Error('Favorite identity mismatch.');
+    return favorite;
+  }
   /** Counts canonical rows, not a separately updated counter that can drift. */
   async countByTarget(targetType: string, targetId: string): Promise<number> {
     const row = this.local.database.prepare(`SELECT COUNT(*) AS total FROM ubeeq_favorites
