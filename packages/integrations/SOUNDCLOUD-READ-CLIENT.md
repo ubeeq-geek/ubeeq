@@ -1,0 +1,9 @@
+# SoundCloud read client
+
+SoundCloudReadClient composes a caller-supplied SoundCloudTransport with shared normalization. It owns account/profile lookup, track listing and lookup, playlist enumeration/member listing, comment/favourite-user pages and feed pages. Construction performs no requests. Invoked methods use GET through the transport's origin checks, redirect rejection, deadlines and response byte budgets. Credentials, capability admission, persistence, scheduling, account-health context and reconciliation remain caller-owned.
+
+Single-page methods return normalized items and a validated nextCursor. They do not traverse the whole feed or catalogue and do not advance checkpoints. Track/comment/favourite entries without identity retain compatibility filtering; missing collection arrays in these single-page methods retain compatibility empty-page behavior. This is not strict response-schema validation or proof of complete remote data. Raw payloads are not sanitized public projections, and tracks do not supply canonical audio bytes.
+
+listCollections is the existing bounded playlist enumerator: at most twenty pages, exact canonical cursor-cycle detection, required collection arrays and playlist identity. A continuation after page twenty raises preflight_blocked, never partial success. Empty intermediate pages with continuation are followed. Large catalogues require a separate durable resumable traversal design; callers must not infer removals when enumeration fails.
+
+OAuth helpers remain on SoundCloudTransport. Mutations, uploads, provider capability declarations, mentions support, engagement batching and worker recovery are not implemented by this read client. Synthetic tests execute the real transport and normalizers but do not qualify live provider behavior or durable restart recovery.

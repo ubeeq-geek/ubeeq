@@ -292,3 +292,4 @@ export const resolveReconciliation = (
   throw new Error("Unsupported reconciliation action.");
 };
 export { ghostReconciliationSnapshot, ghostPublicationHash, type GhostEditablePublication } from './ghost-snapshots.js';
+export { SoundCloudReadClient } from './soundcloud-read-client.js';
