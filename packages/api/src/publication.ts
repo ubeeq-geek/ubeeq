@@ -18,7 +18,8 @@ export interface PublicationResult { intent: PublicationIntentRecord; publicatio
 export class PublicationService {
   constructor(private readonly repositories: PublicationRepositories,
     private readonly authorizeWork: (workId: string, actorId: string) => Promise<WorkRecord>,
-    private readonly admit: (work: WorkRecord, assets: readonly AssetRecord[]) => Promise<void>) {}
+    private readonly admit: (work: WorkRecord, assets: readonly AssetRecord[]) => Promise<void>,
+    private readonly options: { allowWithoutAssets?: (work: Readonly<WorkRecord>) => boolean } = {}) {}
 
   async publish(input: { workId: string; actorId: string; destination: string; idempotencyKey?: unknown }): Promise<PublicationResult> {
     const { workId, actorId, destination: rawDestination, idempotencyKey: header } = input;
@@ -42,7 +43,7 @@ export class PublicationService {
     if (previous) return structuredClone(previous);
     const assets: AssetRecord[] = [];
     for await (const asset of repositoryItems(request => repositories.assets.list(request))) if (asset.workId === work.id) assets.push(asset);
-    if (!assets.length || assets.some(asset => asset.status !== 'ready' || asset.creatorId !== work.creatorId)) throw new PublicationRequestError('processing_incomplete', 'All Work assets must belong to its Creator and finish processing before publication');
+    if ((!assets.length && this.options.allowWithoutAssets?.(structuredClone(work)) !== true) || assets.some(asset => asset.status !== 'ready' || asset.creatorId !== work.creatorId)) throw new PublicationRequestError('processing_incomplete', 'All Work assets must belong to its Creator and finish processing before publication');
     await this.admit(structuredClone(work), structuredClone(assets));
     const scope = { instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision };
     try {
