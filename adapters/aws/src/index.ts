@@ -432,3 +432,5 @@ export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
 };
 export { DynamoSmugMugRepository } from './smugmug-repository.js';
 export { createS3PublicDerivativeStore, type PublicDerivativeStore } from './public-derivative-storage.js';
+export { createDynamoPublicDerivativeRepository, publicDerivativePublicationKey, publicDerivativeAssetKey,
+  type PublicDerivativePublication, type PublicDerivativeRepository } from './public-derivative-repository.js';
