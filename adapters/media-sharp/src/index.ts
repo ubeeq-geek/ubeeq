@@ -42,3 +42,25 @@ export class SharpImageProcessor implements MediaProcessor {
     };
   }
 }
+
+export interface ImageSourceValidationOptions { maxInputBytes?: number; maxInputPixels?: number }
+export type ImageSourceValidation = { safe: true; decodedFormat: string } |
+  { safe: false; reason: 'unsupported_mime' | 'invalid_source_size' | 'invalid_image' | 'mime_mismatch' };
+
+/** Bounded image decode/type validation, not malware, rights or content moderation.
+ * Uses the preview decoder's default page/frame; does not inspect every animation frame. */
+export const validateImageSource = async (source: Uint8Array, mimeType: string, options: ImageSourceValidationOptions = {}): Promise<ImageSourceValidation> => {
+  const maxInputBytes = options.maxInputBytes ?? 50 * 1024 * 1024, maxInputPixels = options.maxInputPixels ?? 40_000_000;
+  if (![maxInputBytes, maxInputPixels].every(value => Number.isSafeInteger(value) && value > 0)) throw new Error('Image validation budgets must be positive integers.');
+  const formats: Record<string, string> = { 'image/jpeg': 'jpeg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/tiff': 'tiff' };
+  const expected = formats[mimeType.toLowerCase()];
+  if (!expected) return { safe: false, reason: 'unsupported_mime' };
+  if (!source.byteLength || source.byteLength > maxInputBytes) return { safe: false, reason: 'invalid_source_size' };
+  try {
+    const result = await new SharpImageProcessor({ width: 1, height: 1, maxInputPixels }).process({
+      source, contentType: mimeType.toLowerCase(), assetId: 'validation', sourceVersionId: 'validation'
+    });
+    if (result.metadata.decodedFormat !== expected) return { safe: false, reason: 'mime_mismatch' };
+    return { safe: true, decodedFormat: result.metadata.decodedFormat };
+  } catch { return { safe: false, reason: 'invalid_image' }; }
+};
