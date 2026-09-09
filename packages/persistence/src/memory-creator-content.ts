@@ -45,7 +45,7 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
       !this.workAssets.some(item => item.tenantId === work.tenantId && item.workId === input.sourceWorkId && item.assetId === asset.assetId) ||
       JSON.stringify(asset) !== JSON.stringify(expectedAsset) || previous.revision !== input.previousRevision ||
       !Number.isSafeInteger(input.previousRevision) || input.previousRevision < 1 || work.revision !== input.previousRevision + 1 ||
-      members.some(item => item.assetId === asset.assetId) || attachment.position !== members.length) return fail();
+      members.some(item => item.assetId === asset.assetId) || attachment.position !== (members.length ? Math.max(...members.map(item => item.position)) + 1 : 0)) return fail();
     const nextWorks = this.works.map(item => item === previous ? structuredClone(work) : item);
     const nextMembers = [...this.workAssets, { ...structuredClone(attachment), tenantId: work.tenantId }];
     const nextReceipts = [...this.sourceReceipts, structuredClone(receipt)];
@@ -65,7 +65,7 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
       throw new CreatorContentCommitError('Work changed or uploaded asset conflicts with stored state.');
     }
     const attachments = this.workAssets.filter((item) => item.tenantId === work.tenantId && item.workId === work.workId);
-    if (attachment.position !== attachments.length) throw new CreatorContentCommitError('Work attachment order changed.');
+    if (attachment.position !== (attachments.length ? Math.max(...attachments.map(item => item.position)) + 1 : 0)) throw new CreatorContentCommitError('Work attachment order changed.');
     const nextWorks = this.works.map((item) => item === previous ? work : item);
     const nextAssets = [...this.canonicalAssets, asset];
     const nextAttachments = [...this.workAssets, { ...attachment, tenantId: work.tenantId }];
