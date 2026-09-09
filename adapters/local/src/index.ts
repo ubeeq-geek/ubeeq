@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from 'node:async_hooks';
 export { LocalCreatorLibraryStore } from "./creator-library.js";
 export { LocalLibraryPublicationView } from './library-publication.js';
+export { LocalWorkPublicationLookup, type WorkPublicationScope } from './publication-lookup.js';
 export { readCreatorLibrarySnapshot, type CreatorLibrarySnapshot } from './library-export.js';
 export { LocalFavoriteStore } from './favorites.js';
 export { LocalCreatorFollowStore } from './creator-follows.js';
@@ -62,7 +63,7 @@ export class LocalSqliteDatabase {
     this.database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
