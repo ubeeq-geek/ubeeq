@@ -78,6 +78,24 @@ test('reference migration checkpoints bounded initialization and processing with
   assert.equal(value.calls.imported.length, 101); assert.equal(value.calls.downloaded, 0); assert.equal(value.calls.published, 0);
 });
 
+test('asset reuse receives connection identity for consumer admission and durable source receipts', async () => {
+  const value = await fixture(async () => ({ images: [image('source')], collections: [] }));
+  value.sink.findAssetByChecksum = async (creatorId, checksum, context) => {
+    assert.equal(creatorId, 'creator'); assert.match(checksum, /^[a-f0-9]{64}$/);
+    assert.equal(context.connectionId, value.connectionId); assert.equal(context.image.remoteId, 'source');
+    return 'existing';
+  };
+  const reused = [];
+  value.sink.reuseAsset = async input => { reused.push(input); };
+  value.sink.quarantine = async () => { throw Error('Unexpected duplicate storage'); };
+  const inventory = await value.service.inventory(value.connectionId, 'actor', 'reuse');
+  const result = await value.service.confirm(inventory.migration.id, 'actor', 'FULL_CATALOGUE_MIGRATION');
+  assert.equal(result.items[0].state, 'DEDUPLICATED'); assert.equal(result.items[0].canonicalAssetId, 'existing');
+  assert.equal(reused.length, 1); assert.equal(reused[0].connectionId, value.connectionId);
+  assert.equal(reused[0].creatorId, 'creator'); assert.equal(reused[0].image.remoteId, 'source');
+  assert.match(reused[0].checksum, /^[a-f0-9]{64}$/); assert.equal(value.calls.published, 0);
+});
+
 test('source transfer verifies bytes and preserves quarantine decisions without claiming a hosted asset', async () => {
   const value = await fixture(async () => ({ images: [{ ...image('source'), mimeType: 'image/jpeg' }], collections: [] }));
   value.sink.quarantine = async () => ({ assetId: 'held', scanPassed: false });
