@@ -1,5 +1,5 @@
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
-import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
+import { parseFragment, serialize, serializeOuter, type DefaultTreeAdapterMap } from 'parse5';
 
 export type DescriptionBlockType = 'paragraph' | 'heading' | 'quote' | 'divider';
 
@@ -85,10 +85,10 @@ export const createStructuredBlock = (type: 'section' | 'link' | 'credit'): Post
     ...(type === 'section' ? { title: '', blocks: [] } : type === 'link' ? { label: '', url: '' } : { author: '', text: '', url: '' }) };
 };
 
-const blockFromElement = (element: HTMLElement): PostBlock | null => {
-  const tag = element.tagName.toLowerCase();
+const blockFromElement = (element: DefaultTreeAdapterMap['element']): PostBlock | null => {
+  const tag = element.tagName;
   if (tag === 'hr') return createDescriptionBlock('divider');
-  const html = sanitizeInlineHtml(element.innerHTML);
+  const html = sanitizeInlineHtml(serialize(element));
   const text = inlineHtmlToText(html).trim();
   if (!text && !html.includes('<br>')) return null;
   if (/^h[1-6]$/.test(tag)) {
@@ -102,6 +102,7 @@ const blockFromElement = (element: HTMLElement): PostBlock | null => {
 
 export const parseDescriptionBlocks = (value?: string): PostBlock[] => {
   const source = value?.trim() || '';
+  if (source.length > 1_048_576) throw new Error('Description exceeds its input budget.');
   if (!source) return [createDescriptionBlock()];
   if (!/<\/?[a-z][^>]*>/i.test(source)) {
     return source.split(/\n\s*\n+/).filter(Boolean).map((text) => ({
@@ -110,28 +111,27 @@ export const parseDescriptionBlocks = (value?: string): PostBlock[] => {
       html: textToInlineHtml(text)
     }));
   }
-  if (typeof DOMParser === 'undefined') {
-    return source.split(/\n\s*\n+/).filter(Boolean).map((text) => ({
-      ...createDescriptionBlock(),
-      text,
-      html: textToInlineHtml(text)
-    }));
+  const document = parseFragment(source);
+  // Serialization is recursive; reject excessive depth before serializing any node.
+  const pending = document.childNodes.map(node => ({ node, depth: 1 }));
+  let visited = 0;
+  while (pending.length) {
+    const { node, depth } = pending.pop()!;
+    if (++visited > 50_000 || depth > 256) throw new Error('Description exceeds its structure budget.');
+    if ('childNodes' in node) for (const child of node.childNodes) pending.push({ node: child, depth: depth + 1 });
   }
-
-  const document = new DOMParser().parseFromString(`<body>${source}</body>`, 'text/html');
   const blocks: PostBlock[] = [];
-  let inlineNodes: Node[] = [];
+  let inlineNodes: DefaultTreeAdapterMap['childNode'][] = [];
   const flushInlineNodes = () => {
     if (!inlineNodes.length) return;
-    const holder = document.createElement('p');
-    inlineNodes.forEach((node) => holder.appendChild(node.cloneNode(true)));
-    const block = blockFromElement(holder);
-    if (block) blocks.push(block);
+    const html = sanitizeInlineHtml(inlineNodes.map(node => serializeOuter(node)).join(''));
+    const text = inlineHtmlToText(html).trim();
+    if (text || html.includes('<br>')) blocks.push({ ...createDescriptionBlock(), text, html });
     inlineNodes = [];
   };
 
-  Array.from(document.body.childNodes).forEach((node) => {
-    if (node instanceof HTMLElement && /^(p|div|h[1-6]|blockquote|hr|section|article|ul|ol)$/.test(node.tagName.toLowerCase())) {
+  document.childNodes.forEach((node) => {
+    if ('tagName' in node && node.namespaceURI === 'http://www.w3.org/1999/xhtml' && /^(p|div|h[1-6]|blockquote|hr|section|article|ul|ol)$/.test(node.tagName)) {
       flushInlineNodes();
       const block = blockFromElement(node);
       if (block) blocks.push(block);
