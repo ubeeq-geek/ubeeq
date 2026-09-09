@@ -130,3 +130,36 @@ test('only exact allowlisted codes select unavailable or transient retry outcome
     if (message.includes('private') || message.startsWith('UNKNOWN')) assert.equal(result.items[0].errorCode, 'FLICKR_SOURCE_TRANSFER_FAILED');
   }
 });
+
+test('large catalogue batches scan photos once and audit only the changed batch without repeated find calls', async () => {
+  const { workflow, calls, repository } = await setup({ scanQuarantine: async () => 'clean' });
+  const initial = migration();
+  const size = 10000; let photoIdReads = 0;
+  initial.photos = Array.from({ length: size }, (_, i) => ({ get remoteId() { photoIdReads++; return String(i); }, originalSourceUrl: 'https://example.invalid/source' }));
+  initial.items = Array.from({ length: size }, (_, i) => ({ remoteId: String(i), transferStatus: 'QUEUED', retryCount: 0 }));
+  initial.sourceCursor = size - 10;
+  for (const rows of [initial.photos, initial.items]) Object.defineProperty(rows, 'find', { value: () => { throw Error('repeated full-array search'); } });
+  // Avoid counting persistence serialization as workflow catalogue lookup work.
+  repository.putMigration = async () => {};
+  const result = await workflow.run(initial);
+  assert.equal(calls.transfer, 10); assert.equal(calls.attach, 10);
+  assert.ok(photoIdReads <= size + 30, `read ${photoIdReads} IDs for ${size} photos`);
+  assert.equal(result.auditEvents.length, 10);
+  assert.deepEqual(result.auditEvents.map(event => event.remoteId), Array.from({ length: 10 }, (_, i) => String(size - 10 + i)));
+  assert.equal(result.items.length, size); assert.equal(result.sourceCursor, 0); assert.equal(result.status, 'REVIEW');
+  assert.ok(result.items.slice(0, size - 10).every(item => item.transferStatus === 'QUEUED'));
+  assert.ok(initial.items.every(item => item.transferStatus === 'QUEUED'));
+});
+
+test('batch photo lookup retains first duplicate match and missing photos remain unavailable', async () => {
+  const urls = [];
+  const { workflow } = await setup({ transfer: async input => { urls.push(input.sourceUrl); return { ...source, scanOutcome: 'clean' }; } });
+  const initial = migration();
+  initial.photos.push({ remoteId: 'p', originalSourceUrl: 'https://example.invalid/duplicate' });
+  initial.items.push({ remoteId: 'missing', transferStatus: 'QUEUED', retryCount: 0 });
+  const result = await workflow.run(initial);
+  assert.deepEqual(urls, ['https://example.invalid/original']);
+  assert.equal(result.items[1].transferStatus, 'UNAVAILABLE');
+  assert.equal(result.items[1].errorCode, 'ORIGINAL_UNAVAILABLE');
+  assert.deepEqual(result.auditEvents.map(event => event.action), ['SOURCE_TRANSFERRED', 'SOURCE_UNAVAILABLE']);
+});

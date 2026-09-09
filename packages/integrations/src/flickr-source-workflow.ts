@@ -51,12 +51,19 @@ export class FlickrSourceWorkflow {
     const start = migration.sourceCursor ?? 0;
     if (!Number.isSafeInteger(start) || start < 0 || start > migration.items.length) throw new Error('Invalid Flickr source cursor');
     const end = Math.min(start + maxItems, migration.items.length);
+    // Retain at most one photo per requested batch ID, preserving first-match semantics.
+    const wanted = new Set(migration.items.slice(start, end).map(item => item.remoteId));
+    const batchPhotos = new Map<string, FlickrManifestPhoto>();
+    for (const photo of migration.photos) {
+      if (wanted.delete(photo.remoteId)) batchPhotos.set(photo.remoteId, photo);
+      if (!wanted.size) break;
+    }
     const items: FlickrMigrationItem[] = migration.items.slice(0, start);
     for (let index = start; index < end; index++) {
       const item = migration.items[index];
       if (item.transferStatus === 'UNAVAILABLE' || item.transferStatus === 'VALIDATED') { items.push(item); continue; }
       if (item.transferStatus === 'FAILED' && (!item.nextRetryAt || item.retryCount >= 3 || item.nextRetryAt > new Date().toISOString())) { items.push(item); continue; }
-      const photo = migration.photos.find((candidate) => candidate.remoteId === item.remoteId);
+      const photo = batchPhotos.get(item.remoteId);
       if (!photo?.originalSourceUrl) { items.push({ ...item, transferStatus: 'UNAVAILABLE', errorCode: 'ORIGINAL_UNAVAILABLE' }); continue; }
       try {
         await admit();
@@ -95,9 +102,9 @@ export class FlickrSourceWorkflow {
     }
     for (let index = end; index < migration.items.length; index++) items.push(migration.items[index]);
     const complete = items.every((item) => item.transferStatus === 'VALIDATED' || item.transferStatus === 'UNAVAILABLE');
-    const transferEvents: FlickrMigration['auditEvents'] = items.flatMap((item) => {
-      const previous = migration.items.find((candidate) => candidate.remoteId === item.remoteId);
-      if (previous?.transferStatus === item.transferStatus) return [];
+    const transferEvents: FlickrMigration['auditEvents'] = items.slice(start, end).flatMap((item, offset) => {
+      const previous = migration.items[start + offset];
+      if (previous.transferStatus === item.transferStatus) return [];
       const action = item.transferStatus === 'VALIDATED' ? 'SOURCE_TRANSFERRED'
         : item.transferStatus === 'UNAVAILABLE' ? 'SOURCE_UNAVAILABLE'
           : item.transferStatus === 'FAILED' ? 'SOURCE_FAILED' : undefined;
