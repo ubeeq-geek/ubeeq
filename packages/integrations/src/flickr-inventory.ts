@@ -65,7 +65,7 @@ export class FlickrInventoryService {
     if (mode !== 'REFERENCE_IMPORT' && !storageConfirmed) throw new Error('Storage and cost confirmation is required for source migration');
     if (mode === 'SELECTED_SOURCE_MIGRATION' && selected.length === 0) throw new Error('Select at least one Flickr photo');
     const now = new Date().toISOString();
-    const updated: FlickrMigration = { ...migration, mode, status: 'CONFIRMED', confirmedAt: now, storageConfirmed, updatedAt: now,
+    const updated: FlickrMigration = { ...migration, mode, status: 'CONFIRMED', confirmedAt: now, storageConfirmed, updatedAt: now, sourceCursor: 0,
       items: selected.map((photo) => ({ remoteId: photo.remoteId, mode,
         sourceQuality: mode === 'REFERENCE_IMPORT' ? undefined : (photo.originalAvailable ? 'original' : 'highest_available'),
         transferStatus: mode === 'REFERENCE_IMPORT' ? 'NOT_REQUESTED' : (photo.originalAvailable ? 'QUEUED' : 'UNAVAILABLE'),

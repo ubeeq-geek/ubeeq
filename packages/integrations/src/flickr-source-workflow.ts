@@ -17,7 +17,8 @@ export interface FlickrSourceWorkflowPorts {
 
 export class FlickrSourceWorkflow {
   constructor(private repository: FlickrRepository, private ports: FlickrSourceWorkflowPorts) {}
-  async run(migration: FlickrMigration): Promise<FlickrMigration> {
+  async run(migration: FlickrMigration, maxItems = 10): Promise<FlickrMigration> {
+    if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 100) throw new Error('Invalid Flickr source batch size');
     if (!migration.mode || migration.mode === 'REFERENCE_IMPORT') return migration;
     if (!migration.confirmedAt || !migration.storageConfirmed) throw new Error('Migration has not been confirmed');
     const connection = await this.repository.getConnection(migration.connectionId);
@@ -34,8 +35,12 @@ export class FlickrSourceWorkflow {
       }
     };
     await admit();
-    const items: FlickrMigrationItem[] = [];
-    for (const item of migration.items) {
+    const start = migration.sourceCursor ?? 0;
+    if (!Number.isSafeInteger(start) || start < 0 || start > migration.items.length) throw new Error('Invalid Flickr source cursor');
+    const end = Math.min(start + maxItems, migration.items.length);
+    const items: FlickrMigrationItem[] = migration.items.slice(0, start);
+    for (let index = start; index < end; index++) {
+      const item = migration.items[index];
       if (item.transferStatus === 'UNAVAILABLE' || item.transferStatus === 'VALIDATED') { items.push(item); continue; }
       if (item.transferStatus === 'FAILED' && (!item.nextRetryAt || item.retryCount >= 3 || item.nextRetryAt > new Date().toISOString())) { items.push(item); continue; }
       const photo = migration.photos.find((candidate) => candidate.remoteId === item.remoteId);
@@ -75,6 +80,7 @@ export class FlickrSourceWorkflow {
           errorCode: code });
       }
     }
+    for (let index = end; index < migration.items.length; index++) items.push(migration.items[index]);
     const complete = items.every((item) => item.transferStatus === 'VALIDATED' || item.transferStatus === 'UNAVAILABLE');
     const transferEvents: FlickrMigration['auditEvents'] = items.flatMap((item) => {
       const previous = migration.items.find((candidate) => candidate.remoteId === item.remoteId);
@@ -86,7 +92,8 @@ export class FlickrSourceWorkflow {
         details: { transferStatus: item.transferStatus, retryCount: item.retryCount, ...(item.errorCode ? { errorCode: item.errorCode } : {}) } }] : [];
     });
     const updated: FlickrMigration = { ...migration, items, auditEvents: [...(migration.auditEvents || []), ...transferEvents],
-      status: complete ? 'COMPLETE' : 'REVIEW', updatedAt: new Date().toISOString() };
+      sourceCursor: complete || end === migration.items.length ? 0 : end,
+      status: complete ? 'COMPLETE' : end < migration.items.length ? 'RUNNING' : 'REVIEW', updatedAt: new Date().toISOString() };
     await admit();
     await this.repository.putMigration(updated); return updated;
   }

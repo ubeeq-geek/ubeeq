@@ -82,6 +82,8 @@ export interface FlickrMigration {
   userId: string;
   status: 'INVENTORY_READY' | 'CONFIRMED' | 'RUNNING' | 'REVIEW' | 'COMPLETE';
   cursor?: string;
+  /** Next source item to inspect; reset to zero after each full sweep. */
+  sourceCursor?: number;
   mode?: FlickrMigrationMode;
   confirmedAt?: string;
   storageConfirmed: boolean;
