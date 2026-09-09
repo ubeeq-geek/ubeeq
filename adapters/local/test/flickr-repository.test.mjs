@@ -25,6 +25,22 @@ test('Flickr SQLite state survives restart, isolates scopes and atomically claim
     const saved = await repository.getMigration('m'); saved.items.length = 0;
     assert.equal((await repository.getMigration('m')).items[0].remoteId, 'updated');
     const foreign = new LocalFlickrRepository(local, 'other');
+    for (const connectionId of ['one', 'two', 'three']) await repository.putConnection({ connectionId, userId: 'user', creatorId: 'creator', state: 'CONNECTED' });
+    await repository.putConnection({ connectionId: 'foreign-user', userId: 'other', creatorId: 'creator' });
+    const first = await repository.listConnections('user', 'creator', { limit: 2 });
+    assert.deepEqual(first.items.map(item => item.connectionId), ['one', 'three']);
+    assert.ok(first.nextCursor);
+    first.items[0].state = 'mutated';
+    assert.equal((await repository.getConnection('one')).state, 'CONNECTED');
+    assert.deepEqual((await repository.listConnections('user', 'creator', { limit: 2, cursor: first.nextCursor })).items.map(item => item.connectionId), ['two']);
+    assert.deepEqual((await foreign.listConnections('user', 'creator', { limit: 2 })).items, []);
+    for (const scope of [['other', 'creator'], ['user', 'other']]) await assert.rejects(repository.listConnections(...scope, { limit: 2, cursor: first.nextCursor }), /cursor/);
+    await assert.rejects(foreign.listConnections('user', 'creator', { limit: 2, cursor: first.nextCursor }), /cursor/);
+    for (const limit of [0, 101, 1.5]) await assert.rejects(repository.listConnections('user', 'creator', { limit }), /page/);
+    const plan = local.database.prepare("EXPLAIN QUERY PLAN SELECT id, payload FROM ubeeq_flickr_state INDEXED BY ubeeq_flickr_owner_connections WHERE cell_id = ? AND tenant_id = ? AND kind = 'connection' AND json_extract(payload, '$.userId') = ? AND json_extract(payload, '$.creatorId') = ? AND id > ? ORDER BY id LIMIT ?")
+      .all('cell', 'tenant', 'user', 'creator', '', 3);
+    assert.match(JSON.stringify(plan), /ubeeq_flickr_owner_connections/);
+    assert.doesNotMatch(JSON.stringify(plan), /TEMP B-TREE/);
     assert.equal(await foreign.getConnection('c'), undefined);
     assert.equal(await foreign.getMigration('m'), undefined);
     assert.equal(await foreign.getMigrationByConnection('c'), undefined);

@@ -109,6 +109,8 @@ export interface FlickrMigration {
 export interface FlickrRepository {
   putConnection(value: FlickrConnection): Promise<void>;
   getConnection(id: string): Promise<FlickrConnection | undefined>;
+  /** Optional indexed discovery port; callers must authorize the user/creator pair. */
+  listConnections?(userId: string, creatorId: string, options: { limit: number; cursor?: string }): Promise<{ items: FlickrConnection[]; nextCursor?: string }>;
   putMigration(value: FlickrMigration): Promise<void>;
   getMigration(id: string): Promise<FlickrMigration | undefined>;
   getMigrationByConnection(connectionId: string): Promise<FlickrMigration | undefined>;

@@ -1,5 +1,11 @@
 # Local Flickr repository
 
+The optional shared `listConnections` port is implemented with an indexed
+user/creator keyset query. Limits are 1–100 and opaque cursors bind cell, tenant,
+user and creator. Results include private repository fields, so applications must
+authorize and project them before returning browser responses. This is not a
+snapshot across concurrent inserts or updates.
+
 `LocalFlickrRepository(database, tenantId)` implements shared Flickr state storage
 in SQLite with cell and tenant partitioning. Connections, migrations and pending
 OAuth requests survive process restarts. OAuth consumption is an owner-bound
