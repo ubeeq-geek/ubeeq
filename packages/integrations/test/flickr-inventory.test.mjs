@@ -12,6 +12,18 @@ const setup = async (materialize = async () => {}) => {
   return { repository, service: new FlickrInventoryService(repository, materialize) };
 };
 
+test('explicit empty album snapshot replaces saved albums while omitted continuation preserves them', async () => {
+  const { service } = await setup();
+  const album = { remoteAlbumId: 'album', title: 'Album', orderedRemotePhotoIds: ['a'] };
+  const first = await service.inventory(connection, [photo('a')], '2', [album]);
+  const appended = await service.inventory(connection, [photo('b')], undefined, undefined, true);
+  assert.deepEqual(appended.albums, first.albums);
+  const cleared = await service.inventory(connection, [photo('a')], '2', []);
+  assert.deepEqual(cleared.albums, []);
+  assert.equal(cleared.auditEvents.at(-1).details.albumCount, 0);
+  assert.deepEqual((await service.inventory(connection, [photo('b')], undefined, undefined, true)).albums, []);
+});
+
 test('inventory persists discovered originals across appended pages and permits source confirmation', async () => {
   const { repository, service } = await setup();
   const initial = { ...connection, capabilities: { inventory: true, originals: false, exif: true } };
