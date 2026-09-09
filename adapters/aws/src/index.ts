@@ -320,18 +320,19 @@ export class AwsJobQueue implements JobQueue {
     return created;
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
+    if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
     const candidates = await this.jobs.list({ limit: 100 });
     const timestamp = Date.now();
     const candidate = candidates.items.find((job) => job.cellId === input.cellId && (job.state === "queued" || job.state === "retry_scheduled") && Date.parse(job.availableAt) <= timestamp && (!input.types || input.types.includes(job.type)));
     if (!candidate) return undefined;
     const leaseToken = randomUUID();
     try {
-      const leased = await this.jobs.update(candidate.id, candidate.revision, { state: "leased", leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
+      const leased = await this.jobs.update(candidate.id, candidate.revision, { state: "leased", attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
       return { job: leased as DurableJob<TPayload>, leaseToken };
-    } catch { return undefined; }
+    } catch (error) { if (error instanceof OptimisticConcurrencyError) return undefined; throw error; }
   }
   async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "completed", leaseExpiresAt: undefined }); }
-  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); const nextAttempt = job.attempt + 1; await this.jobs.update(job.id, job.revision, nextAttempt >= job.maxAttempts ? { state: "dead_lettered", attempt: nextAttempt, lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", attempt: nextAttempt, lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (nextAttempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
+  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.jobs.update(job.id, job.revision, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return recovered; }
