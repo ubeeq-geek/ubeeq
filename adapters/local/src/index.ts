@@ -453,3 +453,4 @@ export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) 
   return { database, repositories: createLocalRepositories(database), storage, identity: new LocalIdentityAdapter(database), credentials: new LocalCredentialVault(database), federation: new LocalFederationKey(database), jobs: new LocalSqliteJobQueue(database), routingDirectory: new LocalRoutingDirectory(database), migrationCheckpoints: new LocalMigrationCheckpoints(database) };
 };
 export { LocalSmugMugInventoryRunner, type LocalSmugMugInventoryRunnerOptions } from './smugmug-inventory-runner.js';
+export { LocalFlickrRepository } from './flickr-repository.js';
