@@ -30,3 +30,28 @@ test('block cloning preserves nested identity, media and unknown metadata withou
   assert.deepEqual(source[0].payload.custom.items, ['original']);
   assert.equal(source[0].blocks[0].payload.nested.value, 1);
 });
+
+test('HTML description import preserves headings, quotes, dividers and inline runs without browser globals', () => {
+  const blocks = parseDescriptionBlocks('Before <b>bold</b><h3>Heading</h3><blockquote>Quoted <i>words</i></blockquote><hr><p>After &amp; next</p>');
+  assert.deepEqual(blocks.map(block => block.type), ['paragraph', 'heading', 'quote', 'divider', 'paragraph']);
+  assert.equal(blocks[0].html, 'Before <strong>bold</strong>');
+  assert.equal(blocks[1].level, 3); assert.equal(blocks[1].text, 'Heading');
+  assert.equal(blocks[2].quote, 'Quoted words'); assert.equal(blocks[2].html, 'Quoted <em>words</em>');
+  assert.equal(blocks[4].text, 'After & next');
+  assert.equal(new Set(blocks.map(block => block.blockId)).size, 5);
+  assert.match(serializeDescriptionBlocks(blocks), /<h3>Heading<\/h3>/);
+});
+
+test('HTML description import drops active content and unsafe links while retaining safe metadata', () => {
+  const blocks = parseDescriptionBlocks('<script>private-script</script><svg><text>foreign</text></svg><p onclick="bad()">Safe <a href="javascript:bad()">label</a> <a href="https://example.test/">link</a><img src="private-source" onerror="bad()"></p>');
+  const html = serializeDescriptionBlocks(blocks);
+  assert.doesNotMatch(html, /private-script|foreign|onclick|javascript:|private-source|onerror|<img/);
+  assert.match(html, /Safe label/); assert.match(html, /href="https:\/\/example.test\/"/);
+});
+
+test('description input has one total budget rather than per-paragraph bypasses', () => {
+  assert.throws(() => parseDescriptionBlocks('x'.repeat(1_048_577)), /input budget/);
+  assert.throws(() => parseDescriptionBlocks('<p>x</p>'.repeat(150000)), /input budget/);
+  assert.throws(() => parseDescriptionBlocks('<br>'.repeat(50001)), /structure budget/);
+  assert.throws(() => parseDescriptionBlocks('<span>'.repeat(257) + 'text' + '</span>'.repeat(257)), /structure budget/);
+});
