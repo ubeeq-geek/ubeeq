@@ -308,7 +308,7 @@ export class S3PresignedDelivery implements DeliveryAdapter {
 interface AwsJobRecord extends DurableJob, RevisionedRecord {}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
-  constructor(dynamo: Dynamo, configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
+  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
     this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs");
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
@@ -332,15 +332,30 @@ export class AwsJobQueue implements JobQueue {
     } catch (error) { if (error instanceof OptimisticConcurrencyError) return undefined; throw error; }
   }
   async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "completed", leaseExpiresAt: undefined }); }
-  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.jobs.update(job.id, job.revision, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
+  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.updateLeased(job, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return recovered; }
   async get(id: string): Promise<DurableJob | undefined> { return this.jobs.get(id); }
   async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> { const page = await this.jobs.list({ limit: Math.max(input.limit * 4, input.limit) }); return page.items.filter((job) => job.cellId === input.cellId && (!input.states || input.states.includes(job.state))).slice(0, input.limit); }
   private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
-  private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || job.correlationId?.split(":").at(-1) !== leaseToken) throw new Error(`Job ${id} does not hold this lease.`); return job; }
-  private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.jobs.update(job.id, job.revision, change); }
+  private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || !leaseToken || job.correlationId?.split(":").at(-1) !== leaseToken || !job.leaseExpiresAt || !(Date.parse(job.leaseExpiresAt) > Date.now())) throw new Error(`Job ${id} does not hold this lease.`); return job; }
+  private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.updateLeased(job, change); }
+  private async updateLeased(job: AwsJobRecord, change: Partial<AwsJobRecord>): Promise<void> {
+    const timestamp = now();
+    const value = { ...job, ...change, revision: job.revision + 1, updatedAt: timestamp };
+    try {
+      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+        Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
+        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision AND #value.#state = :leased AND #value.#owner = :owner AND #value.#expiry > :now',
+        ExpressionAttributeNames: { '#revision': 'revision', '#value': 'value', '#state': 'state', '#owner': 'correlationId', '#expiry': 'leaseExpiresAt' },
+        ExpressionAttributeValues: { ':revision': job.revision, ':leased': 'leased', ':owner': job.correlationId, ':now': timestamp }
+      }));
+    } catch (error) {
+      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') throw new OptimisticConcurrencyError(job.id, job.revision);
+      throw error;
+    }
+  }
   private async notify(id: string, type: string, cellId: string): Promise<void> {
     const detail = JSON.stringify({ id, type, cellId });
     await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: detail }));
