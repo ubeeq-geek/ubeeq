@@ -167,6 +167,35 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       return { ...asset, attachment };
     });
   }
+  /** A custody candidate, not authorization or a reservation. Recheck on attachment. */
+  async findReusableAssetByChecksum(tenantId: string, creatorId: string, checksum: string): Promise<{ assetId: string; sourceWorkId: string } | undefined> {
+    if (!/^[a-f0-9]{64}$/.test(checksum)) throw new CreatorAssetError('invalid_asset', 'Expected a lowercase SHA-256 checksum.');
+    const row = this.local.database.prepare(`
+      SELECT asset.id AS assetId, source.id AS sourceWorkId
+      FROM ubeeq_creator_library AS asset INDEXED BY ubeeq_creator_asset_checksum
+      JOIN ubeeq_creator_asset_memberships AS member
+        ON member.cell_id = asset.cell_id AND member.tenant_id = asset.tenant_id AND member.asset_id = asset.id
+      JOIN ubeeq_creator_library AS source
+        ON source.cell_id = member.cell_id AND source.tenant_id = member.tenant_id AND source.kind = 'work' AND source.id = member.work_id
+      WHERE asset.cell_id = ? AND asset.tenant_id = ? AND asset.creator_id = ? AND asset.kind = 'asset'
+        AND json_extract(asset.payload, '$.checksumSha256') = ?
+        AND json_extract(asset.payload, '$.tenantId') = asset.tenant_id
+        AND json_extract(asset.payload, '$.creatorId') = asset.creator_id
+        AND json_extract(asset.payload, '$.status') <> 'deleted'
+        AND json_extract(asset.payload, '$.storage.scope') = 'private'
+        AND json_type(asset.payload, '$.sizeBytes') = 'integer'
+        AND json_extract(asset.payload, '$.sizeBytes') BETWEEN 1 AND 9007199254740991
+        AND json_extract(asset.payload, '$.storage.byteLength') = json_extract(asset.payload, '$.sizeBytes')
+        AND json_extract(asset.payload, '$.storage.checksum') = json_extract(asset.payload, '$.checksumSha256')
+        AND length(json_extract(asset.payload, '$.storage.versionId')) > 0
+        AND json_extract(asset.payload, '$.processing.state') = 'completed'
+        AND json_extract(asset.payload, '$.processing.sourceVersionId') = json_extract(asset.payload, '$.storage.versionId')
+        AND source.creator_id = asset.creator_id AND json_extract(source.payload, '$.creatorId') = asset.creator_id
+        AND json_extract(source.payload, '$.status') NOT IN ('deleted', 'archived')
+      ORDER BY asset.id, source.id LIMIT 1
+    `).get(this.local.configuration.cellId, tenantId, creatorId, checksum) as { assetId: string; sourceWorkId: string } | undefined;
+    return row ? { ...row } : undefined;
+  }
   async commitPrimaryAsset(input: CreatorPrimaryAssetCommit): Promise<W> {
     const db = this.local.database, cell = this.local.configuration.cellId;
     db.exec('BEGIN IMMEDIATE');
