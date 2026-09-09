@@ -29,12 +29,15 @@ export interface ProcessedRendition { id: string; sourceVersionId: string; conte
   /** Transient output bytes: workers persist these to object storage, not job/asset JSON. */
   body?: Uint8Array;
 }
-export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
+export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string;
+  /** Admitted source-pixel square crop; callers must select a crop-capable image processor. */
+  squareCrop?: import('./image-crops.js').SquareCropInput
+}): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
 
 /** Selects product-installed processors without teaching the application about vendors or codecs. */
 export class MediaProcessorRegistry implements MediaProcessor {
   constructor(private readonly processors: readonly { supports(input: { contentType: string }): boolean; processor: MediaProcessor }[], private readonly fallback: MediaProcessor) {}
-  async process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string }) {
+  async process(input: Parameters<MediaProcessor['process']>[0]) {
     return (this.processors.find(({ supports }) => supports({ contentType: input.contentType }))?.processor ?? this.fallback).process(input);
   }
 }
