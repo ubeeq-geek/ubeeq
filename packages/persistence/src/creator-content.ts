@@ -62,3 +62,23 @@ export interface CreatorContentAssetCommit<M extends CreatorContentRecords> {
 export class CreatorContentCommitError extends Error {
   readonly code = "revision_conflict";
 }
+
+/** Opaque consumer source identity; contains no provider credentials. */
+export interface CreatorContentSourceReceipt {
+  tenantId: string; creatorId: string; receiptId: string; sourceIdentity: string;
+  workId: string; assetId: string; checksum: string;
+}
+export interface CreatorContentReuseCommit<M extends CreatorContentRecords> {
+  previousRevision: number;
+  work: M['work'] & { revision: number };
+  sourceWorkId: string;
+  /** The previously admitted asset snapshot; commit rejects changes to it. */
+  expectedAsset: M['asset'];
+  attachment: M['attachment'];
+  receipt: CreatorContentSourceReceipt;
+}
+/** Separate capability: callers must not emulate this with independent writes. */
+export interface CreatorContentSourceReuseStore<M extends CreatorContentRecords> {
+  getSourceReceipt(tenantId: string, receiptId: string): Promise<CreatorContentSourceReceipt | null>;
+  commitSourceReuse(input: CreatorContentReuseCommit<M>): Promise<void>;
+}

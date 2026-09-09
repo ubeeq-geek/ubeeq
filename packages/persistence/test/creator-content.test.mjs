@@ -27,6 +27,43 @@ test('memory collection recovery remains opt-in and tenant/creator scoped', asyn
   assert.deepEqual((await store.listCreatorCollections('one', 'creator', { includeDeleted: true })).map(c => c.collectionId), ['active', 'removed']);
 });
 
+test('source reuse receipts commit with membership and preserve removals and later creator edits', async () => {
+  const store = new MemoryCreatorContentStore();
+  const source = work('one', 'source', { revision: 1 }), target = work('one', 'target', { revision: 1 });
+  await store.createWork(source); await store.createWork(target);
+  const asset = { tenantId: 'one', creatorId: 'creator', assetId: 'asset', status: 'ready', checksumSha256: 'a'.repeat(64), storage: { mode: 'hosted', objectKey: 'private-original' } };
+  await store.createCanonicalAsset(asset); await store.attachAssetToWork('one', { workId: 'source', assetId: 'asset', role: 'source', position: 0 });
+  const input = { previousRevision: 1, work: { ...target, revision: 2, primaryAssetId: 'asset' }, sourceWorkId: 'source', expectedAsset: structuredClone(asset),
+    attachment: { workId: 'target', assetId: 'asset', role: 'source', position: 0 },
+    receipt: { tenantId: 'one', creatorId: 'creator', receiptId: 'receipt', sourceIdentity: 'opaque-source', workId: 'target', assetId: 'asset', checksum: asset.checksumSha256 } };
+  const snapshot = () => JSON.stringify(store);
+  const before = snapshot();
+  for (const invalid of [{ ...input, previousRevision: 0 }, { ...input, sourceWorkId: 'missing' },
+    { ...input, receipt: { ...input.receipt, creatorId: 'other' } }, { ...input, expectedAsset: { ...asset, status: 'deleted' } },
+    { ...input, attachment: { ...input.attachment, position: 1 } }]) {
+    await assert.rejects(store.commitSourceReuse(invalid), { code: 'revision_conflict' }); assert.equal(snapshot(), before);
+  }
+  await assert.rejects(store.commitSourceReuse({ ...input, work: { ...input.work, unserializable: () => {} } }));
+  assert.equal(snapshot(), before);
+  await store.commitSourceReuse(input);
+  assert.equal(store.sourceReceipts.length, 1); assert.equal(store.canonicalAssets.length, 1);
+  assert.equal((await store.listCanonicalAssetsByWork('one', 'target')).length, 1);
+  const receipt = await store.getSourceReceipt('one', 'receipt'); receipt.assetId = 'changed';
+  assert.equal((await store.getSourceReceipt('one', 'receipt')).assetId, 'asset');
+  assert.equal(await store.getSourceReceipt('other', 'receipt'), null);
+  const restored = Object.assign(new MemoryCreatorContentStore(), JSON.parse(snapshot()));
+  await restored.updateWork({ ...input.work, title: 'Creator edit', revision: 3 });
+  await restored.detachAssetFromWork('one', 'source', 'asset');
+  await restored.commitSourceReuse(input);
+  assert.equal((await restored.getWork('one', 'target')).title, 'Creator edit');
+  assert.equal((await restored.getWork('one', 'target')).revision, 3);
+  await assert.rejects(restored.commitSourceReuse({ ...input, receipt: { ...input.receipt, sourceIdentity: 'different' } }), { code: 'revision_conflict' });
+  await restored.detachAssetFromWork('one', 'target', 'asset');
+  await assert.rejects(restored.commitSourceReuse(input), { code: 'revision_conflict' });
+  assert.equal((await restored.listCanonicalAssetsByWork('one', 'target')).length, 0);
+  assert.equal(restored.sourceReceipts.length, 1);
+});
+
 test("asset metadata commit rejects stale or foreign writes without partial state", async () => {
   const store = new MemoryCreatorContentStore();
   const original = work("one", "work", { revision: 1 });
