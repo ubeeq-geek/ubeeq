@@ -6,6 +6,49 @@ import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService } from "@ubeeq/core";
 
+test('source import attachment, processing job and caller receipt share commit and rollback across restart', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-import-attachment-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    const store = new LocalCreatorLibraryStore(local, { enqueueImageProcessing: true });
+    const work = { tenantId: 'tenant', creatorId: 'creator', workId: 'work', title: 'Imported work', slug: 'work', slugHistory: ['work'], tags: [], status: 'draft', revision: 1, createdAt: 'now', updatedAt: 'now' };
+    await store.createWork(work);
+    local.database.exec('CREATE TABLE import_receipts (id TEXT PRIMARY KEY)');
+    const asset = { tenantId: 'tenant', creatorId: 'creator', assetId: 'source', status: 'pending', mimeType: 'image/jpeg', sizeBytes: 1,
+      checksumSha256: 'a'.repeat(64), storage: { bucket: 'originals', key: 'source', versionId: 'version', contentType: 'image/jpeg', byteLength: 1, checksum: 'a'.repeat(64), scope: 'private' }, createdAt: 'now', updatedAt: 'now' };
+    const service = new CreatorAssetService(store, async () => true);
+    const attach = async () => {
+      await service.attach('tenant', 'work', asset);
+      local.database.prepare('INSERT INTO import_receipts (id) VALUES (?)').run('source');
+    };
+    const unchanged = async () => {
+      assert.equal(await store.getProcessingAsset('tenant', 'source'), null);
+      assert.deepEqual(await store.listCanonicalAssetsByWork('tenant', 'work'), []);
+      assert.equal((await store.getWork('tenant', 'work')).revision, 1);
+      assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM ubeeq_jobs').get().count, 0);
+      assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM import_receipts').get().count, 0);
+    };
+    await assert.rejects(local.transaction(async () => { await attach(); throw Error('receipt acknowledgement failed'); }), /receipt acknowledgement failed/);
+    await unchanged();
+    local.database.exec("CREATE TRIGGER reject_import_job BEFORE INSERT ON ubeeq_jobs BEGIN SELECT RAISE(ABORT, 'queue unavailable'); END");
+    await assert.rejects(local.transaction(async () => {
+      await assert.rejects(attach(), /queue unavailable/);
+      // Catching a nested commit failure must not make a partial import committable.
+    }), /rollback-only/);
+    await unchanged(); local.database.exec('DROP TRIGGER reject_import_job');
+    await local.transaction(attach);
+    local.database.close(); local = new LocalSqliteDatabase(config);
+    const restored = new LocalCreatorLibraryStore(local);
+    assert.equal((await restored.getWork('tenant', 'work')).revision, 2);
+    assert.equal((await restored.getProcessingAsset('tenant', 'source')).status, 'pending');
+    assert.equal((await restored.listCanonicalAssetsByWork('tenant', 'work')).length, 1);
+    assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM import_receipts').get().count, 1);
+    const jobs = await new LocalSqliteJobQueue(local).list({ cellId: 'cell', limit: 10 });
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].state, 'queued'); assert.equal(jobs[0].type, 'creator-asset.process');
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('collection cover writes atomically enforce asset scope and reject a post-read deletion', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-covers-'));
   const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
