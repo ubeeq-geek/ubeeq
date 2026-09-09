@@ -49,11 +49,20 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const works = array(manifest.works, 'works'), collections = array(manifest.collections, 'collections');
   const accounts = array(manifest.integrationAccounts, 'integration accounts');
   const retained = manifest.retainedAssets === undefined ? [] : array(manifest.retainedAssets, 'retained assets');
+  const sourceFiles = manifest.sourceFiles === undefined ? [] : array(manifest.sourceFiles, 'source files');
+  const sourceFileIds = new Set<string>();
   const workIds = new Set<string>(), assetIds = new Set<string>(), collectionIds = new Set<string>();
   const assetRecords = new Map<string, string>();
   const add = (set: Set<string>, value: unknown, name: string) => {
     const key = id(value, name); if (set.has(key)) throw new Error(`Duplicate ${name} identity.`); set.add(key); return key;
   };
+  for (const value of sourceFiles) {
+    const file = object(value, 'source file');
+    if (file.creatorId !== creatorId || (file.tenantId !== undefined && file.tenantId !== tenantId)) throw new Error('Foreign source-file ownership.');
+    add(sourceFileIds, file.fileId, 'source file');
+    if (['sourceKind', 'mimeType', 'storageKey', 'createdAt', 'updatedAt'].some(key => typeof file[key] !== 'string' || !file[key].trim()) ||
+      (file.sizeBytes !== undefined && (!Number.isFinite(file.sizeBytes) || file.sizeBytes < 0))) throw new Error('Invalid source-file metadata.');
+  }
   for (const entry of works) {
     const work = object(object(entry, 'work envelope').work, 'work'); owned(work, 'work');
     add(workIds, work.workId, 'work');
@@ -110,5 +119,6 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       accountStack.push(child);
     }
   }
-  return { manifest, creatorId, tenantId, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size } };
+  return { manifest, creatorId, tenantId, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
+    ...(manifest.sourceFiles === undefined ? {} : { sourceFiles: sourceFileIds.size }) } };
 };

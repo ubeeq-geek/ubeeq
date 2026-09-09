@@ -13,6 +13,11 @@ export class LocalCreatorSourceFileStore<F extends CreatorSourceFileRecord> impl
       VALUES (?, ?, 'source_file', ?, ?, ?)`).run(this.local.configuration.cellId, this.tenantId,
         file.fileId, file.creatorId, JSON.stringify(file));
   }
+  /** Tenant-wide collision lookup; never returns another creator's metadata. */
+  async hasSourceFileId(fileId: string): Promise<boolean> {
+    return Boolean(this.local.database.prepare("SELECT 1 FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = 'source_file' AND id = ?")
+      .get(this.local.configuration.cellId, this.tenantId, fileId));
+  }
   async listCreatorSourceFiles(creatorId: string, request: CreatorSourceFilePageRequest): Promise<CreatorSourceFilePage<F>> {
     const scope = [this.local.configuration.cellId, this.tenantId, creatorId];
     if (!creatorId.trim() || !Number.isSafeInteger(request.limit) || request.limit < 1 || request.limit > 100)
