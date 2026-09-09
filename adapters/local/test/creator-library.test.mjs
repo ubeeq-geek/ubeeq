@@ -5,6 +5,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService, CreatorExistingAssetService } from "@ubeeq/core";
+test('shared upload service appends after sparse local positions and survives restart', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-sparse-upload-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCreatorLibraryStore(local);
+    await store.createWork({ tenantId: 'tenant', creatorId: 'creator', workId: 'work', title: 'Work', slug: 'work', slugHistory: [], tags: [], status: 'draft', revision: 1, createdAt: 'now', updatedAt: 'now' });
+    const asset = id => ({ tenantId: 'tenant', creatorId: 'creator', assetId: id, status: 'ready', mimeType: 'image/png', sizeBytes: 1, checksumSha256: 'a'.repeat(64),
+      storage: { bucket: 'originals', key: id, versionId: 'v1', contentType: 'image/png', byteLength: 1, checksum: 'a'.repeat(64), scope: 'private' }, createdAt: 'now', updatedAt: 'now' });
+    await new CreatorAssetService(store, async () => true).attach('tenant', 'work', asset('first'));
+    local.database.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE kind = 'work_assets' AND id = 'work'")
+      .run(JSON.stringify([{ workId: 'work', assetId: 'first', role: 'primary', position: 5 }]));
+    const result = await new CreatorAssetService(store, async () => true).attach('tenant', 'work', asset('second'));
+    assert.equal(result.attachment.position, 6); assert.equal(result.work.primaryAssetId, 'first');
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCreatorLibraryStore(local);
+    assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'work')).map(item => item.attachment.position), [5, 6]);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('checksum lookup indexes current private custody and upgrades existing attachment records', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-checksum-lookup-'));
