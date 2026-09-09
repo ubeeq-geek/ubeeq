@@ -14,6 +14,7 @@ export interface JobQueue {
   enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>>;
   lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined>;
   complete(input: { id: string; leaseToken: string }): Promise<void>;
+  /** Release a current lease; exhausted attempt budgets dead-letter instead of scheduling another automatic attempt. */
   retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void>;
   deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void>;
   cancel(input: { id: string; reason?: string }): Promise<void>;
@@ -51,6 +52,16 @@ export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "
     try { await queue.recover({ id: target.id }); } catch { rejected = true; }
     if (!rejected || (await queue.get(target.id))?.state !== state) throw new Error(`Job queue contract violation: recovery revived ${state} work.`);
   }
+  const bounded = await queue.enqueue({ cellId: 'contract-cell', type: 'contract-budget', payload: {}, idempotencyKey: `${idempotencyKey}:budget`, maxAttempts: 2 });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const claimed = await queue.lease({ cellId: 'contract-cell', types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' });
+    if (!claimed || claimed.job.id !== bounded.id || claimed.job.attempt !== attempt) throw new Error('Job queue contract violation: retry budget did not retain claim count.');
+    const error = { code: 'temporary', message: 'bounded failure' };
+    await queue.retry({ id: bounded.id, leaseToken: claimed.leaseToken, error, retryAt: new Date(Date.now() - 1_000).toISOString() });
+    const stored = await queue.get(bounded.id);
+    if (stored?.state !== (attempt === 2 ? 'dead_lettered' : 'retry_scheduled') || stored.attempt !== attempt || stored.lastError?.code !== error.code || stored.leaseExpiresAt) throw new Error('Job queue contract violation: exhausted retries must retain the error and dead-letter without another attempt.');
+  }
+  if (await queue.lease({ cellId: 'contract-cell', types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' })) throw new Error('Job queue contract violation: an exhausted job was automatically leased again.');
 };
 
 export class ForeignCellJobError extends Error {

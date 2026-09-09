@@ -9,6 +9,20 @@ import { verifyPasswordIdentityContract } from "@ubeeq/auth";
 
 const connectionString = process.env.UBEEQ_POSTGRES_TEST_URL;
 
+test('PostgreSQL acknowledgements condition retry budgets and lease expiry in one write', async () => {
+  const calls = []; let rowCount = 1;
+  const queue = new PostgresJobQueue({ pool: { query: async (sql, parameters) => { calls.push({ sql, parameters }); return { rowCount }; } } });
+  const input = { id: 'job', leaseToken: 'lease', error: { code: 'temporary', message: 'retry' }, retryAt: '2026-01-01T00:00:00.000Z' };
+  await queue.retry(input);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /CASE WHEN \$1 = 'retry_scheduled' AND attempt >= max_attempts THEN 'dead_lettered' ELSE \$1 END/);
+  assert.match(calls[0].sql, /AND state = 'leased' AND lease_token = \$5 AND lease_expires_at > NOW\(\)/);
+  assert.deepEqual(calls[0].parameters, ['retry_scheduled', JSON.stringify(input.error), input.retryAt, input.id, input.leaseToken]);
+  rowCount = 0;
+  for (const method of ['retry', 'complete', 'deadLetter']) await assert.rejects(queue[method](input), /no longer valid/);
+  assert.equal(calls.length, 4);
+});
+
 test("PostgreSQL repositories and queue satisfy shared durable contracts", { skip: !connectionString }, async () => {
   const database = new PostgresDatabase({ connectionString, cellId: "cell-a", applicationName: "ubeeq-machine-contract" });
   await database.migrate();
