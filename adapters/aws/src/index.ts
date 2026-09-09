@@ -323,13 +323,38 @@ export class AwsJobQueue implements JobQueue {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
     const candidates = await this.jobs.list({ limit: 100 });
     const timestamp = Date.now();
-    const candidate = candidates.items.find((job) => job.cellId === input.cellId && (job.state === "queued" || job.state === "retry_scheduled") && Date.parse(job.availableAt) <= timestamp && (!input.types || input.types.includes(job.type)));
-    if (!candidate) return undefined;
-    const leaseToken = randomUUID();
+    for (const candidate of candidates.items) {
+      if (candidate.cellId !== input.cellId || (input.types?.length && !input.types.includes(candidate.type))) continue;
+      const expired = candidate.state === 'leased' && Boolean(candidate.leaseExpiresAt) && Date.parse(candidate.leaseExpiresAt!) <= timestamp;
+      const available = ['queued', 'retry_scheduled'].includes(candidate.state) && Date.parse(candidate.availableAt) <= timestamp;
+      if (!expired && !available) continue;
+      const leaseToken = randomUUID();
+      try {
+        if (expired && candidate.attempt >= candidate.maxAttempts) {
+          await this.claimOrExpire(candidate, timestamp, true, { state: 'dead_lettered', leaseExpiresAt: undefined, lastError: { code: 'lease_attempts_exhausted', message: 'Worker leases expired through the configured attempt budget.' } });
+          continue;
+        }
+        const leased = await this.claimOrExpire(candidate, timestamp, expired, { state: 'leased', attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
+        return { job: leased as DurableJob<TPayload>, leaseToken };
+      } catch (error) { if (!(error instanceof OptimisticConcurrencyError)) throw error; }
+    }
+    return undefined;
+  }
+  private async claimOrExpire(job: AwsJobRecord, timestamp: number, expired: boolean, change: Partial<AwsJobRecord>): Promise<AwsJobRecord> {
+    const currentTime = new Date(timestamp).toISOString();
+    const value = { ...job, ...change, revision: job.revision + 1, updatedAt: currentTime };
     try {
-      const leased = await this.jobs.update(candidate.id, candidate.revision, { state: "leased", attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
-      return { job: leased as DurableJob<TPayload>, leaseToken };
-    } catch (error) { if (error instanceof OptimisticConcurrencyError) return undefined; throw error; }
+      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+        Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
+        ConditionExpression: `attribute_exists(pk) AND #revision = :revision AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now`,
+        ExpressionAttributeNames: { '#revision': 'revision', '#value': 'value', '#cell': 'cellId', '#state': 'state', '#due': expired ? 'leaseExpiresAt' : 'availableAt' },
+        ExpressionAttributeValues: { ':revision': job.revision, ':cell': job.cellId, ':state': job.state, ':now': currentTime }
+      }));
+      return value;
+    } catch (error) {
+      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') throw new OptimisticConcurrencyError(job.id, job.revision);
+      throw error;
+    }
   }
   async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "completed", leaseExpiresAt: undefined }); }
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.updateLeased(job, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
