@@ -306,3 +306,4 @@ export { FlickrClient, type FlickrOAuthCredentials, type FlickrInventoryPage, ty
 export { normalizeFlickrPhoto, normalizeFlickrProviderPhoto, flickrTextContent, type FlickrManifestPhoto } from './flickr-metadata.js';
 export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewayOptions, type SmugMugOAuthCredential } from './smugmug-gateway.js';
 export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugInventoryPage, SmugMugGateway } from './smugmug-contracts.js';
+export * from './smugmug-migration.js';
