@@ -128,6 +128,29 @@ export interface CreatorAssetPort<W extends CreatorAssetWork, A extends CreatorA
   /** All three records commit atomically, conditioned on the previous Work revision. */
   commitAssetAttachment(input: { previousRevision: number; work: W; asset: A; attachment: CreatorAssetAttachment }): Promise<void>;
 }
+export interface CreatorExistingAssetCommit extends CreatorWorkScope {
+  sourceWorkId: string; workId: string; assetId: string; checksum: string;
+  expectedRevision: number; updatedAt: string;
+}
+export interface CreatorExistingAssetPort<W extends CreatorAssetWork> extends CreatorWorkPort<W> {
+  /** Recheck source custody and atomically attach without replacing the asset. */
+  commitExistingAssetAttachment(input: CreatorExistingAssetCommit): Promise<W>;
+}
+export class CreatorExistingAssetService<W extends CreatorAssetWork> {
+  private readonly works: CreatorWorkService<W>;
+  constructor(private readonly store: CreatorExistingAssetPort<W>, authorize: (scope: CreatorWorkScope) => Promise<boolean>, private readonly now: () => string = () => new Date().toISOString()) {
+    this.works = new CreatorWorkService(store, authorize, now);
+  }
+  async attach(tenantId: string, workId: string, sourceWorkId: string, assetId: string, checksum: string): Promise<W> {
+    const target = await this.works.get(tenantId, workId);
+    const source = await this.works.get(tenantId, sourceWorkId);
+    if (source.creatorId !== target.creatorId || !assetId || !/^[a-f0-9]{64}$/.test(checksum) ||
+      [source.status, target.status].some(status => status === 'deleted' || status === 'archived')) {
+      throw new CreatorAssetError('invalid_asset', 'Existing asset source does not match its target Work.');
+    }
+    return this.store.commitExistingAssetAttachment({ tenantId, creatorId: target.creatorId, workId, sourceWorkId, assetId, checksum, expectedRevision: target.revision, updatedAt: this.now() });
+  }
+}
 export class CreatorAssetError extends Error {
   constructor(public readonly code: "invalid_asset" | "not_found" | "asset_in_use", message: string) { super(message); this.name = "CreatorAssetError"; }
 }
