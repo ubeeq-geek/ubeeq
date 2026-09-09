@@ -12,6 +12,24 @@ const setup = async (materialize = async () => {}) => {
   return { repository, service: new FlickrInventoryService(repository, materialize) };
 };
 
+test('inventory persists discovered originals across appended pages and permits source confirmation', async () => {
+  const { repository, service } = await setup();
+  const initial = { ...connection, capabilities: { inventory: true, originals: false, exif: true } };
+  await repository.putConnection(initial);
+  await service.inventory(initial, [{ ...photo('reference'), originalAvailable: false }], '2');
+  assert.equal((await repository.getConnection('connection')).capabilities.originals, false);
+  await service.inventory(initial, [photo('source')], '3', [], true);
+  assert.deepEqual((await repository.getConnection('connection')).capabilities,
+    { inventory: true, originals: true, exif: true });
+  const complete = await service.inventory(initial, [{ ...photo('last'), originalAvailable: false }], undefined, [], true);
+  assert.equal((await repository.getConnection('connection')).capabilities.originals, true);
+  const confirmed = await service.confirm(complete, 'SELECTED_SOURCE_MIGRATION', ['source'], true);
+  assert.equal(confirmed.items[0].transferStatus, 'QUEUED');
+  const current = await repository.getConnection('connection');
+  await service.inventory(current, [{ ...photo('reference'), originalAvailable: false }]);
+  assert.equal((await repository.getConnection('connection')).capabilities.originals, true);
+});
+
 test('inventory appends pages without marking absent earlier photos missing and retains canonical mappings', async () => {
   const { repository, service } = await setup();
   const first = await service.inventory(connection, [photo('a')], '2');

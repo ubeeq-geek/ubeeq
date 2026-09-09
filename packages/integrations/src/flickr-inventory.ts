@@ -50,7 +50,9 @@ export class FlickrInventoryService {
       createdAt: previous?.createdAt || now, updatedAt: now
     };
     await this.repository.putMigration(migration);
-    await this.repository.putConnection({ ...connection, lastInventoryAt: now });
+    await this.repository.putConnection({ ...connection, lastInventoryAt: now,
+      capabilities: { ...connection.capabilities,
+        originals: connection.capabilities.originals || mergedPhotos.some(photo => photo.originalAvailable) } });
     return migration;
   }
 
