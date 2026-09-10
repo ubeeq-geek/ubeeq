@@ -23,3 +23,23 @@ the same cell retains the existing job; payload equivalence, notification outbox
 recovery and durable receipts remain separate acceptance work. Tests cover the
 ambiguous pair, matching/foreign legacy records and input capture with mocked
 DynamoDB/SQS, not live service qualification.
+
+## Retrying availability notifications
+
+Enqueue retries for a matching queued or retry-scheduled job now re-send its
+availability notification without rewriting the job or accepting changed retry
+payloads. This lets a producer retry recover a failed notification after the
+durable write. Leased and terminal jobs are returned without notification or
+state changes. EventBridge per-entry failures are errors even when the API call
+itself succeeds; the producer can retry them too.
+
+Notifications are at-least-once wake-up hints, not permission to execute. Workers
+must re-read and claim through the existing lease/due-time checks. A state change
+between the read and notification can produce an unnecessary hint. If SQS succeeds
+but EventBridge fails, retry can duplicate the SQS hint. The original payload and
+job identity remain unchanged.
+
+This is producer-retry recovery, not an atomic outbox. A producer that disappears
+after the durable write may still leave notification work outstanding; durable
+discovery/reconciliation remains required. No live notification was sent during
+the mocked contract tests or this implementation change.
