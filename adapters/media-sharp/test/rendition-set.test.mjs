@@ -6,6 +6,33 @@ import { SharpImageRenditionProcessor } from '../dist/index.js';
 const source = (width, height) => sharp({ create: { width, height, channels: 3, background: '#8844aa' } }).png().toBuffer();
 const input = bytes => ({ assetId: 'asset', sourceVersionId: 'version', contentType: 'image/png', source: bytes });
 
+test('explicit square-only selection preserves recipes, crop and lineage without unwanted fitted outputs', async () => {
+  const request = { ...input(await source(80, 40)), squareCrop: { x: 60, y: 0, size: 20 } };
+  const complete = await new SharpImageRenditionProcessor().process(request);
+  const expected = complete.renditions.slice(4);
+  const selected = ['square1024', 'square256', 'square512'];
+  const processor = new SharpImageRenditionProcessor({ renditionNames: selected,
+    maxOutputBytes: expected.reduce((sum, item) => sum + item.byteLength, 0) });
+  selected.splice(0, selected.length, 'w320');
+  const result = await processor.process(request);
+  assert.deepEqual(result.renditions, expected);
+  assert.deepEqual(result.metadata, complete.metadata);
+  assert.equal(result.measuredUnits, 3);
+  const fitted = await new SharpImageRenditionProcessor({ renditionNames: ['w320'] }).process(request);
+  assert.deepEqual(fitted.renditions, complete.renditions.slice(0, 1));
+  assert.equal(fitted.measuredUnits, 1);
+});
+
+test('invalid recipe selection and resource budget violations reject before returning selected output', async () => {
+  for (const renditionNames of [[], ['unknown'], ['w320', 'w320'], null, 'square256', [1]]) {
+    assert.throws(() => new SharpImageRenditionProcessor({ renditionNames }), /Invalid image rendition selection/);
+  }
+  const request = input(await source(20, 20));
+  for (const limits of [{ maxInputPixels: 100 }, { maxSourceBytes: 1 }, { maxOutputBytes: 1 }]) {
+    await assert.rejects(new SharpImageRenditionProcessor({ renditionNames: ['square256'], ...limits }).process(request), /budget|pixel limit/);
+  }
+});
+
 test('seven rendition recipes preserve fitted dimensions, square crops and source lineage', async () => {
   const result = await new SharpImageRenditionProcessor().process(input(await source(2000, 1000)));
   assert.equal(result.renditions.length, 7);
