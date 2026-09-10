@@ -1,4 +1,5 @@
 import type { CreatorContentRecords, CreatorContentStore } from "./creator-content.js";
+import { CreatorContentListBudgetError, creatorContentListBudget, type CreatorContentListOptions } from './creator-content.js';
 import { CreatorContentCommitError, type CreatorContentAssetCommit } from "./creator-content.js";
 import type { CreatorContentSourceReceipt, CreatorContentReuseCommit, CreatorContentSourceReuseStore } from './creator-content.js';
 
@@ -74,9 +75,17 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
     this.canonicalAssets = nextAssets;
     this.workAssets = nextAttachments;
   }
-  async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<M['work'][]> {
-    return this.works
-      .filter((work) => work.tenantId === tenantId && work.creatorId === creatorId && (options.includeDeleted === true || work.status !== 'deleted'))
+  private creatorList<T extends { tenantId: string; creatorId: string; status: string }>(records: readonly T[], tenantId: string, creatorId: string, options: CreatorContentListOptions): T[] {
+    const budget = creatorContentListBudget(options), result: T[] = []; let evaluated = 0;
+    for (const record of records) {
+      if (record.tenantId !== tenantId || record.creatorId !== creatorId) continue;
+      if (++evaluated > budget) throw new CreatorContentListBudgetError();
+      if (options.includeDeleted === true || record.status !== 'deleted') result.push(record);
+    }
+    return result;
+  }
+  async listWorksByCreator(tenantId: string, creatorId: string, options: CreatorContentListOptions = {}): Promise<M['work'][]> {
+    return this.creatorList(this.works, tenantId, creatorId, options)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
@@ -173,9 +182,8 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
     this.publicationIntents = this.publicationIntents.filter((intent) => !(intent.tenantId === tenantId && intent.publicationIntentId === publicationIntentId));
   }
 
-  async listCreatorCollections(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<M['collection'][]> {
-    return this.creatorCollections
-      .filter((collection) => collection.tenantId === tenantId && collection.creatorId === creatorId && (options.includeDeleted === true || collection.status !== 'deleted'))
+  async listCreatorCollections(tenantId: string, creatorId: string, options: CreatorContentListOptions = {}): Promise<M['collection'][]> {
+    return this.creatorList(this.creatorCollections, tenantId, creatorId, options)
       .sort((a, b) => a.title.localeCompare(b.title));
   }
 
