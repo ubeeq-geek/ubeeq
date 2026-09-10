@@ -23,6 +23,14 @@ for (const Client of [NodeClient, BrowserClient]) test(`profile image client sna
   assert.equal(calls[0].options.body, file); assert.equal(calls[0].options.headers.authorization, 'Bearer test-token');
   assert.equal(calls[0].options.headers['content-type'], 'image/png');
   assert.match(calls[0].url, /creator%2Fone\/branding\/profile-image/);
+  const retainedCrop = { x: 2, y: 3, size: 4 };
+  const recropping = client.recropProfileImage('creator/one', 2, retainedCrop); retainedCrop.x = 999;
+  await recropping;
+  const recropRequest = calls.at(-1), recropQuery = new URL(recropRequest.url, 'http://localhost').searchParams;
+  assert.equal(recropRequest.options.method, 'PATCH'); assert.equal(recropRequest.options.body, undefined);
+  assert.equal(recropRequest.options.headers.authorization, 'Bearer test-token');
+  assert.deepEqual(JSON.parse(recropQuery.get('crop')), { x: 2, y: 3, size: 4 });
+  assert.equal(recropQuery.has('altText'), false);
   await client.removeProfileImage('creator/one', 2); assert.equal(calls.at(-1).options.method, 'DELETE');
   assert.equal(calls.at(-1).options.body, undefined);
   assert.equal((await client.profileImagePreview('creator/one')).type, 'image/jpeg');
