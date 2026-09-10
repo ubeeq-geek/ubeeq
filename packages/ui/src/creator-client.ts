@@ -1,5 +1,10 @@
 /** Same-origin creator API client. Credentials are kept in memory, never persisted. */
 import type { WorkKind, CreatorAssetRegenerationRequest } from '@ubeeq/core';
+export interface CreatorCoverImageControls {
+  focalPoint?: { x: number; y: number };
+  crops?: Readonly<Record<string, { x: number; y: number; width: number; height: number }>>;
+  altText?: string;
+}
 export class CreatorClient {
   private token?: string;
   constructor(private readonly request: typeof fetch = fetch, private readonly base = '/api') {}
@@ -24,6 +29,33 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  private coverImagePath(creatorId: string, expectedRevision?: number, controls?: CreatorCoverImageControls) {
+    const query = new URLSearchParams();
+    if (expectedRevision !== undefined) query.set('expectedRevision', String(expectedRevision));
+    if (controls?.focalPoint !== undefined) query.set('focalPoint', JSON.stringify(controls.focalPoint));
+    if (controls?.crops !== undefined) query.set('crops', JSON.stringify(controls.crops));
+    if (controls?.altText !== undefined) query.set('altText', controls.altText);
+    return `/studio/creators/${encodeURIComponent(creatorId)}/branding/cover-image${query.size ? `?${query}` : ''}`;
+  }
+  coverImage(creatorId: string) { return this.call(this.coverImagePath(creatorId)); }
+  removeCoverImage(creatorId: string, expectedRevision: number) { return this.call(this.coverImagePath(creatorId, expectedRevision), 'DELETE'); }
+  recropCoverImage(creatorId: string, expectedRevision: number, controls: CreatorCoverImageControls) {
+    return this.call(this.coverImagePath(creatorId, expectedRevision, controls), 'PATCH');
+  }
+  async saveCoverImage(creatorId: string, expectedRevision: number, file: Blob, controls: CreatorCoverImageControls = {}) {
+    const response = await this.request(`${this.base}${this.coverImagePath(creatorId, expectedRevision, controls)}`, {
+      method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
+    const result = await response.json();
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error(result.message || 'Cover image save failed.'); }
+    return result;
+  }
+  async coverImagePreview(creatorId: string, variant: string): Promise<Blob> {
+    const response = await this.request(`${this.base}${this.coverImagePath(creatorId)}/${encodeURIComponent(variant)}`,
+      { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error('Cover image preview unavailable.'); }
+    if (response.headers.get('content-type') !== 'image/jpeg') throw new Error('Unexpected cover image preview format.');
+    return response.blob();
+  }
   profileImage(creatorId: string) { return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image`); }
   recropProfileImage(creatorId: string, expectedRevision: number, squareCrop: NonNullable<CreatorAssetRegenerationRequest['squareCrop']>, altText?: string) {
     const query = new URLSearchParams({ expectedRevision: String(expectedRevision), crop: JSON.stringify(squareCrop) });
