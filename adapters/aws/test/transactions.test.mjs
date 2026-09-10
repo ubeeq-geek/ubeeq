@@ -142,3 +142,47 @@ test('caught local revision conflicts abort companion writes rather than committ
     assert.equal(f.rows.get('federationActors#versioned').value.label, 'original');
   }
 });
+
+test('nested callbacks share one batch and a caught nested failure poisons the outer transaction', async () => {
+  const f = fixture();
+  await f.repositories.transaction(async outer => {
+    await f.repositories.federationActors.create({ id: 'outer' }, { transaction: outer });
+    await f.repositories.transaction(async inner => {
+      assert.equal(inner.id, outer.id);
+      assert.equal((await f.repositories.federationActors.get('outer', { transaction: inner })).id, 'outer');
+      await f.repositories.federationActors.create({ id: 'inner' }, { transaction: inner });
+    });
+  });
+  assert.equal(f.commands.filter(command => command.constructor.name === 'TransactWriteCommand').length, 1);
+  const before = f.commands.length;
+  await assert.rejects(f.repositories.transaction(async () => {
+    await f.repositories.federationActors.create({ id: 'companion' });
+    await assert.rejects(f.repositories.transaction(async () => {
+      await f.repositories.federationActors.create({ id: 'nested' });
+      throw new Error('nested failure');
+    }), /nested failure/);
+  }), /aborted/);
+  assert.equal(f.commands.length, before);
+  assert.equal(f.rows.has('federationActors#companion'), false);
+  assert.equal(f.rows.has('federationActors#nested'), false);
+});
+
+test('detached asynchronous work cannot reopen an ended transaction or send standalone writes', async () => {
+  for (const nested of [false, true]) {
+    const f = fixture(); let release, detached;
+    const gate = new Promise(resolve => { release = resolve; });
+    await f.repositories.transaction(async () => {
+      await f.repositories.federationActors.create({ id: 'committed' });
+      detached = (async () => {
+        await gate;
+        if (nested) return f.repositories.transaction(async () => f.repositories.federationActors.create({ id: 'late' }));
+        return f.repositories.federationActors.create({ id: 'late' });
+      })();
+    });
+    const rejected = assert.rejects(detached, /context has ended/);
+    release(); await rejected;
+    assert.equal(f.rows.size, 1);
+    assert.equal(f.rows.has('federationActors#late'), false);
+    assert.equal(f.commands.filter(command => command.constructor.name === 'TransactWriteCommand').length, 1);
+  }
+});
