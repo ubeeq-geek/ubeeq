@@ -130,6 +130,8 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       accountStack.push(child);
     }
   }
-  return { manifest, creatorId, tenantId, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
+  return { manifest, creatorId, tenantId,
+    relatedIds: { publications: [...publicationIds], publicationIntents: [...intentIds], integrationAccounts: [...accountIds] },
+    counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
     ...(manifest.sourceFiles === undefined ? {} : { sourceFiles: sourceFileIds.size }) } };
 };

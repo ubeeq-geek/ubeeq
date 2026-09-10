@@ -36,3 +36,22 @@ test('invalid target inventories and malformed source graphs cannot become plans
   }
   assert.throws(() => planCreatorContentImport('{}', inventory), /schema/);
 });
+
+test('related IDs require explicit inventory and report collisions without returning target data', () => {
+  const manifest = JSON.parse(source());
+  manifest.works[0].publications = [{ publicationId: 'receipt', workId: 'work-0' }];
+  manifest.works[0].publicationIntents = [{ id: 'intent', workId: 'work-0' }];
+  manifest.integrationAccounts = [{ externalAccountId: 'account', creatorId: 'source-creator' }];
+  const json = JSON.stringify(manifest);
+  const inventory = { targetTenantId: 'target', targetCreatorId: 'creator', existingWorkIds: [], existingAssetIds: [], existingCollectionIds: [],
+    existingPublicationIds: ['receipt'], existingPublicationIntentIds: ['intent'], existingIntegrationAccountIds: ['account'] };
+  for (const key of ['existingPublicationIds', 'existingPublicationIntentIds', 'existingIntegrationAccountIds']) {
+    const incomplete = { ...inventory }; delete incomplete[key];
+    assert.throws(() => planCreatorContentImport(json, incomplete), /collision inventory/);
+  }
+  const plan = planCreatorContentImport(json, inventory);
+  assert.deepEqual(plan.conflicts, [{ resource: 'publication', id: 'receipt', reason: 'id_exists' },
+    { resource: 'publicationIntent', id: 'intent', reason: 'id_exists' }, { resource: 'integrationAccount', id: 'account', reason: 'id_exists' }]);
+  assert.equal(plan.executionAuthorized, false);
+  assert.equal(JSON.stringify(plan).includes('https://untrusted'), false);
+});
