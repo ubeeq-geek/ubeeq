@@ -9,7 +9,7 @@ const migration = () => ({ migrationId: 'm', connectionId: 'c', userId: 'u', mod
 const source = { objectKey: 'private/source', checksumSha256: 'checksum', mimeType: 'image/jpeg', sizeBytes: 10, scanOutcome: 'pending' };
 const setup = async (overrides = {}) => {
   const repository = new InMemoryFlickrRepository();
-  await repository.putConnection({ connectionId: 'c', userId: 'u', creatorId: 'creator', accountId: 'account', state: 'CONNECTED' });
+  await repository.putConnection({ connectionId: 'c', userId: 'u', creatorId: 'creator', accountId: 'account', state: 'CONNECTED', encryptedTokenRef: 'vault-original' });
   const calls = { transfer: 0, attach: 0 };
   const ports = { canManageCreator: async () => true,
     transfer: async () => { calls.transfer++; return source; },
@@ -111,6 +111,39 @@ test('raw transfer, scanner and attachment errors never enter saved items or aud
     assert.equal(result.auditEvents.at(-1).details.errorCode, 'FLICKR_SOURCE_TRANSFER_FAILED');
     assert.doesNotMatch(JSON.stringify(await repository.getMigration('m')), /signature=secret|storage\/private-key|private\.invalid/);
   }
+});
+
+test('credential rotation during transfer or quarantine scanning aborts before attachment and checkpoint', async () => {
+  for (const stage of ['transfer', 'scan']) {
+    const value = await setup();
+    const rotate = async () => {
+      const current = await value.repository.getConnection('c');
+      await value.repository.putConnection({ ...current, encryptedTokenRef: 'vault-rotated' });
+    };
+    value.ports.transfer = async () => {
+      value.calls.transfer++;
+      if (stage === 'transfer') await rotate();
+      return { ...source, scanOutcome: stage === 'transfer' ? 'clean' : 'pending' };
+    };
+    value.ports.scanQuarantine = async () => { await rotate(); return 'clean'; };
+    await assert.rejects(value.workflow.run(migration()), FlickrSourceAdmissionError);
+    assert.equal(value.calls.transfer, 1); assert.equal(value.calls.attach, 0);
+    assert.equal(await value.repository.getMigration('m'), undefined);
+  }
+});
+
+test('attachment callbacks cannot mutate the expected credential fence to conceal rotation', async () => {
+  const value = await setup({ scanQuarantine: async () => 'clean' });
+  value.ports.attachCleanSource = async connection => {
+    connection.encryptedTokenRef = 'vault-rotated';
+    await value.repository.putConnection(connection);
+    return false;
+  };
+  await assert.rejects(value.workflow.run(migration()), FlickrSourceAdmissionError);
+  assert.equal(await value.repository.getMigration('m'), undefined);
+  // A new batch captures the new reference; cross-batch consent binding is separate.
+  value.ports.attachCleanSource = async () => false;
+  assert.equal((await value.workflow.run(migration())).status, 'COMPLETE');
 });
 
 test('only exact allowlisted codes select unavailable or transient retry outcomes', async () => {
