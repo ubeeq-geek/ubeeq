@@ -23,7 +23,7 @@ if (args.includes('-show_format')) {
   else process.stdout.write(JSON.stringify({ format: { duration: '1' }, args }));
 } else fs.writeFileSync(args.at(-1), JSON.stringify(args));
 `, { mode: 0o700 });
-    const tools = new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, timeoutMs: 500 });
+    const tools = new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, timeoutMs: 5000 });
     const input = join(root, 'input ; literal.mp4'), output = join(root, 'output ; literal.jpg');
     await writeFile(input, 'ok');
     const probed = await tools.probe(input);
@@ -39,11 +39,19 @@ if (args.includes('-show_format')) {
     assert.equal(configured[configured.indexOf('-vf') + 1], 'scale=min(1280\\,iw):-2');
     for (const width of [0, -1, 1.5, NaN, Infinity]) assert.throws(() => new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, maxFrameWidth: width }), /Frame width/);
     await assert.rejects(tools.probe('https://example.test/input'), /absolute local/);
+    await tools.encodeAudio(input, output, { streamIndex: 3, maxDurationSeconds: 12.5, maxOutputBytes: 100000 });
+    const audio = JSON.parse(await readFile(output, 'utf8'));
+    for (const [option, value] of [['-protocol_whitelist', 'file'], ['-map', '0:3'], ['-t', '12.5'], ['-fs', '100000'], ['-c:a', 'libmp3lame'], ['-map_metadata', '-1'], ['-map_metadata:s:a', '-1'], ['-map_chapters', '-1'], ['-ac', '2'], ['-ar', '44100']]) assert.equal(audio[audio.indexOf(option) + 1], value);
+    for (const option of ['-vn', '-sn', '-dn', '-n']) assert.ok(audio.includes(option));
+    for (const change of [{ streamIndex: -1 }, { streamIndex: 0.5 }, { maxDurationSeconds: Infinity }, { maxOutputBytes: 0 }]) await assert.rejects(tools.encodeAudio(input, output, { streamIndex: 0, maxDurationSeconds: 1, maxOutputBytes: 100, ...change }), /limits/);
+    await assert.rejects(tools.encodeAudio('https://example.test/audio', output, { streamIndex: 0, maxDurationSeconds: 1, maxOutputBytes: 100 }), /absolute local/);
     await assert.rejects(tools.extractFrame(input, output, -1), /timestamp/);
-    for (const mode of ['invalid', 'fail', 'wait']) {
+    for (const mode of ['invalid', 'fail']) {
       await writeFile(input, mode);
       await assert.rejects(tools.probe(input));
     }
+    await writeFile(input, 'wait');
+    await assert.rejects(new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, timeoutMs: 500 }).probe(input));
     assert.throws(() => new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, timeoutMs: 0 }), /timeout/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
