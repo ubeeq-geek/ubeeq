@@ -62,6 +62,19 @@ export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "
     if (stored?.state !== (attempt === 2 ? 'dead_lettered' : 'retry_scheduled') || stored.attempt !== attempt || stored.lastError?.code !== error.code || stored.leaseExpiresAt) throw new Error('Job queue contract violation: exhausted retries must retain the error and dead-letter without another attempt.');
   }
   if (await queue.lease({ cellId: 'contract-cell', types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' })) throw new Error('Job queue contract violation: an exhausted job was automatically leased again.');
+  // These pairs collide if an adapter identifies a job by colon concatenation.
+  const scopedInput = { type: 'contract-scope', payload: {}, maxAttempts: 3 };
+  const left = await queue.enqueue({ ...scopedInput, cellId: 'contract:scope', idempotencyKey });
+  const right = await queue.enqueue({ ...scopedInput, cellId: 'contract', idempotencyKey: `scope:${idempotencyKey}` });
+  if (left.id === right.id || left.cellId !== 'contract:scope' || right.cellId !== 'contract') throw new Error('Job queue contract violation: delimiter-bearing scopes collided.');
+  const leftReplay = await queue.enqueue({ ...scopedInput, cellId: 'contract:scope', idempotencyKey });
+  const rightReplay = await queue.enqueue({ ...scopedInput, cellId: 'contract', idempotencyKey: `scope:${idempotencyKey}` });
+  if (leftReplay.id !== left.id || rightReplay.id !== right.id) throw new Error('Job queue contract violation: scoped retries changed identity.');
+  await queue.cancel({ id: left.id });
+  if ((await queue.get(left.id))?.state !== 'cancelled' || (await queue.get(right.id))?.state !== 'queued') throw new Error('Job queue contract violation: cancellation crossed identity scopes.');
+  const rightLease = await queue.lease({ cellId: 'contract', types: ['contract-scope'], leaseDurationSeconds: 60, workerId: 'contract-worker' });
+  if (!rightLease || rightLease.job.id !== right.id) throw new Error('Job queue contract violation: scope-isolated work is not leasable.');
+  await queue.complete({ id: right.id, leaseToken: rightLease.leaseToken });
 };
 
 export class ForeignCellJobError extends Error {
