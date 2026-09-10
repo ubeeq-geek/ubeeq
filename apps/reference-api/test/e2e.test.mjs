@@ -220,6 +220,14 @@ test("migrates a creator through real source and destination cell endpoints", as
     const executor = new RemoteMigrationExecutor(sourceEndpoint, destinationEndpoint, transfer, "cell-b");
     const migration = new MigrationOrchestrator(source.routingDirectory, source.migrationCheckpoints, executor, () => new Date(clock).toISOString());
     const requested = await migration.request({ id: "migration-1", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
+    destination.database.database.exec("CREATE TRIGGER fail_destination_import BEFORE INSERT ON ubeeq_records WHEN NEW.repository = 'integrationAccounts' BEGIN SELECT RAISE(ABORT, 'late import failure'); END");
+    await assert.rejects(migration.resume(requested.id, 60), /late import failure/);
+    assert.equal(await destination.repositories.creators.get('creator-1'), undefined);
+    assert.equal(await destination.repositories.works.get('work-1'), undefined);
+    assert.equal(await destination.repositories.assets.get('asset-1'), undefined);
+    assert.equal((await source.routingDirectory.get('creator-1')).homeCellId, 'cell-a');
+    assert.equal((await source.migrationCheckpoints.get(requested.id)).state, 'transferred');
+    destination.database.database.exec('DROP TRIGGER fail_destination_import');
     const cutOver = await migration.resume(requested.id, 60);
     assert.equal(cutOver.state, "cutover");
     assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-b");
