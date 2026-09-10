@@ -38,15 +38,19 @@ export class CreatorFollowService<F extends CreatorFollowRecord> {
   }
   async list(userId: string): Promise<F[]> {
     await this.access(userId, 'list');
-    return (await this.store.listFollowsByUser(userId)).filter(follow => follow.followerUserId === userId).map(follow => structuredClone(follow));
+    const follows = (await this.store.listFollowsByUser(userId)).filter(follow => follow.followerUserId === userId).map(follow => structuredClone(follow));
+    await this.access(userId, 'list');
+    return follows;
   }
   async listPage(userId: string, options: CreatorFollowPageOptions): Promise<CreatorFollowPage<F>> {
+    const pageOptions = structuredClone(options);
     await this.access(userId, 'list');
     const store = this.store as CreatorFollowPort<F> & Partial<CreatorFollowPagePort<F>>;
     if (!store.listFollowPage) throw new Error('Follow pagination is not supported by this adapter.');
-    const page = await store.listFollowPage(userId, options);
+    const page = structuredClone(await store.listFollowPage(userId, pageOptions));
     if (page.items.some(follow => follow.followerUserId !== userId)) throw new CreatorFollowError('access_denied', 'Invalid follow page scope.');
-    return structuredClone(page);
+    await this.access(userId, 'list');
+    return page;
   }
   async follow(userId: string, record: F): Promise<F> {
     const follow = structuredClone(record);
