@@ -4,6 +4,7 @@ import { isAbsolute } from 'node:path';
 import type { FfprobeJson, VideoToolAdapter } from '@ubeeq/processing';
 export { FfmpegPosterProcessor, renderVideoPoster } from './poster.js';
 export { FfmpegAudioProcessor, type AudioProcessingTools } from './audio.js';
+export { FfmpegFrameProcessor, type VideoFrameSamplingTools } from './frames.js';
 
 const execute = promisify(execFile);
 export interface FfmpegVideoToolOptions { ffprobePath: string; ffmpegPath: string; timeoutMs?: number; maxFrameWidth?: number }
@@ -32,6 +33,14 @@ export class FfmpegVideoToolAdapter implements VideoToolAdapter {
     await execute(this.options.ffmpegPath,
       ['-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-ss', (timestampMs / 1000).toFixed(3), '-i', this.localPath(inputPath),
         '-frames:v', '1', '-map_metadata', '-1', '-vf', `scale=min(${this.options.maxFrameWidth ?? 1920}\\,iw):-2`, '-q:v', '3', '-y', this.localPath(outputPath)],
+      { maxBuffer: 4 * 1024 * 1024, timeout: this.timeout, killSignal: 'SIGKILL' });
+  }
+  /** Decode through EOF, replacing one JPEG, to retain the actual final frame. */
+  async extractLastFrame(inputPath: string, outputPath: string): Promise<void> {
+    await execute(this.options.ffmpegPath,
+      ['-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-i', this.localPath(inputPath),
+        '-map', '0:v:0', '-an', '-sn', '-dn', '-map_metadata', '-1', '-vf', `scale=min(${this.options.maxFrameWidth ?? 1920}\\,iw):-2`,
+        '-q:v', '3', '-fps_mode', 'passthrough', '-update', '1', '-y', this.localPath(outputPath)],
       { maxBuffer: 4 * 1024 * 1024, timeout: this.timeout, killSignal: 'SIGKILL' });
   }
   async encodeAudio(inputPath: string, outputPath: string, limits: { streamIndex: number; maxDurationSeconds: number; maxOutputBytes: number }): Promise<void> {
