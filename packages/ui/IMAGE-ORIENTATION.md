@@ -1,7 +1,7 @@
 # Orientation-aware crop coordinates
 
 orientedImageSize, cropRectToOriented, cropRectToSource and
-orientedFocalPointToSource bridge upright previews and raw-source crop controls.
+orientedFocalPointToSource and sourceFocalPointToOriented bridge upright previews and raw-source crop controls.
 All eight EXIF orientations include reflections. Rectangle coordinates describe
 integer pixel edges; selections must stay inside the corresponding image bounds.
 Missing orientation defaults to 1; invalid orientation values reject.

@@ -26,6 +26,28 @@ export const createImagePreview = async (source: Uint8Array, options: ImagePrevi
     .jpeg({ quality, mozjpeg: true }).toBuffer();
 };
 
+/** Bounded upright editing preview plus raw-source geometry; no storage or delivery. */
+export const createCropSourcePreview = async (source: Uint8Array, options: {
+  maxSourceBytes?: number; maxInputPixels?: number; maxOutputBytes?: number; maxPreviewEdge?: number;
+} = {}) => {
+  const maxSourceBytes = options.maxSourceBytes ?? 50 * 1024 * 1024;
+  const maxInputPixels = options.maxInputPixels ?? 40_000_000;
+  const maxOutputBytes = options.maxOutputBytes ?? 2 * 1024 * 1024;
+  const maxPreviewEdge = options.maxPreviewEdge ?? 640;
+  if (![maxSourceBytes, maxInputPixels, maxOutputBytes, maxPreviewEdge].every(value => Number.isSafeInteger(value) && value > 0) || maxPreviewEdge > 4096) throw new Error('Invalid crop preview budgets.');
+  if (!(source instanceof Uint8Array) || !source.byteLength || source.byteLength > maxSourceBytes) throw new Error('Crop preview source exceeds byte budget.');
+  const bytes = Uint8Array.from(source);
+  const metadata = await sharp(bytes, { limitInputPixels: maxInputPixels, failOn: 'error' }).metadata();
+  const orientation = metadata.orientation ?? 1;
+  if (!metadata.width || !metadata.height || !Number.isInteger(orientation) || orientation < 1 || orientation > 8) throw new Error('Invalid crop source geometry.');
+  const body = await createImagePreview(bytes, { width: maxPreviewEdge, height: maxPreviewEdge, maxInputPixels, withoutEnlargement: true });
+  if (body.byteLength > maxOutputBytes) throw new Error('Crop preview exceeds output byte budget.');
+  const output = await sharp(body).metadata();
+  if (!output.width || !output.height || output.width > maxPreviewEdge || output.height > maxPreviewEdge) throw new Error('Invalid crop preview dimensions.');
+  return { sourceWidth: metadata.width, sourceHeight: metadata.height, orientation, width: output.width, height: output.height,
+    contentType: 'image/jpeg' as const, byteLength: body.byteLength, body };
+};
+
 /** Optional decoded-image processor with immutable source lineage and transient preview bytes. */
 export class SharpImageProcessor implements MediaProcessor {
   constructor(private readonly options: ImagePreviewOptions = { width: 320, height: 320 }) {}
