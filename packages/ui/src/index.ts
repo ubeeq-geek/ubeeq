@@ -1,5 +1,6 @@
 export { CreatorClient } from './creator-client.js';
 export * from './crop-preview.js';
+export * from './image-orientation.js';
 export * from './block-content.js';
 export * from './asset-editor-options.js';
 export interface LocalizedText { defaultLocale: string; translations: Readonly<Record<string, string>>; }
