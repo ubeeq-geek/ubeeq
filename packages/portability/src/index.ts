@@ -82,7 +82,23 @@ export const validateCreatorExport = (value: unknown): CreatorExportManifest => 
   for (const [name, records] of Object.entries({ works: manifest.works, assets: manifest.assets, collections: manifest.collections, publications: manifest.publications, publicationIntents: manifest.publicationIntents, processing: manifest.processing, moderationEvidence: manifest.moderationEvidence, moderationHolds: manifest.moderationHolds, reviewCases: manifest.reviewCases, auditEvents: manifest.auditEvents, usageEvents: manifest.usageEvents, integrationAccounts: manifest.integrationAccounts })) unique(name, records);
   const workIds = new Set(manifest.works.map(({ id }) => id)); const assetIds = new Set(manifest.assets.map(({ id }) => id)); const subjectIds = new Set([creatorId, ...workIds, ...assetIds]);
   if (manifest.publications.some(({ workId }) => !workIds.has(workId)) || manifest.publicationIntents.some(({ workId }) => !workIds.has(workId)) || manifest.processing.some(({ assetId }) => !assetIds.has(assetId)) || [...manifest.moderationEvidence, ...manifest.moderationHolds, ...manifest.reviewCases].some(({ subjectId }) => !subjectIds.has(subjectId))) throw new Error("Export manifest contains a dangling creator-owned relationship.");
-  if (manifest.objectInventory.length !== manifest.assets.length || manifest.objectInventory.some((object) => !assetIds.has(object.assetId) || !object.versionId || !/^[a-f0-9]{64}$/i.test(object.checksum) || (object.byteLength !== undefined && (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0)) || (object.key !== undefined && !object.key.startsWith(`cells/${manifest.creator.homeCellId}/creators/${creatorId}/`)))) throw new Error("Export object inventory is incomplete or invalid.");
+  const inventoryIds = new Set<string>();
+  const assetsById = new Map(manifest.assets.map(asset => [asset.id, asset]));
+  if (manifest.objectInventory.length !== manifest.assets.length) throw new Error("Export object inventory is incomplete or invalid.");
+  for (const object of manifest.objectInventory) {
+    const invalid = () => new Error("Export object inventory is incomplete or inconsistent with its asset.");
+    if (!object || typeof object !== 'object' || inventoryIds.has(object.assetId)) throw invalid();
+    inventoryIds.add(object.assetId);
+    const asset = assetsById.get(object.assetId) as (AssetRecord & { storage?: { key?: string; versionId?: string; byteLength?: number } }) | undefined;
+    if (!asset || typeof object.versionId !== 'string' || !object.versionId || object.versionId !== (asset.storage?.versionId ?? asset.objectVersion)
+      || typeof object.checksum !== 'string' || !/^[a-f0-9]{64}$/i.test(object.checksum)
+      || typeof asset.checksum !== 'string' || object.checksum.toLowerCase() !== asset.checksum.toLowerCase()
+      || object.transferState !== 'manifest_only'
+      || (object.byteLength !== undefined && (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0))
+      || (asset.storage?.byteLength !== undefined && object.byteLength !== asset.storage.byteLength)
+      || (object.key !== undefined && (typeof object.key !== 'string' || !object.key.startsWith(`cells/${manifest.creator.homeCellId}/creators/${creatorId}/`)))
+      || (asset.storage?.key !== undefined && object.key !== asset.storage.key)) throw invalid();
+  }
   const owned = [...manifest.works, ...manifest.assets, ...manifest.collections, ...manifest.publications, ...manifest.publicationIntents, ...manifest.processing, ...manifest.moderationEvidence, ...manifest.moderationHolds, ...manifest.reviewCases, ...manifest.auditEvents, ...manifest.usageEvents, ...manifest.integrationAccounts, ...manifest.exportCheckpoints, ...manifest.importCheckpoints];
   const foreign = owned.some((record) => record.homeCellId !== manifest.creator.homeCellId || record.dataHomeRegion !== manifest.creator.dataHomeRegion || record.dataHomeAssignedAt !== manifest.creator.dataHomeAssignedAt || record.routingRevision !== manifest.creator.routingRevision);
   if (foreign) throw new Error("Export manifest contains records from another data home.");
