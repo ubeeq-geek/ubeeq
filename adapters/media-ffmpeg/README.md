@@ -32,3 +32,10 @@ The opt-in `FfmpegFrameProcessor` provides source-version-bound sampled JPEG
 previews with explicit source, per-frame, aggregate-byte and frame-count budgets.
 See `FRAMES.md` in the source repository for the contract and remaining caller
 responsibilities. It does not change the default poster processor.
+
+# MP4 renditions
+
+The opt-in `FfmpegVideoProcessor` produces source-version-bound H.264 MP4 previews
+with optional AAC audio and explicit source, output, dimension and admission
+budgets. See `VIDEO.md` in the source repository for validation and isolation
+limits. It does not enable publication or change the default poster processor.
