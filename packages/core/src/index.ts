@@ -322,3 +322,4 @@ export * from './comments';
 export * from './release-timing';
 export { FavoriteService, FavoriteError, type FavoriteTarget, type FavoriteRecord, type FavoritePort } from './favorites.js';
 export * from './creator-source-files.js';
+export { createWorkDiscoveryParticipation, type WorkDiscoveryState, type WorkDiscoveryParticipation } from './work-discovery.js';
