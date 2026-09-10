@@ -371,6 +371,14 @@ for (const kind of ["work", "collection"]) {
       const winnerId = attempts[0].status === "fulfilled" ? "one" : "two";
       const winner = await get(a, winnerId);
       await update(a, { ...winner, slug: "renamed", slugHistory: ["shared", "renamed"], revision: 2 });
+      const beforeLookup = first.database.prepare('SELECT * FROM ubeeq_creator_library ORDER BY kind, id').all();
+      assert.equal(await b.hasCreatorContentSlug('tenant', 'creator', kind, 'shared'), true);
+      assert.equal(await b.hasCreatorContentSlug('tenant', 'creator', kind, 'renamed'), true);
+      assert.equal(await b.hasCreatorContentSlug('tenant', 'other-creator', kind, 'shared'), false);
+      assert.equal(await b.hasCreatorContentSlug('other-tenant', 'creator', kind, 'shared'), false);
+      assert.equal(await b.hasCreatorContentSlug('tenant', 'creator', kind === 'work' ? 'collection' : 'work', 'shared'), false);
+      await assert.rejects(b.hasCreatorContentSlug('tenant', 'creator', kind, ''), /Invalid/);
+      assert.deepEqual(first.database.prepare('SELECT * FROM ubeeq_creator_library ORDER BY kind, id').all(), beforeLookup);
       await assert.rejects(create(b, record("other", "shared")), { code: "slug_conflict" });
       await assert.rejects(create(b, record("other", "renamed")), { code: "slug_conflict" });
       await create(b, record("other"));
@@ -378,6 +386,7 @@ for (const kind of ["work", "collection"]) {
       assert.equal((await get(a, "other")).slug, "other");
       const renamed = await get(a, winnerId);
       await update(a, { ...renamed, status: "deleted", revision: 3 });
+      assert.equal(await b.hasCreatorContentSlug('tenant', 'creator', kind, 'shared'), false);
       await create(b, record("reuse", "shared"));
       // Restoring the current slug alone would overlook the reused old alias.
       await assert.rejects(update(a, { ...renamed, status: "draft", revision: 4 }), { code: "slug_conflict" });
