@@ -138,8 +138,18 @@ test("uses an explicit control plane for creator migration requests, operator cu
     const created = await request(base, "/v1/creators", { method: "POST", headers, body: JSON.stringify({ handle: "regional", displayName: "Regional" }) });
     const creator = created.body.creator;
     const migrationHold = await adapters.repositories.moderationHolds.create({ id: "migration-source-hold", instanceId: "local-reference", homeCellId: "cell-a", dataHomeRegion: "local", dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: 1, subjectType: "creator", subjectId: creator.id, state: "active", reason: "migration:in-progress" });
+    for (let index = 0; index < 105; index++) await adapters.repositories.moderationHolds.create({
+      ...migrationHold, id: `a-other-hold-${String(index).padStart(3, '0')}`, subjectId: 'other-creator'
+    });
+    const firstHoldPage = await adapters.repositories.moderationHolds.list({ limit: 100 });
+    assert.ok(firstHoldPage.nextCursor);
+    assert.equal(firstHoldPage.items.some(hold => hold.id === migrationHold.id), false);
     const blockedWrite = await request(base, "/v1/works", { method: "POST", headers, body: JSON.stringify({ title: "must not write" }) });
     assert.equal(blockedWrite.response.status, 409); assert.equal(blockedWrite.body.error.code, "migration_source_held");
+    const blockedCollection = await request(base, '/v1/collections', { method: 'POST', headers, body: JSON.stringify({ title: 'must not create collection' }) });
+    assert.equal(blockedCollection.response.status, 409);
+    assert.equal((await adapters.repositories.works.list({ limit: 100 })).items.length, 0);
+    assert.equal((await adapters.repositories.collections.list({ limit: 100 })).items.length, 0);
     await adapters.repositories.moderationHolds.update(migrationHold.id, migrationHold.revision, { state: "released" });
     await adapters.routingDirectory.create({ creatorId: creator.id, homeCellId: "cell-a", homeRegion: "local", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: new Date().toISOString() });
     const requestMigration = await request(base, "/v1/migrations", { method: "POST", headers, body: JSON.stringify({ destinationCellId: "cell-b", destinationRegion: "other", destinationEndpoint: "https://cell-b.example/" }) });

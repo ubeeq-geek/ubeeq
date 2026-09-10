@@ -151,8 +151,11 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   };
   /** A migration source hold is a data-home safety control, not product moderation policy. */
   const requireCreatorWritable = async (creator: CreatorRecord): Promise<void> => {
-    const hold = (await repositories.moderationHolds.list({ limit: 100 })).items.find((value) => value.subjectId === creator.id && value.state === "active" && value.reason?.startsWith("migration:"));
-    if (hold) throw new HttpError(409, "migration_source_held", "Creator writes are paused while a regional migration is in progress");
+    for await (const hold of repositoryItems(request => repositories.moderationHolds.list(request))) {
+      if (hold.subjectId === creator.id && hold.state === 'active' && hold.reason?.startsWith('migration:')) {
+        throw new HttpError(409, "migration_source_held", "Creator writes are paused while a regional migration is in progress");
+      }
+    }
   };
   const audit = async (input: { action: string; actorId?: string; subjectId?: string; payload?: Record<string, unknown> }): Promise<void> => {
     await repositories.auditEvents.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, action: input.action, actorId: input.actorId, subjectId: input.subjectId, payload: input.payload ?? {} });
