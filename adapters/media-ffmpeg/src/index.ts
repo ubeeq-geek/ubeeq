@@ -11,6 +11,7 @@ export interface FfmpegVideoToolOptions { ffprobePath: string; ffmpegPath: strin
 export class FfmpegVideoToolAdapter implements VideoToolAdapter {
   private readonly timeout: number;
   constructor(private readonly options: FfmpegVideoToolOptions) {
+    this.options = { ...options };
     if (!options.ffprobePath || !options.ffmpegPath) throw new Error('Explicit FFmpeg and FFprobe paths are required');
     this.timeout = options.timeoutMs ?? 30_000;
     if (!Number.isSafeInteger(this.timeout) || this.timeout < 1) throw new Error('Video command timeout must be a positive integer');

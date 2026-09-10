@@ -25,7 +25,14 @@ if (args.includes('-show_format')) {
 `, { mode: 0o700 });
     const tools = new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, timeoutMs: 5000 });
     const input = join(root, 'input ; literal.mp4'), output = join(root, 'output ; literal.jpg');
+    const mutable = { ffmpegPath: binary, ffprobePath: binary, maxFrameWidth: 640 };
+    const snapshot = new FfmpegVideoToolAdapter(mutable);
+    mutable.ffmpegPath = '/does-not-exist'; mutable.ffprobePath = '/does-not-exist'; mutable.maxFrameWidth = 999;
     await writeFile(input, 'ok');
+    await snapshot.probe(input);
+    await snapshot.extractFrame(input, output, 0);
+    const snapshotArgs = JSON.parse(await readFile(output, 'utf8'));
+    assert.ok(snapshotArgs[snapshotArgs.indexOf('-vf') + 1].includes('640'));
     const probed = await tools.probe(input);
     assert.deepEqual(probed.args.slice(0, 4), ['-v', 'error', '-protocol_whitelist', 'file']);
     assert.equal(probed.args.at(-1), input);
