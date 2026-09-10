@@ -81,3 +81,4 @@ export const validateAccessibleAction = (action: AccessibleAction): AccessibleAc
 };
 export { createPrivateMediaPlayback } from './private-media-playback.js';
 export { createSourceFileBrowser, type SourceFileBrowserOptions } from './source-file-browser.js';
+export { createProfileLinkEditor, type ProfileLinkValue } from './profile-link-editor.js';
