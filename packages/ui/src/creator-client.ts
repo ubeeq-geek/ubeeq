@@ -5,6 +5,10 @@ export interface CreatorCoverImageControls {
   crops?: Readonly<Record<string, { x: number; y: number; width: number; height: number }>>;
   altText?: string;
 }
+export interface CreatorCropSourcePreview {
+  revision: number; imageId: string; sourceWidth: number; sourceHeight: number; orientation: number;
+  width: number; height: number; preview: Blob;
+}
 export class CreatorClient {
   private token?: string;
   constructor(private readonly request: typeof fetch = fetch, private readonly base = '/api') {}
@@ -29,6 +33,19 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  async brandingCropSource(creatorId: string, kind: 'profile' | 'cover'): Promise<CreatorCropSourcePreview> {
+    if (kind !== 'profile' && kind !== 'cover') throw new Error('Invalid branding image kind.');
+    const value = await this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/${kind}-image/crop-source`);
+    if (!value || typeof value.imageId !== 'string' || !value.imageId || value.imageId.length > 200 ||
+      ![value.revision, value.sourceWidth, value.sourceHeight, value.width, value.height, value.byteLength].every(n => Number.isSafeInteger(n) && n > 0) ||
+      !Number.isInteger(value.orientation) || value.orientation < 1 || value.orientation > 8 || value.contentType !== 'image/jpeg' || value.byteLength > 2 * 1024 * 1024 ||
+      typeof value.previewBase64 !== 'string' || value.previewBase64.length !== Math.ceil(value.byteLength / 3) * 4 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(value.previewBase64)) throw new Error('Invalid crop source preview.');
+    const bytes = Uint8Array.from(atob(value.previewBase64), character => character.charCodeAt(0));
+    if (bytes.byteLength !== value.byteLength) throw new Error('Invalid crop source preview length.');
+    return { revision: value.revision, imageId: value.imageId, sourceWidth: value.sourceWidth, sourceHeight: value.sourceHeight,
+      orientation: value.orientation, width: value.width, height: value.height, preview: new Blob([bytes], { type: 'image/jpeg' }) };
+  }
   private coverImagePath(creatorId: string, expectedRevision?: number, controls?: CreatorCoverImageControls) {
     const query = new URLSearchParams();
     if (expectedRevision !== undefined) query.set('expectedRevision', String(expectedRevision));

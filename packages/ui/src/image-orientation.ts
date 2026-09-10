@@ -45,3 +45,8 @@ export const orientedFocalPointToSource = (point: { x: number; y: number }, orie
   const [x, y] = edgePoint(point.x, point.y, 1, 1, inverse(orientationValue(orientation)));
   return { x, y };
 };
+export const sourceFocalPointToOriented = (point: { x: number; y: number }, orientation = 1) => {
+  if (![point.x, point.y].every(value => Number.isFinite(value) && value >= 0 && value <= 1)) throw new Error('Invalid focal fractions.');
+  const [x, y] = edgePoint(point.x, point.y, 1, 1, orientationValue(orientation));
+  return { x, y };
+};
