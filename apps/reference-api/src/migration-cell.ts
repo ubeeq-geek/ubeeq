@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { createCreatorExport, validateCreatorExport } from "@ubeeq/portability";
 import type { UbeeqRepositories } from "@ubeeq/persistence";
 import type { ObjectStorage, StoredObject } from "@ubeeq/storage";
@@ -47,7 +48,20 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       const home = { homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision + 1 };
       const clean = (value: any) => { const { revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt, ...record } = value; return { ...record, instanceId: input.instanceId, ...home }; };
       await input.repositories.transaction(async transaction => {
-        const put = async (repository: any, value: any, key: string) => { if (!await repository.get(value.id, { transaction })) await repository.create(clean(value), { transaction, idempotencyKey: `migration:${command.checkpoint.id}:${key}:${value.id}` }); };
+        const put = async (repository: any, value: any, key: string) => {
+          const expected = clean(value);
+          const existing = await repository.get(value.id, { transaction });
+          if (existing) {
+            // Repository timestamps/revisions are generated locally. Everything
+            // else, including destination ownership and routing, must match.
+            const { revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt, ...record } = existing;
+            if (!isDeepStrictEqual(JSON.parse(JSON.stringify(record)), JSON.parse(JSON.stringify(expected)))) {
+              throw new Error(`Migration destination conflict for ${key} ${value.id}; reconciliation is required.`);
+            }
+            return;
+          }
+          await repository.create(expected, { transaction, idempotencyKey: `migration:${command.checkpoint.id}:${key}:${value.id}` });
+        };
         await put(input.repositories.creators, manifest.creator, "creator");
         for (const value of manifest.works) await put(input.repositories.works, value, "work");
         for (const value of manifest.collections) await put(input.repositories.collections, value, "collection");
