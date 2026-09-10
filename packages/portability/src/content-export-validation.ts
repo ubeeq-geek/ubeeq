@@ -52,9 +52,15 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const sourceFiles = manifest.sourceFiles === undefined ? [] : array(manifest.sourceFiles, 'source files');
   const sourceFileIds = new Set<string>();
   const workIds = new Set<string>(), assetIds = new Set<string>(), collectionIds = new Set<string>();
+  const publicationIds = new Set<string>(), intentIds = new Set<string>(), accountIds = new Set<string>();
   const assetRecords = new Map<string, string>();
   const add = (set: Set<string>, value: unknown, name: string) => {
     const key = id(value, name); if (set.has(key)) throw new Error(`Duplicate ${name} identity.`); set.add(key); return key;
+  };
+  const relatedIdentity = (record: RecordValue, keys: string[], name: string): string => {
+    const values = keys.filter(key => record[key] !== undefined).map(key => id(record[key], name));
+    if (!values.length || values.some(value => value !== values[0])) throw new Error(`Missing or conflicting ${name} identity.`);
+    return values[0];
   };
   for (const value of sourceFiles) {
     const file = object(value, 'source file');
@@ -86,6 +92,10 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       if (entry[field] === undefined) continue;
       for (const value of array(entry[field], field)) {
         const record = object(value, field);
+        const intent = field === 'publicationIntents';
+        add(intent ? intentIds : publicationIds,
+          relatedIdentity(record, ['id', intent ? 'publicationIntentId' : 'publicationId'], intent ? 'publication intent' : 'publication'),
+          intent ? 'publication intent' : 'publication');
         if (record.workId !== work.workId || (record.creatorId !== undefined && record.creatorId !== creatorId) ||
           (record.tenantId !== undefined && record.tenantId !== tenantId) || (record.instanceId !== undefined && record.instanceId !== tenantId)) throw new Error('Foreign publication relationship.');
       }
@@ -108,6 +118,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const secretKeys = new Set(['accessToken', 'refreshToken', 'password', 'clientSecret', 'credentialReference', 'credentials']);
   for (const value of accounts) {
     const account = object(value, 'integration account');
+    add(accountIds, relatedIdentity(account, ['id', 'integrationAccountId', 'externalAccountId'], 'integration account'), 'integration account');
     if (['creatorId', 'creatorIdentityId'].some(key => account[key] !== undefined && account[key] !== creatorId) ||
       ['tenantId', 'instanceId'].some(key => account[key] !== undefined && account[key] !== tenantId)) throw new Error('Foreign integration account ownership.');
   }
