@@ -27,8 +27,15 @@ them dead-lettered when the expired attempt exhausted the budget. Every claim
 checks revision, cell, state and due/expiry timestamp in the write. Other cells,
 excluded types, active leases and malformed expiries are not reclaimed.
 
-Discovery still reads only the first 100 records from the repository-wide index;
+Legacy discovery still reads only the first 100 records from the repository-wide index;
 eligible work beyond that page may be starved. This is not complete queue liveness
 qualification: a cell/due-work access pattern and recovery scheduling remain needed.
 Malformed and historical attempt records require explicit qualification, not an
 implicit repair. No live AWS acceptance or data backfill is implied by mock tests.
+
+An explicit [indexed discovery mode](INDEXED-JOB-DISCOVERY.md) now queries sparse
+cell/due and cell/type/due indexes, strongly rereads candidates and preserves
+conditional claims. Queue writes maintain its index attributes, but deployments
+must provision/qualify both indexes and historical jobs before enabling it.
+Administrative `list` still uses the legacy repository index; this change is not
+full queue liveness or production qualification.

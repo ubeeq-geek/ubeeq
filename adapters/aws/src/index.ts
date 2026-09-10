@@ -16,6 +16,8 @@ import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ub
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
+import { jobDiscoveryAttributes, jobCellTypePartition, type AwsJobDiscoveryIndexes } from './job-discovery.js';
+export { jobDiscoveryAttributes, jobCellTypePartition, type AwsJobDiscoveryIndexes } from './job-discovery.js';
 import { MigrationOrchestrator, RemoteMigrationExecutor, RoutingDirectoryConflictError, validateCellRoute, validateMigrationCellRegistration, validateMigrationCheckpoint, type CellRoute, type MigrationCellCommand, type MigrationCellCommandResult, type MigrationCellEndpoint, type MigrationCellRegistration, type MigrationCellRegistry, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
@@ -26,7 +28,10 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   const dynamo = new DynamoDBClient({ region: input.region }), s3 = new S3Client({ region: input.region }), sqs = new SQSClient({ region: input.region }); const jsonResponse = (statusCode: number, body: unknown): AwsFunctionUrlResult => ({ statusCode, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(body) });
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
-export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
+export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string;
+  /** Enable only after both indexes and historical job attributes are qualified. */
+  jobDiscoveryIndexes?: AwsJobDiscoveryIndexes;
+}
 type Dynamo = Pick<DynamoDBDocumentClient, "send"> & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void };
 const now = () => new Date().toISOString();
 const pk = (repository: string, id: string) => `${repository}#${id}`;
@@ -38,17 +43,20 @@ const withoutUndefined = <T>(value: T): T => {
 };
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
-  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {}
+  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string,
+    private readonly indexAttributes?: (record: T) => Record<string, unknown>) {}
+  private item(value: T) { return { ...this.indexAttributes?.(value), pk: pk(this.repository, value.id), sk: 'record',
+    repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) }; }
   private assertTransaction(options?: { transaction?: { id: string } }): void {
     if (!options?.transaction) return;
     if (!this.dynamo.assertTransaction) throw new Error('This repository has no transaction coordinator.');
     this.dynamo.assertTransaction(options.transaction);
   }
-  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const timestamp = now(); const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, value.id), sk: "record", repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) }, ConditionExpression: "attribute_not_exists(pk)" })); return value; } catch (error) { const existing = options?.idempotencyKey && (error as { name?: string }).name === "ConditionalCheckFailedException" ? await this.get(value.id) : undefined; if (existing) return existing; throw error; } }
+  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const timestamp = now(); const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: this.item(value), ConditionExpression: "attribute_not_exists(pk)" })); return value; } catch (error) { const existing = options?.idempotencyKey && (error as { name?: string }).name === "ConditionalCheckFailedException" ? await this.get(value.id) : undefined; if (existing) return existing; throw error; } }
   async get(id: string, options?: { transaction?: { id: string } }): Promise<T | undefined> { this.assertTransaction(options); const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConsistentRead: true })); return response.Item?.value as T | undefined; }
   /** Records are queried through the explicit repository/id index, never a filtered scan. */
   async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: (response.Items ?? []).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
-  async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>, options?: { transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const current = await this.get(id); if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); } const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, id), sk: "record", repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) }, ConditionExpression: "attribute_exists(pk) AND #revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); return value; } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
+  async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>, options?: { transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const current = await this.get(id); if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); } const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: this.item(value), ConditionExpression: "attribute_exists(pk) AND #revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); return value; } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
   async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
 }
 
@@ -308,8 +316,14 @@ export class S3PresignedDelivery implements DeliveryAdapter {
 interface AwsJobRecord extends DurableJob, RevisionedRecord {}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
+  private readonly discoveryIndexes?: AwsJobDiscoveryIndexes;
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
-    this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs");
+    if (configuration.jobDiscoveryIndexes !== undefined) {
+      const indexes = structuredClone(configuration.jobDiscoveryIndexes);
+      if (!indexes || ![indexes.cellDue, indexes.cellTypeDue].every(name => typeof name === 'string' && /^[A-Za-z0-9_.-]{3,255}$/.test(name)) || indexes.cellDue === indexes.cellTypeDue) throw new Error('Two distinct job discovery indexes are required.');
+      this.discoveryIndexes = indexes;
+    }
+    this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs", jobDiscoveryAttributes);
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
     const id = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
@@ -321,9 +335,12 @@ export class AwsJobQueue implements JobQueue {
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const candidates = await this.jobs.list({ limit: 100 });
+    if (this.discoveryIndexes && input.types !== undefined && (!Array.isArray(input.types) || input.types.length > 16 || input.types.some(type => typeof type !== 'string' || !type.trim()))) throw new Error('Indexed discovery accepts at most 16 nonempty job types.');
+    // Caller-owned type arrays must not change which partitions or jobs are eligible.
+    input = { ...input, ...(input.types ? { types: [...input.types] } : {}) };
+    const candidates = this.discoveryIndexes ? await this.discover(input, Date.now()) : (await this.jobs.list({ limit: 100 })).items;
     const timestamp = Date.now();
-    for (const candidate of candidates.items) {
+    for (const candidate of candidates) {
       if (candidate.cellId !== input.cellId || (input.types?.length && !input.types.includes(candidate.type))) continue;
       const expired = candidate.state === 'leased' && Boolean(candidate.leaseExpiresAt) && Date.parse(candidate.leaseExpiresAt!) <= timestamp;
       const available = ['queued', 'retry_scheduled'].includes(candidate.state) && Date.parse(candidate.availableAt) <= timestamp;
@@ -340,15 +357,44 @@ export class AwsJobQueue implements JobQueue {
     }
     return undefined;
   }
+  private async discover(input: { cellId: string; types?: readonly string[] }, timestamp: number): Promise<AwsJobRecord[]> {
+    const types = input.types?.length ? [...new Set(input.types)] : [undefined];
+    const limit = Math.floor(100 / types.length), seen = new Set<string>(), candidates: AwsJobRecord[] = [];
+    for (const type of types) {
+      const partition = type === undefined ? input.cellId : jobCellTypePartition(input.cellId, type);
+      if (Buffer.byteLength(partition) > 2048) throw new Error('Job discovery partition exceeds the DynamoDB key budget.');
+      const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName,
+        IndexName: type === undefined ? this.discoveryIndexes!.cellDue : this.discoveryIndexes!.cellTypeDue,
+        KeyConditionExpression: '#partition = :partition AND #due <= :due',
+        ExpressionAttributeNames: { '#partition': type === undefined ? 'jobCell' : 'jobCellType', '#due': 'jobDue', '#pk': 'pk', '#sk': 'sk' },
+        ExpressionAttributeValues: { ':partition': partition, ':due': timestamp }, ProjectionExpression: '#pk, #sk',
+        ScanIndexForward: true, Limit: limit }));
+      if (response.Items !== undefined && (!Array.isArray(response.Items) || response.Items.length > limit)) throw new Error('Invalid job discovery page.');
+      for (const key of response.Items ?? []) {
+        if (typeof key.pk !== 'string' || !key.pk.startsWith('durableJobs#') || key.sk !== 'record') throw new Error('Invalid job discovery key.');
+        const id = key.pk.slice('durableJobs#'.length);
+        if (!id) throw new Error('Invalid job discovery key.');
+        if (seen.has(id)) continue;
+        seen.add(id);
+        // GSIs are eventually consistent. Never claim the projected state: read
+        // the base record strongly, then use revision/state/due write conditions.
+        const current = await this.jobs.get(id);
+        if (current && current.id !== id) throw new Error('Job discovery identity mismatch.');
+        if (current?.cellId === input.cellId && (type === undefined || current.type === type)) candidates.push(current);
+      }
+    }
+    const due = (job: AwsJobRecord) => Date.parse(job.state === 'leased' ? job.leaseExpiresAt ?? '' : job.availableAt);
+    return candidates.sort((a, b) => due(a) - due(b) || a.id.localeCompare(b.id));
+  }
   private async claimOrExpire(job: AwsJobRecord, timestamp: number, expired: boolean, change: Partial<AwsJobRecord>): Promise<AwsJobRecord> {
     const currentTime = new Date(timestamp).toISOString();
     const value = { ...job, ...change, revision: job.revision + 1, updatedAt: currentTime };
     try {
       await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
-        Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
-        ConditionExpression: `attribute_exists(pk) AND #revision = :revision AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now`,
+        Item: { ...jobDiscoveryAttributes(value), pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
+        ConditionExpression: `attribute_exists(pk) AND #revision = :revision AND #value.#cell = :cell AND #value.#state = :state AND #value.#due = :due`,
         ExpressionAttributeNames: { '#revision': 'revision', '#value': 'value', '#cell': 'cellId', '#state': 'state', '#due': expired ? 'leaseExpiresAt' : 'availableAt' },
-        ExpressionAttributeValues: { ':revision': job.revision, ':cell': job.cellId, ':state': job.state, ':now': currentTime }
+        ExpressionAttributeValues: { ':revision': job.revision, ':cell': job.cellId, ':state': job.state, ':due': expired ? job.leaseExpiresAt : job.availableAt }
       }));
       return value;
     } catch (error) {
@@ -371,7 +417,7 @@ export class AwsJobQueue implements JobQueue {
     const value = { ...job, ...change, revision: job.revision + 1, updatedAt: timestamp };
     try {
       await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
-        Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
+        Item: { ...jobDiscoveryAttributes(value), pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
         ConditionExpression: 'attribute_exists(pk) AND #revision = :revision AND #value.#state = :leased AND #value.#owner = :owner AND #value.#expiry > :now',
         ExpressionAttributeNames: { '#revision': 'revision', '#value': 'value', '#state': 'state', '#owner': 'correlationId', '#expiry': 'leaseExpiresAt' },
         ExpressionAttributeValues: { ':revision': job.revision, ':leased': 'leased', ':owner': job.correlationId, ':now': timestamp }
