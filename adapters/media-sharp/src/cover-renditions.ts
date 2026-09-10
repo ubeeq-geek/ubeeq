@@ -1,6 +1,7 @@
 import sharp from 'sharp';
 import { pickCoverCrop, type CoverCropInput, type FocalPointInput } from '@ubeeq/processing';
 import { renderImageRendition } from './rendition.js';
+import { renditionDimensions, validateCoordinateSpace, type ImageCoordinateSpace } from './coordinate-space.js';
 
 export interface CoverRenditionVariant<Name extends string = string> {
   name: Name; width: number; height: number; crop?: CoverCropInput;
@@ -8,6 +9,8 @@ export interface CoverRenditionVariant<Name extends string = string> {
 export interface CoverRenditionSetOptions<Name extends string = string> {
   variants: readonly CoverRenditionVariant<Name>[];
   focalPoint?: FocalPointInput;
+  /** Focal points, crops and dimensions share this space. Default: raw. */
+  coordinateSpace?: ImageCoordinateSpace;
   maxSourceBytes?: number;
   maxInputPixels?: number;
   maxOutputPixels?: number;
@@ -15,9 +18,10 @@ export interface CoverRenditionSetOptions<Name extends string = string> {
 }
 
 /** Storage-free cover rendering. Product composition supplies sizes and names.
- * Coordinates precede EXIF orientation, as in renderImageRendition. */
+ * Coordinates default to raw pixels; oriented mode applies EXIF first. */
 export const renderCoverRenditions = async <Name extends string>(source: Uint8Array, options: CoverRenditionSetOptions<Name>) => {
   const snapshot = structuredClone(options);
+  validateCoordinateSpace(snapshot.coordinateSpace);
   const maxSourceBytes = snapshot.maxSourceBytes ?? 50 * 1024 * 1024;
   const maxInputPixels = snapshot.maxInputPixels ?? 40_000_000;
   const maxOutputPixels = snapshot.maxOutputPixels ?? 40_000_000;
@@ -39,17 +43,21 @@ export const renderCoverRenditions = async <Name extends string>(source: Uint8Ar
   const bytes = Uint8Array.from(source);
   const metadata = await sharp(bytes, { limitInputPixels: maxInputPixels, failOn: 'error' }).metadata();
   if (!metadata.width || !metadata.height) throw new Error('Invalid cover source dimensions.');
-  const width = metadata.width, height = metadata.height;
+  const { width, height } = renditionDimensions(metadata.width, metadata.height, metadata.orientation, snapshot.coordinateSpace);
   // Resolve every crop before rendering any variant, including overrides late in the set.
   const selections = variants.map(variant => ({ ...variant,
     crop: pickCoverCrop(width, height, variant.width, variant.height, focalPoint, variant.crop) }));
   const renditions: Array<{ name: Name; crop: CoverCropInput; body: Uint8Array; contentType: 'image/jpeg'; byteLength: number }> = [];
   let outputBytes = 0;
   for (const variant of selections) {
-    const body = await renderImageRendition(bytes, { width: variant.width, height: variant.height, crop: variant.crop, maxInputPixels });
+    const body = await renderImageRendition(bytes, { width: variant.width, height: variant.height, crop: variant.crop, maxInputPixels,
+      coordinateSpace: snapshot.coordinateSpace });
     outputBytes += body.byteLength;
     if (outputBytes > maxOutputBytes) throw new Error('Cover output exceeds byte budget.');
     renditions.push({ name: variant.name, crop: variant.crop, body, contentType: 'image/jpeg', byteLength: body.byteLength });
   }
-  return { sourceWidth: width, sourceHeight: height, focalPoint, renditions };
+  return { sourceWidth: width, sourceHeight: height,
+    ...(snapshot.coordinateSpace === 'oriented' ? { coordinateSpace: 'oriented' as const,
+      rawSourceWidth: metadata.width, rawSourceHeight: metadata.height, sourceOrientation: metadata.orientation ?? 1 } : {}),
+    focalPoint, renditions };
 };
