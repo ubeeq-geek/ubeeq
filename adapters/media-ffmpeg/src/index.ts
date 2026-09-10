@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { isAbsolute } from 'node:path';
 import type { FfprobeJson, VideoToolAdapter } from '@ubeeq/processing';
 export { FfmpegPosterProcessor, renderVideoPoster } from './poster.js';
+export { FfmpegAudioProcessor, type AudioProcessingTools } from './audio.js';
 
 const execute = promisify(execFile);
 export interface FfmpegVideoToolOptions { ffprobePath: string; ffmpegPath: string; timeoutMs?: number; maxFrameWidth?: number }
@@ -31,5 +32,13 @@ export class FfmpegVideoToolAdapter implements VideoToolAdapter {
       ['-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-ss', (timestampMs / 1000).toFixed(3), '-i', this.localPath(inputPath),
         '-frames:v', '1', '-map_metadata', '-1', '-vf', `scale=min(${this.options.maxFrameWidth ?? 1920}\\,iw):-2`, '-q:v', '3', '-y', this.localPath(outputPath)],
       { maxBuffer: 4 * 1024 * 1024, timeout: this.timeout, killSignal: 'SIGKILL' });
+  }
+  async encodeAudio(inputPath: string, outputPath: string, limits: { streamIndex: number; maxDurationSeconds: number; maxOutputBytes: number }): Promise<void> {
+    if (!Number.isSafeInteger(limits.streamIndex) || limits.streamIndex < 0 || !Number.isFinite(limits.maxDurationSeconds) || limits.maxDurationSeconds <= 0 || !Number.isSafeInteger(limits.maxOutputBytes) || limits.maxOutputBytes < 1) throw new Error('Invalid audio encoding limits.');
+    await execute(this.options.ffmpegPath, ['-nostdin', '-v', 'error', '-protocol_whitelist', 'file', '-i', this.localPath(inputPath),
+      '-map', `0:${limits.streamIndex}`, '-vn', '-sn', '-dn', '-map_metadata', '-1', '-map_metadata:s:a', '-1', '-map_chapters', '-1',
+      '-t', String(limits.maxDurationSeconds), '-ac', '2', '-ar', '44100', '-c:a', 'libmp3lame', '-b:a', '128k', '-threads', '1',
+      '-fs', String(limits.maxOutputBytes), '-f', 'mp3', '-n', this.localPath(outputPath)],
+      { maxBuffer: 1024 * 1024, timeout: this.timeout, killSignal: 'SIGKILL' });
   }
 }
