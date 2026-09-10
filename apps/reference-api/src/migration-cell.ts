@@ -167,8 +167,16 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
     const assetObjects = assets.flatMap((asset) => {
       if (!asset.storage) throw new Error(`Migration asset ${asset.id} has no active storage location.`);
       const active = inventoryEntry(asset.id, asset.storage, asset);
-      if (!asset.originalStorage || asset.originalStorage.key === asset.storage.key) return [active];
-      return [active, inventoryEntry(`${asset.id}:original`, asset.originalStorage, asset)];
+      if (!asset.originalStorage) return [active];
+      const original = inventoryEntry(`${asset.id}:original`, asset.originalStorage, asset);
+      if (original.destination.key === active.destination.key) {
+        // Source versions (or buckets) may share a key. Destination imports
+        // currently read unversioned locations, so preserve both references
+        // without letting the second transfer overwrite the first object's bytes.
+        const id = createHash('sha256').update(JSON.stringify([command.checkpoint.id, asset.id])).digest('hex');
+        original.destination.key = `cells/${command.checkpoint.destination.cellId}/creators/${asset.creatorId}/originals/migration-${id}`;
+      }
+      return [active, original];
     });
     const objects = [{ id: "migration-manifest", source: { bucket: storedManifest.object.bucket, key: manifestKey, versionId: storedManifest.object.versionId }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assetObjects];
     return { manifestChecksum: manifest.checksum, objectInventory: objects };

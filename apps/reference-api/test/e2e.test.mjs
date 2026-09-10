@@ -179,7 +179,7 @@ test("moves original objects only through an explicit migration executor, never 
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });
 
-for (const rollback of [false, true]) test(`migrates a creator through real cell endpoints (${rollback ? 'rollback' : 'retirement'})`, async () => {
+for (const objectLayout of ['separate', 'shared-key', 'shared-object']) for (const rollback of [false, true]) test(`migrates a creator through real cell endpoints (${objectLayout}, ${rollback ? 'rollback' : 'retirement'})`, async () => {
   const sourceDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-source-"));
   const destinationDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-destination-"));
   const source = createLocalAdapterSet({ databasePath: join(sourceDirectory, "state.sqlite"), dataDirectory: sourceDirectory, publicBaseUrl: "https://cell-a.example", cellId: "cell-a" });
@@ -188,10 +188,12 @@ for (const rollback of [false, true]) test(`migrates a creator through real cell
   const dataHome = { homeCellId: "cell-a", dataHomeRegion: "region-a", dataHomeAssignedAt: assignedAt, routingRevision: 1 };
   const bytes = Buffer.from("creator-original");
   const checksum = createHash("sha256").update(bytes).digest("hex");
-  const renditionBytes = Buffer.from("processed-creator-rendition");
+  const renditionBytes = objectLayout === 'shared-object' ? bytes : Buffer.from("processed-creator-rendition");
   const renditionChecksum = createHash("sha256").update(renditionBytes).digest("hex");
   const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
   const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: renditionBytes.length, checksum: renditionChecksum, scope: "public" };
+  if (objectLayout !== 'separate') original.key = rendition.key;
+  if (objectLayout === 'shared-object') { rendition.versionId = original.versionId; rendition.scope = 'private'; }
   let clock = Date.parse(assignedAt);
   try {
     await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
@@ -245,9 +247,10 @@ for (const rollback of [false, true]) test(`migrates a creator through real cell
     const importedIntegration = await destination.repositories.integrationAccounts.get("integration-1");
     assert.equal(importedCreator?.homeCellId, "cell-b"); assert.equal(importedCreator?.routingRevision, 2);
     assert.equal(importedAsset?.homeCellId, "cell-b"); assert.equal(importedAsset?.storage.key, "cells/cell-b/creators/creator-1/renditions/asset-1");
-    assert.equal(importedAsset?.originalStorage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
+    assert.ok(importedAsset?.originalStorage.key.startsWith('cells/cell-b/creators/creator-1/originals/'));
+    assert.notEqual(importedAsset?.originalStorage.key, importedAsset?.storage.key);
     assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
-    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
+    assert.deepEqual(Buffer.from((await destination.storage.get(importedAsset.originalStorage)).body), bytes);
     assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), renditionBytes);
     // Retrying the same verified import is a no-op, not a false ID conflict.
     await destinationEndpoint.execute({ operation: 'import', checkpoint: cutOver });
