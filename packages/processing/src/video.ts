@@ -26,6 +26,8 @@ export interface VideoValidationProfile {
 export interface FfprobeJson {
   format?: { duration?: string; format_name?: string; bit_rate?: string };
   streams?: Array<{ codec_type?: string; codec_name?: string; width?: number; height?: number;
+    index?: number; sample_rate?: string; channels?: number; duration?: string;
+    disposition?: { attached_pic?: number };
     tags?: { rotate?: string }; side_data_list?: Array<{ rotation?: number }> }>;
 }
 export interface ValidatedVideoMetadata {
