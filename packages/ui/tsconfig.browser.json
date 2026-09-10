@@ -1,1 +1,1 @@
-{ "extends": "./tsconfig.json", "compilerOptions": { "module": "ES2022", "moduleResolution": "Bundler", "outDir": "dist/browser", "declaration": false }, "include": ["src/creator-client.ts", "src/private-media-playback.ts", "src/source-file-browser.ts"] }
+{ "extends": "./tsconfig.json", "compilerOptions": { "module": "ES2022", "moduleResolution": "Bundler", "outDir": "dist/browser", "declaration": false }, "include": ["src/creator-client.ts", "src/private-media-playback.ts", "src/source-file-browser.ts", "src/image-orientation.ts"] }
