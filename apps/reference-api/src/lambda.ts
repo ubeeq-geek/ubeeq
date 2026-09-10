@@ -2,6 +2,7 @@ import { Readable } from "node:stream";
 import { AwsMigrationControlWorker, createAwsAdapterSet, createAwsMigrationCommandQueue, createAwsRoutingControlPlane } from "@ubeeq/adapter-aws";
 import { createReferenceApi, type ReferenceAdapterSet } from "./server.js";
 import { createMigrationCellEndpoint } from "./migration-cell.js";
+import { jobDiscoveryConfiguration } from "./job-discovery-configuration.js";
 
 type FunctionUrlEvent = {
   rawPath?: string;
@@ -75,6 +76,7 @@ const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??
   operator: process.env.UBEEQ_CELL_OPERATOR ?? "self-hosted",
   publicBaseUrl: required("UBEEQ_PUBLIC_BASE_URL"),
   adapters: createAwsAdapterSet({
+    ...jobDiscoveryConfiguration(process.env),
     region: process.env.AWS_REGION,
     cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
     tableName: required("UBEEQ_RECORDS_TABLE"),
@@ -88,6 +90,7 @@ const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??
 });
 
 const awsCellAdapters = () => createAwsAdapterSet({
+  ...jobDiscoveryConfiguration(process.env),
   region: process.env.AWS_REGION,
   cellId: process.env.UBEEQ_CELL_ID ?? process.env.AWS_REGION ?? "aws-reference-cell",
   tableName: required("UBEEQ_RECORDS_TABLE"), objectBucket: required("UBEEQ_SOURCE_BUCKET"), queueUrl: required("UBEEQ_JOBS_QUEUE_URL"),
