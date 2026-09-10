@@ -1,4 +1,4 @@
-export { CreatorClient, type CreatorCoverImageControls, type CreatorCropSourcePreview } from './creator-client.js';
+export { CreatorClient, type CreatorCoverImageControls, type CreatorCropSourcePreview, type CreatorImageCoordinateSpace } from './creator-client.js';
 export * from './crop-preview.js';
 export * from './image-orientation.js';
 export * from './block-content.js';
