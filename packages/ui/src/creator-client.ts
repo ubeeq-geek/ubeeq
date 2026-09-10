@@ -1,5 +1,6 @@
 /** Same-origin creator API client. Credentials are kept in memory, never persisted. */
 import type { WorkKind, CreatorAssetRegenerationRequest } from '@ubeeq/core';
+export type CreatorImageCoordinateSpace = 'raw' | 'oriented';
 export interface CreatorCoverImageControls {
   focalPoint?: { x: number; y: number };
   crops?: Readonly<Record<string, { x: number; y: number; width: number; height: number }>>;
@@ -46,8 +47,14 @@ export class CreatorClient {
     return { revision: value.revision, imageId: value.imageId, sourceWidth: value.sourceWidth, sourceHeight: value.sourceHeight,
       orientation: value.orientation, width: value.width, height: value.height, preview: new Blob([bytes], { type: 'image/jpeg' }) };
   }
-  private coverImagePath(creatorId: string, expectedRevision?: number, controls?: CreatorCoverImageControls) {
+  private setImageCoordinateSpace(query: URLSearchParams, coordinateSpace?: CreatorImageCoordinateSpace) {
+    if (coordinateSpace === undefined) return;
+    if (coordinateSpace !== 'raw' && coordinateSpace !== 'oriented') throw new Error('Invalid image coordinate space.');
+    query.set('coordinateSpace', coordinateSpace);
+  }
+  private coverImagePath(creatorId: string, expectedRevision?: number, controls?: CreatorCoverImageControls, coordinateSpace?: CreatorImageCoordinateSpace) {
     const query = new URLSearchParams();
+    this.setImageCoordinateSpace(query, coordinateSpace);
     if (expectedRevision !== undefined) query.set('expectedRevision', String(expectedRevision));
     if (controls?.focalPoint !== undefined) query.set('focalPoint', JSON.stringify(controls.focalPoint));
     if (controls?.crops !== undefined) query.set('crops', JSON.stringify(controls.crops));
@@ -59,8 +66,8 @@ export class CreatorClient {
   recropCoverImage(creatorId: string, expectedRevision: number, controls: CreatorCoverImageControls) {
     return this.call(this.coverImagePath(creatorId, expectedRevision, controls), 'PATCH');
   }
-  async saveCoverImage(creatorId: string, expectedRevision: number, file: Blob, controls: CreatorCoverImageControls = {}) {
-    const response = await this.request(`${this.base}${this.coverImagePath(creatorId, expectedRevision, controls)}`, {
+  async saveCoverImage(creatorId: string, expectedRevision: number, file: Blob, controls: CreatorCoverImageControls = {}, coordinateSpace?: CreatorImageCoordinateSpace) {
+    const response = await this.request(`${this.base}${this.coverImagePath(creatorId, expectedRevision, controls, coordinateSpace)}`, {
       method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
     const result = await response.json();
     if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error(result.message || 'Cover image save failed.'); }
@@ -82,8 +89,9 @@ export class CreatorClient {
   removeProfileImage(creatorId: string, expectedRevision: number) {
     return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?expectedRevision=${expectedRevision}`, 'DELETE');
   }
-  async saveProfileImage(creatorId: string, expectedRevision: number, file: Blob, squareCrop?: CreatorAssetRegenerationRequest['squareCrop'], altText = '') {
+  async saveProfileImage(creatorId: string, expectedRevision: number, file: Blob, squareCrop?: CreatorAssetRegenerationRequest['squareCrop'], altText = '', coordinateSpace?: CreatorImageCoordinateSpace) {
     const query = new URLSearchParams({ expectedRevision: String(expectedRevision), altText });
+    this.setImageCoordinateSpace(query, coordinateSpace);
     if (squareCrop !== undefined) query.set('crop', JSON.stringify(squareCrop));
     const response = await this.request(`${this.base}/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?${query}`, {
       method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
