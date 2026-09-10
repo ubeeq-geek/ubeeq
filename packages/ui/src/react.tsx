@@ -292,3 +292,4 @@ export function BlockEditor({
   );
 }
 export { ProfileExternalLinksEditor } from './profile-external-links-editor.js';
+export { AutoLoadSentinel, type AutoLoadSentinelProps } from './auto-load-sentinel.js';
