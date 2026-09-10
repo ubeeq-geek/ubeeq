@@ -7,7 +7,7 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
+import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
@@ -400,7 +400,26 @@ export class CognitoIdentity implements IdentityAdapter {
   constructor(private readonly cognito: Pick<CognitoIdentityProviderClient, "send">, private readonly userPoolId: string, private readonly clientId: string) {}
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> { try { const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential })); const id = user.Username; if (!id) return undefined; return { id: input.credential, subject: { id, roles: [], scopes: user.UserAttributes?.filter((item) => item.Name === "scope").flatMap((item) => item.Value?.split(" ") ?? []) }, issuedAt: "", expiresAt: "", authenticationMethod: "oidc" }; } catch { return undefined; } }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return { id: subjectId, subjectId, status: "active", createdAt: "", updatedAt: "" }; }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    if (typeof subjectId !== 'string' || !subjectId.trim()) throw new Error('A canonical Cognito subject is required.');
+    let account;
+    try { account = await this.cognito.send(new AdminGetUserCommand({ UserPoolId: this.userPoolId, Username: subjectId })); }
+    catch (error) {
+      if ((error as { name?: string }).name === 'UserNotFoundException') return undefined;
+      throw error;
+    }
+    // Session verification uses Cognito Username as the canonical subject. Do
+    // not accept an alias response as a different account under the supplied ID.
+    if (account.Username !== subjectId || typeof account.Enabled !== 'boolean' || typeof account.UserStatus !== 'string' ||
+      !(account.UserCreateDate instanceof Date) || !Number.isFinite(account.UserCreateDate.getTime()) ||
+      !(account.UserLastModifiedDate instanceof Date) || !Number.isFinite(account.UserLastModifiedDate.getTime())) {
+      throw new Error('Cognito returned invalid account identity or state metadata.');
+    }
+    const status: IdentityAccount['status'] = !account.Enabled ? 'suspended'
+      : account.UserStatus === 'UNCONFIRMED' ? 'pending_verification'
+      : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(account.UserStatus) ? 'active' : 'suspended';
+    return { id: subjectId, subjectId, status, createdAt: account.UserCreateDate.toISOString(), updatedAt: account.UserLastModifiedDate.toISOString() };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
   async authenticate(input: { username: string; password: string }): Promise<{ token: string }> { const result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); if (!result.AuthenticationResult?.AccessToken) throw new Error("Cognito authentication did not return an access token."); return { token: result.AuthenticationResult.AccessToken }; }
