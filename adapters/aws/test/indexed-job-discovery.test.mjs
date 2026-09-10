@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AwsJobQueue, jobDiscoveryAttributes, jobCellTypePartition } from '../dist/index.js';
 import { verifyJobQueueContract } from '@ubeeq/jobs';
+import { createHash } from 'node:crypto';
 
 const indexes = { cellDue: 'jobs-cell-due', cellTypeDue: 'jobs-cell-type-due' };
 const conflict = () => Object.assign(new Error('conditional conflict'), { name: 'ConditionalCheckFailedException' });
@@ -41,6 +42,35 @@ class IndexedDynamo {
 }
 const makeQueue = (dynamo, extra = {}) => new AwsJobQueue(dynamo, { tableName: 'records', cellId: 'cell', jobDiscoveryIndexes: indexes, ...extra }, { send: async () => ({}) }, 'https://queue.test/jobs');
 const enqueue = (queue, key, extra = {}) => queue.enqueue({ cellId: 'cell', type: 'render', payload: {}, idempotencyKey: key, maxAttempts: 3, availableAt: new Date(0).toISOString(), ...extra });
+
+test('job IDs distinguish delimiter-bearing cell/key pairs and retain only matching legacy jobs', async () => {
+  const memory = new IndexedDynamo(), queue = makeQueue(memory);
+  const first = await enqueue(queue, 'c', { cellId: 'a:b' });
+  const second = await enqueue(queue, 'b:c', { cellId: 'a' });
+  assert.notEqual(first.id, second.id);
+  assert.equal((await enqueue(queue, 'c', { cellId: 'a:b' })).id, first.id);
+  const row = structuredClone(memory.rows.get(`durableJobs#${first.id}`));
+  memory.rows.clear();
+  const legacyId = `job-${createHash('sha256').update('a:b:c').digest('hex').slice(0, 32)}`;
+  row.pk = `durableJobs#${legacyId}`; row.id = legacyId; row.value.id = legacyId;
+  memory.rows.set(row.pk, row);
+  assert.equal((await enqueue(queue, 'c', { cellId: 'a:b' })).id, legacyId);
+  const isolated = await enqueue(queue, 'b:c', { cellId: 'a' });
+  assert.notEqual(isolated.id, legacyId); assert.equal(isolated.cellId, 'a');
+  assert.equal(memory.rows.size, 2);
+});
+
+test('enqueue captures scope before asynchronous reads and rejects empty identity without I/O', async () => {
+  const memory = new IndexedDynamo(), queue = makeQueue(memory);
+  const input = { cellId: 'cell', type: 'render', payload: { value: 1 }, idempotencyKey: 'stable', maxAttempts: 3 };
+  const pending = queue.enqueue(input); input.cellId = 'changed'; input.idempotencyKey = 'changed'; input.payload.value = 2;
+  const job = await pending;
+  assert.equal(job.cellId, 'cell'); assert.equal(job.idempotencyKey, 'stable'); assert.equal(job.payload.value, 1);
+  const before = memory.calls.length;
+  await assert.rejects(queue.enqueue({ ...input, cellId: '' }), /required/);
+  await assert.rejects(queue.enqueue({ ...input, idempotencyKey: ' ' }), /required/);
+  assert.equal(memory.calls.length, before);
+});
 const lease = (queue, extra = {}) => queue.lease({ cellId: 'cell', types: ['render'], workerId: 'worker', leaseDurationSeconds: 60, ...extra });
 const rowFor = value => ({ ...jobDiscoveryAttributes(value), pk: `durableJobs#${value.id}`, sk: 'record', repository: 'durableJobs', id: value.id, revision: value.revision, value });
 
