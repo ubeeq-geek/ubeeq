@@ -38,6 +38,8 @@ export interface ValidatedVideoMetadata {
 export interface VideoToolAdapter {
   probe(inputPath: string): Promise<FfprobeJson>;
   extractFrame(inputPath: string, outputPath: string, timestampMs: number): Promise<void>;
+  /** Optional for legacy tools; native adapters can retain the actual final decoded frame. */
+  extractLastFrame?(inputPath: string, outputPath: string): Promise<void>;
 }
 
 export const validateFfprobeOutput = (probe: FfprobeJson, profile: VideoValidationProfile): ValidatedVideoMetadata => {
@@ -63,7 +65,12 @@ export const validateFfprobeOutput = (probe: FfprobeJson, profile: VideoValidati
 
 /** Returns only after every planned extraction succeeds. Partial files belong to the caller's attempt directory. */
 export const extractValidatedFrames = async (input: { inputPath: string; outputPath(timestampMs: number): string; tools: VideoToolAdapter; profile: VideoValidationProfile }): Promise<ValidatedVideoMetadata> => {
-  const metadata = validateFfprobeOutput(await input.tools.probe(input.inputPath), input.profile);
-  for (const timestamp of metadata.frameTimestampsMs) await input.tools.extractFrame(input.inputPath, input.outputPath(timestamp), timestamp);
+  const { inputPath, outputPath, tools } = input;
+  const profile = structuredClone(input.profile);
+  const metadata = validateFfprobeOutput(await tools.probe(inputPath), profile);
+  for (const timestamp of metadata.frameTimestampsMs) {
+    if (timestamp === metadata.frameTimestampsMs.at(-1) && tools.extractLastFrame) await tools.extractLastFrame(inputPath, outputPath(timestamp));
+    else await tools.extractFrame(inputPath, outputPath(timestamp), timestamp);
+  }
   return metadata;
 };

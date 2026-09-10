@@ -1,5 +1,12 @@
 # Bounded sampled video frames
 
+The file-based `extractValidatedFrames` helper also uses `extractLastFrame` when
+the injected adapter provides it, preserving existing timestamp-labelled output
+paths and metadata. Legacy tools without that method retain timestamp seeking.
+Final-frame decoding failures propagate; there is no successful-plan fallback.
+The file-based helper does not gain the byte budgets of `FfmpegFrameProcessor`:
+its caller still owns source and generated-file limits and attempt cleanup.
+
 `FfmpegFrameProcessor` adapts deterministic video sampling to `MediaProcessor`.
 Install it explicitly where sampled JPEGs are needed; existing poster and audio
 processors and default registries are unchanged. Products supply admission policy,
