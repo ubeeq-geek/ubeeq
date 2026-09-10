@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 export * from './object-key-scope.js';
 export { readBoundedBytes } from './bounded-bytes.js';
+export { writeBoundedStreamFile } from './bounded-file.js';
 export { transferVerifiedObject, type VerifiedObjectTransferPorts } from './verified-transfer.js';
 
 /** Storage and delivery ports with no product-specific retention or access policy. */
