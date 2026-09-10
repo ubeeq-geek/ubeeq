@@ -89,10 +89,11 @@ export const validateCreatorExport = (value: unknown): CreatorExportManifest => 
     const invalid = () => new Error("Export object inventory is incomplete or inconsistent with its asset.");
     if (!object || typeof object !== 'object' || inventoryIds.has(object.assetId)) throw invalid();
     inventoryIds.add(object.assetId);
-    const asset = assetsById.get(object.assetId) as (AssetRecord & { storage?: { key?: string; versionId?: string; byteLength?: number } }) | undefined;
+    const asset = assetsById.get(object.assetId) as (AssetRecord & { storage?: { key?: string; versionId?: string; byteLength?: number; checksum?: string } }) | undefined;
     if (!asset || typeof object.versionId !== 'string' || !object.versionId || object.versionId !== (asset.storage?.versionId ?? asset.objectVersion)
       || typeof object.checksum !== 'string' || !/^[a-f0-9]{64}$/i.test(object.checksum)
-      || typeof asset.checksum !== 'string' || object.checksum.toLowerCase() !== asset.checksum.toLowerCase()
+      || typeof asset.checksum !== 'string'
+      || typeof (asset.storage?.checksum ?? asset.checksum) !== 'string' || object.checksum.toLowerCase() !== (asset.storage?.checksum ?? asset.checksum).toLowerCase()
       || object.transferState !== 'manifest_only'
       || (object.byteLength !== undefined && (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0))
       || (asset.storage?.byteLength !== undefined && object.byteLength !== asset.storage.byteLength)

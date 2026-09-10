@@ -188,14 +188,16 @@ test("migrates a creator through real source and destination cell endpoints", as
   const dataHome = { homeCellId: "cell-a", dataHomeRegion: "region-a", dataHomeAssignedAt: assignedAt, routingRevision: 1 };
   const bytes = Buffer.from("creator-original");
   const checksum = createHash("sha256").update(bytes).digest("hex");
+  const renditionBytes = Buffer.from("processed-creator-rendition");
+  const renditionChecksum = createHash("sha256").update(renditionBytes).digest("hex");
   const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
-  const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "public" };
+  const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: renditionBytes.length, checksum: renditionChecksum, scope: "public" };
   let clock = Date.parse(assignedAt);
   try {
     await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
     await source.repositories.works.create({ id: "work-1", instanceId: "source", ...dataHome, creatorId: "creator-1", title: "Migrating work", status: "ready" });
     await source.storage.put({ object: original, body: bytes });
-    await source.storage.put({ object: rendition, body: bytes });
+    await source.storage.put({ object: rendition, body: renditionBytes });
     await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: rendition, originalStorage: original });
     await source.repositories.integrationAccounts.create({ id: "integration-1", instanceId: "source", ...dataHome, creatorId: "creator-1", connectorId: "reference", health: "healthy", credentialReference: "must-not-migrate" });
     await source.routingDirectory.create({ creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: assignedAt });
@@ -240,7 +242,7 @@ test("migrates a creator through real source and destination cell endpoints", as
     assert.equal(importedAsset?.originalStorage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
     assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
     assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
-    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), bytes);
+    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), renditionBytes);
     const rolledBack = await migration.rollback(requested.id);
     assert.equal(rolledBack.state, "rolled_back"); assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-a");
     const second = await migration.request({ id: "migration-2", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
