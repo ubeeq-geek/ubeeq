@@ -134,6 +134,35 @@ test("collection renames cannot reuse another collection's current or historical
   await f.service.update({ ...f.collections.get("one"), slug: "one" });
 });
 
+test('collection creation validates imported historical aliases before any write', async () => {
+  const f = fixture();
+  await f.service.create(collection('owner', 'reserved'));
+  const writes = f.writes();
+  await assert.rejects(f.service.create({ ...collection('imported'), slugHistory: ['reserved'] }), { code: 'slug_conflict' });
+  assert.equal(f.writes(), writes);
+  assert.equal(f.collections.has('imported'), false);
+});
+
+test('collection restoration reacquires all authoritative aliases without discarding history', async () => {
+  for (const claimed of ['original', 'renamed']) {
+    for (const nextSlug of ['renamed', 'fresh']) {
+      const f = fixture();
+      await f.service.create(collection('one', 'original'));
+      await f.service.update({ ...f.collections.get('one'), slug: 'renamed' });
+      await f.service.remove('tenant', 'one');
+      await f.service.create(collection('two', claimed));
+      const before = structuredClone(f.collections.get('one')), writes = f.writes();
+      await assert.rejects(f.service.update({ ...before, status: 'draft', slug: nextSlug, slugHistory: [], productMetadata: { replaced: true } }), { code: 'slug_conflict' });
+      assert.deepEqual(f.collections.get('one'), before);
+      assert.equal(f.writes(), writes);
+      await f.service.remove('tenant', 'two');
+      const restored = await f.service.update({ ...before, status: 'draft', slug: nextSlug, slugHistory: [] });
+      assert.deepEqual(restored.slugHistory, [...new Set(['original', 'renamed', nextSlug])]);
+      assert.deepEqual(restored.productMetadata, { preserved: true });
+    }
+  }
+});
+
 test("invalid, foreign and deleted Works never replace the existing membership", async () => {
   const f = fixture();
   f.collections.set("one", collection("one"));
