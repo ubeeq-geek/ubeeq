@@ -1,5 +1,5 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
-import { CreatorWorkError, CreatorCollectionError, CreatorAssetError } from "@ubeeq/core";
+import { CreatorWorkError, CreatorCollectionError, CreatorAssetError, contentAssetReferences } from "@ubeeq/core";
 import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit } from "@ubeeq/core";
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
@@ -27,6 +27,20 @@ const validCollectionCover = `(? = '' OR EXISTS (
     AND json_extract(cover.payload, '$.status') <> 'deleted'
     AND json_extract(cover.payload, '$.storage.scope') = 'private'
 ))`;
+
+const validWorkAssetReferences = `NOT EXISTS (
+  SELECT 1 FROM json_each(?) AS ref WHERE NOT EXISTS (
+    SELECT 1 FROM ubeeq_creator_library AS asset
+    JOIN ubeeq_creator_library AS membership ON membership.cell_id = asset.cell_id
+      AND membership.tenant_id = asset.tenant_id AND membership.kind = 'work_assets' AND membership.id = ?
+    WHERE asset.cell_id = ? AND asset.tenant_id = ? AND asset.kind = 'asset' AND asset.id = ref.value
+      AND asset.creator_id = ? AND json_extract(asset.payload, '$.status') <> 'deleted'
+      AND json_extract(asset.payload, '$.storage.scope') = 'private'
+      AND EXISTS (SELECT 1 FROM json_each(membership.payload) AS attached
+        WHERE json_extract(attached.value, '$.assetId') = asset.id
+          AND json_extract(attached.value, '$.workId') = membership.id)
+  )
+)`;
 
 /** Durable compatibility library; it does not replace the cell-owned repositories. */
 export class LocalCreatorLibraryStore<W extends CreatorWorkRecord, C extends CreatorCollectionRecord>
@@ -199,15 +213,26 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
   async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<W[]> {
     return this.list<W>(tenantId, "work", creatorId).filter((work) => options.includeDeleted === true || work.status !== "deleted").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
-  async createWork(work: W): Promise<void> { this.create("work", work.workId, work); }
+  private referenceParameters(work: W): string[] {
+    const content = work as W & { body?: unknown; media?: unknown };
+    return [JSON.stringify(contentAssetReferences(content.body, content.media)), work.workId, this.local.configuration.cellId, work.tenantId, work.creatorId];
+  }
+  async createWork(work: W): Promise<void> {
+    // A newly created Work has no attachments. Upload first, then save references.
+    if (this.referenceParameters(work)[0] !== '[]') throw new CreatorAssetError('invalid_asset', 'Create the Work and attach its assets before referencing them.');
+    this.create("work", work.workId, work);
+  }
   async updateWork(work: W): Promise<void> {
-    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ? AND creator_id = ? AND json_extract(payload, '$.revision') = ? AND ${availableSlug}`)
-      .run(JSON.stringify(work), this.local.configuration.cellId, work.tenantId, work.workId, work.creatorId, work.revision - 1, ...this.slugParameters("work", work.workId, work));
+    const references = this.referenceParameters(work);
+    const result = this.local.database.prepare(`UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ? AND creator_id = ? AND json_extract(payload, '$.revision') = ? AND ${availableSlug} AND ${validWorkAssetReferences}`)
+      .run(JSON.stringify(work), this.local.configuration.cellId, work.tenantId, work.workId, work.creatorId, work.revision - 1, ...this.slugParameters("work", work.workId, work), ...references);
     if (result.changes !== 1) {
       const current = this.get<W>(work.tenantId, "work", work.workId);
       if (!current || current.creatorId !== work.creatorId || current.revision !== work.revision - 1) {
         throw new CreatorWorkError("revision_conflict", "Work revision conflict or record not found.");
       }
+      const valid = this.local.database.prepare(`SELECT ${validWorkAssetReferences} AS valid`).get(...references) as { valid: number };
+      if (!valid.valid) throw new CreatorAssetError('invalid_asset', 'Content must reference active private assets attached to this Work.');
       throw this.slugConflict("work");
     }
   }
