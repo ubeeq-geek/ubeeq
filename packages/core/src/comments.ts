@@ -12,6 +12,32 @@ export interface CommentPort<C extends CommentRecord> {
   createComment(comment: C): Promise<void>;
 }
 export interface CommentTarget { targetType: string; targetId: string }
+/** Implementations must be bound to the caller's tenant/cell scope. */
+export interface CommentModerationPort {
+  updateCommentVisibility(commentId: string, hidden: boolean): Promise<void>;
+  deleteComment(commentId: string): Promise<void>;
+}
+/** Product policy resolves whether this actor may moderate this exact comment.
+ * No public admission or cross-tenant lookup is implied by possession of an ID.
+ */
+export class CommentModerationService {
+  constructor(private readonly store: CommentModerationPort, private readonly authorize:
+    (operation: 'visibility' | 'delete', commentId: string, actorId: string) => Promise<boolean>) {}
+  private async admit(operation: 'visibility' | 'delete', commentId: string, actorId: string): Promise<void> {
+    if (typeof actorId !== 'string' || !actorId.trim()) throw new CommentError('access_denied', 'Comment moderation denied.');
+    if (typeof commentId !== 'string' || !commentId.trim()) throw new CommentError('invalid_comment', 'Comment ID is required.');
+    if (!await this.authorize(operation, commentId, actorId)) throw new CommentError('access_denied', 'Comment moderation denied.');
+  }
+  async setHidden(actorId: string, commentId: string, hidden: boolean): Promise<void> {
+    await this.admit('visibility', commentId, actorId);
+    if (typeof hidden !== 'boolean') throw new CommentError('invalid_comment', 'Comment visibility must be a boolean.');
+    await this.store.updateCommentVisibility(commentId, hidden);
+  }
+  async delete(actorId: string, commentId: string): Promise<void> {
+    await this.admit('delete', commentId, actorId);
+    await this.store.deleteComment(commentId);
+  }
+}
 export class CommentError extends Error {
   constructor(readonly code: 'access_denied' | 'invalid_comment', message: string) {
     super(message); this.name = 'CommentError';

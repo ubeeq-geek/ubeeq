@@ -1,8 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CommentService } from '../dist/index.js';
+import { CommentModerationService, CommentService } from '../dist/index.js';
 
 const comment = { commentId: 'c', userId: 'user', targetType: 'work', targetId: 'work', body: 'Comment', hidden: false, createdAt: 'now', author: { labels: ['Author'] } };
+test('comment moderation authorizes the exact actor and ID before forwarding explicit operations', async () => {
+  const calls = [];
+  const service = new CommentModerationService({ updateCommentVisibility: async (...args) => calls.push(['visibility', ...args]),
+    deleteComment: async (...args) => calls.push(['delete', ...args]) }, async (...args) => { calls.push(['admit', ...args]); return true; });
+  await service.setHidden('moderator', 'comment', true);
+  await service.setHidden('moderator', 'comment', false);
+  await service.delete('moderator', 'comment');
+  assert.deepEqual(calls, [['admit', 'visibility', 'comment', 'moderator'], ['visibility', 'comment', true],
+    ['admit', 'visibility', 'comment', 'moderator'], ['visibility', 'comment', false],
+    ['admit', 'delete', 'comment', 'moderator'], ['delete', 'comment']]);
+});
+test('comment moderation rejects denied actors, missing IDs and coerced visibility without storage writes', async () => {
+  let writes = 0;
+  const store = { updateCommentVisibility: async () => writes++, deleteComment: async () => writes++ };
+  const denied = new CommentModerationService(store, async () => false);
+  await assert.rejects(denied.setHidden('actor', 'comment', true), { code: 'access_denied' });
+  await assert.rejects(denied.delete('actor', 'comment'), { code: 'access_denied' });
+  const allowed = new CommentModerationService(store, async () => true);
+  for (const value of [undefined, null, 0, 1, 'false', {}, []]) await assert.rejects(allowed.setHidden('actor', 'comment', value), { code: 'invalid_comment' });
+  await assert.rejects(allowed.delete('', 'comment'), { code: 'access_denied' });
+  await assert.rejects(allowed.delete('actor', ' '), { code: 'invalid_comment' });
+  assert.equal(writes, 0);
+});
+test('comment moderation propagates storage and policy failures', async () => {
+  const failure = new Error('unavailable');
+  const service = new CommentModerationService({ updateCommentVisibility: async () => { throw failure; }, deleteComment: async () => { throw failure; } }, async () => true);
+  await assert.rejects(service.setHidden('actor', 'comment', true), error => error === failure);
+  await assert.rejects(service.delete('actor', 'comment'), error => error === failure);
+  const denied = new CommentModerationService({}, async () => { throw failure; });
+  await assert.rejects(denied.delete('actor', 'comment'), error => error === failure);
+});
 test('comment listing filters target and hidden state before returning independent records', async () => {
   const rows = [structuredClone(comment), { ...comment, hidden: true }, { ...comment, targetId: 'foreign' }, { ...comment, targetType: 'collection' }];
   const calls = [];
