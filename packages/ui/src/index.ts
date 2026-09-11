@@ -77,3 +77,4 @@ export const validateAccessibleAction = (action: AccessibleAction): AccessibleAc
   if (action.description) resolveLocalizedText(action.description, action.description.defaultLocale);
   return action;
 };
+export { createPrivateMediaPlayback } from './private-media-playback.js';
