@@ -1,4 +1,5 @@
 import { CreatorWorkError, CreatorWorkService, type CreatorWorkPort, type CreatorWorkRecord, type CreatorWorkScope } from "./creator-works.js";
+import { contentAssetReferences } from './content-asset-references.js';
 
 export interface CreatorAssetIdentity extends CreatorWorkScope { assetId: string }
 export interface CreatorAssetRecord extends CreatorAssetIdentity {
@@ -35,6 +36,30 @@ export interface CreatorAssetProcessingPort {
   commitAssetProcessing(input: CreatorAssetProcessingCommit): Promise<void>;
 }
 export interface CreatorAssetWork extends CreatorWorkRecord { primaryAssetId?: string }
+export interface CreatorAssetDetachmentCommit extends CreatorWorkScope {
+  workId: string; assetId: string; expectedRevision: number; updatedAt: string;
+}
+export interface CreatorAssetDetachmentPort<W extends CreatorAssetWork> extends CreatorWorkPort<W> {
+  /** Atomically recheck revision, membership and content references; detach, normalize order/primary and cancel matching active jobs. Retain stored files and assets. */
+  commitAssetDetachment(input: CreatorAssetDetachmentCommit): Promise<W>;
+}
+export class CreatorAssetDetachmentService<W extends CreatorAssetWork> {
+  private readonly works: CreatorWorkService<W>;
+  constructor(private readonly store: CreatorAssetDetachmentPort<W>, authorize: (scope: CreatorWorkScope) => Promise<boolean>,
+    private readonly now: () => string = () => new Date().toISOString()) { this.works = new CreatorWorkService(store, authorize, now); }
+  async detach(tenantId: string, workId: string, assetId: string, expectedRevision: number): Promise<W> {
+    const work = await this.works.get(tenantId, workId);
+    if (work.status === 'deleted') throw new CreatorAssetError('not_found', 'Work not found.');
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision !== work.revision) {
+      throw new CreatorWorkError('revision_conflict', 'Work changed; refresh before removing an asset.');
+    }
+    const content = work as W & { body?: unknown; media?: unknown };
+    if (contentAssetReferences(content.body, content.media).includes(assetId)) {
+      throw new CreatorAssetError('asset_in_use', 'Remove this asset from the saved Work content before detaching it.');
+    }
+    return structuredClone(await this.store.commitAssetDetachment({ tenantId, creatorId: work.creatorId, workId, assetId, expectedRevision, updatedAt: this.now() }));
+  }
+}
 export interface CreatorAssetAttachment { workId: string; assetId: string; role: "primary" | "content"; position: number }
 export interface CreatorAssetMembership { workId: string; assetId: string; role: string; position: number }
 export interface CreatorPrimaryAssetCommit extends CreatorWorkScope {
@@ -102,7 +127,7 @@ export interface CreatorAssetPort<W extends CreatorAssetWork, A extends CreatorA
   commitAssetAttachment(input: { previousRevision: number; work: W; asset: A; attachment: CreatorAssetAttachment }): Promise<void>;
 }
 export class CreatorAssetError extends Error {
-  constructor(public readonly code: "invalid_asset" | "not_found", message: string) { super(message); this.name = "CreatorAssetError"; }
+  constructor(public readonly code: "invalid_asset" | "not_found" | "asset_in_use", message: string) { super(message); this.name = "CreatorAssetError"; }
 }
 /** Select only current private outputs. Callers must authorize the attached asset first. */
 export const selectPrivateAssetRendition = (asset: CreatorAssetRecord, renditionId: string): CreatorAssetRendition => {
