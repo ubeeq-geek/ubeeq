@@ -12,7 +12,10 @@ export class LocalFlickrRepository implements FlickrRepository {
       connection_id TEXT, payload TEXT NOT NULL,
       PRIMARY KEY (cell_id, tenant_id, kind, id));
       CREATE INDEX IF NOT EXISTS ubeeq_flickr_connection ON ubeeq_flickr_state
-      (cell_id, tenant_id, kind, connection_id);`);
+      (cell_id, tenant_id, kind, connection_id);
+      CREATE INDEX IF NOT EXISTS ubeeq_flickr_owner_connections ON ubeeq_flickr_state
+      (cell_id, tenant_id, json_extract(payload, '$.userId'), json_extract(payload, '$.creatorId'), id)
+      WHERE kind = 'connection';`);
   }
   private put(kind: string, id: string, value: unknown, connectionId: string | null = null) {
     this.local.database.prepare(`INSERT INTO ubeeq_flickr_state (cell_id, tenant_id, kind, id, connection_id, payload)
@@ -27,6 +30,27 @@ export class LocalFlickrRepository implements FlickrRepository {
   }
   async putConnection(value: FlickrConnection) { this.put('connection', value.connectionId, value); }
   async getConnection(id: string) { return this.get<FlickrConnection>('connection', id); }
+  async listConnections(userId: string, creatorId: string, options: { limit: number; cursor?: string }): Promise<{ items: FlickrConnection[]; nextCursor?: string }> {
+    if (![userId, creatorId].every(value => typeof value === 'string' && value.trim() && value.length <= 200)
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100) throw new Error('Invalid Flickr connection page');
+    const scope = [this.cellId, this.tenantId, userId, creatorId];
+    let after = '';
+    if (options.cursor !== undefined) {
+      try {
+        if (typeof options.cursor !== 'string' || !options.cursor || options.cursor.length > 8192) throw Error();
+        const parsed = JSON.parse(Buffer.from(options.cursor, 'base64url').toString());
+        if (!Array.isArray(parsed) || parsed.length !== 5 || scope.some((value, i) => parsed[i] !== value) || typeof parsed[4] !== 'string' || !parsed[4]) throw Error();
+        after = parsed[4];
+      } catch { throw new Error('Invalid Flickr connection cursor'); }
+    }
+    const rows = this.local.database.prepare(`SELECT id, payload FROM ubeeq_flickr_state INDEXED BY ubeeq_flickr_owner_connections
+      WHERE cell_id = ? AND tenant_id = ? AND kind = 'connection'
+      AND json_extract(payload, '$.userId') = ? AND json_extract(payload, '$.creatorId') = ? AND id > ? ORDER BY id LIMIT ?`)
+      .all(...scope, after, options.limit + 1) as Array<{ id: string; payload: string }>;
+    const page = rows.slice(0, options.limit);
+    return { items: page.map(row => JSON.parse(row.payload) as FlickrConnection),
+      nextCursor: rows.length > options.limit ? Buffer.from(JSON.stringify([...scope, page[page.length - 1].id])).toString('base64url') : undefined };
+  }
   async putMigration(value: FlickrMigration) { this.put('migration', value.migrationId, value, value.connectionId); }
   async getMigration(id: string) { return this.get<FlickrMigration>('migration', id); }
   async getMigrationByConnection(connectionId: string): Promise<FlickrMigration | undefined> {
