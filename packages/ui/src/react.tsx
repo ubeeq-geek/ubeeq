@@ -291,3 +291,4 @@ export function BlockEditor({
     </div>
   );
 }
+export { ProfileExternalLinksEditor } from './profile-external-links-editor.js';
