@@ -48,7 +48,7 @@ const validWorkAssetReferences = `NOT EXISTS (
 export class LocalCreatorLibraryStore<W extends CreatorWorkRecord, C extends CreatorCollectionRecord>
 implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingPort {
   readonly supportsExpectedCollectionOrder = true;
-  constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean; allowSquareCrop?: boolean } = {}) {}
+  constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean; enqueueAudioProcessing?: boolean; allowSquareCrop?: boolean } = {}) {}
 
   private get<T>(tenantId: string, kind: string, id: string): T | null {
     const row = this.local.database.prepare("SELECT payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = ? AND id = ?")
@@ -102,7 +102,8 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       if (asset.storage.scope !== 'private' || asset.storage.versionId !== input.sourceVersionId) throw new CreatorAssetRegenerationError('source_changed', 'Processing source changed.');
       if (squareCrop && (!this.options.allowSquareCrop || !this.options.enqueueImageProcessing || !asset.mimeType.startsWith('image/'))) throw new CreatorAssetRegenerationError('processing_unsupported', 'Square crop processing is not enabled.');
       if (!((this.options.enqueueImageProcessing && asset.mimeType.startsWith('image/')) ||
-        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith('video/')))) throw new CreatorAssetRegenerationError('processing_unsupported', 'No enabled processor for this media.');
+        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith('video/')) ||
+        (this.options.enqueueAudioProcessing && asset.mimeType.startsWith('audio/')))) throw new CreatorAssetRegenerationError('processing_unsupported', 'No enabled processor for this media.');
       const key = JSON.stringify(['creator-asset.regenerate', input.tenantId, input.creatorId, input.workId, input.assetId, input.sourceVersionId, input.requestId]);
       const previous = db.prepare('SELECT id, state, payload FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?')
         .get(cell, `${cell}:${key}`) as { id: string; state: string; payload: string } | undefined;
@@ -305,7 +306,8 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
         .run(JSON.stringify(next), cell, work.tenantId, work.workId);
       if (asset.status === "pending" && ((this.options.enqueueImageProcessing && asset.mimeType.startsWith("image/")) ||
-        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith("video/")))) {
+        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith("video/")) ||
+        (this.options.enqueueAudioProcessing && asset.mimeType.startsWith("audio/")))) {
         new LocalSqliteJobQueue(this.local).enqueueSync({ cellId: cell, type: "creator-asset.process",
           payload: { tenantId: asset.tenantId, creatorId: asset.creatorId, workId: work.workId, assetId: asset.assetId, sourceVersionId: asset.storage.versionId },
           idempotencyKey: JSON.stringify(["creator-asset.process", asset.tenantId, asset.assetId, asset.storage.versionId]), maxAttempts: 3 });
