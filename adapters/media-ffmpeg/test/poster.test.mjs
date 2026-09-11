@@ -34,6 +34,31 @@ test('buffer poster rendering preserves capture time and cleans failed and succe
 const profile = { profile: 'fixture', maxDurationSeconds: 60, maxWidth: 100, maxHeight: 100,
   allowedContainers: ['mp4'], allowedVideoCodecs: ['h264'], frameIntervalSeconds: 3 };
 const input = { assetId: 'asset', sourceVersionId: 'version', contentType: 'video/mp4', source: new Uint8Array([1]) };
+test('video processors snapshot source bytes, lineage, policy and render controls', async () => {
+  const source = new Uint8Array([1, 2, 3]), mutableProfile = structuredClone(profile);
+  const calls = [];
+  const tools = { probe: async path => {
+    assert.deepEqual(new Uint8Array(await readFile(path)), new Uint8Array([1, 2, 3]));
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    return { format: { duration: '2', format_name: 'mp4' }, streams: [{ codec_type: 'video', codec_name: 'h264', width: 64, height: 48 }] };
+  }, extractFrame: async (path, output, time) => {
+    calls.push(time); assert.deepEqual(new Uint8Array(await readFile(path)), new Uint8Array([1, 2, 3]));
+    await writeFile(output, new Uint8Array([255, 216, 255, 0]));
+  } };
+  const processor = new FfmpegPosterProcessor(tools, mutableProfile, 4);
+  const mutableInput = { ...input, source };
+  const pending = processor.process(mutableInput);
+  source.fill(9); mutableInput.sourceVersionId = 'changed'; mutableInput.contentType = 'audio/wav';
+  mutableProfile.allowedContainers.length = 0; mutableProfile.maxDurationSeconds = 1;
+  const result = await pending;
+  assert.equal(result.renditions[0].id, 'poster:version'); assert.equal(result.renditions[0].sourceVersionId, 'version');
+  assert.equal(result.metadata.contentType, 'video/mp4'); assert.equal(result.metadata.validationProfile, 'fixture');
+  const bytes = new Uint8Array([1, 2, 3]), options = { tools, captureAtMs: 1250, maxOutputBytes: 4 };
+  const render = renderVideoPoster(bytes, options);
+  bytes.fill(8); options.captureAtMs = 9999; options.maxOutputBytes = 1;
+  options.tools = { extractFrame: async () => assert.fail('replaced tool must not run') };
+  assert.equal((await render).byteLength, 4); assert.deepEqual(calls, [0, 1250]);
+});
 test('poster preserves lineage, enforces output bounds and cleans attempt files', async () => {
   let directory, calls = 0, body = new Uint8Array([255, 216, 255, 0]);
   const tools = { probe: async path => { directory = dirname(path); return { format: { duration: '2', format_name: 'mp4' },
