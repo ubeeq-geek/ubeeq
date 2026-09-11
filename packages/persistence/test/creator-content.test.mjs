@@ -4,6 +4,15 @@ import { MemoryCreatorContentStore } from "../dist/index.js";
 
 const work = (tenantId, workId, extra = {}) => ({ tenantId, workId, creatorId: "creator", status: "draft", updatedAt: "2026-09-04T00:00:00Z", ...extra });
 
+test('memory collection recovery remains opt-in and tenant/creator scoped', async () => {
+  const store = new MemoryCreatorContentStore();
+  for (const [id, tenantId, creatorId, status] of [['active', 'one', 'creator', 'draft'], ['removed', 'one', 'creator', 'deleted'], ['foreign', 'two', 'creator', 'deleted'], ['other', 'one', 'other', 'deleted']]) {
+    await store.createCreatorCollection({ collectionId: id, title: id, tenantId, creatorId, status, updatedAt: 'now' });
+  }
+  assert.deepEqual((await store.listCreatorCollections('one', 'creator')).map(c => c.collectionId), ['active']);
+  assert.deepEqual((await store.listCreatorCollections('one', 'creator', { includeDeleted: true })).map(c => c.collectionId), ['active', 'removed']);
+});
+
 test("asset metadata commit rejects stale or foreign writes without partial state", async () => {
   const store = new MemoryCreatorContentStore();
   const original = work("one", "work", { revision: 1 });

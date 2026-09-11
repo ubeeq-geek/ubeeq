@@ -30,7 +30,7 @@ export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
   getProcessingAsset?(tenantId: string, assetId: string): Promise<{
     tenantId: string; creatorId: string; assetId: string; status: string; storage: { scope: string };
   } | null>;
-  listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]>;
+  listCreatorCollections(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<C[]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null>;
   createCreatorCollection(collection: C): Promise<void>;
   updateCreatorCollection(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<void>;
@@ -81,10 +81,10 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     return { ...collection, workIds: memberships.map(({ workId }) => workId) };
   }
 
-  async list(scope: CreatorCollectionScope): Promise<Array<C & { workIds: string[] }>> {
+  async list(scope: CreatorCollectionScope, options: { includeDeleted?: boolean } = {}): Promise<Array<C & { workIds: string[] }>> {
     await this.requireAccess(scope);
-    const collections = await this.store.listCreatorCollections(scope.tenantId, scope.creatorId);
-    return Promise.all(collections.filter((collection) => collection.tenantId === scope.tenantId && collection.creatorId === scope.creatorId).map((collection) => this.view(collection)));
+    const collections = await this.store.listCreatorCollections(scope.tenantId, scope.creatorId, options);
+    return Promise.all(collections.filter((collection) => collection.tenantId === scope.tenantId && collection.creatorId === scope.creatorId && (options.includeDeleted === true || collection.status !== 'deleted')).map((collection) => this.view(collection)));
   }
 
   private async requireAvailableSlug(collection: C): Promise<void> {

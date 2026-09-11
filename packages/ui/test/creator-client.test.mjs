@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection recovery uses opt-in listing and an explicit revisioned draft request', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
+  await client.collections('creator/one');
+  assert.equal(calls.at(-1).url, '/api/studio/collections?creatorId=creator%2Fone');
+  await client.collections('creator/one', { includeDeleted: true });
+  assert.equal(calls.at(-1).url, '/api/studio/collections?creatorId=creator%2Fone&includeDeleted=true');
+  await client.restoreCollection('collection/one', 4);
+  assert.equal(calls.at(-1).url, '/api/studio/collections/collection%2Fone');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { status: 'draft', expectedRevision: 4 });
+});
 test('removed-Work recovery opts into listing and restores only to a revisioned draft', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });

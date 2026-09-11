@@ -40,7 +40,7 @@ export interface CreatorContentStore<M extends CreatorContentRecords = CreatorCo
   upsertPublicationIntent(intent: M['intent']): Promise<void>;
   deletePublicationIntent(tenantId: string, publicationIntentId: string): Promise<void>;
 
-  listCreatorCollections(tenantId: string, creatorId: string): Promise<M['collection'][]>;
+  listCreatorCollections(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<M['collection'][]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<M['collection'] | null>;
   createCreatorCollection(collection: M['collection']): Promise<void>;
   updateCreatorCollection(collection: M['collection']): Promise<void>;
