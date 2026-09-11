@@ -1,6 +1,6 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
 import { CreatorWorkError, CreatorCollectionError, CreatorAssetError } from "@ubeeq/core";
-import type { CreatorPrimaryAssetCommit } from "@ubeeq/core";
+import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit } from "@ubeeq/core";
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
 import { LocalSqliteJobQueue } from "./index.js";
@@ -133,6 +133,31 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       const roles = attachments.map(item => ({ ...item, role: item.assetId === input.assetId ? 'primary' : 'content' }));
       db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work_assets' AND id = ?")
         .run(JSON.stringify(roles), cell, input.tenantId, input.workId);
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
+        .run(JSON.stringify(next), cell, input.tenantId, input.workId);
+      db.exec('COMMIT');
+      return next;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  async commitAssetOrder(input: CreatorAssetOrderCommit): Promise<W> {
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const previous = this.get<W>(input.tenantId, 'work', input.workId);
+      if (!previous || previous.creatorId !== input.creatorId || previous.status === 'deleted' ||
+        !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1 || previous.revision !== input.expectedRevision) {
+        throw new CreatorWorkError('revision_conflict', 'Work changed before asset ordering.');
+      }
+      const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
+      const ids = input.assetIds;
+      if (!Array.isArray(ids) || new Set(ids).size !== ids.length || new Set(attachments.map(item => item.assetId)).size !== attachments.length || ids.length !== attachments.length ||
+        ids.some(id => typeof id !== 'string' || !id) || attachments.some(item => item.workId !== input.workId || !ids.includes(item.assetId))) {
+        throw new CreatorAssetError('invalid_asset', 'Supply every attached asset exactly once.');
+      }
+      const ordered = ids.map((id, position) => ({ ...attachments.find(item => item.assetId === id)!, position }));
+      const next = { ...previous, revision: previous.revision + 1, updatedAt: input.updatedAt };
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work_assets' AND id = ?")
+        .run(JSON.stringify(ordered), cell, input.tenantId, input.workId);
       db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
         .run(JSON.stringify(next), cell, input.tenantId, input.workId);
       db.exec('COMMIT');

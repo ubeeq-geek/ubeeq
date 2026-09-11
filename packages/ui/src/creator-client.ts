@@ -81,6 +81,9 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }
   assets(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/assets`); }
+  setAssetOrder(workId: string, assetIds: string[], expectedRevision: number) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}/asset-order`, 'PUT', { assetIds, expectedRevision });
+  }
   setPrimaryAsset(workId: string, assetId: string, expectedRevision: number) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/primary-asset`, 'PUT', { assetId, expectedRevision });
   }
