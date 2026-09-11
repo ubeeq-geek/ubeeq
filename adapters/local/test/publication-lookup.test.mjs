@@ -28,5 +28,18 @@ test('Work publication lookup scopes pages and current live state without reposi
     const other = new LocalSqliteDatabase({ ...config, cellId: 'other-cell' });
     try { assert.deepEqual((await new LocalWorkPublicationLookup(other).list(scope, { limit: 100 })).items, []); }
     finally { other.database.close(); }
+    const fresh = createLocalRepositories(local), exportLookup = new LocalWorkPublicationLookup(local);
+    await fresh.publications.create({ ...scope, destination: 'second', id: 'second-destination', homeCellId: 'cell', status: 'removed' });
+    const exported = await exportLookup.listForWork(scope, { limit: 100 });
+    const rest = await exportLookup.listForWork(scope, { limit: 100, cursor: exported.nextCursor });
+    assert.equal(exported.items.length + rest.items.length, 106);
+    assert.equal(rest.items.at(-1).destination, 'second');
+    assert.equal(rest.nextCursor, undefined);
+    await assert.rejects(exportLookup.listForWork({ ...scope, instanceId: 'other' }, { limit: 100, cursor: exported.nextCursor }), /cursor scope/);
+    await assert.rejects(exportLookup.listForWork({ ...scope, workId: 'other' }, { limit: 100, cursor: exported.nextCursor }), /cursor scope/);
+    await assert.rejects(exportLookup.list(scope, { limit: 100, cursor: exported.nextCursor }), /cursor scope/);
+    await assert.rejects(exportLookup.listForWork(scope, { limit: 100, cursor: first.nextCursor }), /cursor scope/);
+    await assert.rejects(exportLookup.listForWork(scope, { limit: 101 }), /limit/);
+    await assert.rejects(exportLookup.listForWork({ ...scope, workId: '' }, { limit: 1 }), /scope/);
   } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
