@@ -1,6 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderGhostLexical, validateGhostLexical } from '../dist/index.js';
+import { renderGhostLexical, validateGhostLexical, GHOST_LEXICAL_LIMITS } from '../dist/index.js';
+
+test('Ghost enforces exact UTF-8 byte limits before parsing', () => {
+  const base = JSON.stringify({ root: { type: 'root', children: [] }, pad: '' });
+  const remaining = GHOST_LEXICAL_LIMITS.maxBytes - Buffer.byteLength(base);
+  const value = base.replace('"pad":""', '"pad":"' + 'é'.repeat(Math.floor(remaining / 2)) + (remaining % 2 ? 'a' : '') + '"');
+  assert.equal(Buffer.byteLength(value), GHOST_LEXICAL_LIMITS.maxBytes);
+  assert.equal(validateGhostLexical(value), value);
+  assert.throws(() => validateGhostLexical(value + ' '), /byte limit/);
+  assert.throws(() => renderGhostLexical([{ type: 'paragraph', text: 'a'.repeat(GHOST_LEXICAL_LIMITS.maxBytes) }], 'https://example.com'), /byte limit/);
+});
+
+test('Ghost bounds all values including extension metadata with exact boundaries', () => {
+  const document = count => JSON.stringify({ root: { type: 'root', children: [], metadata: Array(count).fill(0) } });
+  assert.doesNotThrow(() => validateGhostLexical(document(GHOST_LEXICAL_LIMITS.maxValues - 5)));
+  assert.throws(() => validateGhostLexical(document(GHOST_LEXICAL_LIMITS.maxValues - 4)), /value limit/);
+  assert.throws(() => renderGhostLexical(Array(2000).fill({ type: 'paragraph', text: 'x' }), 'https://example.com'), /value limit/);
+});
+
+test('Ghost rejects excessive metadata and node nesting before recursive validation or serialization', () => {
+  const metadata = depth => '{"root":{"type":"root","metadata":' + '{"next":'.repeat(depth) + '{}' + '}'.repeat(depth) + '}}';
+  assert.doesNotThrow(() => validateGhostLexical(metadata(62)));
+  assert.throws(() => validateGhostLexical(metadata(63)), /nesting limit/);
+  assert.throws(() => validateGhostLexical(metadata(10_000)), /nesting limit/);
+  const nodes = '{"root":' + '{"type":"paragraph","children":['.repeat(100) + '{"type":"text","text":"leaf"}' + ']}'.repeat(100) + '}';
+  assert.throws(() => validateGhostLexical(nodes), /nesting limit/);
+});
 
 test('Ghost content preserves semantic node output and uses caller-owned attribution text', () => {
   const blocks = [{ type: 'paragraph', text: '<literal>& text' }, { type: 'heading', level: 3, text: 'Heading' },

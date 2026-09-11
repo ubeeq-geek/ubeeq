@@ -2,10 +2,35 @@
  * Product-neutral Ghost content serialization and legacy node/URL validation.
  * No network, credentials, publication authorization or site eligibility.
  * Validation is not a complete Lexical schema or HTML sanitizer; callers remain
- * responsible for input size/nesting limits and approved media provenance.
+ * responsible for approved media provenance and transport-level body limits.
  */
+export const GHOST_LEXICAL_LIMITS = Object.freeze({ maxBytes: 4 * 1024 * 1024, maxDepth: 64, maxValues: 10_000 });
+
+const checkGhostStructure = (document: unknown): void => {
+  const pending = [{ value: document, depth: 0 }];
+  let count = 0;
+  while (pending.length) {
+    const { value, depth } = pending.pop()!;
+    if (++count > GHOST_LEXICAL_LIMITS.maxValues) throw new Error('Ghost Lexical value limit exceeded');
+    if (!value || typeof value !== 'object') continue;
+    if (depth > GHOST_LEXICAL_LIMITS.maxDepth) throw new Error('Ghost Lexical nesting limit exceeded');
+    const values = Object.values(value);
+    if (values.length > GHOST_LEXICAL_LIMITS.maxValues - count) throw new Error('Ghost Lexical value limit exceeded');
+    for (const child of values) pending.push({ value: child, depth: depth + 1 });
+  }
+};
+
 export type GhostRenderBlock = { type: 'paragraph' | 'heading' | 'image' | 'code' | 'link'; text?: string; level?: 2 | 3 | 4; src?: string; alt?: string; caption?: string; href?: string };
 export const renderGhostLexical = (blocks: readonly GhostRenderBlock[], canonicalUrl: string, options: { canonicalLinkText?: string } = {}): string => {
+  if (blocks.length > GHOST_LEXICAL_LIMITS.maxValues) throw new Error('Ghost Lexical value limit exceeded');
+  let inputBytes = Buffer.byteLength(canonicalUrl) + Buffer.byteLength(options.canonicalLinkText ?? 'View the canonical Work');
+  if (inputBytes > GHOST_LEXICAL_LIMITS.maxBytes) throw new Error('Ghost Lexical byte limit exceeded');
+  for (const block of blocks) {
+    for (const value of [block.text, block.src, block.alt, block.caption, block.href]) {
+      if (typeof value === 'string') inputBytes += Buffer.byteLength(value);
+    }
+    if (inputBytes > GHOST_LEXICAL_LIMITS.maxBytes) throw new Error('Ghost Lexical byte limit exceeded');
+  }
   const safeUrl = (value: string, image = false) => {
     const url = new URL(value);
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && !image)) throw new Error('Only safe HTTP(S) URLs are supported');
@@ -18,16 +43,19 @@ export const renderGhostLexical = (blocks: readonly GhostRenderBlock[], canonica
     return { type: 'paragraph', version: 1, children: [{ type: 'link', version: 1, url: safeUrl(block.href || ''), children: [{ type: 'text', version: 1, text: block.text || block.href || '' }] }] };
   });
   children.push({ type: 'paragraph', version: 1, children: [{ type: 'link', version: 1, url: safeUrl(canonicalUrl), children: [{ type: 'text', version: 1, text: options.canonicalLinkText ?? 'View the canonical Work' }] }] });
-  return JSON.stringify({ root: { type: 'root', version: 1, children } });
+  return validateGhostLexical(JSON.stringify({ root: { type: 'root', version: 1, children } }));
 };
 
 export const validateGhostLexical = (value: string): string => {
+  if (typeof value !== 'string') throw new Error('Ghost Lexical content must be a JSON string');
+  if (Buffer.byteLength(value) > GHOST_LEXICAL_LIMITS.maxBytes) throw new Error('Ghost Lexical byte limit exceeded');
   let document: unknown;
   try {
     document = JSON.parse(value);
   } catch {
     throw new Error('Ghost Lexical content must be valid JSON');
   }
+  checkGhostStructure(document);
   const allowed = new Set(['root', 'paragraph', 'heading', 'text', 'image', 'code', 'link']);
   const visit = (node: unknown): void => {
     if (!node || typeof node !== 'object' || Array.isArray(node)) throw new Error('Ghost Lexical nodes must be objects');
