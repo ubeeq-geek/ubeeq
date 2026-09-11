@@ -40,6 +40,8 @@ for (const [target, api] of [['node', node], ['browser', browser]]) {
       const actual = api.orientedFocalPointToSource(point, orientation);
       assert.ok(Math.abs(actual.x - expected[orientation - 1][0]) < 1e-12);
       assert.ok(Math.abs(actual.y - expected[orientation - 1][1]) < 1e-12);
+      const roundTrip = api.sourceFocalPointToOriented(actual, orientation);
+      assert.ok(Math.abs(roundTrip.x - point.x) < 1e-12 && Math.abs(roundTrip.y - point.y) < 1e-12);
     }
     for (const x of [-0.1, 1.1, NaN, Infinity]) assert.throws(() => api.orientedFocalPointToSource({ x, y: 0.5 }));
     assert.deepEqual(point, { x: 0.2, y: 0.7 });
