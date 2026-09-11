@@ -24,3 +24,14 @@ test('activity normalization retains provider IDs and deterministic fallback ide
   assert.equal(first.remoteActivityId, 'soundcloud:track-like:3:2:2023-11-14T22:13:20.000Z');
   assert.equal(activity({ ...input, urn: 'event:1' }).sourceMessageId, 'event:1');
 });
+
+test('incomplete activity identity fails the page instead of generating colliding type-only IDs', () => {
+  const complete = { type: 'track-like', user: { id: 3 }, track: { id: 2 }, created_at: '2026-01-01T00:00:00Z' };
+  for (const input of [null, {}, { type: 'track-like' }, { ...complete, type: undefined }, { ...complete, user: undefined },
+    { ...complete, track: undefined }, { ...complete, created_at: undefined }, { ...complete, created_at: 'invalid' }]) {
+    assert.throws(() => activity(input), { name: 'ExternalProviderError', code: 'invalid_response' });
+  }
+  // An authoritative provider identifier remains usable without inferred fields.
+  assert.equal(activity({ id: 7 }).sourceMessageId, '7');
+  assert.equal(activity({ urn: 'event:7' }).sourceMessageId, 'event:7');
+});
