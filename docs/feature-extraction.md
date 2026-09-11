@@ -21,6 +21,17 @@ Features are complete only when a consuming application executes the shared impl
 
 ## Initial integration slice
 
+Announcement publication identity and snapshot guards now live in integrations.
+The shared factory preserves the legacy provider/connection/target/idempotency
+tuple hash and clones the supplied content. Replacement guards protect content,
+identity, destination and optional Work linkage; delivery status and remote
+receipts remain updateable. Products supply snapshot fields, provider selection,
+disclosure wording and renderers. The consumer's existing memory and cloud
+repository guards import the shared mechanism; memory tests verify rejected
+destination edits do not replace stored data. This is not an atomic cloud
+conditional-write guarantee, a delivery state machine, or exactly-once sending;
+concurrent persistence and external-side-effect fencing remain unfinished.
+
 Publication preflight now lives in the integrations package with an injected
 capability declaration. It evaluates supported operations/media, supplied size
 limits, disclosure precision, connection state, scopes, holds and configured
