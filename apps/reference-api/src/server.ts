@@ -34,9 +34,9 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("error", reject);
 });
 const rewriteImportManifest = (manifest: CreatorExportManifest, targetCreatorId: string, preserveIds: boolean) => {
-  if (preserveIds) return { manifest, idMap: new Map<string, string>() };
   const idMap = new Map<string, string>();
   const remap = (id: string): string => {
+    if (preserveIds) return id;
     const mapped = idMap.get(id);
     if (mapped) return mapped;
     const next = randomUUID();
@@ -53,7 +53,11 @@ const rewriteImportManifest = (manifest: CreatorExportManifest, targetCreatorId:
         const { storage: _storage, originalStorage: _originalStorage, processing: _processing, renditions: _renditions, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processing?: unknown; renditions?: unknown; };
         return { ...portableAsset, id: remap(asset.id), creatorId: targetCreatorId, workId: asset.workId ? remap(asset.workId) : undefined, status: "pending" };
       }),
-      collections: manifest.collections.map((collection) => ({ ...collection, id: remap(collection.id), creatorId: targetCreatorId })),
+      collections: manifest.collections.map((collection) => {
+        const workIds = (collection as typeof collection & { workIds?: string[] }).workIds;
+        return { ...collection, id: remap(collection.id), creatorId: targetCreatorId,
+          ...(workIds ? { workIds: workIds.map(remap) } : {}) };
+      }),
       publications: manifest.publications.map((publication) => ({ ...publication, id: remap(publication.id), workId: remap(publication.workId) })),
       publicationIntents: manifest.publicationIntents.map((intent) => ({ ...intent, id: remap(intent.id), workId: remap(intent.workId) })),
       moderationEvidence: manifest.moderationEvidence.map((evidence) => ({ ...evidence, id: remap(evidence.id), subjectId: remapSubjectId(evidence.subjectId) })),

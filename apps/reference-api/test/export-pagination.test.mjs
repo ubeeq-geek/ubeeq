@@ -56,7 +56,7 @@ test('export and import preflight visit every repository page and reject broken 
     assert.equal(exported.body.processing.length, 101);
     assert.equal(JSON.stringify(exported.body).includes('private-reference'), false);
     for (const endpoint of ['/v1/imports/validate', '/v1/imports']) {
-      const response = await request(endpoint, { manifest: exported.body });
+      const response = await request(endpoint, { manifest: exported.body, preserveIds: true });
       assert.equal(response.status, 200);
       for (const [resource, repository] of [['work', 'works'], ['asset', 'assets'], ['collection', 'collections'],
         ['publication', 'publications'], ['publicationIntent', 'publicationIntents'], ['moderationEvidence', 'moderationEvidence'],
