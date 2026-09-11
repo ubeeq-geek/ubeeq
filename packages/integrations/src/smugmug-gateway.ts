@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'crypto';
+import { readBoundedBytes } from '@ubeeq/storage';
 import { readBoundedResponseText } from './bounded-response-text.js';
 import type { SmugMugCapabilities, SmugMugGateway, SmugMugInventoryPage, SmugMugRemoteCollection, SmugMugRemoteImage } from './smugmug-contracts.js';
 
@@ -23,6 +24,7 @@ export interface SmugMugHttpGatewayOptions {
   oauthOrigin?: string;
   requestTimeoutMs?: number;
   maxMetadataBytes?: number;
+  maxDownloadBytes?: number;
 }
 
 const encode = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -44,12 +46,15 @@ export class SmugMugHttpGateway implements SmugMugGateway {
   private readonly oauthOrigin: string;
   private readonly requestTimeoutMs: number;
   private readonly maxMetadataBytes: number;
+  private readonly maxDownloadBytes: number;
 
   constructor(private readonly options: SmugMugHttpGatewayOptions) {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.maxMetadataBytes = options.maxMetadataBytes ?? 4 * 1024 * 1024;
+    this.maxDownloadBytes = options.maxDownloadBytes ?? 50 * 1024 * 1024;
     if (!Number.isSafeInteger(this.requestTimeoutMs) || this.requestTimeoutMs < 1 || this.requestTimeoutMs > 300_000
-      || !Number.isSafeInteger(this.maxMetadataBytes) || this.maxMetadataBytes < 1 || this.maxMetadataBytes > 16 * 1024 * 1024) throw new Error('Invalid SmugMug request limits.');
+      || !Number.isSafeInteger(this.maxMetadataBytes) || this.maxMetadataBytes < 1 || this.maxMetadataBytes > 16 * 1024 * 1024
+      || !Number.isSafeInteger(this.maxDownloadBytes) || this.maxDownloadBytes < 1) throw new Error('Invalid SmugMug request limits.');
     this.request = options.fetch || fetch;
     this.apiOrigin = (options.apiOrigin || 'https://api.smugmug.com').replace(/\/$/, '');
     this.oauthOrigin = (options.oauthOrigin || 'https://api.smugmug.com/services/oauth/1.0a').replace(/\/$/, '');
@@ -131,12 +136,36 @@ export class SmugMugHttpGateway implements SmugMugGateway {
 
   async download(credentialRef: string, image: SmugMugRemoteImage) {
     if (!image.originalAvailable || !image.sourceUrl) throw new Error('The SmugMug original is unavailable.');
+    const expectedSize = image.byteSize;
+    if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 1)) throw new Error('Invalid SmugMug source size.');
+    if (expectedSize !== undefined && expectedSize > this.maxDownloadBytes) throw new Error('SmugMug source exceeds byte limit.');
     const credential = await this.requiredCredential(credentialRef);
     const response = await this.signedFetch('GET', image.sourceUrl, credential);
     await this.requireOk(response, 'source download');
-    const contentLength = Number(response.headers.get('content-length') || 0);
-    if (image.byteSize && contentLength && contentLength !== image.byteSize) throw new Error('SmugMug source download was partial.');
-    return { body: Buffer.from(await response.arrayBuffer()), mimeType: response.headers.get('content-type')?.split(';')[0] || image.mimeType || 'application/octet-stream' };
+    const reader = response.body?.getReader();
+    try {
+      const declaredSize = response.headers.get('content-length');
+      const contentLength = declaredSize === null ? undefined : Number(declaredSize);
+      if (declaredSize !== null && (!/^\d+$/.test(declaredSize) || !Number.isSafeInteger(contentLength))) throw new Error('Invalid SmugMug source size.');
+      if (contentLength !== undefined && contentLength > this.maxDownloadBytes) throw new Error('SmugMug source exceeds byte limit.');
+      if (expectedSize !== undefined && contentLength !== undefined && contentLength !== expectedSize) throw new Error('SmugMug source download was partial.');
+      if (!reader) throw new Error('SmugMug source download was empty.');
+      async function* chunks() {
+        while (true) {
+          const chunk = await reader!.read();
+          if (chunk.done) return;
+          yield chunk.value;
+        }
+      }
+      const bytes = await readBoundedBytes(chunks(), this.maxDownloadBytes);
+      if (!bytes.byteLength) throw new Error('SmugMug source download was empty.');
+      if ((expectedSize !== undefined && bytes.byteLength !== expectedSize)
+        || (contentLength !== undefined && bytes.byteLength !== contentLength)) throw new Error('SmugMug source download was partial.');
+      return { body: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength), mimeType: response.headers.get('content-type')?.split(';')[0] || image.mimeType || 'application/octet-stream' };
+    } finally {
+      try { await reader?.cancel(); } catch { /* Preserve the download failure. */ }
+      reader?.releaseLock();
+    }
   }
 
   async publish(credentialRef: string, input: { galleryUri: string; body: Buffer; filename: string; mimeType: string; title: string; caption?: string; keywords: string[] }) {
