@@ -1,5 +1,6 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
-import { CreatorWorkError, CreatorCollectionError } from "@ubeeq/core";
+import { CreatorWorkError, CreatorCollectionError, CreatorAssetError } from "@ubeeq/core";
+import type { CreatorPrimaryAssetCommit } from "@ubeeq/core";
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
 import { LocalSqliteJobQueue } from "./index.js";
@@ -112,6 +113,31 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       if (!asset) throw new Error("Stored Work attachment has no asset.");
       return { ...asset, attachment };
     });
+  }
+  async commitPrimaryAsset(input: CreatorPrimaryAssetCommit): Promise<W> {
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const previous = this.get<W>(input.tenantId, 'work', input.workId);
+      if (!previous || previous.creatorId !== input.creatorId || previous.status === 'deleted' ||
+        !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1 || previous.revision !== input.expectedRevision) {
+        throw new CreatorWorkError('revision_conflict', 'Work changed before primary selection.');
+      }
+      const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
+      const asset = this.get<CreatorAssetRecord>(input.tenantId, 'asset', input.assetId);
+      if (!asset || asset.creatorId !== input.creatorId || asset.tenantId !== input.tenantId || asset.status === 'deleted' || asset.storage?.scope !== 'private' ||
+        !attachments.some(item => item.workId === input.workId && item.assetId === input.assetId)) {
+        throw new CreatorAssetError('invalid_asset', 'Select an attached private asset.');
+      }
+      const next = { ...previous, primaryAssetId: input.assetId, revision: previous.revision + 1, updatedAt: input.updatedAt };
+      const roles = attachments.map(item => ({ ...item, role: item.assetId === input.assetId ? 'primary' : 'content' }));
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work_assets' AND id = ?")
+        .run(JSON.stringify(roles), cell, input.tenantId, input.workId);
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
+        .run(JSON.stringify(next), cell, input.tenantId, input.workId);
+      db.exec('COMMIT');
+      return next;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
   }
   async commitAssetAttachment(input: { previousRevision: number; work: W; asset: CreatorAssetRecord; attachment: CreatorAssetAttachment }): Promise<void> {
     const { work, asset, attachment } = input;

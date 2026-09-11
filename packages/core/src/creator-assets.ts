@@ -1,4 +1,4 @@
-import { CreatorWorkService, type CreatorWorkPort, type CreatorWorkRecord, type CreatorWorkScope } from "./creator-works.js";
+import { CreatorWorkError, CreatorWorkService, type CreatorWorkPort, type CreatorWorkRecord, type CreatorWorkScope } from "./creator-works.js";
 
 export interface CreatorAssetIdentity extends CreatorWorkScope { assetId: string }
 export interface CreatorAssetRecord extends CreatorAssetIdentity {
@@ -37,6 +37,35 @@ export interface CreatorAssetProcessingPort {
 export interface CreatorAssetWork extends CreatorWorkRecord { primaryAssetId?: string }
 export interface CreatorAssetAttachment { workId: string; assetId: string; role: "primary" | "content"; position: number }
 export interface CreatorAssetMembership { workId: string; assetId: string; role: string; position: number }
+export interface CreatorPrimaryAssetCommit extends CreatorWorkScope {
+  workId: string; assetId: string; expectedRevision: number; updatedAt: string;
+}
+export interface CreatorPrimaryAssetPort<W extends CreatorAssetWork, A extends CreatorAssetIdentity> extends CreatorWorkPort<W> {
+  listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<A & { attachment: CreatorAssetMembership }>>;
+  /** Atomically check revision and live membership, update primary pointer and all roles; preserve order and other Work fields. */
+  commitPrimaryAsset(input: CreatorPrimaryAssetCommit): Promise<W>;
+}
+export class CreatorPrimaryAssetService<W extends CreatorAssetWork, A extends CreatorAssetIdentity> {
+  private readonly works: CreatorWorkService<W>;
+  constructor(private readonly store: CreatorPrimaryAssetPort<W, A>, authorize: (scope: CreatorWorkScope) => Promise<boolean>,
+    private readonly now: () => string = () => new Date().toISOString()) {
+    this.works = new CreatorWorkService(store, authorize, now);
+  }
+  async select(tenantId: string, workId: string, assetId: string, expectedRevision: number): Promise<W> {
+    const work = await this.works.get(tenantId, workId);
+    if (work.status === 'deleted') throw new CreatorAssetError('not_found', 'Work not found.');
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision !== work.revision) {
+      throw new CreatorWorkError('revision_conflict', 'Work changed; refresh before selecting its primary asset.');
+    }
+    const assets = await this.store.listCanonicalAssetsByWork(tenantId, workId);
+    const asset = assets.find(item => item.assetId === assetId && item.tenantId === tenantId && item.creatorId === work.creatorId &&
+      item.attachment.workId === workId && item.attachment.assetId === assetId);
+    if (!asset || !isPrivateStoredCreatorAsset(asset) || (asset as unknown as CreatorAssetRecord).status === 'deleted') {
+      throw new CreatorAssetError('invalid_asset', 'Select an attached private asset.');
+    }
+    return structuredClone(await this.store.commitPrimaryAsset({ tenantId, creatorId: work.creatorId, workId, assetId, expectedRevision, updatedAt: this.now() }));
+  }
+}
 export interface CreatorAssetPort<W extends CreatorAssetWork, A extends CreatorAssetIdentity> extends CreatorWorkPort<W> {
   listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<A & { attachment: CreatorAssetMembership }>>;
   /** All three records commit atomically, conditioned on the previous Work revision. */
