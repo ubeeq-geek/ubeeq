@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+export { LimitedBioEditor } from './limited-bio-editor.js';
 export { CropCanvas } from './crop-canvas.js';
 export { PrivateMediaPlayer, type PrivateMediaPlayerProps } from './private-media-player.js';
 export { BlockPreview, type BlockPreviewMedia, type BlockMediaRenderer } from './block-preview.js';
