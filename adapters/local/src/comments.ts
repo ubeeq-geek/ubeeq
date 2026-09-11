@@ -1,13 +1,24 @@
-import type { CommentPort, CommentRecord } from '@ubeeq/core';
+import type { CommentModerationPort, CommentPort, CommentRecord } from '@ubeeq/core';
 import { UniqueConstraintError } from '@ubeeq/persistence';
 import type { LocalSqliteDatabase } from './index.js';
 
 /** Persistence only: product admission and rendering remain caller responsibilities. */
-export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C> {
+export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort {
   constructor(private readonly local: LocalSqliteDatabase, private readonly tenantId: string) {
     if (!tenantId.trim()) throw new Error('Comment tenant is required.');
   }
   private scope() { return [this.local.configuration.cellId, this.tenantId]; }
+  async updateCommentVisibility(commentId: string, hidden: boolean): Promise<void> {
+    if (typeof commentId !== 'string' || !commentId.trim() || typeof hidden !== 'boolean') throw new Error('Invalid comment moderation request.');
+    this.local.database.prepare(`UPDATE ubeeq_comments SET payload = json_set(payload, '$.hidden', json(?))
+      WHERE cell_id = ? AND tenant_id = ? AND comment_id = ?`)
+      .run(JSON.stringify(hidden), ...this.scope(), commentId);
+  }
+  async deleteComment(commentId: string): Promise<void> {
+    if (typeof commentId !== 'string' || !commentId.trim()) throw new Error('Invalid comment moderation request.');
+    this.local.database.prepare('DELETE FROM ubeeq_comments WHERE cell_id = ? AND tenant_id = ? AND comment_id = ?')
+      .run(...this.scope(), commentId);
+  }
   async listComments(targetType: C['targetType'], targetId: string): Promise<C[]> {
     const rows = this.local.database.prepare(`SELECT comment_id, payload FROM ubeeq_comments
       WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ? ORDER BY created_at, comment_id`)

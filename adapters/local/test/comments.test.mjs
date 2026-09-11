@@ -4,7 +4,44 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalCommentStore, LocalSqliteDatabase } from '../dist/index.js';
-import { CommentService } from '@ubeeq/core';
+import { CommentModerationService, CommentService } from '@ubeeq/core';
+
+test('local comment moderation is scoped, durable, non-resurrecting and participates in rollback', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-moderation-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCommentStore(local, 'tenant');
+    const foreign = new LocalCommentStore(local, 'foreign');
+    const comment = { commentId: 'comment', userId: 'author', targetType: 'work', targetId: 'work', body: 'Retained', hidden: false, createdAt: 'now', labels: ['extra'] };
+    await store.createComment(comment); await foreign.createComment(comment);
+    let allowed = false;
+    const service = new CommentModerationService(store, async () => allowed);
+    await assert.rejects(service.setHidden('actor', 'comment', true), { code: 'access_denied' });
+    await assert.rejects(service.delete('actor', 'comment'), { code: 'access_denied' });
+    allowed = true;
+    await service.setHidden('actor', 'comment', true);
+    assert.deepEqual(await store.listComments('work', 'work'), [{ ...comment, hidden: true }]);
+    assert.deepEqual(await foreign.listComments('work', 'work'), [comment]);
+    await assert.rejects(local.transaction(async () => {
+      await service.setHidden('actor', 'comment', false); throw new Error('audit failed');
+    }), /audit failed/);
+    await assert.rejects(local.transaction(async () => {
+      await service.delete('actor', 'comment'); throw new Error('audit failed');
+    }), /audit failed/);
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCommentStore(local, 'tenant');
+    assert.deepEqual(await store.listComments('work', 'work'), [{ ...comment, hidden: true }]);
+    const restored = new CommentModerationService(store, async () => true);
+    await restored.setHidden('actor', 'comment', false);
+    assert.deepEqual(await store.listComments('work', 'work'), [comment]);
+    await restored.delete('actor', 'comment'); await restored.delete('actor', 'comment');
+    await restored.setHidden('actor', 'comment', false); // Missing rows are not recreated.
+    await assert.rejects(store.updateCommentVisibility('comment', 'false'), /Invalid/);
+    local.database.close(); local = new LocalSqliteDatabase(config);
+    assert.deepEqual(await new LocalCommentStore(local, 'tenant').listComments('work', 'work'), []);
+    assert.deepEqual(await new LocalCommentStore(local, 'foreign').listComments('work', 'work'), [comment]);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('local comments survive restart without overwrites, hidden leakage or cross-tenant reads', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comments-'));
