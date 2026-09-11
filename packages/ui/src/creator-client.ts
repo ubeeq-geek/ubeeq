@@ -66,6 +66,10 @@ export class CreatorClient {
   setWorkArchived(workId: string, revision: number, archived: boolean) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, status: archived ? 'archived' : 'draft' });
   }
+  /** Soft-delete from the creator library; retained originals are not erased. */
+  deleteWork(workId: string, revision: number) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, status: 'deleted' });
+  }
   updateWorkBody(workId: string, revision: number, body: unknown[]) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }

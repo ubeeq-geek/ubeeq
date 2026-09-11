@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('Work removal is an authenticated revisioned soft-delete with an encoded ID', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
+  await client.signIn('owner@example.test', 'password');
+  await client.deleteWork('id/space here', 7);
+  assert.equal(calls.at(-1).url, '/api/studio/works/id%2Fspace%20here');
+  assert.equal(calls.at(-1).options.method, 'PATCH');
+  assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 7, status: 'deleted' });
+});
 test('Work metadata edits forward only an explicit slug and preserve legacy request bodies', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
