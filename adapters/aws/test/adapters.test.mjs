@@ -385,7 +385,7 @@ test("S3 direct upload binds a checksum and returns the immutable object version
 
 test("Cognito identity verifies opaque sessions and maps access scopes", async () => {
   let revoked = false;
-  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); return { Username: "subject-1", UserAttributes: [{ Name: "scope", Value: "works:write exports:read" }] }; } }, "pool", "client");
+  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); return { Username: "subject-1", Enabled: true, UserStatus: 'CONFIRMED', UserCreateDate: new Date('2026-01-01T00:00:00Z'), UserLastModifiedDate: new Date('2026-01-02T00:00:00Z'), UserAttributes: [{ Name: "scope", Value: "works:write exports:read" }] }; } }, "pool", "client");
   const session = await identity.verifySession({ credential: "opaque-access-token" });
   assert.equal(session?.subject.id, "subject-1");
   assert.deepEqual(session?.subject.scopes, ["works:write", "exports:read"]);
