@@ -18,3 +18,9 @@ admission before exposure. `listByProfile` includes private records and currentl
 materializes the complete result. It is not a public response or a scalable
 paginated feed. Product HTTP/UI composition, audit/idempotency integration and
 cloud adapter qualification remain separate work.
+
+`readCreatorLibrarySnapshot` includes creator-profile favorites in the same SQLite
+read transaction and aggregate row/byte budgets as library records. It excludes
+other tenants, profiles and user-profile favorites. Target references are retained
+even if unavailable; they are not delivery grants or validated restore targets.
+Export callers must apply product policy to these records before returning them.

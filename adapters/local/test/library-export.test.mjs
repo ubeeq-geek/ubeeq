@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { LocalSqliteDatabase, LocalCreatorLibraryStore, readCreatorLibrarySnapshot } from '../dist/index.js';
+import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalFavoriteStore, readCreatorLibrarySnapshot } from '../dist/index.js';
 import { CreatorAssetService } from '@ubeeq/core';
 
 test('library snapshot retains all metadata and relationships across restart without worker state', async () => {
@@ -28,6 +28,12 @@ test('library snapshot retains all metadata and relationships across restart wit
     await store.createCreatorCollection(collection);
     await store.replaceCollectionWorks('tenant', 'collection', [{ collectionId: 'collection', workId: 'work-1', position: 0 }, { collectionId: 'collection', workId: 'work-0', position: 1 }]);
     const snapshot = readCreatorLibrarySnapshot(db, scope);
+    const favorite = { userId: 'actor', ownerProfileType: 'creator', ownerProfileId: 'creator', targetType: 'work', targetId: 'work-100', visibility: 'private', createdAt: 'before' };
+    await new LocalFavoriteStore(db, 'tenant').addFavorite(favorite);
+    await new LocalFavoriteStore(db, 'foreign').addFavorite(favorite);
+    await new LocalFavoriteStore(db, 'tenant').addFavorite({ ...favorite, ownerProfileId: 'foreign' });
+    assert.deepEqual(readCreatorLibrarySnapshot(db, scope).favorites, [favorite]);
+    snapshot.favorites = [favorite];
     assert.equal(snapshot.works.length, 102);
     assert.equal(snapshot.works.find(work => work.workId === 'work-100').status, 'deleted');
     assert.deepEqual(snapshot.works.find(work => work.workId === 'work-101'), work(101));
