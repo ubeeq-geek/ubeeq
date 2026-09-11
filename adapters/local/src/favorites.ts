@@ -25,6 +25,22 @@ export class LocalFavoriteStore<F extends FavoriteRecord = FavoriteRecord> imple
       AND profile_type = ? AND profile_id = ? ORDER BY target_type, target_id`).all(...this.scope(), profileType, profileId) as Array<{ payload: string }>;
     return rows.map(row => JSON.parse(row.payload) as F);
   }
+  /** Indexed keyset page for one target type; position is not an access grant. */
+  async listFavoritePage(profileType: string, profileId: string, targetType: string, options: { limit: number; afterTargetId?: string }): Promise<{ items: F[]; nextAfterTargetId?: string }> {
+    if (![profileType, profileId, targetType].every(value => typeof value === 'string' && Boolean(value.trim()))
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100
+      || (options.afterTargetId !== undefined && (typeof options.afterTargetId !== 'string' || !options.afterTargetId.trim()))) throw new Error('Invalid favorite page.');
+    const rows = this.local.database.prepare(`SELECT target_id, payload FROM ubeeq_favorites WHERE cell_id = ? AND tenant_id = ?
+      AND profile_type = ? AND profile_id = ? AND target_type = ? ${options.afterTargetId === undefined ? '' : 'AND target_id > ?'}
+      ORDER BY target_id LIMIT ?`).all(...this.scope(), profileType, profileId, targetType,
+        ...(options.afterTargetId === undefined ? [] : [options.afterTargetId]), options.limit + 1) as Array<{ target_id: string; payload: string }>;
+    const items = rows.slice(0, options.limit).map(row => {
+      const favorite = JSON.parse(row.payload) as F;
+      if (favorite.ownerProfileType !== profileType || favorite.ownerProfileId !== profileId || favorite.targetType !== targetType || favorite.targetId !== row.target_id) throw new Error('Favorite identity mismatch.');
+      return favorite;
+    });
+    return { items, ...(rows.length > options.limit ? { nextAfterTargetId: items.at(-1)!.targetId } : {}) };
+  }
   /** Exact scoped identity lookup; does not confer profile or target access. */
   async getFavorite(profileType: string, profileId: string, targetType: string, targetId: string): Promise<F | undefined> {
     if (![profileType, profileId, targetType, targetId].every(value => typeof value === 'string' && Boolean(value.trim()))) throw new Error('Invalid favorite lookup.');
