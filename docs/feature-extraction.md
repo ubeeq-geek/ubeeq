@@ -120,6 +120,18 @@ provider claim mapping, hosted/local mode selection and role policy stay private
 
 ## Editor block normalization
 
+Input normalization now preflights structure iteratively before recursive parsing
+or metadata cloning. Defaults are 64 JSON container levels and 10,000 input
+values, counting metadata and ignored fields as well as blocks. Callers may set
+positive node budgets and a depth from 1 to 128. Cycles are rejected; repeated
+non-cyclic references are permitted. The existing `unbounded` option only disables
+per-field text truncation, not these structural limits. Failures raise
+`ContentBlockInputError` with code `invalid_content_structure`; transports must
+map that error to invalid input before advancing their shared-package pin.
+The local consumer's normalization boundary maps rejection to HTTP 400 and its
+integration test verifies that rejected edits leave content and revision intact.
+This is not a request-byte limit, renderer sanitizer, or total processing deadline.
+
 `parseContentBlocks` now normalizes the editor tree shared by both consumers.
 `parseStoredPostBlocks` retains existing `blockId/mediaId/payload/blocks` storage
 keys while the portable result uses `id/assetId/data/children`. The parser preserves

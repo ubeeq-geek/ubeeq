@@ -2,6 +2,29 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseContentBlocks, parseStoredPostBlocks, toStoredPostBlocks, validateContentBlocks } from "../dist/index.js";
 
+test('structural budgets reject deep blocks, metadata, broad input and cycles before parsing', () => {
+  let deep = [{ type: 'paragraph', text: 'leaf' }];
+  for (let i = 0; i < 10000; i++) deep = [{ type: 'section', children: deep }];
+  assert.throws(() => parseContentBlocks(deep, { unbounded: true }), { code: 'invalid_content_structure' });
+  let payload = {};
+  for (let i = 0; i < 10000; i++) payload = { nested: payload };
+  assert.throws(() => parseStoredPostBlocks([{ type: 'section', payload }]), { code: 'invalid_content_structure' });
+  assert.throws(() => parseContentBlocks(Array(10001).fill(null)), { code: 'invalid_content_structure' });
+  const cyclic = { type: 'section' }; cyclic.children = [cyclic];
+  assert.throws(() => parseContentBlocks([cyclic]), { code: 'invalid_content_structure' });
+});
+
+test('exact budgets preserve long text and repeated non-cyclic metadata', () => {
+  const input = [{ type: 'paragraph', text: 'a'.repeat(100000) }];
+  assert.equal(parseContentBlocks(input, { unbounded: true, maxDepth: 2, maxNodes: 4 })[0].text.length, 100000);
+  assert.throws(() => parseContentBlocks(input, { maxDepth: 1 }), { code: 'invalid_content_structure' });
+  assert.throws(() => parseContentBlocks(input, { maxNodes: 3 }), { code: 'invalid_content_structure' });
+  const data = { label: 'shared' };
+  assert.equal(parseContentBlocks([{ type: 'section', data }, { type: 'section', data }]).length, 2);
+  for (const maxDepth of [0, 129, Infinity, 1.5]) assert.throws(() => parseContentBlocks([], { maxDepth }), { code: 'invalid_content_structure' });
+  for (const maxNodes of [0, Infinity, 1.5]) assert.throws(() => parseContentBlocks([], { maxNodes }), { code: 'invalid_content_structure' });
+});
+
 test("legacy and portable editor trees share normalization without losing media or file references", () => {
   const legacy = [{ blockId: "section", type: "section", payload: { status: "draft", custom: true }, blocks: [
     { blockId: "paragraph", type: "paragraph", text: "Body" },
