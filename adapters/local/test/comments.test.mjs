@@ -6,6 +6,38 @@ import { join } from 'node:path';
 import { LocalCommentStore, LocalSqliteDatabase } from '../dist/index.js';
 import { CommentModerationService, CommentService } from '@ubeeq/core';
 
+test('comment keyset pages bound results, filter hidden records before paging and retain target scope', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-pages-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCommentStore(local, 'tenant');
+    const comment = id => ({ commentId: id, userId: 'author', targetType: 'work', targetId: 'work', body: id, hidden: ['b', 'd'].includes(id), createdAt: '2026-01-01' });
+    for (const id of ['e', 'b', 'a', 'd', 'c']) await store.createComment(comment(id));
+    await store.createComment({ ...comment('foreign-target'), targetId: 'other' });
+    await new LocalCommentStore(local, 'other').createComment(comment('foreign-tenant'));
+    const first = await store.listCommentPage('work', 'work', { limit: 2 });
+    assert.deepEqual(first.items.map(item => item.commentId), ['a', 'c']);
+    assert.deepEqual(first.nextCursor, { createdAt: '2026-01-01', commentId: 'c' });
+    const second = await store.listCommentPage('work', 'work', { limit: 2, after: first.nextCursor });
+    assert.deepEqual(second.items.map(item => item.commentId), ['e']); assert.equal(second.nextCursor, undefined);
+    const moderation = await store.listCommentPage('work', 'work', { limit: 2, includeHidden: true });
+    assert.deepEqual(moderation.items.map(item => item.commentId), ['a', 'b']);
+    for (const options of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: 2, includeHidden: 'false' }, { limit: 2, after: {} }]) {
+      await assert.rejects(store.listCommentPage('work', 'work', options), /Invalid comment page/);
+    }
+    const plan = local.database.prepare("EXPLAIN QUERY PLAN SELECT payload FROM ubeeq_comments WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ? AND json_extract(payload, '$.hidden') = 0 AND (created_at, comment_id) > (?, ?) ORDER BY created_at, comment_id LIMIT ?")
+      .all('cell', 'tenant', 'work', 'work', '2026-01-01', 'a', 3);
+    assert.ok(plan.some(row => row.detail.includes('ubeeq_comments_visible_target')));
+    await store.deleteComment('c'); // A continuation is a position, not a required live row.
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCommentStore(local, 'tenant');
+    assert.deepEqual((await store.listCommentPage('work', 'work', { limit: 2, after: first.nextCursor })).items.map(item => item.commentId), ['e']);
+    await store.updateCommentVisibility('b', false);
+    assert.deepEqual((await store.listCommentPage('work', 'work', { limit: 2 })).items.map(item => item.commentId), ['a', 'b']);
+    assert.deepEqual((await store.listCommentPage('work', 'missing', { limit: 2 })).items, []);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('exact comment lookup is scoped, includes hidden retry records and survives restart', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-comment-lookup-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
