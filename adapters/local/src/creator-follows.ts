@@ -1,12 +1,21 @@
-import type { CreatorFollowPort, CreatorFollowRecord } from '@ubeeq/core';
+import type { CreatorFollowPort, CreatorFollowRecord, CreatorFollowLookupPort } from '@ubeeq/core';
 import type { LocalSqliteDatabase } from './index.js';
 
 /** Tenant-bound persistence. Following never grants content access by itself. */
-export class LocalCreatorFollowStore<F extends CreatorFollowRecord = CreatorFollowRecord> implements CreatorFollowPort<F> {
+export class LocalCreatorFollowStore<F extends CreatorFollowRecord = CreatorFollowRecord> implements CreatorFollowPort<F>, CreatorFollowLookupPort<F> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly tenantId: string) {
     if (!tenantId.trim()) throw new Error('Follow tenant is required.');
   }
   private scope() { return [this.local.configuration.cellId, this.tenantId]; }
+  async getFollow(userId: string, creatorId: string): Promise<F | null> {
+    if (![userId, creatorId].every(value => typeof value === 'string' && value.trim())) throw new Error('Follow lookup requires user and creator IDs.');
+    const row = this.local.database.prepare(`SELECT payload FROM ubeeq_creator_follows
+      WHERE cell_id = ? AND tenant_id = ? AND user_id = ? AND creator_id = ?`).get(...this.scope(), userId, creatorId) as { payload: string } | undefined;
+    if (!row) return null;
+    const value = JSON.parse(row.payload) as F;
+    if (!value || value.followerUserId !== userId || value.creatorId !== creatorId || typeof value.notificationsEnabled !== 'boolean') throw new Error('Invalid stored follow scope.');
+    return value;
+  }
   async listFollowsByUser(userId: string): Promise<F[]> {
     const rows = this.local.database.prepare(`SELECT creator_id, payload FROM ubeeq_creator_follows
       WHERE cell_id = ? AND tenant_id = ? AND user_id = ? ORDER BY creator_id`).all(...this.scope(), userId) as Array<{ creator_id: string; payload: string }>;

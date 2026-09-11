@@ -6,6 +6,29 @@ import { join } from 'node:path';
 import { LocalCreatorFollowStore, LocalSqliteDatabase } from '../dist/index.js';
 import { CreatorFollowService } from '@ubeeq/core';
 
+test('follow point reads are scoped, detached, restart-safe and fail closed on corrupt identity', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-follow-lookup-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCreatorFollowStore(local, 'tenant');
+    const record = { followId: 'follow', followerUserId: 'user', creatorId: 'creator', insertedDate: 'before', notificationsEnabled: false };
+    await store.followCreator(record);
+    assert.deepEqual(await store.getFollow('user', 'creator'), record);
+    const detached = await store.getFollow('user', 'creator'); detached.notificationsEnabled = true;
+    assert.equal((await store.getFollow('user', 'creator')).notificationsEnabled, false);
+    for (const [user, creator] of [['other', 'creator'], ['user', 'other']]) assert.equal(await store.getFollow(user, creator), null);
+    assert.equal(await new LocalCreatorFollowStore(local, 'foreign').getFollow('user', 'creator'), null);
+    for (const id of ['', ' ', null]) await assert.rejects(store.getFollow(id, 'creator'));
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCreatorFollowStore(local, 'tenant');
+    assert.deepEqual(await store.getFollow('user', 'creator'), record);
+    const foreign = new LocalSqliteDatabase({ ...config, cellId: 'foreign' });
+    try { assert.equal(await new LocalCreatorFollowStore(foreign, 'tenant').getFollow('user', 'creator'), null); } finally { foreign.database.close(); }
+    local.database.prepare('UPDATE ubeeq_creator_follows SET payload = ?').run(JSON.stringify({ ...record, creatorId: 'wrong' }));
+    await assert.rejects(store.getFollow('user', 'creator'), /stored follow scope/);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('local follows retain complete tenant-scoped state, atomically replace pairs and survive restart', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-follows-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, cellId: 'cell', publicBaseUrl: 'http://localhost' };
