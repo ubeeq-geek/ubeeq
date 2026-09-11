@@ -1,9 +1,9 @@
-import type { CommentLookupPort, CommentModerationPort, CommentPageOptions, CommentPagePort, CommentPort, CommentRecord } from '@ubeeq/core';
+import type { CommentErasurePort, CommentLookupPort, CommentModerationPort, CommentPageOptions, CommentPagePort, CommentPort, CommentRecord } from '@ubeeq/core';
 import { UniqueConstraintError } from '@ubeeq/persistence';
 import type { LocalSqliteDatabase } from './index.js';
 
 /** Persistence only: product admission and rendering remain caller responsibilities. */
-export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort, CommentLookupPort<C>, CommentPagePort<C> {
+export class LocalCommentStore<C extends CommentRecord = CommentRecord> implements CommentPort<C>, CommentModerationPort, CommentLookupPort<C>, CommentPagePort<C>, CommentErasurePort {
   constructor(private readonly local: LocalSqliteDatabase, private readonly tenantId: string) {
     if (!tenantId.trim()) throw new Error('Comment tenant is required.');
   }
@@ -15,6 +15,7 @@ export class LocalCommentStore<C extends CommentRecord = CommentRecord> implemen
       (options.after !== undefined && (!options.after || ![options.after.createdAt, options.after.commentId].every(value => typeof value === 'string' && Boolean(value.trim()))))) throw new Error('Invalid comment page request.');
     const rows = this.local.database.prepare(`SELECT comment_id, created_at, payload FROM ubeeq_comments
       WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ?
+      AND json_extract(payload, '$.deletedAt') IS NULL
       ${options.includeHidden ? '' : "AND json_extract(payload, '$.hidden') = 0"}
       ${options.after ? 'AND (created_at, comment_id) > (?, ?)' : ''}
       ORDER BY created_at, comment_id LIMIT ?`)
@@ -42,7 +43,7 @@ export class LocalCommentStore<C extends CommentRecord = CommentRecord> implemen
   async updateCommentVisibility(commentId: string, hidden: boolean): Promise<void> {
     if (typeof commentId !== 'string' || !commentId.trim() || typeof hidden !== 'boolean') throw new Error('Invalid comment moderation request.');
     this.local.database.prepare(`UPDATE ubeeq_comments SET payload = json_set(payload, '$.hidden', json(?))
-      WHERE cell_id = ? AND tenant_id = ? AND comment_id = ?`)
+      WHERE cell_id = ? AND tenant_id = ? AND comment_id = ? AND json_extract(payload, '$.deletedAt') IS NULL`)
       .run(JSON.stringify(hidden), ...this.scope(), commentId);
   }
   async deleteComment(commentId: string): Promise<void> {
@@ -50,9 +51,16 @@ export class LocalCommentStore<C extends CommentRecord = CommentRecord> implemen
     this.local.database.prepare('DELETE FROM ubeeq_comments WHERE cell_id = ? AND tenant_id = ? AND comment_id = ?')
       .run(...this.scope(), commentId);
   }
+  async eraseComment(targetType: string, targetId: string, commentId: string, deletedAt: string): Promise<boolean> {
+    if (![targetType, targetId, commentId, deletedAt].every(value => typeof value === 'string' && Boolean(value.trim())) || !Number.isFinite(Date.parse(deletedAt))) throw new Error('Invalid comment erasure.');
+    const result = this.local.database.prepare(`UPDATE ubeeq_comments SET payload = json_set(payload, '$.body', '', '$.hidden', json('true'), '$.deletedAt', ?)
+      WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ? AND comment_id = ? AND json_extract(payload, '$.deletedAt') IS NULL`)
+      .run(deletedAt, ...this.scope(), targetType, targetId, commentId);
+    return Boolean(result.changes);
+  }
   async listComments(targetType: C['targetType'], targetId: string): Promise<C[]> {
     const rows = this.local.database.prepare(`SELECT comment_id, payload FROM ubeeq_comments
-      WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ? ORDER BY created_at, comment_id`)
+      WHERE cell_id = ? AND tenant_id = ? AND target_type = ? AND target_id = ? AND json_extract(payload, '$.deletedAt') IS NULL ORDER BY created_at, comment_id`)
       .all(...this.scope(), targetType, targetId) as Array<{ comment_id: string; payload: string }>;
     return rows.map(row => {
       const value = JSON.parse(row.payload) as C;
@@ -63,7 +71,7 @@ export class LocalCommentStore<C extends CommentRecord = CommentRecord> implemen
   async createComment(record: C): Promise<void> {
     const comment = structuredClone(record);
     if (![comment.commentId, comment.userId, comment.targetType, comment.targetId, comment.body, comment.createdAt]
-      .every(value => typeof value === 'string' && Boolean(value.trim())) || typeof comment.hidden !== 'boolean') throw new Error('Invalid comment record.');
+      .every(value => typeof value === 'string' && Boolean(value.trim())) || typeof comment.hidden !== 'boolean' || comment.deletedAt !== undefined) throw new Error('Invalid comment record.');
     const result = this.local.database.prepare(`INSERT INTO ubeeq_comments
       (cell_id, tenant_id, comment_id, target_type, target_id, created_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (cell_id, tenant_id, comment_id) DO NOTHING`)
