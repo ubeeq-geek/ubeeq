@@ -1,6 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('regeneration client preserves source, revision and retry identity', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
+  await client.signIn('owner@example.test', 'password');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await client.regenerateAsset('work/one', 'asset/two', 4, 'version', 'same-key');
+    const { url, options } = calls.at(-1);
+    assert.equal(url, '/api/studio/works/work%2Fone/assets/asset%2Ftwo/regenerate');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.headers.authorization, 'Bearer session');
+    assert.equal(options.headers['idempotency-key'], 'same-key');
+    assert.deepEqual(JSON.parse(options.body), { expectedRevision: 4, sourceVersionId: 'version' });
+  }
+});
 test('publication client preserves retry keys and scopes receipt listing and withdrawal', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
