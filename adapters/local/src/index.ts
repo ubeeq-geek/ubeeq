@@ -4,6 +4,7 @@ import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from 'node:async_hooks';
 export { LocalCreatorLibraryStore } from "./creator-library.js";
+export { LocalLibraryPublicationView } from './library-publication.js';
 import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";

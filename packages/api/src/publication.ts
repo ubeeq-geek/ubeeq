@@ -6,7 +6,10 @@ export class PublicationRequestError extends Error {
     super(message); this.name = 'PublicationRequestError';
   }
 }
-export type PublicationRepositories = Pick<UbeeqRepositories, 'works' | 'assets' | 'publicationIntents' | 'publications' | 'auditEvents' | 'transaction'>;
+export type PublicationRepositories = Pick<UbeeqRepositories, 'publicationIntents' | 'publications' | 'auditEvents' | 'transaction'> & {
+  works: Pick<UbeeqRepositories['works'], 'get' | 'update'>;
+  assets: Pick<UbeeqRepositories['assets'], 'list'>;
+};
 export interface PublicationResult { intent: PublicationIntentRecord; publication: PublicationRecord; work: WorkRecord; idempotent: boolean }
 
 /** Canonical local-publication mechanism. Products must explicitly authorize the actor and admit publication.

@@ -8,6 +8,11 @@ publication-admission callback; there is no default allow policy. The reference
 route composes those callbacks with its ownership and moderation checks. The
 service requires canonical repository ports and does not dispatch to providers.
 
+Existing SQLite compatibility-library consumers can supply those ports using the
+[request-scoped library publication view](../../adapters/local/LIBRARY_PUBLICATION.md).
+This preserves their stored identities without copying Work and asset records;
+it does not automatically connect the reference public routes to that library.
+
 Publication writes the intent, live publication, Work revision and audit record in
 one repository transaction. Local failure-injection tests verify rollback at each
 later write boundary. Publication requests with a non-empty `Idempotency-Key` of
