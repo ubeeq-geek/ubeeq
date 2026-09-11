@@ -4,6 +4,7 @@ import { createLocalAdapterSet, type LocalAdapterConfiguration } from "@ubeeq/ad
 import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
+import { JobRecoveryError } from "@ubeeq/jobs";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
@@ -357,6 +358,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof UniqueConstraintError && error.constraint.name === 'creator_current_handle') {
         return json(response, 409, { error: { code: 'handle_conflict', message: 'Creator handle is already in use.', requestId } }, requestId);
       }

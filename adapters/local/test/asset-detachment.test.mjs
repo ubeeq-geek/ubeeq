@@ -32,6 +32,8 @@ test('detachment preserves stored assets, guards references and atomically cance
     assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'work')).map(item => [item.assetId, item.attachment.role, item.attachment.position]), [['b', 'primary', 0]]);
     assert.deepEqual(await store.getProcessingAsset('tenant', 'a'), asset('a'));
     assert.equal((await queue.get(lease.job.id)).state, 'cancelled');
+    await assert.rejects(queue.recover({ id: lease.job.id }), { code: 'job_not_recoverable' });
+    assert.equal((await queue.get(lease.job.id)).state, 'cancelled');
     await assert.rejects(queue.complete({ id: lease.job.id, leaseToken: lease.leaseToken }));
     assert.deepEqual((await queue.list({ cellId: 'cell', states: ['queued'], limit: 10 })).map(job => job.payload.assetId), ['b']);
     await assert.rejects(detach.detach('tenant', 'work', 'b', 5), { code: 'revision_conflict' });
