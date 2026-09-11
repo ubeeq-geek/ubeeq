@@ -8,8 +8,7 @@ revision returns no lease; infrastructure failures propagate to the caller inste
 of being reported as an empty queue.
 
 These checks are mocked adapter qualification, not live deployment acceptance.
-Expired-lease recovery, bounded
-cell-specific candidate discovery, notification reconciliation and atomic fencing
+Bounded cell-specific candidate discovery, notification reconciliation and atomic fencing
 of job-dependent content writes remain separate requirements. Existing historical
 AWS attempt counts are not rewritten; jobs leased under older code may retain the
 older attempt convention until explicitly reconciled. No backfill runs implicitly.
@@ -20,4 +19,16 @@ leased state, owner token and stored expiry later than the supplied current UTC
 timestamp. State changes clear the expiry. The condition protects against changed
 lease state between the read and write; it is not a database-generated clock or a
 fence on external effects. Clock skew, requests delayed after timestamp capture,
-lease recovery and job-dependent content transactions still require qualification.
+job-dependent content transactions still require qualification.
+
+Lease acquisition now recognizes expired jobs in its bounded candidate page. It
+conditionally reclaims them with a new token and incremented attempt, or marks
+them dead-lettered when the expired attempt exhausted the budget. Every claim
+checks revision, cell, state and due/expiry timestamp in the write. Other cells,
+excluded types, active leases and malformed expiries are not reclaimed.
+
+Discovery still reads only the first 100 records from the repository-wide index;
+eligible work beyond that page may be starved. This is not complete queue liveness
+qualification: a cell/due-work access pattern and recovery scheduling remain needed.
+Malformed and historical attempt records require explicit qualification, not an
+implicit repair. No live AWS acceptance or data backfill is implied by mock tests.
