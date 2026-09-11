@@ -34,13 +34,15 @@ export class FlickrSourceWorkflow {
     if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 100) throw new Error('Invalid Flickr source batch size');
     if (!migration.mode || migration.mode === 'REFERENCE_IMPORT') return migration;
     if (!migration.confirmedAt || !migration.storageConfirmed) throw new Error('Migration has not been confirmed');
-    const connection = await this.repository.getConnection(migration.connectionId);
-    if (!connection) throw new FlickrSourceAdmissionError('Flickr connection is no longer available');
+    const storedConnection = await this.repository.getConnection(migration.connectionId);
+    if (!storedConnection) throw new FlickrSourceAdmissionError('Flickr connection is no longer available');
+    const connection = structuredClone(storedConnection);
     const admit = async () => {
       try {
         const current = await this.repository.getConnection(migration.connectionId);
         if (!current || current.state !== 'CONNECTED' || current.userId !== migration.userId || current.userId !== connection.userId
           || current.creatorId !== connection.creatorId || current.accountId !== connection.accountId
+          || current.encryptedTokenRef !== connection.encryptedTokenRef
           || !await this.ports.canManageCreator(migration.userId, current.creatorId)) throw new FlickrSourceAdmissionError('Flickr source migration access revoked');
       } catch (error) {
         if (error instanceof FlickrSourceAdmissionError) throw error;
@@ -86,7 +88,7 @@ export class FlickrSourceWorkflow {
             retryCount: item.retryCount, errorCode: undefined });
           continue;
         }
-        const existing = await this.ports.attachCleanSource(connection, photo, item, stored);
+        const existing = await this.ports.attachCleanSource(structuredClone(connection), photo, item, stored);
         items.push({ ...item, transferStatus: 'VALIDATED', checksumSha256: stored.checksumSha256, quarantineObjectKey: stored.objectKey,
           quarantinedMimeType: stored.mimeType, quarantinedSizeBytes: stored.sizeBytes, scanOutcome, retryCount: item.retryCount,
           dedupeStatus: existing ? 'CHECKSUM_MATCH' : 'UNIQUE', errorCode: undefined, nextRetryAt: undefined });
