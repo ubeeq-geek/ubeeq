@@ -309,3 +309,4 @@ export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, 
 export * from './smugmug-migration.js';
 export * from './public-derivative-publication.js';
 export * from './publication-reconciliation.js';
+export * from './flickr-source-download.js';
