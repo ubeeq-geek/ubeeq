@@ -328,10 +328,18 @@ export class AwsJobQueue implements JobQueue {
     this.jobs = new DynamoRevisionedRepository<AwsJobRecord>(dynamo, configuration, "durableJobs", jobDiscoveryAttributes);
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
-    const id = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
+    input = structuredClone(input);
+    if (typeof input.cellId !== 'string' || !input.cellId.trim() || typeof input.idempotencyKey !== 'string' || !input.idempotencyKey.trim()) throw new Error('Job cell and idempotency key are required.');
+    const id = `job-v2-${createHash("sha256").update(JSON.stringify([input.cellId, input.idempotencyKey])).digest("hex").slice(0, 32)}`;
+    const matches = (job: DurableJob<TPayload>) => job.cellId === input.cellId && job.idempotencyKey === input.idempotencyKey;
     const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
-    if (existing) return existing;
+    if (existing) { if (!matches(existing)) throw new Error('Job idempotency scope mismatch.'); return existing; }
+    // Keep known legacy jobs addressable without accepting ambiguous cross-cell IDs.
+    const legacyId = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
+    const legacy = await this.jobs.get(legacyId) as DurableJob<TPayload> | undefined;
+    if (legacy && matches(legacy)) return legacy;
     const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
+    if (!matches(created)) throw new Error('Job idempotency scope mismatch.');
     await this.notify(created.id, created.type, created.cellId);
     return created;
   }
