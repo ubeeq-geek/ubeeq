@@ -430,3 +430,4 @@ export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
     credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
   };
 };
+export { DynamoSmugMugRepository } from './smugmug-repository.js';
