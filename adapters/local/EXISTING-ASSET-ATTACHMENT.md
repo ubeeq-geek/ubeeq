@@ -20,4 +20,17 @@ This is an explicit attachment primitive, not checksum discovery, moderation
 approval or an automatic import policy. Consumers must retain source receipts to
 avoid automatically reattaching an asset a creator previously removed. They must
 also recheck connector admission and source identity. Production/distributed
-adapter implementations and checksum discovery are separate work.
+adapter implementations are separate work.
+
+`LocalCreatorLibraryStore.findReusableAssetByChecksum(tenantId, creatorId,
+checksum)` returns at most one deterministic `{ assetId, sourceWorkId }` candidate
+from current, same-cell private processed custody. It is a lookup, not admission
+or a reservation: use the atomic attachment operation to recheck custody.
+Migration 015 adds an expression index for asset checksums and a derived reverse
+membership table. Triggers keep it synchronized with canonical JSON attachment
+inserts, updates and deletes in the same transaction. Existing memberships are
+indexed once during schema upgrade; no source files are moved or removed.
+Lookup does not materialize all Works/assets in application memory. Its one-row
+result bound is not a hard database execution-time bound, especially when many
+same-checksum candidates are no longer eligible. Connector-specific discovery
+and receipt handling still need to be wired by consumers.

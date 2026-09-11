@@ -6,6 +6,49 @@ import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService, CreatorExistingAssetService } from "@ubeeq/core";
 
+test('checksum lookup indexes current private custody and upgrades existing attachment records', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-checksum-lookup-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    let store = new LocalCreatorLibraryStore(local);
+    const work = { tenantId: 'tenant', creatorId: 'creator', workId: 'work', title: 'Source', slug: 'source', slugHistory: ['source'], tags: [], status: 'draft', revision: 1, createdAt: 'now', updatedAt: 'now' };
+    const asset = { tenantId: 'tenant', creatorId: 'creator', assetId: 'asset', status: 'ready', mimeType: 'image/png', sizeBytes: 1,
+      checksumSha256: 'a'.repeat(64), storage: { bucket: 'originals', key: 'source', versionId: 'version', contentType: 'image/png', byteLength: 1, checksum: 'a'.repeat(64), scope: 'private' },
+      processing: { state: 'completed', sourceVersionId: 'version', completedAt: 'now', metadata: {}, renditions: [] }, createdAt: 'now', updatedAt: 'now' };
+    await store.createWork(work); await new CreatorAssetService(store, async () => true).attach('tenant', 'work', asset);
+    const lookup = () => store.findReusableAssetByChecksum('tenant', 'creator', asset.checksumSha256);
+    assert.deepEqual(await lookup(), { assetId: 'asset', sourceWorkId: 'work' });
+    assert.equal(await store.findReusableAssetByChecksum('tenant', 'other', asset.checksumSha256), undefined);
+    assert.equal(await store.findReusableAssetByChecksum('other', 'creator', asset.checksumSha256), undefined);
+    await assert.rejects(store.findReusableAssetByChecksum('tenant', 'creator', 'invalid'), { code: 'invalid_asset' });
+    const memberships = JSON.stringify([{ workId: 'work', assetId: 'asset', position: 0, role: 'primary' }]);
+    const writeMembers = value => local.database.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE kind = 'work_assets' AND id = 'work'").run(value);
+    await assert.rejects(local.transaction(async () => { writeMembers('[]'); assert.equal(await lookup(), undefined); throw Error('rollback'); }), /rollback/);
+    assert.ok(await lookup());
+    writeMembers('[]'); assert.equal(await lookup(), undefined); writeMembers(memberships);
+    const writeAsset = value => local.database.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE kind = 'asset' AND id = 'asset'").run(JSON.stringify(value));
+    for (const changed of [{ ...asset, status: 'deleted' }, { ...asset, processing: undefined }, { ...asset, storage: { ...asset.storage, scope: 'public' } }, { ...asset, processing: { ...asset.processing, sourceVersionId: 'old' } }]) {
+      writeAsset(changed); assert.equal(await lookup(), undefined);
+    }
+    writeAsset(asset);
+    const source = await store.getWork('tenant', 'work');
+    await store.updateWork({ ...source, revision: source.revision + 1, status: 'archived' }); assert.equal(await lookup(), undefined);
+    await store.updateWork({ ...source, revision: source.revision + 2 });
+    // Reconstruct the pre-index schema in this disposable database, then reopen.
+    local.database.exec('DROP TRIGGER ubeeq_creator_asset_membership_insert; DROP TRIGGER ubeeq_creator_asset_membership_update; DROP TRIGGER ubeeq_creator_asset_membership_delete; DROP TABLE ubeeq_creator_asset_memberships; DROP INDEX ubeeq_creator_asset_checksum;');
+    local.database.prepare('DELETE FROM ubeeq_schema_migrations WHERE id = ?').run('015-creator-asset-lookup');
+    local.database.close(); local = new LocalSqliteDatabase(config); store = new LocalCreatorLibraryStore(local);
+    assert.deepEqual(await lookup(), { assetId: 'asset', sourceWorkId: 'work' });
+    const otherCell = new LocalSqliteDatabase({ ...config, cellId: 'other-cell' });
+    try { assert.equal(await new LocalCreatorLibraryStore(otherCell).findReusableAssetByChecksum('tenant', 'creator', asset.checksumSha256), undefined); }
+    finally { otherCell.database.close(); }
+    local.database.prepare("DELETE FROM ubeeq_creator_library WHERE kind = 'work_assets' AND id = 'work'").run();
+    assert.equal(await lookup(), undefined);
+    assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM ubeeq_creator_asset_memberships').get().count, 0);
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('existing processed assets attach atomically without replacing custody or scheduling processing', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-existing-asset-'));
   const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
