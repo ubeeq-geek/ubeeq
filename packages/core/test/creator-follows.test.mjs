@@ -3,6 +3,27 @@ import assert from 'node:assert/strict';
 import { CreatorFollowService } from '../dist/index.js';
 
 const record = { followId: 'f', followerUserId: 'user', creatorId: 'creator', insertedDate: 'now', notificationsEnabled: true, extra: { tags: ['retained'] } };
+test('follow reads recheck access after storage and snapshot page controls and results', async () => {
+  for (const paged of [false, true]) {
+    let allowed = true, reads = 0;
+    const store = { listFollowsByUser: async () => { reads++; allowed = false; return [record]; },
+      listFollowPage: async () => { reads++; allowed = false; return { items: [record] }; } };
+    const service = new CreatorFollowService(store, async () => allowed);
+    await assert.rejects(paged ? service.listPage('user', { limit: 2 }) : service.list('user'), { code: 'access_denied' });
+    assert.equal(reads, 1);
+  }
+  const options = { limit: 2, afterCreatorId: 'before' }, result = { items: [structuredClone(record)], nextCreatorId: 'creator' };
+  let checks = 0;
+  const service = new CreatorFollowService({ listFollowPage: async (_user, supplied) => {
+    assert.deepEqual(supplied, { limit: 2, afterCreatorId: 'before' }); return result;
+  } }, async () => {
+    if (++checks === 1) { options.limit = 100; options.afterCreatorId = 'changed'; }
+    else { result.items[0].followerUserId = 'other'; result.nextCreatorId = 'changed'; }
+    return true;
+  });
+  assert.deepEqual(await service.listPage('user', options), { items: [record], nextCreatorId: 'creator' });
+  assert.equal(checks, 2);
+});
 test('follow operations isolate records and scope lists before returning adapter data', async () => {
   const records = []; const calls = [];
   const service = new CreatorFollowService({
