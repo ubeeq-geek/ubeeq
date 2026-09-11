@@ -3,6 +3,19 @@ import type { FlickrManifestPhoto } from './flickr-metadata.js';
 import type { FlickrRepository, FlickrMigration, FlickrMigrationItem, FlickrConnection } from './flickr-migration-state.js';
 
 export class FlickrSourceAdmissionError extends Error {}
+// Port failures may contain signed URLs, credentials or private storage details.
+// Only exact public codes may enter durable items or audit events.
+const transferErrorCodes = new Set([
+  'FLICKR_SOURCE_INVALID_BYTE_LIMIT', 'FLICKR_SOURCE_URL_REJECTED',
+  'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE', 'FLICKR_SOURCE_UNAVAILABLE',
+  'FLICKR_SOURCE_TOO_LARGE', 'FLICKR_SOURCE_MIME_INVALID', 'FLICKR_SOURCE_TRANSFER_FAILED'
+]);
+const transferErrorCode = (error: unknown): string => {
+  if (!(error instanceof Error)) return 'FLICKR_SOURCE_TRANSFER_FAILED';
+  // Preserve the reference port's legacy transient signal without persisting free text.
+  if (error.message === 'TEMPORARILY_UNAVAILABLE') return 'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE';
+  return transferErrorCodes.has(error.message) ? error.message : 'FLICKR_SOURCE_TRANSFER_FAILED';
+};
 export interface FlickrQuarantinedSource {
   objectKey: string; checksumSha256: string; mimeType: string; sizeBytes: number;
   scanOutcome: 'pending' | 'clean' | 'blocked';
@@ -72,10 +85,10 @@ export class FlickrSourceWorkflow {
           dedupeStatus: existing ? 'CHECKSUM_MATCH' : 'UNIQUE', errorCode: undefined, nextRetryAt: undefined });
       } catch (error) {
         if (error instanceof FlickrSourceAdmissionError) throw error;
-        const code = error instanceof Error ? error.message : 'FLICKR_SOURCE_TRANSFER_FAILED';
-        const transient = code.includes('TEMPORARILY');
+        const code = transferErrorCode(error);
+        const transient = code === 'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE';
         const retryCount = item.retryCount + (transient ? 1 : 0);
-        items.push({ ...item, transferStatus: code.includes('UNAVAILABLE') && !transient ? 'UNAVAILABLE' : 'FAILED', retryCount,
+        items.push({ ...item, transferStatus: code === 'FLICKR_SOURCE_UNAVAILABLE' ? 'UNAVAILABLE' : 'FAILED', retryCount,
           nextRetryAt: transient && retryCount < 3 ? new Date(Date.now() + Math.min(3600, 30 * 2 ** retryCount) * 1000).toISOString() : undefined,
           errorCode: code });
       }

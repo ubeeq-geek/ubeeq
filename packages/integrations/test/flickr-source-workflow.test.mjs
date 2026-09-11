@@ -97,3 +97,36 @@ test('revocation after transfer and explicit attachment admission errors abort w
   await assert.rejects(collision.workflow.run(migration()), /owner collision/);
   assert.equal(await collision.repository.getMigration('m'), undefined);
 });
+
+test('raw transfer, scanner and attachment errors never enter saved items or audit events', async () => {
+  for (const port of ['transfer', 'scanQuarantine', 'attachCleanSource']) {
+    const privateError = new Error('TEMPORARILY_UNAVAILABLE https://private.invalid/original?signature=secret storage/private-key');
+    const overrides = { scanQuarantine: async () => 'clean', [port]: async () => { throw privateError; } };
+    const { workflow, repository } = await setup(overrides);
+    const result = await workflow.run(migration());
+    assert.equal(result.items[0].errorCode, 'FLICKR_SOURCE_TRANSFER_FAILED');
+    assert.equal(result.items[0].transferStatus, 'FAILED');
+    assert.equal(result.items[0].retryCount, 0);
+    assert.equal(result.items[0].nextRetryAt, undefined);
+    assert.equal(result.auditEvents.at(-1).details.errorCode, 'FLICKR_SOURCE_TRANSFER_FAILED');
+    assert.doesNotMatch(JSON.stringify(await repository.getMigration('m')), /signature=secret|storage\/private-key|private\.invalid/);
+  }
+});
+
+test('only exact allowlisted codes select unavailable or transient retry outcomes', async () => {
+  for (const [message, status, retry] of [
+    ['FLICKR_SOURCE_UNAVAILABLE', 'UNAVAILABLE', 0],
+    ['FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE', 'FAILED', 1],
+    ['TEMPORARILY_UNAVAILABLE', 'FAILED', 1],
+    ['FLICKR_SOURCE_TOO_LARGE', 'FAILED', 0],
+    ['FLICKR_SOURCE_UNAVAILABLE: private URL', 'FAILED', 0],
+    ['UNKNOWN_UNAVAILABLE', 'FAILED', 0]
+  ]) {
+    const { workflow } = await setup({ transfer: async () => { throw new Error(message); } });
+    const result = await workflow.run(migration());
+    assert.equal(result.items[0].transferStatus, status, message);
+    assert.equal(result.items[0].retryCount, retry, message);
+    assert.equal(!!result.items[0].nextRetryAt, retry === 1, message);
+    if (message.includes('private') || message.startsWith('UNKNOWN')) assert.equal(result.items[0].errorCode, 'FLICKR_SOURCE_TRANSFER_FAILED');
+  }
+});
