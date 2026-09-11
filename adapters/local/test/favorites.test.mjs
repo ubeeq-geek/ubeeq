@@ -27,9 +27,15 @@ test('local favorites survive restart, isolate tenants and keep duplicate counts
     assert.equal(await store.countByTarget('work', 'work'), 2);
     local.database.close(); local = new LocalSqliteDatabase(configuration); store = new LocalFavoriteStore(local, 'tenant');
     assert.deepEqual(await store.listByProfile('creator', 'profile'), [record]);
+    store.listByProfile = async () => { throw new Error('must not enumerate'); };
+    assert.deepEqual(await store.getFavorite('creator', 'profile', 'work', 'work'), record);
+    for (const args of [['creator', 'other', 'work', 'work'], ['creator', 'profile', 'other', 'work'], ['creator', 'profile', 'work', 'other']]) assert.equal(await store.getFavorite(...args), undefined);
+    assert.equal(await new LocalFavoriteStore(local, 'missing').getFavorite('creator', 'profile', 'work', 'work'), undefined);
+    await assert.rejects(store.getFavorite('', 'profile', 'work', 'work'), /Invalid favorite lookup/);
     await store.removeFavorite('delegate', 'work', 'work', 'creator', 'profile');
     await store.removeFavorite('delegate', 'work', 'work', 'creator', 'profile');
     assert.equal(await store.countByTarget('work', 'work'), 1);
+    assert.equal(await store.getFavorite('creator', 'profile', 'work', 'work'), undefined);
     assert.equal(await new LocalFavoriteStore(local, 'foreign').countByTarget('work', 'work'), 1);
   } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
