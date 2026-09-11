@@ -42,6 +42,29 @@ test('revisioned collection updates and removals require support and forward the
   }
 });
 
+test('collection covers require an atomic adapter and an active private asset in the creator scope', async () => {
+  const f = fixture();
+  const record = { ...collection('one'), coverAssetId: 'cover' };
+  await assert.rejects(f.service.create(record), { code: 'invalid_cover' });
+  assert.equal(f.writes(), 0);
+  f.store.supportsCollectionCoverValidation = true;
+  const asset = { ...scope, assetId: 'cover', status: 'ready', storage: { scope: 'private' } };
+  for (const value of [null, { ...asset, assetId: 'wrong' }, { ...asset, tenantId: 'foreign' },
+    { ...asset, creatorId: 'foreign' }, { ...asset, status: 'deleted' }, { ...asset, storage: { scope: 'public' } }]) {
+    f.store.getProcessingAsset = async () => value;
+    await assert.rejects(f.service.create(record), { code: 'invalid_cover' });
+    assert.equal(f.writes(), 0);
+  }
+  f.store.getProcessingAsset = async () => asset;
+  assert.equal((await f.service.create(record)).coverAssetId, 'cover');
+  f.store.getProcessingAsset = async () => null;
+  await assert.rejects(f.service.update({ ...record, slug: 'changed' }), { code: 'invalid_cover' });
+  assert.equal(f.collections.get('one').slug, 'one');
+  assert.equal((await f.service.update({ ...record, coverAssetId: '' })).coverAssetId, '');
+  const denied = fixture(false);
+  await assert.rejects(denied.service.create(record), { code: 'access_denied' });
+});
+
 test('conditional ordering fails closed when the adapter does not support it', async () => {
   const f = fixture();
   await f.service.create(collection('one'));

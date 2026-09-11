@@ -6,6 +6,49 @@ import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
 import { CreatorWorkService, CreatorCollectionService, CreatorAssetService } from "@ubeeq/core";
 
+test('collection cover writes atomically enforce asset scope and reject a post-read deletion', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-covers-'));
+  const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  const first = new LocalSqliteDatabase(configuration), second = new LocalSqliteDatabase(configuration);
+  try {
+    const store = new LocalCreatorLibraryStore(first);
+    const insert = (id, extra = {}, cell = 'cell') => {
+      const asset = { tenantId: 'tenant', creatorId: 'creator', assetId: id, status: 'ready', storage: { scope: 'private' }, ...extra };
+      first.database.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'asset', ?, ?, ?)")
+        .run(cell, asset.tenantId, id, asset.creatorId, JSON.stringify(asset));
+    };
+    insert('valid'); insert('foreign-owner', { creatorId: 'other' }); insert('foreign-tenant', { tenantId: 'other' });
+    insert('foreign-cell', {}, 'other'); insert('deleted', { status: 'deleted' }); insert('public', { storage: { scope: 'public' } });
+    const record = { tenantId: 'tenant', creatorId: 'creator', collectionId: 'collection', slug: 'original', slugHistory: ['original'], status: 'draft', updatedAt: 'before' };
+    for (const coverAssetId of ['missing', 'foreign-owner', 'foreign-tenant', 'foreign-cell', 'deleted', 'public']) {
+      await assert.rejects(store.createCreatorCollection({ ...record, coverAssetId }), { code: 'invalid_cover' });
+    }
+    assert.equal(await store.getCreatorCollection('tenant', 'collection'), null);
+    await store.createCreatorCollection({ ...record, coverAssetId: 'valid' });
+    const before = await store.getCreatorCollection('tenant', 'collection');
+    await assert.rejects(store.updateCreatorCollection({ ...before, coverAssetId: 'foreign-owner' }, undefined, 0), { code: 'invalid_cover' });
+    assert.deepEqual(await store.getCreatorCollection('tenant', 'collection'), before);
+    insert('racy');
+    const getAsset = store.getProcessingAsset.bind(store);
+    store.getProcessingAsset = async (tenant, id) => {
+      const snapshot = await getAsset(tenant, id);
+      second.database.prepare("UPDATE ubeeq_creator_library SET payload = json_set(payload, '$.status', 'deleted') WHERE kind = 'asset' AND id = ?").run(id);
+      return snapshot;
+    };
+    const service = new CreatorCollectionService(store, async () => true);
+    await assert.rejects(service.update({ ...before, coverAssetId: 'racy' }, undefined, 0), { code: 'invalid_cover' });
+    assert.deepEqual(await store.getCreatorCollection('tenant', 'collection'), before);
+    // Clearing a cover never deletes its original, and deletion is possible even when a prior cover is gone.
+    await store.updateCreatorCollection({ ...before, coverAssetId: '' }, undefined, 0);
+    assert.equal((await store.getCreatorCollection('tenant', 'collection')).coverAssetId, '');
+    assert.equal((await getAsset('tenant', 'valid')).status, 'ready');
+    await store.updateCreatorCollection({ ...before, coverAssetId: 'missing', status: 'deleted' }, undefined, 1);
+    assert.deepEqual(await store.listCreatorCollections('tenant', 'creator'), []);
+  } finally {
+    first.database.close(); second.database.close(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('collection revisions fence competing writers, legacy rows and status ABA changes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-collection-revisions-'));
   const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };

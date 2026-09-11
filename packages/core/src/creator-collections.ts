@@ -8,6 +8,7 @@ export interface CreatorCollectionRecord {
   status: string;
   updatedAt: string;
   revision?: number;
+  coverAssetId?: string;
 }
 
 export interface CreatorCollectionScope { tenantId: string; creatorId: string }
@@ -24,6 +25,11 @@ export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
   readonly supportsExpectedCollectionOrder?: boolean;
   readonly supportsExpectedCollectionStatus?: boolean;
   readonly supportsExpectedCollectionRevision?: boolean;
+  /** Cover ownership and active state are rechecked atomically during writes. */
+  readonly supportsCollectionCoverValidation?: boolean;
+  getProcessingAsset?(tenantId: string, assetId: string): Promise<{
+    tenantId: string; creatorId: string; assetId: string; status: string; storage: { scope: string };
+  } | null>;
   listCreatorCollections(tenantId: string, creatorId: string): Promise<C[]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<C | null>;
   createCreatorCollection(collection: C): Promise<void>;
@@ -36,7 +42,7 @@ export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
 }
 
 export class CreatorCollectionError extends Error {
-  constructor(public readonly code: "access_denied" | "not_found" | "slug_conflict" | "invalid_works" | "immutable_owner" | "revision_conflict", message: string) {
+  constructor(public readonly code: "access_denied" | "not_found" | "slug_conflict" | "invalid_works" | "invalid_cover" | "immutable_owner" | "revision_conflict", message: string) {
     super(message);
     this.name = "CreatorCollectionError";
   }
@@ -91,6 +97,7 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
 
   async create(collection: C): Promise<C & { workIds: string[] }> {
     await this.requireAccess(collection);
+    await this.requireValidCover(collection);
     await this.requireAvailableSlug(collection);
     const created = { ...collection, slugHistory: [...new Set([...collection.slugHistory, collection.slug])] };
     await this.store.createCreatorCollection(created);
@@ -106,6 +113,7 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     if (previous.creatorId !== collection.creatorId) {
       throw new CreatorCollectionError("immutable_owner", "Collection ownership cannot be changed.");
     }
+    await this.requireValidCover(collection);
     await this.requireAvailableSlug(collection);
     const updated = { ...collection, slugHistory: [...new Set([...(previous.slugHistory || []), previous.slug, collection.slug])] };
     await this.store.updateCreatorCollection(updated, expectedStatus, expectedRevision);
@@ -118,6 +126,18 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     if (expectedRevision !== undefined && (!this.store.supportsExpectedCollectionRevision ||
       !Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER)) {
       throw new CreatorCollectionError('revision_conflict', 'A supported, valid collection revision is required.');
+    }
+  }
+
+  private async requireValidCover(collection: C): Promise<void> {
+    if (!collection.coverAssetId) return;
+    if (!this.store.supportsCollectionCoverValidation || !this.store.getProcessingAsset) {
+      throw new CreatorCollectionError('invalid_cover', 'Validated collection covers are unavailable in this adapter.');
+    }
+    const asset = await this.store.getProcessingAsset(collection.tenantId, collection.coverAssetId);
+    if (!asset || asset.assetId !== collection.coverAssetId || asset.tenantId !== collection.tenantId ||
+      asset.creatorId !== collection.creatorId || asset.status === 'deleted' || asset.storage?.scope !== 'private') {
+      throw new CreatorCollectionError('invalid_cover', 'Choose an active private asset owned by this Creator.');
     }
   }
 
