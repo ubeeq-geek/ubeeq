@@ -1,5 +1,6 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
 import { CreatorWorkError, CreatorCollectionError, CreatorAssetError, contentAssetReferences } from "@ubeeq/core";
+import { CreatorAssetRegenerationError, type CreatorAssetRegenerationRequest, type CreatorAssetRegenerationReceipt } from '@ubeeq/core';
 import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit, CreatorAssetDetachmentCommit } from "@ubeeq/core";
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
@@ -80,6 +81,42 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
 
   async getWork(tenantId: string, workId: string): Promise<W | null> { return this.get(tenantId, "work", workId); }
   async getProcessingAsset(tenantId: string, assetId: string): Promise<CreatorAssetRecord | null> { return this.get(tenantId, "asset", assetId); }
+  async enqueueAssetRegeneration(input: CreatorAssetRegenerationRequest): Promise<CreatorAssetRegenerationReceipt> {
+    const db = this.local.database, cell = this.local.configuration.cellId;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if ([input.tenantId, input.creatorId, input.workId, input.assetId, input.sourceVersionId, input.requestId].some(value =>
+        typeof value !== 'string' || !value.trim() || value.length > 500) || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1) {
+        throw new CreatorAssetRegenerationError('invalid_request', 'Invalid regeneration request.');
+      }
+      const work = this.get<W>(input.tenantId, 'work', input.workId);
+      const asset = this.get<CreatorAssetRecord>(input.tenantId, 'asset', input.assetId);
+      const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
+      if (!work || work.creatorId !== input.creatorId || work.status === 'deleted' || !asset || asset.creatorId !== input.creatorId ||
+        asset.status === 'deleted' || !attachments.some(item => item.assetId === input.assetId && item.workId === input.workId)) {
+        throw new CreatorAssetError('not_found', 'Attached processing asset not found.');
+      }
+      if (work.revision !== input.expectedRevision) throw new CreatorWorkError('revision_conflict', 'Work changed before regeneration.');
+      if (asset.storage.scope !== 'private' || asset.storage.versionId !== input.sourceVersionId) throw new CreatorAssetRegenerationError('source_changed', 'Processing source changed.');
+      if (!((this.options.enqueueImageProcessing && asset.mimeType.startsWith('image/')) ||
+        (this.options.enqueueVideoProcessing && asset.mimeType.startsWith('video/')))) throw new CreatorAssetRegenerationError('processing_unsupported', 'No enabled processor for this media.');
+      const key = JSON.stringify(['creator-asset.regenerate', input.tenantId, input.creatorId, input.workId, input.assetId, input.sourceVersionId, input.requestId]);
+      const previous = db.prepare('SELECT id, state FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?')
+        .get(cell, `${cell}:${key}`) as { id: string; state: string } | undefined;
+      if (previous) { db.exec('COMMIT'); return { jobId: previous.id, state: previous.state, idempotent: true }; }
+      const active = db.prepare(`SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND type = 'creator-asset.process'
+        AND state IN ('queued', 'leased', 'retry_scheduled') AND json_extract(payload, '$.tenantId') = ?
+        AND json_extract(payload, '$.assetId') = ? LIMIT 1`).get(cell, input.tenantId, input.assetId);
+      if (active) throw new CreatorAssetRegenerationError('processing_busy', 'An active job already processes this asset.');
+      const job = new LocalSqliteJobQueue(this.local).enqueueSync({ cellId: cell, type: 'creator-asset.process',
+        payload: { tenantId: input.tenantId, creatorId: input.creatorId, workId: input.workId, assetId: input.assetId, sourceVersionId: input.sourceVersionId },
+        idempotencyKey: key, maxAttempts: 3 });
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'asset' AND id = ?")
+        .run(JSON.stringify({ ...asset, processingJobId: job.id }), cell, input.tenantId, input.assetId);
+      db.exec('COMMIT');
+      return { jobId: job.id, state: job.state, idempotent: false };
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
   async commitAssetProcessing(input: CreatorAssetProcessingCommit): Promise<void> {
     const db = this.local.database, cell = this.local.configuration.cellId;
     db.exec("BEGIN IMMEDIATE");
@@ -96,6 +133,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       const work = this.get<W>(input.tenantId, "work", input.workId);
       const attachments = this.get<CreatorAssetAttachment[]>(input.tenantId, "work_assets", input.workId) || [];
       if (!asset || asset.creatorId !== input.creatorId || asset.storage.versionId !== input.sourceVersionId || asset.status === "deleted" ||
+        (asset.processingJobId !== undefined && asset.processingJobId !== input.jobId) ||
         !work || work.creatorId !== input.creatorId || work.status === "deleted" || !attachments.some((item) => item.assetId === input.assetId)) {
         throw new Error("Processing source or ownership changed.");
       }
