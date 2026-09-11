@@ -189,7 +189,8 @@ export class CreatorAssetService<W extends CreatorAssetWork, A extends CreatorAs
       throw new CreatorAssetError("invalid_asset", "Uploaded asset does not match its Work or stored object.");
     }
     const existing = await this.store.listCanonicalAssetsByWork(tenantId, workId);
-    const attachment: CreatorAssetAttachment = { workId, assetId: asset.assetId, role: previous.primaryAssetId ? "content" : "primary", position: existing.length };
+    const attachment: CreatorAssetAttachment = { workId, assetId: asset.assetId, role: previous.primaryAssetId ? "content" : "primary",
+      position: existing.length ? Math.max(...existing.map(asset => asset.attachment.position)) + 1 : 0 };
     const work = { ...previous, primaryAssetId: previous.primaryAssetId || asset.assetId, revision: previous.revision + 1, updatedAt: this.now() };
     await this.store.commitAssetAttachment({ previousRevision: previous.revision, work, asset, attachment });
     return { work, asset, attachment };

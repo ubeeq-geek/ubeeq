@@ -290,7 +290,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       }
       const attachments = this.get<CreatorAssetAttachment[]>(work.tenantId, "work_assets", work.workId) || [];
       if (asset.tenantId !== work.tenantId || asset.creatorId !== work.creatorId || attachment.workId !== work.workId ||
-        attachment.assetId !== asset.assetId || attachment.position !== attachments.length) throw new Error("Invalid asset attachment scope or position.");
+        attachment.assetId !== asset.assetId || attachment.position !== (attachments.length ? Math.max(...attachments.map(item => item.position)) + 1 : 0)) throw new Error("Invalid asset attachment scope or position.");
       db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'asset', ?, ?, ?)")
         .run(cell, asset.tenantId, asset.assetId, asset.creatorId, JSON.stringify(asset));
       db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'work_assets', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
@@ -328,7 +328,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       const members = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
       if (members.some(member => member.assetId === input.assetId)) return target;
       const primaryAssetId = (target as W & { primaryAssetId?: string }).primaryAssetId || input.assetId;
-      const member: CreatorAssetAttachment = { workId: input.workId, assetId: input.assetId, position: members.length,
+      const member: CreatorAssetAttachment = { workId: input.workId, assetId: input.assetId, position: members.length ? Math.max(...members.map(item => item.position)) + 1 : 0,
         role: primaryAssetId === input.assetId ? 'primary' : 'content' };
       const next = { ...target, primaryAssetId, revision: target.revision + 1, updatedAt: input.updatedAt };
       db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'work_assets', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
