@@ -74,7 +74,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
     add(workIds, work.workId, 'work');
   }
   for (const entry of works) {
-    const work = entry.work, localIds = new Set<string>();
+    const work = entry.work, localIds = new Set<string>(), attachmentPositions = new Set<number>();
     for (const value of array(entry.assets, 'work assets')) {
       const asset = object(value, 'asset'); owned(asset, 'asset');
       const assetId = add(localIds, asset.assetId, 'attached asset'); assetIds.add(assetId);
@@ -85,6 +85,8 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       if (asset.attachment !== undefined) {
         const attachment = object(asset.attachment, 'attachment');
         if (attachment.assetId !== assetId || attachment.workId !== work.workId || !Number.isSafeInteger(attachment.position) || attachment.position < 0) throw new Error('Invalid asset attachment relationship.');
+        if (attachmentPositions.has(attachment.position)) throw new Error('Duplicate asset attachment position.');
+        attachmentPositions.add(attachment.position);
       }
     }
     if (work.primaryAssetId && !localIds.has(work.primaryAssetId)) throw new Error('Dangling primary asset reference.');
@@ -106,12 +108,14 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   }
   for (const entry of collections) {
     const collection = object(object(entry, 'collection envelope').collection, 'collection'); owned(collection, 'collection');
-    const collectionId = add(collectionIds, collection.collectionId, 'collection'), members = new Set<string>();
+    const collectionId = add(collectionIds, collection.collectionId, 'collection'), members = new Set<string>(), positions = new Set<number>();
     for (const value of array(entry.works, 'collection works')) {
       const membership = object(value, 'collection membership');
       const workId = add(members, membership.workId, 'collection member');
       if (!workIds.has(workId) || (membership.collectionId !== undefined && membership.collectionId !== collectionId) ||
         !Number.isSafeInteger(membership.position) || membership.position < 0) throw new Error('Dangling or invalid collection relationship.');
+      if (positions.has(membership.position)) throw new Error('Duplicate collection membership position.');
+      positions.add(membership.position);
     }
     if (collection.coverAssetId && !assetIds.has(collection.coverAssetId)) throw new Error('Dangling collection cover reference.');
   }

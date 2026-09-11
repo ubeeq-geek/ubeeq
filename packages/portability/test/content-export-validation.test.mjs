@@ -43,6 +43,26 @@ test('foreign identities, duplicate records, broken references and integration s
     assert.throws(() => parseCreatorContentExport(JSON.stringify(value)));
   }
 });
+test('explicit ordering is unique within each parent while sparse positions remain intact', () => {
+  const value = fixture('id');
+  const asset = structuredClone(value.works[0].assets[0]);
+  asset.assetId = 'second-asset'; asset.attachment.assetId = asset.assetId;
+  value.works[0].assets.push(asset);
+  assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /Duplicate asset attachment position/);
+  asset.attachment.position = 7;
+  const second = { work: { ...value.works[0].work, workId: 'second-work', primaryAssetId: undefined }, assets: [] };
+  value.works.push(second);
+  value.collections[0].works.push({ collectionId: 'collection', workId: 'second-work', position: 2 });
+  assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /Duplicate collection membership position/);
+  value.collections[0].works[1].position = 9;
+  const parsed = parseCreatorContentExport(JSON.stringify(value));
+  assert.deepEqual(parsed.manifest.works[0].assets.map(item => item.attachment.position), [0, 7]);
+  assert.deepEqual(parsed.manifest.collections[0].works.map(item => item.position), [2, 9]);
+  // Other parents may reuse positions; only sibling ordering must be unique.
+  value.collections.push({ collection: { ...value.collections[0].collection, collectionId: 'other' },
+    works: [{ collectionId: 'other', workId: 'second-work', position: 2 }] });
+  assert.ok(parseCreatorContentExport(JSON.stringify(value)));
+});
 test('byte, node and depth budgets reject before a restore plan can be trusted', () => {
   const json = JSON.stringify(fixture('id'));
   assert.throws(() => parseCreatorContentExport(json, { maxBytes: 10 }), /byte budget/);
