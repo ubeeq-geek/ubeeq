@@ -62,7 +62,7 @@ export class CreatorClient {
     return response.blob();
   }
   replaceCollectionWorks(collectionId: string, workIds: string[], expectedWorkIds?: string[]) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}/works`, 'PUT', { workIds, expectedWorkIds }); }
-  updateWork(workId: string, revision: number, title: string, description: string, tags?: string[]) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }) }); }
+  updateWork(workId: string, revision: number, title: string, description: string, tags?: string[], metadata: { slug?: string } = {}) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }), ...(metadata.slug === undefined ? {} : { slug: metadata.slug }) }); }
   setWorkArchived(workId: string, revision: number, archived: boolean) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, status: archived ? 'archived' : 'draft' });
   }
