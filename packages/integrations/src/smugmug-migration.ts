@@ -77,8 +77,8 @@ export interface SmugMugOutboundSource {
 
 export interface SmugMugMigrationSink {
   importReference(input: { connectionId: string; creatorId: string; image: SmugMugRemoteImage; collections: SmugMugRemoteCollection[] }): Promise<void>;
-  findAssetByChecksum(creatorId: string, checksum: string): Promise<string | undefined>;
-  reuseAsset?(input: { creatorId: string; image: SmugMugRemoteImage; assetId: string; checksum: string }): Promise<void>;
+  findAssetByChecksum(creatorId: string, checksum: string, context?: { connectionId: string; image: SmugMugRemoteImage }): Promise<string | undefined>;
+  reuseAsset?(input: { connectionId: string; creatorId: string; image: SmugMugRemoteImage; assetId: string; checksum: string }): Promise<void>;
   quarantine(input: { connectionId: string; creatorId: string; image: SmugMugRemoteImage; body: Buffer; mimeType: string; checksum: string }): Promise<{ assetId: string; scanPassed: boolean }>;
 }
 
@@ -503,10 +503,10 @@ export class SmugMugIntegrationService {
           : undefined;
         if (image.checksum && providerChecksum?.toLowerCase() !== image.checksum.toLowerCase()) throw new SmugMugError('CHECKSUM_MISMATCH', 422);
         item.checksum = checksum;
-        const existing = await this.sink.findAssetByChecksum(migration.creatorId, checksum);
+        const existing = await this.sink.findAssetByChecksum(migration.creatorId, checksum, { connectionId: connection.id, image });
         await this.requireCurrentConnection(connection);
         if (existing && this.sink.reuseAsset) {
-          await this.sink.reuseAsset({ creatorId: migration.creatorId, image, assetId: existing, checksum });
+          await this.sink.reuseAsset({ connectionId: connection.id, creatorId: migration.creatorId, image, assetId: existing, checksum });
           item.canonicalAssetId = existing; item.state = 'DEDUPLICATED'; continue;
         }
         const quarantined = await this.sink.quarantine({ connectionId: connection.id, creatorId: migration.creatorId, image, ...transfer, checksum });
