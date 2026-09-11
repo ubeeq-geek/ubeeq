@@ -2,6 +2,22 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { transferVimeoUpload, VimeoApiError } from '../dist/index.js';
 
+test('Vimeo chunk budgets yield a checkpointed offset and a later call resumes to completion', async () => {
+  let remote = 0, sends = 0;
+  const checkpoints = [];
+  const input = { uploadUrl: 'fixture', chunkBytes: 2, maxChunks: 1,
+    source: { sizeBytes: 5, async read(_offset, length) { return new Uint8Array(length); } },
+    client: { async uploadOffset() { return remote; }, async uploadChunk(_url, offset, body) { sends++; remote = offset + body.byteLength; return remote; } },
+    async onProgress(offset) { checkpoints.push(offset); }
+  };
+  assert.equal(await transferVimeoUpload(input), 2); assert.equal(sends, 1);
+  assert.equal(await transferVimeoUpload(input), 4); assert.equal(sends, 2);
+  assert.equal(await transferVimeoUpload(input), 5); assert.equal(sends, 3);
+  assert.deepEqual(checkpoints, [2, 4, 5]);
+  for (const maxChunks of [0, -1, Infinity, 1.5]) await assert.rejects(transferVimeoUpload({ ...input, maxChunks }), VimeoApiError);
+  assert.equal(sends, 3);
+});
+
 test('Vimeo transfer resumes at the authoritative offset and checkpoints each bounded chunk', async () => {
   const events = [], bytes = Buffer.from('0123456789');
   const offset = await transferVimeoUpload({ uploadUrl: 'fixture', chunkBytes: 3,
