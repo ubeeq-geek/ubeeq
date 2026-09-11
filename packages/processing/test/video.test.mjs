@@ -34,6 +34,20 @@ test('video validation retains metadata and rejects malformed geometry and confi
   assert.throws(() => validateFfprobeOutput(probe, { ...profile, maxWidth: NaN }), /profile/);
   assert.equal(validateFfprobeOutput({ ...probe, format: { ...probe.format, bit_rate: 'bad' } }, profile).bitrate, undefined);
 });
+test('file sampler snapshots its inputs and uses final-frame capability without masking failure', async () => {
+  const calls = [], mutableProfile = structuredClone(profile);
+  const tools = { probe: async () => probe, extractFrame: async (...args) => calls.push(args),
+    extractLastFrame: async (...args) => calls.push(['last', ...args]) };
+  const input = { inputPath: '/input', outputPath: t => `/attempt/${t}.jpg`, profile: mutableProfile, tools };
+  const pending = extractValidatedFrames(input);
+  input.inputPath = '/changed'; input.outputPath = () => '/wrong'; mutableProfile.allowedContainers.length = 0;
+  input.tools = { probe: async () => { throw new Error('wrong tool'); } };
+  const result = await pending;
+  assert.deepEqual(calls.slice(0, -1).map(call => call[2]), result.frameTimestampsMs.slice(0, -1));
+  assert.deepEqual(calls.at(-1), ['last', '/input', '/attempt/10249.jpg']);
+  await assert.rejects(extractValidatedFrames({ inputPath: '/input', outputPath: t => `/attempt/${t}.jpg`, profile,
+    tools: { ...tools, extractLastFrame: async () => { throw new Error('final decode failed'); } } }), /final decode failed/);
+});
 test('extraction executes every frame and rejects without returning a completed plan on partial failure', async () => {
   const calls = [];
   const tools = { probe: async () => probe, extractFrame: async (...args) => { calls.push(args); } };
