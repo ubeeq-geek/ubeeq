@@ -34,8 +34,10 @@ export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "
   if ((await queue.list({ cellId: "contract-cell", limit: 10 })).some((job) => job.id === foreign.id)) throw new Error("Job queue contract violation: list exposed another cell's work.");
   const lease = await queue.lease({ cellId: "contract-cell", types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });
   if (!lease || lease.job.id !== created.id || lease.job.state !== "leased") throw new Error("Job queue contract violation: queued work is not leasable.");
+  if (lease.job.attempt !== created.attempt + 1) throw new Error("Job queue contract violation: claiming work must count its attempt.");
   await queue.retry({ id: created.id, leaseToken: lease.leaseToken, error: { code: "temporary", message: "retry" }, retryAt: new Date(Date.now() - 1_000).toISOString() });
   if ((await queue.get(created.id))?.state !== "retry_scheduled") throw new Error("Job queue contract violation: retry state was not retained.");
+  if ((await queue.get(created.id))?.attempt !== lease.job.attempt) throw new Error("Job queue contract violation: retry must not count another execution attempt.");
   const recovered = await queue.recover({ id: created.id });
   if (recovered.state !== "queued") throw new Error("Job queue contract violation: recovery must return work to queued state.");
   const finalLease = await queue.lease({ cellId: "contract-cell", types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });

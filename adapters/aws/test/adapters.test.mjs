@@ -122,6 +122,46 @@ test("SQS-notified DynamoDB queue obeys the shared durable job contract", async 
   assert.equal(events[0].Entries[0].DetailType, "job.available");
 });
 
+test('AWS queue counts each claimed execution once and dead-letters at the attempt budget', async () => {
+  const queue = new AwsJobQueue(new MemoryDynamo(), { tableName: 'records', cellId: 'cell' }, { send: async () => ({}) }, 'https://queue.test/jobs');
+  const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: 'attempts', maxAttempts: 2 });
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const lease = await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 });
+    assert.equal(lease.job.attempt, attempt);
+    assert.equal((await queue.get(job.id)).attempt, attempt);
+    await queue.retry({ id: job.id, leaseToken: lease.leaseToken, error: { code: 'temporary', message: 'retry' }, retryAt: new Date(0).toISOString() });
+    const saved = await queue.get(job.id);
+    assert.equal(saved.attempt, attempt);
+    assert.equal(saved.state, attempt === 2 ? 'dead_lettered' : 'retry_scheduled');
+  }
+  assert.equal(await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 }), undefined);
+});
+
+test('AWS lease conflicts return no claim but infrastructure write failures propagate', async () => {
+  const memory = new MemoryDynamo(); let failure;
+  const queue = new AwsJobQueue({ send: async command => {
+    if (command.constructor.name === 'PutCommand' && command.input.Item.value.state === 'leased' && failure) throw failure;
+    return memory.send(command);
+  } }, { tableName: 'records', cellId: 'cell' }, { send: async () => ({}) }, 'https://queue.test/jobs');
+  const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: 'errors', maxAttempts: 3 });
+  const input = { cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 };
+  failure = new Error('database unavailable');
+  await assert.rejects(queue.lease(input), error => error === failure);
+  assert.equal((await queue.get(job.id)).attempt, 0);
+  failure = Object.assign(new Error('conflict'), { name: 'ConditionalCheckFailedException' });
+  assert.equal(await queue.lease(input), undefined);
+  failure = undefined;
+  assert.equal((await queue.lease(input)).job.attempt, 1);
+});
+
+test('AWS lease admission rejects invalid durations and blank cells before database access', async () => {
+  const queue = new AwsJobQueue({ send: async () => assert.fail('invalid lease must not access database') }, { tableName: 'records', cellId: 'cell' }, { send: async () => assert.fail('must not notify') }, 'https://queue.test/jobs');
+  for (const leaseDurationSeconds of [0, -1, 0.5, Infinity, NaN]) {
+    await assert.rejects(queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds }), /positive integer/);
+  }
+  await assert.rejects(queue.lease({ cellId: ' ', workerId: 'worker', leaseDurationSeconds: 60 }), /cell/);
+});
+
 test("S3 adapter obeys the shared storage contract without prescribing a delivery provider", async () => {
   const values = new Map(); let put;
   const storage = new S3ObjectStorage({ send: async (command) => {
