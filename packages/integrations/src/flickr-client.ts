@@ -141,6 +141,46 @@ export class FlickrClient {
     return albums;
   }
 
+  /** One provider request. Callers persist continuation rather than walking the whole catalogue. */
+  async albumsPage(credentials: FlickrOAuthCredentials, page: number, perPage = 100): Promise<{ page: number; pages: number; albums: Array<Record<string, unknown>> }> {
+    this.validateAlbumPageRequest(page, perPage);
+    const payload = await this.rest('flickr.photosets.getList', credentials, { user_id: 'me', page: String(page), per_page: String(perPage) });
+    const result = this.validateAlbumPage(payload.photosets, 'photoset', page, perPage);
+    return { page, pages: result.pages, albums: result.items };
+  }
+
+  /** One provider request; preserves provider ordering and rejects incomplete item identities. */
+  async albumPhotoIdsPage(credentials: FlickrOAuthCredentials, albumId: string, page: number, perPage = 100): Promise<{ page: number; pages: number; photoIds: string[] }> {
+    this.validateAlbumPageRequest(page, perPage);
+    if (typeof albumId !== 'string' || !albumId.trim() || albumId.length > 200) throw new Error('Invalid Flickr album identity');
+    const payload = await this.rest('flickr.photosets.getPhotos', credentials, { photoset_id: albumId, user_id: 'me', page: String(page), per_page: String(perPage) });
+    const result = this.validateAlbumPage(payload.photoset, 'photo', page, perPage);
+    const returnedId = (payload.photoset as { id?: unknown }).id;
+    if (returnedId !== albumId) throw new Error('Invalid Flickr album response identity');
+    return { page, pages: result.pages, photoIds: result.items.map(item => item.id as string) };
+  }
+
+  private validateAlbumPageRequest(page: number, perPage: number) {
+    if (!Number.isSafeInteger(page) || page < 1 || page === Number.MAX_SAFE_INTEGER
+      || !Number.isSafeInteger(perPage) || perPage < 1 || perPage > 500) throw new Error('Invalid Flickr album pagination');
+  }
+
+  private validateAlbumPage(value: unknown, field: 'photo' | 'photoset', requestedPage: number, limit: number): { pages: number; items: Array<Record<string, unknown>> } {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Flickr album page');
+    const record = value as Record<string, unknown>;
+    const integer = (input: unknown): number => typeof input === 'number' || (typeof input === 'string' && /^\d+$/.test(input)) ? Number(input) : NaN;
+    const page = integer(record.page), pages = integer(record.pages), items = record[field];
+    if (page !== requestedPage || !Number.isSafeInteger(pages) || pages < 0 || pages === Number.MAX_SAFE_INTEGER
+      || !Array.isArray(items) || items.length > limit
+      || (pages < page && !(page === 1 && pages === 0 && items.length === 0))) throw new Error('Invalid Flickr album page');
+    const seen = new Set<string>();
+    for (const item of items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || seen.has(item.id)) throw new Error('Invalid Flickr album page item');
+      seen.add(item.id);
+    }
+    return { pages, items: items as Array<Record<string, unknown>> };
+  }
+
   async albumPhotoIds(credentials: FlickrOAuthCredentials, albumId: string): Promise<string[]> {
     const ids: string[] = []; let page = 1; let pages = 1;
     do {
