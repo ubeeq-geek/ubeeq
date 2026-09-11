@@ -78,3 +78,4 @@ export const validateAccessibleAction = (action: AccessibleAction): AccessibleAc
   return action;
 };
 export { createPrivateMediaPlayback } from './private-media-playback.js';
+export { createSourceFileBrowser, type SourceFileBrowserOptions } from './source-file-browser.js';
