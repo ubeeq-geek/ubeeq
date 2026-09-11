@@ -307,3 +307,4 @@ export { normalizeFlickrPhoto, normalizeFlickrProviderPhoto, flickrTextContent, 
 export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewayOptions, type SmugMugOAuthCredential } from './smugmug-gateway.js';
 export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugInventoryPage, SmugMugGateway } from './smugmug-contracts.js';
 export * from './smugmug-migration.js';
+export * from './public-derivative-publication.js';
