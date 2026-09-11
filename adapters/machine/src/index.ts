@@ -168,7 +168,7 @@ export class PostgresJobQueue implements JobQueue, Scheduler {
     });
   }
   private async transition(input: { id: string; leaseToken: string; state: DurableJob["state"]; error?: { code: string; message: string }; retryAt?: string }): Promise<void> {
-    const result = await this.database.pool.query("UPDATE ubeeq_jobs SET state = $1, last_error = $2::jsonb, available_at = COALESCE($3::timestamptz, available_at), lease_token = NULL, lease_expires_at = NULL, updated_at = NOW() WHERE id = $4 AND state = 'leased' AND lease_token = $5", [input.state, input.error ? JSON.stringify(input.error) : null, input.retryAt ?? null, input.id, input.leaseToken]);
+    const result = await this.database.pool.query("UPDATE ubeeq_jobs SET state = CASE WHEN $1 = 'retry_scheduled' AND attempt >= max_attempts THEN 'dead_lettered' ELSE $1 END, last_error = $2::jsonb, available_at = CASE WHEN $1 = 'retry_scheduled' AND attempt >= max_attempts THEN available_at ELSE COALESCE($3::timestamptz, available_at) END, lease_token = NULL, lease_expires_at = NULL, updated_at = NOW() WHERE id = $4 AND state = 'leased' AND lease_token = $5 AND lease_expires_at > NOW()", [input.state, input.error ? JSON.stringify(input.error) : null, input.retryAt ?? null, input.id, input.leaseToken]);
     if (result.rowCount !== 1) throw new Error("Job lease is no longer valid.");
   }
   async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.transition({ ...input, state: "completed" }); }
