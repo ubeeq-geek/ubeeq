@@ -2,7 +2,15 @@ import sharp from 'sharp';
 import { pickSquareCrop, type MediaProcessor, type ProcessedRendition, type SquareCropInput } from '@ubeeq/processing';
 import { renderImageRendition } from './rendition.js';
 
+const recipes = [
+  ['w320', 320, false], ['w640', 640, false], ['w1280', 1280, false], ['w1920', 1920, false],
+  ['square256', 256, true], ['square512', 512, true], ['square1024', 1024, true]
+] as const;
+export type ImageRenditionName = typeof recipes[number][0];
+
 export interface ImageRenditionSetOptions {
+  /** Explicit nonempty subset, returned in canonical recipe order. Default: all seven. */
+  renditionNames?: readonly ImageRenditionName[];
   squareCrop?: SquareCropInput;
   maxInputPixels?: number;
   maxSourceBytes?: number;
@@ -16,6 +24,11 @@ export class SharpImageRenditionProcessor implements MediaProcessor {
   private readonly options: ImageRenditionSetOptions;
   constructor(options: ImageRenditionSetOptions = {}) {
     this.options = structuredClone(options);
+    const selected = this.options.renditionNames;
+    if (selected !== undefined && (!Array.isArray(selected) || !selected.length || selected.length > recipes.length ||
+      new Set(selected).size !== selected.length || selected.some(name => !recipes.some(recipe => recipe[0] === name)))) {
+      throw new Error('Invalid image rendition selection.');
+    }
     for (const value of [options.maxInputPixels, options.maxSourceBytes, options.maxOutputBytes]) {
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error('Image rendition budgets must be positive integers.');
     }
@@ -36,10 +49,8 @@ export class SharpImageRenditionProcessor implements MediaProcessor {
     const crop = pickSquareCrop(metadata.width, metadata.height, squareCrop);
     const renditions: ProcessedRendition[] = [];
     let outputBytes = 0;
-    for (const [name, size, square] of [
-      ['w320', 320, false], ['w640', 640, false], ['w1280', 1280, false], ['w1920', 1920, false],
-      ['square256', 256, true], ['square512', 512, true], ['square1024', 1024, true]
-    ] as const) {
+    for (const [name, size, square] of recipes) {
+      if (this.options.renditionNames && !this.options.renditionNames.includes(name)) continue;
       const body = await renderImageRendition(source, { width: size, height: size, quality: 82, maxInputPixels,
         fit: square ? 'cover' : 'inside', withoutEnlargement: !square,
         ...(square ? { crop: { x: crop.x, y: crop.y, width: crop.size, height: crop.size } } : {}) });
