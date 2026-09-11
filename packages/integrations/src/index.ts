@@ -300,3 +300,4 @@ export { requestVimeo, VimeoApiError } from './vimeo-request.js';
 export { VimeoReadClient } from './vimeo-read-client.js';
 export { VimeoWriteClient, type VimeoPrivacyUpdate, type VimeoVideoUpdate } from './vimeo-write-client.js';
 export { VimeoOAuthClient, type VimeoTokens, type VimeoCodeExchange } from './vimeo-oauth-client.js';
+export { VimeoUploadClient, type VimeoUploadTicket } from './vimeo-upload-client.js';
