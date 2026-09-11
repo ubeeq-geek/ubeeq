@@ -39,3 +39,11 @@ unrelated existing ID. The retained conditional-conflict fallback is legacy
 compatibility, not durable request-bound idempotency: it does not persist or
 compare request keys/payloads or retain an immutable create receipt. That broader
 contract remains an acceptance gap and must not be assumed from this fix.
+
+Lifetime regressions additionally verify that nested callbacks reuse the outer
+handle and produce only one atomic batch. Catching a nested callback failure
+does not permit outer companion writes to commit. Async work released after
+the outer callback has completed cannot stage a late write or open a nested
+transaction from its expired context. These tests use controlled promise gates
+and await their completion; they do not infer cleanup from elapsed time or
+qualify live service behavior.
