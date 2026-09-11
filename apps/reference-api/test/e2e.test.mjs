@@ -69,7 +69,17 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     assert.equal(publicWork.response.status, 200); assert.equal(publicWork.body.work.status, "published");
     assert.match(publicWork.body.assets[0].storage.key, /\/renditions\//);
     const delivery = await fetch(publicWork.body.assets[0].delivery.url.replace("http://127.0.0.1:0", base));
-    assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes); assert.match(delivery.headers.get("cache-control"), /public/);
+    assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes); assert.equal(delivery.headers.get('cache-control'), 'private, no-store');
+    const issuedUrl = publicWork.body.assets[0].delivery.url.replace('http://127.0.0.1:0', base);
+    for (const [subjectType, subjectId] of [['work', work.body.work.id], ['creator', creator.body.creator.id], ['asset', publicWork.body.assets[0].id]]) {
+      const laterHold = await request(base, '/v1/operations/holds', { method: 'POST', headers, body: JSON.stringify({ subjectType, subjectId, reason: 'later_review' }) });
+      assert.equal(laterHold.response.status, 201);
+      const hidden = await request(base, `/v1/public/works/${work.body.work.id}`);
+      assert.equal(hidden.response.status, 404); assert.equal(hidden.response.headers.get('cache-control'), 'private, no-store');
+      assert.equal((await fetch(issuedUrl)).status, 404);
+      await request(base, `/v1/operations/holds/${laterHold.body.hold.id}/release`, { method: 'POST', headers, body: '{}' });
+      assert.equal((await fetch(issuedUrl)).status, 200);
+    }
     const exported = await request(base, "/v1/exports/me", { headers });
     assert.equal(exported.response.status, 200); assert.equal(exported.body.schemaVersion, "2"); assert.equal(exported.body.secretsExcluded, true); assert.equal(exported.body.works.length, 1); assert.equal(exported.body.processing.length, 1); assert.equal(exported.body.objectInventory.length, 1);
     const importDirectory = mkdtempSync(join(tmpdir(), "ubeeq-reference-import-"));

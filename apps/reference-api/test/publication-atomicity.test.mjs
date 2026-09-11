@@ -61,5 +61,21 @@ test('reference publication rolls back intent, publication, Work and audit on an
     assert.equal((await local.repositories.publicationIntents.list({ limit: 100 })).items.length, 1);
     assert.equal((await local.repositories.publications.list({ limit: 100 })).items.length, 1);
     assert.equal((await local.repositories.auditEvents.list({ limit: 100 })).items.filter(item => item.action === 'work.published').length, 1);
+    const object = { bucket: 'cell', key: 'cells/cell/creators/owner/renditions/asset', versionId: 'v1', contentType: 'application/octet-stream', byteLength: 1, scope: 'private' };
+    await local.storage.put({ object, body: new Uint8Array([7]) });
+    const original = await local.repositories.assets.get('asset');
+    let stored = await local.repositories.assets.update(original.id, original.revision, { storage: object });
+    const issued = await local.storage.issue({ object: { ...object, scope: 'public' }, expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    const deliveryUrl = `http://127.0.0.1:${api.server.address().port}${new URL(issued.url).pathname}`;
+    assert.equal((await fetch(deliveryUrl)).status, 200);
+    const withdrawn = await local.repositories.publications.update(published.body.publication.id, published.body.publication.revision, { status: 'withdrawn' });
+    assert.equal((await fetch(deliveryUrl)).status, 404);
+    await local.repositories.publications.update(withdrawn.id, withdrawn.revision, { status: 'live' });
+    stored = await local.repositories.assets.update(stored.id, stored.revision, { storage: { ...object, versionId: 'v2' } });
+    assert.equal((await fetch(deliveryUrl)).status, 404);
+    stored = await local.repositories.assets.update(stored.id, stored.revision, { storage: object, status: 'pending' });
+    assert.equal((await fetch(deliveryUrl)).status, 404);
+    await local.repositories.assets.update(stored.id, stored.revision, { status: 'ready' });
+    assert.equal((await fetch(deliveryUrl)).status, 200);
   } finally { await api.close(); local.database.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
