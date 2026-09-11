@@ -1,6 +1,6 @@
 import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollectionRecord, CreatorWorkPort, CreatorWorkRecord } from "@ubeeq/core";
 import { CreatorWorkError, CreatorCollectionError, CreatorAssetError, contentAssetReferences } from "@ubeeq/core";
-import { CreatorAssetRegenerationError, type CreatorAssetRegenerationRequest, type CreatorAssetRegenerationReceipt } from '@ubeeq/core';
+import { CreatorAssetRegenerationError, snapshotCreatorSquareCrop, type CreatorAssetRegenerationRequest, type CreatorAssetRegenerationReceipt } from '@ubeeq/core';
 import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit, CreatorAssetDetachmentCommit } from "@ubeeq/core";
 import { isPrivateStoredCreatorAsset, type CreatorExistingAssetCommit } from '@ubeeq/core';
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
@@ -48,7 +48,7 @@ const validWorkAssetReferences = `NOT EXISTS (
 export class LocalCreatorLibraryStore<W extends CreatorWorkRecord, C extends CreatorCollectionRecord>
 implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingPort {
   readonly supportsExpectedCollectionOrder = true;
-  constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean } = {}) {}
+  constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean; allowSquareCrop?: boolean } = {}) {}
 
   private get<T>(tenantId: string, kind: string, id: string): T | null {
     const row = this.local.database.prepare("SELECT payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = ? AND id = ?")
@@ -83,6 +83,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
   async getWork(tenantId: string, workId: string): Promise<W | null> { return this.get(tenantId, "work", workId); }
   async getProcessingAsset(tenantId: string, assetId: string): Promise<CreatorAssetRecord | null> { return this.get(tenantId, "asset", assetId); }
   async enqueueAssetRegeneration(input: CreatorAssetRegenerationRequest): Promise<CreatorAssetRegenerationReceipt> {
+    const squareCrop = snapshotCreatorSquareCrop(input.squareCrop);
     const db = this.local.database, cell = this.local.configuration.cellId;
     db.exec('BEGIN IMMEDIATE');
     try {
@@ -99,18 +100,22 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       }
       if (work.revision !== input.expectedRevision) throw new CreatorWorkError('revision_conflict', 'Work changed before regeneration.');
       if (asset.storage.scope !== 'private' || asset.storage.versionId !== input.sourceVersionId) throw new CreatorAssetRegenerationError('source_changed', 'Processing source changed.');
+      if (squareCrop && (!this.options.allowSquareCrop || !this.options.enqueueImageProcessing || !asset.mimeType.startsWith('image/'))) throw new CreatorAssetRegenerationError('processing_unsupported', 'Square crop processing is not enabled.');
       if (!((this.options.enqueueImageProcessing && asset.mimeType.startsWith('image/')) ||
         (this.options.enqueueVideoProcessing && asset.mimeType.startsWith('video/')))) throw new CreatorAssetRegenerationError('processing_unsupported', 'No enabled processor for this media.');
       const key = JSON.stringify(['creator-asset.regenerate', input.tenantId, input.creatorId, input.workId, input.assetId, input.sourceVersionId, input.requestId]);
-      const previous = db.prepare('SELECT id, state FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?')
-        .get(cell, `${cell}:${key}`) as { id: string; state: string } | undefined;
-      if (previous) { db.exec('COMMIT'); return { jobId: previous.id, state: previous.state, idempotent: true }; }
+      const previous = db.prepare('SELECT id, state, payload FROM ubeeq_jobs WHERE cell_id = ? AND idempotency_key = ?')
+        .get(cell, `${cell}:${key}`) as { id: string; state: string; payload: string } | undefined;
+      if (previous) {
+        if (JSON.stringify(snapshotCreatorSquareCrop(JSON.parse(previous.payload).squareCrop)) !== JSON.stringify(squareCrop)) throw new CreatorAssetRegenerationError('invalid_request', 'Request key already belongs to a different crop.');
+        db.exec('COMMIT'); return { jobId: previous.id, state: previous.state, idempotent: true };
+      }
       const active = db.prepare(`SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND type = 'creator-asset.process'
         AND state IN ('queued', 'leased', 'retry_scheduled') AND json_extract(payload, '$.tenantId') = ?
         AND json_extract(payload, '$.assetId') = ? LIMIT 1`).get(cell, input.tenantId, input.assetId);
       if (active) throw new CreatorAssetRegenerationError('processing_busy', 'An active job already processes this asset.');
       const job = new LocalSqliteJobQueue(this.local).enqueueSync({ cellId: cell, type: 'creator-asset.process',
-        payload: { tenantId: input.tenantId, creatorId: input.creatorId, workId: input.workId, assetId: input.assetId, sourceVersionId: input.sourceVersionId },
+        payload: { tenantId: input.tenantId, creatorId: input.creatorId, workId: input.workId, assetId: input.assetId, sourceVersionId: input.sourceVersionId, ...(squareCrop ? { squareCrop } : {}) },
         idempotencyKey: key, maxAttempts: 3 });
       db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'asset' AND id = ?")
         .run(JSON.stringify({ ...asset, processingJobId: job.id }), cell, input.tenantId, input.assetId);
