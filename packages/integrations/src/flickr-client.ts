@@ -110,12 +110,24 @@ export class FlickrClient {
   }
 
   async inventoryPage(credentials: FlickrOAuthCredentials, page: number, perPage = 100): Promise<FlickrInventoryPage> {
+    if (!Number.isSafeInteger(page) || page < 1 || page === Number.MAX_SAFE_INTEGER || !Number.isSafeInteger(perPage) || perPage < 1) throw new Error('Invalid Flickr inventory pagination');
     const payload = await this.rest('flickr.people.getPhotos', credentials, {
       user_id: 'me', page: String(page), per_page: String(Math.min(500, perPage)),
       extras: 'description,date_upload,date_taken,license,tags,url_m,url_o,original_format,o_dims,media,path_alias'
     });
-    const photos = payload.photos as { page?: number; pages?: number; photo?: Array<Record<string, unknown>> } | undefined;
-    return { page: Number(photos?.page || page), pages: Number(photos?.pages || page), photos: photos?.photo || [] };
+    const photos = payload?.photos as { page?: unknown; pages?: unknown; photo?: unknown } | undefined;
+    const integer = (value: unknown): number => typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value)) ? Number(value) : NaN;
+    const returnedPage = integer(photos?.page), pages = integer(photos?.pages);
+    if (!photos || typeof photos !== 'object' || Array.isArray(photos) || returnedPage !== page
+      || !Number.isSafeInteger(pages) || pages < 0 || pages === Number.MAX_SAFE_INTEGER
+      || !Array.isArray(photos.photo) || photos.photo.length > Math.min(500, perPage)
+      || (pages < page && !(page === 1 && pages === 0 && photos.photo.length === 0))) throw new Error('Invalid Flickr inventory response');
+    const ids = new Set<string>();
+    for (const photo of photos.photo) {
+      if (!photo || typeof photo !== 'object' || Array.isArray(photo) || typeof photo.id !== 'string' || !photo.id.trim() || ids.has(photo.id)) throw new Error('Invalid Flickr inventory photo');
+      ids.add(photo.id);
+    }
+    return { page: returnedPage, pages, photos: photos.photo as Array<Record<string, unknown>> };
   }
 
   async albums(credentials: FlickrOAuthCredentials): Promise<Array<Record<string, unknown>>> {

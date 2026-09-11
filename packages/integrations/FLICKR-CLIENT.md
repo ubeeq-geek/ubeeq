@@ -21,9 +21,16 @@ request and body consumption. Error bodies are bounded too; their HTTP status
 still controls the existing retry policy. Successful oversized responses and
 transport failures are not automatically retried.
 
+Inventory pages require explicit page counts and a photo array, matching the
+requested page, within the requested size ceiling, with unique nonblank string
+photo IDs. Numeric-string counts and an explicit empty first page with zero total
+pages are supported. Missing or malformed data rejects the operation rather than
+inventing an empty final catalogue. Photo metadata is preserved without projection;
+applications still validate fields before storing or displaying them.
+
 This extraction is not production qualification: per-attempt timeouts are not a
 total operation deadline, including pacing/retries; album enumeration
-materializes all pages; provider payload validation is permissive;
+materializes all pages; album payload validation is permissive;
 retry pacing is process-local rather than a durable/global quota. Those gaps need
 operation budgets and resumable jobs before hosted readiness. The injected fetch
 supports offline conformance tests without contacting a provider.
