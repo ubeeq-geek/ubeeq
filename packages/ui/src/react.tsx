@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+export { ProfileAvatar, type ProfileAvatarProps } from './profile-avatar.js';
 export { LimitedBioEditor } from './limited-bio-editor.js';
 export { CropCanvas } from './crop-canvas.js';
 export { PrivateMediaPlayer, type PrivateMediaPlayerProps } from './private-media-player.js';
