@@ -43,6 +43,37 @@ class IndexedDynamo {
 const makeQueue = (dynamo, extra = {}) => new AwsJobQueue(dynamo, { tableName: 'records', cellId: 'cell', jobDiscoveryIndexes: indexes, ...extra }, { send: async () => ({}) }, 'https://queue.test/jobs');
 const enqueue = (queue, key, extra = {}) => queue.enqueue({ cellId: 'cell', type: 'render', payload: {}, idempotencyKey: key, maxAttempts: 3, availableAt: new Date(0).toISOString(), ...extra });
 
+test('enqueue retries notification failures against the same durable job without rewriting it', async () => {
+  const memory = new IndexedDynamo(), notices = []; let unavailable = true;
+  const queue = new AwsJobQueue(memory, { tableName: 'records', cellId: 'cell' }, { send: async command => {
+    notices.push(JSON.parse(command.input.MessageBody)); if (unavailable) throw new Error('notification unavailable'); return {};
+  } }, 'https://queue.test/jobs');
+  await assert.rejects(enqueue(queue, 'recover-notice'), /notification unavailable/);
+  assert.equal(memory.rows.size, 1);
+  const before = structuredClone([...memory.rows.values()][0]); unavailable = false;
+  const job = await enqueue(queue, 'recover-notice', { payload: { ignoredRetryChange: true } });
+  assert.equal(job.id, before.value.id); assert.deepEqual([...memory.rows.values()][0], before);
+  assert.deepEqual(notices[0], notices[1]); assert.equal(notices.length, 2);
+  for (const state of ['leased', 'completed', 'cancelled', 'dead_lettered']) {
+    memory.rows.get(before.pk).value.state = state;
+    assert.equal((await enqueue(queue, 'recover-notice')).state, state);
+  }
+  assert.equal(notices.length, 2);
+  memory.rows.get(before.pk).value.state = 'retry_scheduled';
+  await enqueue(queue, 'recover-notice'); assert.equal(notices.length, 3);
+});
+
+test('EventBridge entry failures propagate and retry reuses the stored job', async () => {
+  const memory = new IndexedDynamo(); let failed = true, messages = 0;
+  const queue = new AwsJobQueue(memory, { tableName: 'records', cellId: 'cell' }, { send: async () => { messages++; return {}; } }, 'https://queue.test/jobs', {
+    client: { send: async () => failed ? { FailedEntryCount: 1, Entries: [{ ErrorCode: 'InternalFailure' }] } : { FailedEntryCount: 0, Entries: [{ EventId: 'accepted' }] } }, eventBusName: 'jobs'
+  });
+  await assert.rejects(enqueue(queue, 'event-retry'), /not accepted/);
+  const id = [...memory.rows.values()][0].value.id; failed = false;
+  assert.equal((await enqueue(queue, 'event-retry')).id, id);
+  assert.equal(memory.rows.size, 1); assert.equal(messages, 2);
+});
+
 test('job IDs distinguish delimiter-bearing cell/key pairs and retain only matching legacy jobs', async () => {
   const memory = new IndexedDynamo(), queue = makeQueue(memory);
   const first = await enqueue(queue, 'c', { cellId: 'a:b' });

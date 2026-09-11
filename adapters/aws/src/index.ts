@@ -332,16 +332,19 @@ export class AwsJobQueue implements JobQueue {
     if (typeof input.cellId !== 'string' || !input.cellId.trim() || typeof input.idempotencyKey !== 'string' || !input.idempotencyKey.trim()) throw new Error('Job cell and idempotency key are required.');
     const id = `job-v2-${createHash("sha256").update(JSON.stringify([input.cellId, input.idempotencyKey])).digest("hex").slice(0, 32)}`;
     const matches = (job: DurableJob<TPayload>) => job.cellId === input.cellId && job.idempotencyKey === input.idempotencyKey;
+    const resume = async (job: DurableJob<TPayload>) => {
+      if (!matches(job)) throw new Error('Job idempotency scope mismatch.');
+      if (job.state === 'queued' || job.state === 'retry_scheduled') await this.notify(job.id, job.type, job.cellId);
+      return job;
+    };
     const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
-    if (existing) { if (!matches(existing)) throw new Error('Job idempotency scope mismatch.'); return existing; }
+    if (existing) return resume(existing);
     // Keep known legacy jobs addressable without accepting ambiguous cross-cell IDs.
     const legacyId = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
     const legacy = await this.jobs.get(legacyId) as DurableJob<TPayload> | undefined;
-    if (legacy && matches(legacy)) return legacy;
+    if (legacy && matches(legacy)) return resume(legacy);
     const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
-    if (!matches(created)) throw new Error('Job idempotency scope mismatch.');
-    await this.notify(created.id, created.type, created.cellId);
-    return created;
+    return resume(created);
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
@@ -440,7 +443,10 @@ export class AwsJobQueue implements JobQueue {
   private async notify(id: string, type: string, cellId: string): Promise<void> {
     const detail = JSON.stringify({ id, type, cellId });
     await this.sqs.send(new SendMessageCommand({ QueueUrl: this.queueUrl, MessageBody: detail }));
-    if (this.eventBridge) await this.eventBridge.client.send(new PutEventsCommand({ Entries: [{ EventBusName: this.eventBridge.eventBusName, Source: "ubeeq.jobs", DetailType: "job.available", Detail: detail }] }));
+    if (this.eventBridge) {
+      const receipt = await this.eventBridge.client.send(new PutEventsCommand({ Entries: [{ EventBusName: this.eventBridge.eventBusName, Source: "ubeeq.jobs", DetailType: "job.available", Detail: detail }] }));
+      if ((receipt.FailedEntryCount ?? 0) > 0 || receipt.Entries?.some(entry => entry.ErrorCode)) throw new Error('Job availability event was not accepted.');
+    }
   }
 }
 
