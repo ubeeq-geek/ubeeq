@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+export { ProfileCoverPicker, type ProfileCoverPickerProps } from './profile-cover-picker.js';
 export { ProfileAvatar, type ProfileAvatarProps } from './profile-avatar.js';
 export { LimitedBioEditor } from './limited-bio-editor.js';
 export { CropCanvas } from './crop-canvas.js';
