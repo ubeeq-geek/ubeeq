@@ -1,6 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('publication client preserves retry keys and scopes receipt listing and withdrawal', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });
+  await client.signIn('owner@example.test', 'password');
+  await client.publications('work/one');
+  assert.equal(calls.at(-1).url, '/api/studio/works/work%2Fone/publications');
+  assert.equal(calls.at(-1).options.method, 'GET');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await client.publishWork('work/one', 3, 'same-key');
+    assert.equal(calls.at(-1).options.headers['idempotency-key'], 'same-key');
+    assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+    assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 3 });
+  }
+  await client.withdrawPublication('work/one', 'receipt/two', 2);
+  assert.equal(calls.at(-1).url, '/api/studio/works/work%2Fone/publications/receipt%2Ftwo');
+  assert.equal(calls.at(-1).options.method, 'DELETE');
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 2 });
+});
 test('asset detachment sends an explicit revision and encoded Work and asset IDs', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json({}); });
