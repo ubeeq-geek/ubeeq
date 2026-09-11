@@ -312,3 +312,4 @@ export * from './publication-reconciliation.js';
 export * from './flickr-source-download.js';
 export * from './flickr-migration-state.js';
 export * from './flickr-inventory.js';
+export * from './flickr-source-workflow.js';
