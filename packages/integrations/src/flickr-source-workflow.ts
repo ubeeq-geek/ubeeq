@@ -10,7 +10,7 @@ const transferErrorCodes = new Set([
   'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE', 'FLICKR_SOURCE_UNAVAILABLE',
   'FLICKR_SOURCE_TOO_LARGE', 'FLICKR_SOURCE_MIME_INVALID', 'FLICKR_SOURCE_TRANSFER_FAILED'
 ]);
-const transferErrorCode = (error: unknown): string => {
+export const flickrSourceFailureCode = (error: unknown): string => {
   if (!(error instanceof Error)) return 'FLICKR_SOURCE_TRANSFER_FAILED';
   // Preserve the reference port's legacy transient signal without persisting free text.
   if (error.message === 'TEMPORARILY_UNAVAILABLE') return 'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE';
@@ -85,7 +85,7 @@ export class FlickrSourceWorkflow {
           dedupeStatus: existing ? 'CHECKSUM_MATCH' : 'UNIQUE', errorCode: undefined, nextRetryAt: undefined });
       } catch (error) {
         if (error instanceof FlickrSourceAdmissionError) throw error;
-        const code = transferErrorCode(error);
+        const code = flickrSourceFailureCode(error);
         const transient = code === 'FLICKR_SOURCE_TEMPORARILY_UNAVAILABLE';
         const retryCount = item.retryCount + (transient ? 1 : 0);
         items.push({ ...item, transferStatus: code === 'FLICKR_SOURCE_UNAVAILABLE' ? 'UNAVAILABLE' : 'FAILED', retryCount,

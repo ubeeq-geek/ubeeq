@@ -314,3 +314,4 @@ export * from './flickr-migration-state.js';
 export * from './flickr-inventory.js';
 export * from './flickr-source-workflow.js';
 export * from './flickr-album-inventory.js';
+export * from './flickr-browser-projection.js';

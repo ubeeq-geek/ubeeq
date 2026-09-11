@@ -16,3 +16,13 @@ This is forward-looking normalization, not a cleanup of historical records.
 Already persisted item errors and audit events are retained. Callers must continue
 to redact their browser projections and protect stored history. The original
 port exception is deliberately not copied into the migration or logged here.
+
+`projectFlickrMigrationForBrowser` provides a detached authenticated-control-plane
+view. It removes photo source/page URLs, provenance source URLs and quarantine
+object keys, normalizes historical item/audit errors, and permits only typed
+progress/consent audit details. It preserves creator/provider metadata and does
+not make the record public-safe or replace caller authorization. Preview URLs
+remain part of the existing metadata contract. The projection neither rewrites
+history nor bounds whole-record memory; paged endpoints remain preferable for
+large catalogues. Other application logs and error responses require their own
+review.
