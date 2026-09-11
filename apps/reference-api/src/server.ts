@@ -5,6 +5,7 @@ import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequi
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
+import { repositoryItems } from "@ubeeq/persistence";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
@@ -151,9 +152,11 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     await repositories.auditEvents.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, action: input.action, actorId: input.actorId, subjectId: input.subjectId, payload: input.payload ?? {} });
   };
   const requireClearAdmission = async (operation: string, subjectIds: readonly string[]): Promise<void> => {
-    const holds = (await repositories.moderationHolds.list({ limit: 100 })).items
-      .filter((hold) => hold.state === "active" && subjectIds.includes(hold.subjectId))
-      .map((hold): ReviewHold => ({ id: hold.id, cellId: hold.homeCellId, subjectId: hold.subjectId, active: true, sourceId: hold.id, reasonCode: hold.reason ?? "review_hold", createdAt: hold.createdAt }));
+    const holds: ReviewHold[] = [];
+    const subjects = new Set(subjectIds);
+    for await (const hold of repositoryItems(request => repositories.moderationHolds.list(request))) {
+      if (hold.state === 'active' && subjects.has(hold.subjectId)) holds.push({ id: hold.id, cellId: hold.homeCellId, subjectId: hold.subjectId, active: true, sourceId: hold.id, reasonCode: hold.reason ?? 'review_hold', createdAt: hold.createdAt });
+    }
     requireAdmission(subjectIds.map((subjectId) => ({ subjectId })), holds, operation);
   };
   const existingImportIds = async () => ({ publication: (await repositories.publications.list({ limit: 100 })).items.map(({ id }) => id), publicationIntent: (await repositories.publicationIntents.list({ limit: 100 })).items.map(({ id }) => id), moderationEvidence: (await repositories.moderationEvidence.list({ limit: 100 })).items.map(({ id }) => id), moderationHold: (await repositories.moderationHolds.list({ limit: 100 })).items.map(({ id }) => id), reviewCase: (await repositories.reviewCases.list({ limit: 100 })).items.map(({ id }) => id), auditEvent: (await repositories.auditEvents.list({ limit: 100 })).items.map(({ id }) => id), usageEvent: (await repositories.usageEvents.list({ limit: 100 })).items.map(({ id }) => id), integrationAccount: (await repositories.integrationAccounts.list({ limit: 100 })).items.map(({ id }) => id) });
@@ -312,7 +315,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && publicationMatch) {
         const identity = await session(request);
         const work = await ownedWork(publicationMatch[1], identity.subject.id);
-        const assets = (await repositories.assets.list({ limit: 100 })).items.filter((asset) => asset.workId === work.id);
+        const assets: AssetRecord[] = [];
+        for await (const asset of repositoryItems(request => repositories.assets.list(request))) {
+          if (asset.workId === work.id) assets.push(asset);
+        }
         if (!assets.length || assets.some((asset) => asset.status !== "ready")) throw new HttpError(409, "processing_incomplete", "All Work assets must finish processing before publication");
         await requireClearAdmission("Publication", [work.id, work.creatorId, ...assets.map((asset) => asset.id)]);
         const body = await parseBody(request);

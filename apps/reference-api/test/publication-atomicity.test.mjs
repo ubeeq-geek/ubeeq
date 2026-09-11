@@ -22,6 +22,28 @@ test('reference publication rolls back intent, publication, Work and audit on an
     assert.equal(created.status, 201);
     const work = created.body.work;
     await local.repositories.assets.create({ id: 'asset', instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision, creatorId: work.creatorId, workId: work.id, status: 'ready', mimeType: 'image/png', checksum: 'hash', objectVersion: 'v1' });
+    const scope = { instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision };
+    for (let index = 0; index < 101; index++) {
+      await local.repositories.assets.create({ ...scope, id: `b-${String(index).padStart(3, '0')}`, creatorId: work.creatorId, workId: work.id, status: 'ready', mimeType: 'image/png', checksum: 'hash', objectVersion: 'v1' });
+      await local.repositories.moderationHolds.create({ ...scope, id: `h-${String(index).padStart(3, '0')}`, subjectId: `unrelated-${index}`, state: 'active', reason: 'unrelated' });
+    }
+    const pending = await local.repositories.assets.create({ ...scope, id: 'zz-pending', creatorId: work.creatorId, workId: work.id, status: 'pending', mimeType: 'image/png', checksum: 'hash', objectVersion: 'v1' });
+    const pendingResponse = await request(`/v1/works/${work.id}/publications`, { destination: 'local' });
+    assert.equal(pendingResponse.status, 409); assert.equal(pendingResponse.body.error.code, 'processing_incomplete');
+    await local.repositories.assets.update(pending.id, pending.revision, { status: 'ready' });
+    const hold = await local.repositories.moderationHolds.create({ ...scope, id: 'zz-held', subjectId: pending.id, state: 'active', reason: 'review' });
+    const heldResponse = await request(`/v1/works/${work.id}/publications`, { destination: 'local' });
+    assert.equal(heldResponse.status, 409); assert.equal(heldResponse.body.error.code, 'admission_blocked');
+    assert.deepEqual((await local.repositories.publicationIntents.list({ limit: 100 })).items, []);
+    await local.repositories.moderationHolds.update(hold.id, hold.revision, { state: 'released' });
+    const listAssets = local.repositories.assets.list.bind(local.repositories.assets);
+    local.repositories.assets.list = async page => {
+      if (page.cursor) throw new Error('later asset page unavailable');
+      return listAssets(page);
+    };
+    try { assert.equal((await request(`/v1/works/${work.id}/publications`, { destination: 'local' })).status, 500); }
+    finally { local.repositories.assets.list = listAssets; }
+    assert.deepEqual((await local.repositories.publicationIntents.list({ limit: 100 })).items, []);
     const auditBefore = (await local.repositories.auditEvents.list({ limit: 100 })).items;
     for (const [repository, method] of [[local.repositories.publications, 'create'], [local.repositories.works, 'update'], [local.repositories.auditEvents, 'create']]) {
       const original = repository[method].bind(repository);

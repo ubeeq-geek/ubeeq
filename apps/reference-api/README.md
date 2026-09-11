@@ -5,9 +5,15 @@ The reference API is a neutral, local-first implementation of the creator profil
 Publication writes the intent, live publication, Work revision and audit record in
 one repository transaction. Local failure-injection tests verify rollback at each
 later write boundary. This is not full publication qualification: repeated request
-idempotency, complete paginated asset/admission checks, concurrent policy changes,
+idempotency, indexed asset/admission queries, concurrent policy changes,
 and withdrawal/revocation of issued delivery URLs still need work. The destination
 field is metadata here, not confirmation of delivery to an external provider.
+
+Publication admission walks every asset and moderation-hold page; a failed or
+repeating cursor aborts the request. Only matching records are retained, but the
+scan still grows with cell data and is not a transactionally consistent snapshot.
+Other list paths, including public viewing and exports, still need a separate
+pagination audit.
 
 These routes use the canonical `repositories.works/assets/publications` records.
 They do not automatically consume `LocalCreatorLibraryStore` compatibility records.
