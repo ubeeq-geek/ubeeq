@@ -277,11 +277,11 @@ export const resolveReconciliation = (
   options: { detachedCopyExcludedKeys?: readonly string[] } = {}
 ): ReconciliationResolutionResult => {
   if (!resolution.confirmed) throw new Error("Explicit reconciliation confirmation is required.");
-  if (resolution.action === "accept_remote") return { local: { ...remote } };
-  if (resolution.action === "keep_local") return { local: { ...local } };
+  if (resolution.action === "accept_remote") return { local: structuredClone(remote) };
+  if (resolution.action === "keep_local") return { local: structuredClone(local) };
   if (resolution.action === "create_detached_copy") {
     const excluded = new Set(options.detachedCopyExcludedKeys || []);
-    return { local: { ...local }, detachedCopy: Object.fromEntries(Object.entries(remote).filter(([key]) => !excluded.has(key))) };
+    return { local: structuredClone(local), detachedCopy: structuredClone(Object.fromEntries(Object.entries(remote).filter(([key]) => !excluded.has(key)))) };
   }
   throw new Error("Unsupported reconciliation action.");
 };
