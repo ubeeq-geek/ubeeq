@@ -304,3 +304,5 @@ export { VimeoUploadClient, type VimeoUploadTicket } from './vimeo-upload-client
 export { transferVimeoUpload, type VimeoUploadSource, type VimeoUploadTransferPort } from './vimeo-upload-transfer.js';
 export { FlickrClient, type FlickrOAuthCredentials, type FlickrInventoryPage, type FlickrRequestLimits } from './flickr-client.js';
 export { normalizeFlickrPhoto, normalizeFlickrProviderPhoto, flickrTextContent, type FlickrManifestPhoto } from './flickr-metadata.js';
+export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewayOptions, type SmugMugOAuthCredential } from './smugmug-gateway.js';
+export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugInventoryPage, SmugMugGateway } from './smugmug-contracts.js';
