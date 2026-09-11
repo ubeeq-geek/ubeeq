@@ -12,9 +12,17 @@ The extracted behavior retains existing constructor/method contracts and cursor
 encoding. Authorization currently requests Read permission; presence of write
 methods is not proof those credentials permit uploads. Account metadata fallback,
 permissive provider parsing, unbounded buffered responses/downloads, missing
-request deadlines/redirect rejection, and provider-URL admission remain known
+request deadlines, and original-source URL admission remain known
 qualification gaps. Do not treat a cursor, source URL or gallery URI as an access
 grant. Callers must not expose tokens or source capabilities in browser responses.
+
+API catalogue/update destinations must remain on the configured API origin under
+`/api/v2`, without URL credentials or fragments. Same-origin absolute continuation
+URLs normalize to relative cursor entries; foreign provider links reject the page
+before a cursor is returned. All signed and OAuth requests reject redirects.
+These host/path checks are not per-account authorization, DNS admission or a
+source-download host allowlist. Custom API/OAuth origins remain trusted operator
+configuration.
 
 Tests use injected provider fixtures. This extraction does not publish media,
 contact providers, deploy infrastructure or claim hosted readiness.
