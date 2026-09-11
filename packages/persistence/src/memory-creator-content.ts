@@ -1,12 +1,13 @@
 import type { CreatorContentRecords, CreatorContentStore } from "./creator-content.js";
 import { CreatorContentCommitError, type CreatorContentAssetCommit } from "./creator-content.js";
+import type { CreatorContentSourceReceipt, CreatorContentReuseCommit, CreatorContentSourceReuseStore } from './creator-content.js';
 
 /**
  * Reference in-memory adapter, also used by local snapshot-backed compositions.
  * It does not claim persistence or transaction durability. Durable adapters must
  * implement the same content port. The enumerable arrays retain snapshot compatibility.
  */
-export class MemoryCreatorContentStore<M extends CreatorContentRecords = CreatorContentRecords> implements CreatorContentStore<M> {
+export class MemoryCreatorContentStore<M extends CreatorContentRecords = CreatorContentRecords> implements CreatorContentStore<M>, CreatorContentSourceReuseStore<M> {
   works: M['work'][] = [];
   canonicalAssets: M['asset'][] = [];
   workAssets: Array<M['attachment'] & { tenantId: string }> = [];
@@ -15,6 +16,43 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
   creatorCollections: M['collection'][] = [];
   collectionWorks: Array<M['collectionWork'] & { tenantId: string }> = [];
   workDiscovery: M['discovery'][] = [];
+  sourceReceipts: CreatorContentSourceReceipt[] = [];
+
+  async getSourceReceipt(tenantId: string, receiptId: string): Promise<CreatorContentSourceReceipt | null> {
+    return structuredClone(this.sourceReceipts.find(receipt => receipt.tenantId === tenantId && receipt.receiptId === receiptId) || null);
+  }
+
+  async commitSourceReuse(input: CreatorContentReuseCommit<M>): Promise<void> {
+    const { work, expectedAsset, attachment, receipt } = input;
+    const fail = () => { throw new CreatorContentCommitError('Source reuse custody, receipt or Work revision changed.'); };
+    const previous = this.works.find(item => item.tenantId === work.tenantId && item.workId === work.workId) as (M['work'] & { revision?: number }) | undefined;
+    const asset = this.canonicalAssets.find(item => item.tenantId === work.tenantId && item.assetId === expectedAsset.assetId) as (M['asset'] & { status?: string; checksumSha256?: string }) | undefined;
+    if (!previous || previous.creatorId !== work.creatorId || ['deleted', 'archived'].includes(previous.status) ||
+      !asset || asset.creatorId !== work.creatorId || asset.status === 'deleted' || asset.checksumSha256 !== receipt.checksum ||
+      expectedAsset.tenantId !== work.tenantId || expectedAsset.creatorId !== work.creatorId ||
+      receipt.tenantId !== work.tenantId || receipt.creatorId !== work.creatorId || receipt.workId !== work.workId ||
+      receipt.assetId !== asset.assetId || !receipt.receiptId || !receipt.sourceIdentity || !/^[a-f0-9]{64}$/.test(receipt.checksum) ||
+      attachment.workId !== work.workId || attachment.assetId !== asset.assetId) return fail();
+    const members = this.workAssets.filter(item => item.tenantId === work.tenantId && item.workId === work.workId);
+    const saved = this.sourceReceipts.find(item => item.tenantId === receipt.tenantId && item.receiptId === receipt.receiptId);
+    if (saved) {
+      if (Object.keys(receipt).some(key => receipt[key as keyof CreatorContentSourceReceipt] !== saved[key as keyof CreatorContentSourceReceipt]) ||
+        !members.some(item => item.assetId === receipt.assetId)) return fail();
+      return; // Preserve later creator edits; never recreate a removed membership.
+    }
+    const source = this.works.find(item => item.tenantId === work.tenantId && item.workId === input.sourceWorkId);
+    if (!source || source.creatorId !== work.creatorId || ['deleted', 'archived'].includes(source.status) ||
+      !this.workAssets.some(item => item.tenantId === work.tenantId && item.workId === input.sourceWorkId && item.assetId === asset.assetId) ||
+      JSON.stringify(asset) !== JSON.stringify(expectedAsset) || previous.revision !== input.previousRevision ||
+      !Number.isSafeInteger(input.previousRevision) || input.previousRevision < 1 || work.revision !== input.previousRevision + 1 ||
+      members.some(item => item.assetId === asset.assetId) || attachment.position !== members.length) return fail();
+    const nextWorks = this.works.map(item => item === previous ? structuredClone(work) : item);
+    const nextMembers = [...this.workAssets, { ...structuredClone(attachment), tenantId: work.tenantId }];
+    const nextReceipts = [...this.sourceReceipts, structuredClone(receipt)];
+    // Stage all fallible cloning before synchronously replacing state. The caller
+    // owns durable checkpointing; this reference adapter does not promise disk I/O.
+    this.works = nextWorks; this.workAssets = nextMembers; this.sourceReceipts = nextReceipts;
+  }
 
   protected async validatePublication(_previous: M['publication'] | null, _next: M['publication']): Promise<void> {}
   async commitAssetAttachment(input: CreatorContentAssetCommit<M>): Promise<void> {
