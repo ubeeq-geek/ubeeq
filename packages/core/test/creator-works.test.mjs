@@ -3,6 +3,23 @@ import test from "node:test";
 import { CreatorWorkService } from "../dist/index.js";
 
 const scope = { tenantId: "tenant", creatorId: "creator" };
+test('removed-Work listing is explicit, authorized, scoped and searchable', async () => {
+  let reads = 0;
+  const records = [
+    { ...scope, workId: 'removed', title: 'Removed', tags: ['recover'], status: 'deleted' },
+    { ...scope, workId: 'active', title: 'Active', tags: [], status: 'draft' },
+    { ...scope, creatorId: 'foreign', workId: 'foreign', title: 'Foreign', tags: [], status: 'deleted' },
+    { ...scope, tenantId: 'foreign', workId: 'tenant', title: 'Foreign', tags: [], status: 'deleted' }
+  ];
+  const store = { listWorksByCreator: async () => { reads++; return records; } };
+  const service = new CreatorWorkService(store, async () => true);
+  assert.deepEqual((await service.list(scope)).map(w => w.workId), ['active']);
+  assert.deepEqual((await service.list(scope, '', { includeDeleted: true })).map(w => w.workId), ['removed', 'active']);
+  assert.deepEqual((await service.list(scope, 'RECOVER', { includeDeleted: true })).map(w => w.workId), ['removed']);
+  const denied = new CreatorWorkService(store, async () => false), before = reads;
+  await assert.rejects(denied.list(scope, '', { includeDeleted: true }), { code: 'access_denied' });
+  assert.equal(reads, before);
+});
 const record = (id, extra = {}) => ({ ...scope, workId: id, title: id, tags: [], slug: id,
   slugHistory: [id], status: "draft", revision: 1, createdAt: "created", updatedAt: "created", ...extra });
 function fixture(allowed = true) {

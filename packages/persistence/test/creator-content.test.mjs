@@ -37,6 +37,8 @@ test("canonical records preserve tenant boundaries, lifecycle filtering and meta
   await store.createWork(work("two", "same"));
   await store.createWork(work("one", "deleted", { status: "deleted" }));
   assert.deepEqual((await store.listWorksByCreator("one", "creator")).map(item => item.workId), ["same"]);
+  assert.deepEqual((await store.listWorksByCreator("one", "creator", { includeDeleted: true })).map(item => item.workId), ["same", "deleted"]);
+  assert.deepEqual(await store.listWorksByCreator("one", "foreign", { includeDeleted: true }), []);
   assert.deepEqual((await store.getWork("one", "same")).customField, { retained: true });
   assert.equal(await store.getWork("foreign", "same"), null);
   await store.updateWork(work("one", "same", { status: "ready" }));

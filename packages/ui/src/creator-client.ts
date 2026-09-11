@@ -38,7 +38,11 @@ export class CreatorClient {
   updateCreator(id: string, expectedRevision: number, fields: { displayName?: string; bio?: string; links?: { label: string; url: string }[] }) {
     return this.call(`/studio/creators/${encodeURIComponent(id)}`, 'PATCH', { ...fields, expectedRevision });
   }
-  works(creatorId: string, query = '') { return this.call(`/studio/works?creatorId=${encodeURIComponent(creatorId)}&query=${encodeURIComponent(query)}`); }
+  works(creatorId: string, query = '', options: { includeDeleted?: boolean } = {}) { return this.call(`/studio/works?creatorId=${encodeURIComponent(creatorId)}&query=${encodeURIComponent(query)}${options.includeDeleted === true ? '&includeDeleted=true' : ''}`); }
+  /** Return a retained Work to draft; the server must revalidate aliases and policy. */
+  restoreWork(workId: string, revision: number) {
+    return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, status: 'draft' });
+  }
   createWork(creatorId: string, title: string, description: string, tags?: string[], kind?: WorkKind) { return this.call('/studio/works', 'POST', { creatorId, title, description, ...(tags === undefined ? {} : { tags }), ...(kind === undefined ? {} : { kind }) }); }
   collections(creatorId: string) { return this.call(`/studio/collections?creatorId=${encodeURIComponent(creatorId)}`); }
   createCollection(creatorId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string } = {}) {
