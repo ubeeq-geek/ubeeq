@@ -18,6 +18,7 @@ import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
 import { jobDiscoveryAttributes, jobCellTypePartition, type AwsJobDiscoveryIndexes } from './job-discovery.js';
 export { jobDiscoveryAttributes, jobCellTypePartition, type AwsJobDiscoveryIndexes } from './job-discovery.js';
+export { auditJobIndexPage, type JobIndexAuditCursor, type JobIndexAuditIssue } from './job-index-audit.js';
 import { MigrationOrchestrator, RemoteMigrationExecutor, RoutingDirectoryConflictError, validateCellRoute, validateMigrationCellRegistration, validateMigrationCheckpoint, type CellRoute, type MigrationCellCommand, type MigrationCellCommandResult, type MigrationCellEndpoint, type MigrationCellRegistration, type MigrationCellRegistry, type MigrationCheckpoint, type MigrationCheckpointStore, type MigrationObjectInventoryEntry, type MigrationObjectTransfer, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 export const AWS_ADAPTERS_API_VERSION = "1" as const;
