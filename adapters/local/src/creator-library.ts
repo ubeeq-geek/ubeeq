@@ -251,9 +251,8 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
     const { work, asset, attachment } = input;
     const db = this.local.database, cell = this.local.configuration.cellId;
     // No await inside this synchronous transaction: unrelated requests cannot
-    // enter the connection between its statements. BEGIN fails if already owned.
-    db.exec("BEGIN IMMEDIATE");
-    try {
+    // enter the connection between its statements. Join an owned import transaction.
+    this.local.transactionSync(() => {
       const previous = this.get<W>(work.tenantId, "work", work.workId);
       if (!previous || previous.revision !== input.previousRevision || work.revision !== input.previousRevision + 1 ||
         previous.creatorId !== work.creatorId || previous.status === "deleted") {
@@ -276,8 +275,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
           payload: { tenantId: asset.tenantId, creatorId: asset.creatorId, workId: work.workId, assetId: asset.assetId, sourceVersionId: asset.storage.versionId },
           idempotencyKey: JSON.stringify(["creator-asset.process", asset.tenantId, asset.assetId, asset.storage.versionId]), maxAttempts: 3 });
       }
-      db.exec("COMMIT");
-    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    });
   }
   async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<W[]> {
     return this.list<W>(tenantId, "work", creatorId).filter((work) => options.includeDeleted === true || work.status !== "deleted").sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
