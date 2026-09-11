@@ -35,6 +35,40 @@ test('source workflow resumes retained quarantine without downloading again and 
   assert.equal(calls.attach, 1);
 });
 
+test('source batches persist continuation and never attempt more than the requested item budget', async () => {
+  const { workflow, calls, repository } = await setup({ scanQuarantine: async () => 'clean' });
+  const initial = migration();
+  initial.photos = Array.from({ length: 12 }, (_, i) => ({ remoteId: String(i), originalSourceUrl: 'https://example.invalid/original' }));
+  initial.items = initial.photos.map(photo => ({ remoteId: photo.remoteId, transferStatus: 'QUEUED', retryCount: 0 }));
+  const first = await workflow.run(initial);
+  assert.equal(first.status, 'RUNNING'); assert.equal(first.sourceCursor, 10);
+  assert.equal(calls.transfer, 10); assert.equal(calls.attach, 10);
+  assert.equal(first.items[10].transferStatus, 'QUEUED');
+  const saved = await repository.getMigration('m');
+  const complete = await workflow.run(saved);
+  assert.equal(complete.status, 'COMPLETE'); assert.equal(complete.sourceCursor, 0);
+  assert.equal(calls.transfer, 12); assert.equal(calls.attach, 12);
+  assert.equal(complete.auditEvents.length, 12);
+  assert.ok(initial.items.every(item => item.transferStatus === 'QUEUED'));
+  for (const limit of [0, -1, 1.5, 101]) await assert.rejects(workflow.run(initial, limit), /batch size/);
+  await assert.rejects(workflow.run({ ...initial, sourceCursor: 13 }), /source cursor/);
+  assert.equal(calls.transfer, 12);
+});
+
+test('terminal entries consume the inspection budget and pending scans are revisited after a sweep', async () => {
+  const { workflow, ports, calls } = await setup();
+  const initial = migration();
+  initial.items.unshift({ remoteId: 'done', transferStatus: 'VALIDATED', retryCount: 0 });
+  const first = await workflow.run(initial, 1);
+  assert.equal(first.sourceCursor, 1); assert.equal(calls.transfer, 0);
+  const pending = await workflow.run(first, 1);
+  assert.equal(pending.status, 'REVIEW'); assert.equal(pending.sourceCursor, 0);
+  assert.equal(calls.transfer, 1);
+  ports.scanQuarantine = async () => 'clean';
+  const complete = await workflow.run(await workflow.run(pending, 1), 1);
+  assert.equal(complete.status, 'COMPLETE'); assert.equal(calls.transfer, 1); assert.equal(calls.attach, 1);
+});
+
 test('blocked scan never attaches content; transient failures retain bounded retry scheduling', async () => {
   const blocked = await setup({ scanQuarantine: async () => 'blocked' });
   const result = await blocked.workflow.run(migration());
