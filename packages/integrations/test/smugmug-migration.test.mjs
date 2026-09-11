@@ -22,6 +22,40 @@ const fixture = async (inventory, admission = async () => true) => {
   return { service, repository, gateway, sink, compose, calls, connectionId: connection.id };
 };
 
+test('imports retain bounded collection ancestry from the saved inventory scope', async () => {
+  const collections = [
+    { remoteId: 'album', parentRemoteId: 'folder', kind: 'ALBUM', title: 'Album', position: 0, privacy: {} },
+    { remoteId: 'folder', parentRemoteId: 'root', kind: 'FOLDER', title: 'Folder', position: 0, privacy: {} },
+    { remoteId: 'root', parentRemoteId: 'not-in-inventory', kind: 'FOLDER', title: 'Root', position: 0, privacy: {} },
+    { remoteId: 'unrelated', kind: 'ALBUM', title: 'Other', position: 0, privacy: {} }
+  ];
+  const f = await fixture(async () => ({ images: [image('source')], collections }));
+  const inventory = await f.service.inventory(f.connectionId, 'actor', 'lineage');
+  const reads = [], get = f.repository.getCollection.bind(f.repository);
+  f.repository.getCollection = async (scope, id) => { reads.push([scope, id]); return get(scope, id); };
+  let received;
+  f.sink.importReference = async input => { received = input.collections; };
+  await f.service.confirm(inventory.migration.id, 'actor', 'REFERENCE_ONLY');
+  assert.deepEqual(received, collections.slice(0, 3));
+  assert.deepEqual(reads.map(([scope]) => scope), Array(4).fill(inventory.migration.inventoryScopeId));
+  assert.deepEqual(reads.map(([, id]) => id), ['album', 'folder', 'root', 'not-in-inventory']);
+});
+
+test('cyclic and excessive source ancestry fail before sink side effects', async () => {
+  for (const cycle of [true, false]) {
+    const collections = Array.from({ length: cycle ? 1 : 101 }, (_, index) => ({ remoteId: index ? `node-${index}` : 'album',
+      parentRemoteId: cycle ? 'album' : index === 100 ? undefined : `node-${index + 1}`, kind: 'FOLDER', title: 'Node', position: 0, privacy: {} }));
+    const f = await fixture(async () => ({ images: [image('source')], collections }));
+    let inventory;
+    do { inventory = await f.service.inventory(f.connectionId, 'actor', 'lineage-limit'); } while (!inventory.complete);
+    const result = await f.service.confirm(inventory.migration.id, 'actor', 'REFERENCE_ONLY');
+    assert.equal(result.items[0].state, 'FAILED');
+    assert.equal(result.items[0].errorCode, cycle ? 'MIGRATION_COLLECTION_CYCLE' : 'MIGRATION_COLLECTION_DEPTH');
+    assert.equal(f.calls.imported.length, 0);
+    assert.equal(f.calls.downloaded, 0);
+  }
+});
+
 test('shared workflow defaults to deny and observes ownership and revoked admission before metadata commits', async () => {
   const denied = new SmugMugIntegrationService({}, {});
   await assert.rejects(denied.start('actor', 'creator'), { code: 'CREATOR_FORBIDDEN' });

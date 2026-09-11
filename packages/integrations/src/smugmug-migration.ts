@@ -486,10 +486,22 @@ export class SmugMugIntegrationService {
         const scope = migration.inventoryScopeId || connection.id;
         const image = await this.repository.getImage(scope, item.remoteId);
         if (!image || image.remoteId !== item.remoteId) throw new SmugMugError('MIGRATION_IMAGE_MISSING', 409);
-        const collection = await this.repository.getCollection(scope, image.galleryId);
-        if (collection && collection.remoteId !== image.galleryId) throw new SmugMugError('MIGRATION_COLLECTION_MISMATCH', 409);
+        const collections: SmugMugRemoteCollection[] = [];
+        const visited = new Set<string>();
+        let parent: string | undefined = image.galleryId;
+        while (parent) {
+          if (visited.has(parent)) throw new SmugMugError('MIGRATION_COLLECTION_CYCLE', 409);
+          if (collections.length >= 100) throw new SmugMugError('MIGRATION_COLLECTION_DEPTH', 409);
+          visited.add(parent);
+          const collection = await this.repository.getCollection(scope, parent);
+          // Partial provider inventories may omit an ancestor; preserve the
+          // known records and their parent references without inventing a node.
+          if (!collection) break;
+          if (collection.remoteId !== parent) throw new SmugMugError('MIGRATION_COLLECTION_MISMATCH', 409);
+          collections.push(collection);
+          parent = collection.parentRemoteId;
+        }
         await this.requireCurrentConnection(connection);
-        const collections = collection ? [collection] : [];
         delete item.errorCode;
         await this.sink.importReference({ connectionId: connection.id, creatorId: migration.creatorId, image, collections });
         if (item.requestedQuality === 'EXTERNAL_REFERENCE_ONLY') { item.state = 'REFERENCE_IMPORTED'; continue; }
