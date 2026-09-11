@@ -99,3 +99,27 @@ test("concurrent shared edits do not silently overwrite one another", async () =
   assert.equal(f.records.get("one").revision, 2);
   assert.equal(f.writes(), 1);
 });
+
+test('restoring a deleted Work preflights every retained alias before changing any state', async () => {
+  for (const claimed of ['original', 'renamed']) {
+    for (const restoredSlug of ['renamed', 'fresh']) {
+      const f = fixture();
+      await f.service.create(record('one', { slug: 'original', tags: ['retained'] }));
+      await f.service.revise('tenant', 'one', w => ({ ...w, slug: 'renamed' }));
+      const deleted = await f.service.revise('tenant', 'one', w => ({ ...w, status: 'deleted' }));
+      await f.service.create(record('two', { slug: claimed }));
+      const before = structuredClone(deleted), writes = f.writes();
+      await assert.rejects(f.service.revise('tenant', 'one', w => {
+        w.tags.push('must not save');
+        return { ...w, status: 'draft', slug: restoredSlug, slugHistory: [] };
+      }), { code: 'slug_conflict' });
+      assert.deepEqual(f.records.get('one'), before);
+      assert.equal(f.writes(), writes);
+      await f.service.revise('tenant', 'two', w => ({ ...w, status: 'deleted' }));
+      const restored = await f.service.revise('tenant', 'one', w => ({ ...w, status: 'draft', slug: restoredSlug }));
+      assert.equal(restored.deletedAt, undefined);
+      assert.equal(restored.revision, deleted.revision + 1);
+      assert.deepEqual(restored.slugHistory, [...new Set(['original', 'renamed', restoredSlug])]);
+    }
+  }
+});

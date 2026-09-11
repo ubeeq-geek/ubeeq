@@ -67,9 +67,12 @@ export class CreatorWorkService<W extends CreatorWorkRecord> {
       (!normalizedQuery || [work.title, work.description || "", ...work.tags].some((value) => value.toLowerCase().includes(normalizedQuery))));
   }
 
-  private async requireAvailableSlug(work: W): Promise<void> {
+  private async requireAvailableSlug(work: W, aliases: readonly string[] = [work.slug]): Promise<void> {
     const existing = await this.store.listWorksByCreator(work.tenantId, work.creatorId);
-    if (existing.some((other) => other.workId !== work.workId && (other.slug === work.slug || other.slugHistory?.includes(work.slug)))) {
+    const requested = new Set(aliases);
+    if (existing.some((other) => other.workId !== work.workId && other.tenantId === work.tenantId &&
+      other.creatorId === work.creatorId && other.status !== 'deleted' &&
+      [other.slug, ...(other.slugHistory || [])].some(alias => requested.has(alias)))) {
       throw new CreatorWorkError("slug_conflict", "Work slug is already in use for this Creator.");
     }
   }
@@ -90,7 +93,6 @@ export class CreatorWorkService<W extends CreatorWorkRecord> {
     if (proposed.tenantId !== previous.tenantId || proposed.creatorId !== previous.creatorId || proposed.workId !== previous.workId) {
       throw new CreatorWorkError("immutable_identity", "Work identity and ownership cannot be changed.");
     }
-    if (proposed.slug !== previous.slug) await this.requireAvailableSlug(proposed);
     const updated = {
       ...proposed,
       slugHistory: [...new Set([...(previous.slugHistory || []), previous.slug, proposed.slug])],
@@ -100,6 +102,12 @@ export class CreatorWorkService<W extends CreatorWorkRecord> {
       archivedAt: proposed.status === "archived" ? timestamp : undefined,
       deletedAt: proposed.status === "deleted" ? timestamp : undefined
     };
+    // Restoration reacquires all aliases, even when the current slug is unchanged
+    // or the callback tries to discard history. Adapters must enforce this again
+    // atomically with the revision commit to close concurrent reservation races.
+    if (updated.status !== 'deleted' && (previous.status === 'deleted' || updated.slug !== previous.slug)) {
+      await this.requireAvailableSlug(updated, previous.status === 'deleted' ? updated.slugHistory : [updated.slug]);
+    }
     await this.store.commitWorkRevision(updated, previous.revision);
     return updated;
   }
