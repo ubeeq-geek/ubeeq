@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.mjs",
     "synth": "cdk synth",
     "deploy": "npm run package:lambda --workspace @ubeeq/reference-api && cdk deploy"
   },

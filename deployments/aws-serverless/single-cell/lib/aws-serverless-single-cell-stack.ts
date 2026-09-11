@@ -28,6 +28,20 @@ export class AwsServerlessSingleCellStack extends Stack {
     // Lets operators reconcile a legacy/manual Lambda configuration drift
     // without changing any data-plane resource or application contract.
     const runtimeRevision = this.node.tryGetContext("runtimeRevision") || process.env.UBEEQ_RUNTIME_REVISION || "1";
+    // Provision separately from runtime adoption. Existing tables must advance
+    // one index at a time, with operator checks between stack updates.
+    const jobIndexStage = this.node.tryGetContext("jobDiscoveryIndexStage") ?? "none";
+    const jobDiscoveryQualified = this.node.tryGetContext("jobDiscoveryQualified");
+    if (!["none", "cell", "both"].includes(jobIndexStage)) throw new Error("jobDiscoveryIndexStage must be none, cell or both.");
+    if (jobDiscoveryQualified !== undefined && jobDiscoveryQualified !== "true" && jobDiscoveryQualified !== "false") throw new Error("jobDiscoveryQualified must be the string true or false.");
+    if (jobDiscoveryQualified === "true" && jobIndexStage !== "both") throw new Error("Qualified job discovery requires both indexes.");
+    const cellDueIndex = "job-cell-due-index";
+    const cellTypeDueIndex = "job-cell-type-due-index";
+    const jobDiscoveryEnvironment: Record<string, string> = jobDiscoveryQualified === "true" ? {
+      UBEEQ_JOB_CELL_DUE_INDEX: cellDueIndex,
+      UBEEQ_JOB_CELL_TYPE_DUE_INDEX: cellTypeDueIndex,
+      UBEEQ_JOB_DISCOVERY_QUALIFIED: "true",
+    } : {};
     Tags.of(this).add("ubeeq:cell-id", cellId);
     Tags.of(this).add("ubeeq:cell-region", cellRegion);
     const bucketProps = { blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL, encryption: s3.BucketEncryption.S3_MANAGED, enforceSSL: true, versioned: true, removalPolicy: RemovalPolicy.RETAIN, autoDeleteObjects: false };
@@ -35,6 +49,8 @@ export class AwsServerlessSingleCellStack extends Stack {
     const deliveryStore = new s3.Bucket(this, "DeliveryStore", bucketProps);
     const records = new dynamodb.Table(this, "Records", { partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING }, sortKey: { name: "sk", type: dynamodb.AttributeType.STRING }, billingMode: dynamodb.BillingMode.PAY_PER_REQUEST, pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true }, encryption: dynamodb.TableEncryption.AWS_MANAGED, removalPolicy: RemovalPolicy.RETAIN });
     records.addGlobalSecondaryIndex({ indexName: "repository-id-index", partitionKey: { name: "repository", type: dynamodb.AttributeType.STRING }, sortKey: { name: "id", type: dynamodb.AttributeType.STRING } });
+    if (jobIndexStage !== "none") records.addGlobalSecondaryIndex({ indexName: cellDueIndex, partitionKey: { name: "jobCell", type: dynamodb.AttributeType.STRING }, sortKey: { name: "jobDue", type: dynamodb.AttributeType.NUMBER }, projectionType: dynamodb.ProjectionType.KEYS_ONLY });
+    if (jobIndexStage === "both") records.addGlobalSecondaryIndex({ indexName: cellTypeDueIndex, partitionKey: { name: "jobCellType", type: dynamodb.AttributeType.STRING }, sortKey: { name: "jobDue", type: dynamodb.AttributeType.NUMBER }, projectionType: dynamodb.ProjectionType.KEYS_ONLY });
     const deadLetters = new sqs.Queue(this, "DeadLetters", { encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14), removalPolicy: RemovalPolicy.RETAIN });
     const jobs = new sqs.Queue(this, "Jobs", { encryption: sqs.QueueEncryption.SQS_MANAGED, deadLetterQueue: { queue: deadLetters, maxReceiveCount: 3 }, visibilityTimeout: Duration.minutes(5), removalPolicy: RemovalPolicy.RETAIN });
     new events.Rule(this, "RecoverySchedule", { schedule: events.Schedule.rate(Duration.minutes(5)), description: "Neutral scheduled recovery trigger for Ubeeq durable jobs" });
@@ -54,6 +70,7 @@ export class AwsServerlessSingleCellStack extends Stack {
     if (routingDirectoryTableName && !routingDirectoryTableArn) throw new Error("UBEEQ_ROUTING_DIRECTORY_TABLE_ARN is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME so a cell can read a control-plane table in another region.");
     if (routingDirectoryTableName && !routingDirectoryRegion) throw new Error("UBEEQ_ROUTING_DIRECTORY_REGION is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME.");
     const runtimeEnvironment = { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_CELL_ID: cellId, UBEEQ_CELL_REGION: cellRegion, UBEEQ_CELL_OPERATOR: "self-hosted", UBEEQ_RUNTIME_REVISION: runtimeRevision, UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials", ...(routingDirectoryTableName ? { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routingDirectoryTableName, UBEEQ_ROUTING_DIRECTORY_REGION: routingDirectoryRegion! } : {}) };
+    Object.assign(runtimeEnvironment, jobDiscoveryEnvironment);
     const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     const web = new lambda.Function(this, "ReferenceWeb", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.web", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl } });
     const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
