@@ -45,5 +45,30 @@ test('metadata-only HTTP import strips processing outputs and remote publication
     assert.deepEqual(local.database.database.prepare('SELECT * FROM ubeeq_jobs ORDER BY id').all(), jobsBefore);
     assert.deepEqual(manifest, before);
     assert.equal((await request('/v1/imports', { manifest, importId: 'metadata', dryRun: false })).body.idempotent, true);
+    const moderated = createCreatorExport({ exportedAt: '2026-01-01T00:00:00Z', creator: source,
+      works: [{ ...source, id: 'held-work', creatorId: 'source', title: 'Held work', status: 'ready' }], assets: [], collections: [], publications: [],
+      publicationIntents: [], processing: [], usageEvents: [], integrationAccounts: [], exportCheckpoints: [], importCheckpoints: [], objectInventory: [],
+      moderationEvidence: [{ ...source, id: 'evidence', subjectType: 'creator', subjectId: 'source', source: 'review', payload: { finding: 'retained' } }],
+      moderationHolds: [
+        { ...source, id: 'creator-hold', subjectType: 'creator', subjectId: 'source', state: 'active', reason: 'review' },
+        { ...source, id: 'work-hold', subjectType: 'work', subjectId: 'held-work', state: 'active', reason: 'review' }
+      ],
+      reviewCases: [{ ...source, id: 'review', subjectId: 'source', state: 'open' }],
+      auditEvents: [{ ...source, id: 'source-audit', subjectId: 'source', actorId: 'source-actor', action: 'review.created', payload: {} }]
+    });
+    assert.equal((await request('/v1/imports', { manifest: moderated, importId: 'moderated', dryRun: false })).status, 201);
+    for (const [repository, id] of [['moderationEvidence', 'evidence'], ['moderationHolds', 'creator-hold'], ['reviewCases', 'review'], ['auditEvents', 'source-audit']]) {
+      assert.equal((await local.repositories[repository].get(id)).subjectId, creator.id);
+    }
+    assert.equal((await local.repositories.moderationHolds.get('creator-hold')).state, 'active');
+    assert.equal((await local.repositories.moderationHolds.get('work-hold')).subjectId, 'held-work');
+    assert.equal((await local.repositories.moderationEvidence.get('evidence')).payload.finding, 'retained');
+    assert.equal((await local.repositories.auditEvents.get('source-audit')).actorId, undefined);
+    // The earlier Work has no direct hold: creator-level moderation alone must block it.
+    // Simulate completed media admission in this disposable fixture to reach the policy gate.
+    await local.repositories.assets.update(imported.id, imported.revision, { status: 'ready' });
+    const blocked = await request('/v1/works/work/publications', { destination: 'local' });
+    assert.equal(blocked.status, 409); assert.equal(blocked.body.error.code, 'admission_blocked');
+    assert.equal((await local.repositories.works.get('work')).status, 'ready');
   } finally { await api.close(); local.database.database.close(); rmSync(directory, { recursive: true, force: true }); }
 });
