@@ -13,9 +13,17 @@ metadata extras, provider-order pagination, and three-attempt handling of HTTP
 automatically retried. Applications retain ownership checks, OAuth state/replay
 protection, storage, consent, source migration, and public response projection.
 
-This extraction is not production qualification: default fetch has no deadline
-or response-byte limit here; redirects are not explicitly rejected; album
-enumeration materializes all pages; provider payload validation is permissive;
+Requests reject redirects and have a 30-second abort signal and a 4 MiB streamed
+response limit by default. The optional fifth constructor argument accepts
+`timeoutMs` (1–300000) and `maxResponseBytes` (1–16777216). Limits are validated and
+copied at construction. Fetch implementations must honor the signal during both
+request and body consumption. Error bodies are bounded too; their HTTP status
+still controls the existing retry policy. Successful oversized responses and
+transport failures are not automatically retried.
+
+This extraction is not production qualification: per-attempt timeouts are not a
+total operation deadline, including pacing/retries; album enumeration
+materializes all pages; provider payload validation is permissive;
 retry pacing is process-local rather than a durable/global quota. Those gaps need
-bounded transport and resumable jobs before hosted readiness. The injected fetch
+operation budgets and resumable jobs before hosted readiness. The injected fetch
 supports offline conformance tests without contacting a provider.
