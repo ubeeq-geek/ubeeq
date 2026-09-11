@@ -76,6 +76,10 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
     return this.canonicalAssets.find((asset) => asset.tenantId === tenantId && asset.assetId === assetId) || null;
   }
 
+  async listCanonicalAssetsByCreator(tenantId: string, creatorId: string): Promise<M['asset'][]> {
+    return structuredClone(this.canonicalAssets.filter(asset => asset.tenantId === tenantId && asset.creatorId === creatorId));
+  }
+
   async createCanonicalAsset(asset: M['asset']): Promise<void> {
     this.canonicalAssets = this.canonicalAssets.filter((item) => !(item.tenantId === asset.tenantId && item.assetId === asset.assetId));
     this.canonicalAssets.push(asset);

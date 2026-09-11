@@ -25,6 +25,8 @@ export interface CreatorContentStore<M extends CreatorContentRecords = CreatorCo
   commitWorkRevision(work: M['work'] & { revision: number }, expectedRevision: number): Promise<void>;
 
   listCanonicalAssetsByWork(tenantId: string, workId: string): Promise<Array<M['asset'] & { attachment: M['attachment'] }>>;
+  /** Complete creator inventory, including detached/retained records; no authorization implied. */
+  listCanonicalAssetsByCreator(tenantId: string, creatorId: string): Promise<M['asset'][]>;
   getCanonicalAsset(tenantId: string, assetId: string): Promise<M['asset'] | null>;
   createCanonicalAsset(asset: M['asset']): Promise<void>;
   updateCanonicalAsset(asset: M['asset']): Promise<void>;
