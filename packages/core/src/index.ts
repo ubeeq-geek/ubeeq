@@ -321,3 +321,4 @@ export * from './creator-follows';
 export * from './comments';
 export * from './release-timing';
 export { FavoriteService, FavoriteError, type FavoriteTarget, type FavoriteRecord, type FavoritePort } from './favorites.js';
+export * from './creator-source-files.js';
