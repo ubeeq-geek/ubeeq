@@ -1,5 +1,9 @@
 # Shared Flickr inventory and confirmation
 
+The optional `albums` argument distinguishes an omitted snapshot (`undefined`,
+retain saved albums on photo continuation) from an explicitly empty snapshot
+(`[]`, replace the saved provider album list). This does not delete local content.
+
 `FlickrInventoryService` owns inventory page merging, publication observations,
 provenance, saved collection reconciliation continuity, migration selection and
 confirmation checkpoints. Applications supply a `FlickrRepository` and a required

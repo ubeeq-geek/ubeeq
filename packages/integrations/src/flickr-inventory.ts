@@ -9,7 +9,7 @@ export type FlickrReferenceMaterializer = (migration: FlickrMigration, connectio
 export class FlickrInventoryService {
   constructor(private repository: FlickrRepository, private materializeReferences: FlickrReferenceMaterializer) {}
 
-  async inventory(connection: FlickrConnection, photos: FlickrManifestPhoto[], cursor?: string, albums: FlickrExternalCollection[] = [], append = false): Promise<FlickrMigration> {
+  async inventory(connection: FlickrConnection, photos: FlickrManifestPhoto[], cursor?: string, albums?: FlickrExternalCollection[], append = false): Promise<FlickrMigration> {
     const now = new Date().toISOString();
     const previous = await this.repository.getMigrationByConnection(connection.connectionId);
     const previousPhotos = new Map(previous?.photos.map((photo) => [photo.remoteId, photo]));
@@ -33,7 +33,7 @@ export class FlickrInventoryService {
     const migration: FlickrMigration = {
       migrationId: previous?.migrationId || randomUUID(), connectionId: connection.connectionId, userId: connection.userId,
       status: 'INVENTORY_READY', cursor, storageConfirmed: false, discoveryEnabled: false,
-      photos: mergedPhotos, albums: albums.length ? albums.map(album => {
+      photos: mergedPhotos, albums: albums !== undefined ? albums.map(album => {
         const prior = previous?.albums.find(item => item.remoteAlbumId === album.remoteAlbumId);
         return { remoteAlbumId: album.remoteAlbumId, title: album.title, description: album.description,
           orderedRemotePhotoIds: [...album.orderedRemotePhotoIds], mappedCollectionId: prior?.mappedCollectionId,
@@ -46,7 +46,7 @@ export class FlickrInventoryService {
       items: previous?.items || [], estimatedBytes: mergedPhotos.some((p) => p.originalSizeBytes !== undefined)
         ? mergedPhotos.reduce((total, photo) => total + (photo.originalSizeBytes || 0), 0) : undefined,
       auditEvents: [...(previous?.auditEvents || []), { eventId: randomUUID(), action: 'INVENTORY_CAPTURED', occurredAt: now,
-        details: { photoCount: mergedPhotos.length, albumCount: albums.length || previous?.albums.length || 0, complete: !cursor } }],
+        details: { photoCount: mergedPhotos.length, albumCount: albums?.length ?? previous?.albums.length ?? 0, complete: !cursor } }],
       createdAt: previous?.createdAt || now, updatedAt: now
     };
     await this.repository.putMigration(migration);
