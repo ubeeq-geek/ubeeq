@@ -13,7 +13,7 @@ import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
-import { requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
@@ -183,6 +183,22 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
   }
   async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> {
     const path = this.objectPath(input.object); mkdirSync(resolve(path, ".."), { recursive: true }); writeFileSync(path, input.body); writeFileSync(`${path}.json`, json(input.object));
+  }
+  /** Private transfer writer; authorization remains the transfer caller's duty. */
+  async writePrivateVersion(input: { object: Omit<StoredObject, "versionId">; body: Uint8Array }): Promise<StoredObject> {
+    const object: StoredObject = { ...structuredClone(input.object), versionId: randomUUID() };
+    const body = Uint8Array.from(input.body);
+    const match = object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//);
+    if (!match || match[1] !== this.local.configuration.cellId || object.bucket !== this.local.configuration.cellId ||
+      object.scope !== "private" || !object.contentType || !body.byteLength ||
+      object.byteLength !== body.byteLength || object.checksum !== digest(body)) throw new Error("Invalid private transfer object.");
+    if (!isObjectKeyWithinPrefix(object.key, `cells/${match[1]}/creators/${match[2]}`)) throw new Error("Invalid private transfer key.");
+    const path = this.objectPath(object);
+    mkdirSync(resolve(path, ".."), { recursive: true });
+    // The local provider owns this physical version; never overwrite one.
+    writeFileSync(path, body, { flag: "wx", mode: 0o600 });
+    writeFileSync(`${path}.json`, json(object), { flag: "wx", mode: 0o600 });
+    return object;
   }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> {
     const path = this.objectPath(input); return { object: parse<StoredObject>(readFileSync(`${path}.json`, "utf8")), body: readFileSync(path) };
