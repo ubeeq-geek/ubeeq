@@ -55,6 +55,7 @@ class MemoryDynamo {
       const current = this.values.get(key);
       if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       if (input.ConditionExpression?.includes("#revision") && (!current || current.revision !== input.ExpressionAttributeValues[":revision"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression?.includes('#expiry') && (!current || current.value.state !== input.ExpressionAttributeValues[':leased'] || current.value.correlationId !== input.ExpressionAttributeValues[':owner'] || !(current.value.leaseExpiresAt > input.ExpressionAttributeValues[':now']))) throw Object.assign(new Error('lease conflict'), { name: 'ConditionalCheckFailedException' });
       if (input.ConditionExpression?.includes("#routingRevision") && (!current || current.routingRevision !== input.ExpressionAttributeValues[":expected"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       if (input.ConditionExpression?.includes("#updatedAt") && (!current || current.updatedAt !== input.ExpressionAttributeValues[":expected"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       this.values.set(key, input.Item); return {};
@@ -135,6 +136,77 @@ test('AWS queue counts each claimed execution once and dead-letters at the attem
     assert.equal(saved.state, attempt === 2 ? 'dead_lettered' : 'retry_scheduled');
   }
   assert.equal(await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 }), undefined);
+});
+
+test('expired, missing and malformed AWS lease expiries cannot acknowledge work', async () => {
+  for (const operation of ['complete', 'retry', 'deadLetter']) {
+    for (const expiry of [new Date(0).toISOString(), undefined, 'invalid']) {
+      const memory = new MemoryDynamo(), notices = [];
+      const queue = new AwsJobQueue(memory, { tableName: 'records', cellId: 'cell' }, { send: async command => { notices.push(command); return {}; } }, 'https://queue.test/jobs');
+      const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: 'expiry', maxAttempts: 3 });
+      const lease = await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 });
+      const record = memory.values.get(`durableJobs#${job.id}|record`);
+      record.value.leaseExpiresAt = expiry;
+      const before = structuredClone(record);
+      await assert.rejects(queue[operation]({ id: job.id, leaseToken: lease.leaseToken, retryAt: new Date(0).toISOString(), error: { code: 'error', message: 'test' } }), /does not hold this lease/);
+      assert.deepEqual(memory.values.get(`durableJobs#${job.id}|record`), before);
+      assert.equal(notices.length, 1);
+    }
+  }
+});
+
+test('AWS lease transition conditions reject changes between the read and the write', async () => {
+  for (const change of ['expiry', 'owner', 'state', 'revision']) {
+    const memory = new MemoryDynamo(); let guarded;
+    const queue = new AwsJobQueue({ send: async command => {
+      if (command.input.ConditionExpression?.includes('#expiry')) {
+        guarded = command.input;
+        const record = memory.values.get(`${command.input.Item.pk}|record`);
+        if (change === 'expiry') record.value.leaseExpiresAt = new Date(0).toISOString();
+        if (change === 'owner') record.value.correlationId = 'new-worker:new-token';
+        if (change === 'state') record.value.state = 'cancelled';
+        if (change === 'revision') record.revision += 1;
+      }
+      return memory.send(command);
+    } }, { tableName: 'records', cellId: 'cell' }, { send: async () => ({}) }, 'https://queue.test/jobs');
+    const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: 'race', maxAttempts: 3 });
+    const lease = await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 });
+    await assert.rejects(queue.complete({ id: job.id, leaseToken: lease.leaseToken }));
+    assert.match(guarded.ConditionExpression, /#expiry > :now/);
+    assert.equal(guarded.ExpressionAttributeValues[':owner'], `worker:${lease.leaseToken}`);
+    assert.notEqual((await queue.get(job.id)).state, 'completed');
+  }
+});
+
+test('successful AWS acknowledgements clear expiry and duplicate tokens cannot change final state', async () => {
+  for (const operation of ['complete', 'retry', 'deadLetter']) {
+    const queue = new AwsJobQueue(new MemoryDynamo(), { tableName: 'records', cellId: 'cell' }, { send: async () => ({}) }, 'https://queue.test/jobs');
+    const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: operation, maxAttempts: 3 });
+    const lease = await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 });
+    const input = { id: job.id, leaseToken: lease.leaseToken, retryAt: new Date(0).toISOString(), error: { code: 'error', message: 'test' } };
+    await queue[operation](input);
+    const saved = await queue.get(job.id);
+    assert.equal(saved.state, { complete: 'completed', retry: 'retry_scheduled', deadLetter: 'dead_lettered' }[operation]);
+    assert.equal(saved.leaseExpiresAt, undefined);
+    await assert.rejects(queue[operation](input), /does not hold this lease/);
+    assert.deepEqual(await queue.get(job.id), saved);
+  }
+});
+
+test('AWS acknowledgement infrastructure failures preserve the lease and do not send retry notices', async () => {
+  const memory = new MemoryDynamo(), notices = [], failure = new Error('write unavailable');
+  const queue = new AwsJobQueue({ send: async command => {
+    if (command.input.ConditionExpression?.includes('#expiry')) throw failure;
+    return memory.send(command);
+  } }, { tableName: 'records', cellId: 'cell' }, { send: async command => { notices.push(command); return {}; } }, 'https://queue.test/jobs');
+  const job = await queue.enqueue({ cellId: 'cell', type: 'work', payload: {}, idempotencyKey: 'ack-errors', maxAttempts: 3 });
+  const lease = await queue.lease({ cellId: 'cell', workerId: 'worker', leaseDurationSeconds: 60 });
+  const before = await queue.get(job.id);
+  for (const operation of ['complete', 'retry', 'deadLetter']) {
+    await assert.rejects(queue[operation]({ id: job.id, leaseToken: lease.leaseToken, retryAt: new Date(0).toISOString(), error: { code: 'error', message: 'test' } }), error => error === failure);
+    assert.deepEqual(await queue.get(job.id), before);
+  }
+  assert.equal(notices.length, 1);
 });
 
 test('AWS lease conflicts return no claim but infrastructure write failures propagate', async () => {
