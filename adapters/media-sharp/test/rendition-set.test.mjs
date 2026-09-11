@@ -52,3 +52,26 @@ test('malformed sources, missing lineage and finite resource budgets fail closed
   await assert.rejects(new SharpImageRenditionProcessor().process({ ...valid, assetId: '' }));
   await assert.rejects(new SharpImageRenditionProcessor().process({ ...valid, contentType: 'text/plain' }));
 });
+
+test('request crops override defaults without cross-request mutation and leave fitted recipes unchanged', async () => {
+  const red = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#ff0000' } }).png().toBuffer();
+  const blue = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#0000ff' } }).png().toBuffer();
+  const bytes = await sharp({ create: { width: 16, height: 8, channels: 3, background: '#000000' } }).composite([
+    { input: red, left: 0, top: 0 }, { input: blue, left: 8, top: 0 }
+  ]).png().toBuffer();
+  const processor = new SharpImageRenditionProcessor({ squareCrop: { x: 0, y: 0, size: 8 } });
+  const crop = { x: 8, y: 0, size: 8 };
+  const rightPromise = processor.process({ ...input(bytes), squareCrop: crop });
+  crop.x = 0; crop.size = 1;
+  const [right, left] = await Promise.all([rightPromise, processor.process(input(bytes))]);
+  assert.equal(right.metadata.squareCropX, 8); assert.equal(right.metadata.squareCropSize, 8);
+  assert.equal(left.metadata.squareCropX, 0); assert.equal(left.metadata.squareCropSize, 8);
+  for (let i = 0; i < 4; i++) assert.deepEqual(right.renditions[i].body, left.renditions[i].body);
+  const rightPixel = await sharp(right.renditions[4].body).resize(1, 1).raw().toBuffer();
+  const leftPixel = await sharp(left.renditions[4].body).resize(1, 1).raw().toBuffer();
+  assert.ok(rightPixel[2] > 240 && rightPixel[0] < 15);
+  assert.ok(leftPixel[0] > 240 && leftPixel[2] < 15);
+  for (const squareCrop of [{ x: NaN, y: 0, size: 1 }, { x: 0, y: 0 }, { x: 0, y: Infinity, size: 1 }]) {
+    await assert.rejects(processor.process({ ...input(bytes), squareCrop }), /Invalid square crop/);
+  }
+});

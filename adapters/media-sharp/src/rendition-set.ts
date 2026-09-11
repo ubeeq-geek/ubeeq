@@ -23,13 +23,17 @@ export class SharpImageRenditionProcessor implements MediaProcessor {
   }
   async process(input: Parameters<MediaProcessor['process']>[0]) {
     const { assetId, sourceVersionId, contentType } = input;
+    // Capture request-owned options before the first decoder await. Never mutate
+    // the shared processor defaults or retain a caller-owned crop object.
+    const squareCrop = input.squareCrop === undefined ? this.options.squareCrop : { ...input.squareCrop };
+    if (squareCrop && ![squareCrop.x, squareCrop.y, squareCrop.size].every(Number.isFinite)) throw new Error('Invalid square crop.');
     if (!assetId || !sourceVersionId || !contentType.startsWith('image/')) throw new Error('Image processing requires asset identity, image type and source version.');
     if (!input.source.byteLength || input.source.byteLength > (this.options.maxSourceBytes ?? 50 * 1024 * 1024)) throw new Error('Image source exceeds byte budget.');
     const source = Uint8Array.from(input.source);
     const maxInputPixels = this.options.maxInputPixels ?? 40_000_000;
     const metadata = await sharp(source, { limitInputPixels: maxInputPixels, failOn: 'error' }).metadata();
     if (!metadata.width || !metadata.height || !metadata.format) throw new Error('Image decoder did not produce valid dimensions.');
-    const crop = pickSquareCrop(metadata.width, metadata.height, this.options.squareCrop);
+    const crop = pickSquareCrop(metadata.width, metadata.height, squareCrop);
     const renditions: ProcessedRendition[] = [];
     let outputBytes = 0;
     for (const [name, size, square] of [
