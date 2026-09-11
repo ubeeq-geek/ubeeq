@@ -308,3 +308,4 @@ export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewa
 export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugInventoryPage, SmugMugGateway } from './smugmug-contracts.js';
 export * from './smugmug-migration.js';
 export * from './public-derivative-publication.js';
+export * from './publication-reconciliation.js';
