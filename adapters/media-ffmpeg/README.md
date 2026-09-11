@@ -11,7 +11,14 @@ FFmpeg/FFprobe executables. No binaries, cloud SDKs, product profiles or environ
 defaults are included. Commands use argument arrays, absolute local paths, a file-only
 protocol whitelist, bounded captured output, and a per-command timeout (30 seconds
 by default). Frame encoding retains the compatibility JPEG recipe: metadata stripped,
-width at most 1920, proportional even height, quality 3.
+width at most 1920 by default (configurable through `maxFrameWidth`), proportional
+even height, quality 3.
+
+`renderVideoPoster` supports already-admitted byte sources and a caller-selected
+capture timestamp without requiring a metadata probe. It bounds JPEG output reads
+and cleans private temporary input/output files on success and failure. Input
+download limits, decoder isolation, source-version binding and publication remain
+the caller's responsibility; the helper is not a video validation profile.
 
 Run native decoders in a restricted worker with only the current attempt's files
 available. A file-only protocol whitelist does not isolate filesystem access or bound

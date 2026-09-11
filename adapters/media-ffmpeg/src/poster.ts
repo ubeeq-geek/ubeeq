@@ -3,6 +3,33 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateFfprobeOutput, type VideoValidationProfile, type VideoToolAdapter, type MediaProcessor } from '@ubeeq/processing';
 
+const readPoster = async (outputPath: string, maxOutputBytes: number): Promise<Uint8Array> => {
+  const size = (await stat(outputPath)).size;
+  if (size < 1 || size > maxOutputBytes) throw new Error('Poster exceeds byte budget');
+  const body = new Uint8Array(await readFile(outputPath));
+  if (body.byteLength !== size || body[0] !== 255 || body[1] !== 216 || body[2] !== 255) throw new Error('Video tool did not produce a JPEG poster');
+  return body;
+};
+
+/**
+ * Render an already-admitted local source. Caller owns input admission, source
+ * version binding and persistence; this helper does not probe or approve video.
+ */
+export const renderVideoPoster = async (source: Uint8Array, options: {
+  tools: Pick<VideoToolAdapter, 'extractFrame'>; captureAtMs: number; maxOutputBytes: number;
+}): Promise<Uint8Array> => {
+  if (!source.byteLength) throw new Error('A nonempty video source is required');
+  if (!Number.isSafeInteger(options.captureAtMs) || options.captureAtMs < 0) throw new Error('Poster timestamp must be non-negative integer milliseconds');
+  if (!Number.isSafeInteger(options.maxOutputBytes) || options.maxOutputBytes < 1) throw new Error('Poster byte budget must be a positive integer');
+  const directory = await mkdtemp(join(tmpdir(), 'video-poster-'));
+  try {
+    const sourcePath = join(directory, 'source'), outputPath = join(directory, 'poster.jpg');
+    await writeFile(sourcePath, source, { flag: 'wx', mode: 0o600 });
+    await options.tools.extractFrame(sourcePath, outputPath, options.captureAtMs);
+    return await readPoster(outputPath, options.maxOutputBytes);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+};
+
 /** Private poster output; persistence, authorization and job fencing remain the worker's responsibility. */
 export class FfmpegPosterProcessor implements MediaProcessor {
   constructor(private readonly tools: VideoToolAdapter, private readonly profile: VideoValidationProfile,
@@ -17,10 +44,7 @@ export class FfmpegPosterProcessor implements MediaProcessor {
       await writeFile(sourcePath, input.source, { flag: 'wx' });
       const metadata = validateFfprobeOutput(await this.tools.probe(sourcePath), this.profile);
       await this.tools.extractFrame(sourcePath, outputPath, 0);
-      const size = (await stat(outputPath)).size;
-      if (size < 1 || size > this.maxOutputBytes) throw new Error('Poster exceeds byte budget');
-      const body = new Uint8Array(await readFile(outputPath));
-      if (body.byteLength !== size || body[0] !== 255 || body[1] !== 216 || body[2] !== 255) throw new Error('Video tool did not produce a JPEG poster');
+      const body = await readPoster(outputPath, this.maxOutputBytes);
       return { metadata: { contentType: input.contentType, width: metadata.width, height: metadata.height,
         durationSeconds: metadata.durationSeconds, videoCodec: metadata.videoCodec, container: metadata.container,
         rotation: metadata.rotation, hasAudio: metadata.hasAudio, validationProfile: metadata.validationProfile },
