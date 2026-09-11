@@ -23,8 +23,7 @@ test('explicit media renderer resolves admitted identities without receiving sto
   assert.match(html, /src="\/public\/works\/work\/assets\/admitted\/version"/);
   assert.match(html, /&lt;script&gt;caption&lt;\/script&gt;/);
   assert.match(html, /Media unavailable/);
-  // Without a DOM, the sanitizer deliberately escapes inline markup.
-  assert.match(html, /&lt;strong&gt;Published&lt;\/strong&gt;/);
+  assert.match(html, /<strong>Published<\/strong>/);
   assert.doesNotMatch(html, /<script|private.invalid/);
   assert.equal(inputs.length, 2); assert.ok(inputs.every(input => !('url' in input)));
   assert.deepEqual(value, before);

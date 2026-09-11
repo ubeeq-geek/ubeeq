@@ -12,9 +12,9 @@ test('description import preserves text paragraphs and emits stable block identi
   assert.equal(createDescriptionBlock('divider').text, undefined);
 });
 
-test('non-DOM fallback escapes HTML, and destination heading limits are explicit', () => {
+test('portable inline rendering drops active content, and destination heading limits are explicit', () => {
   assert.equal(textToInlineHtml('<img onerror="bad">\nnext'), '&lt;img onerror=&quot;bad&quot;&gt;<br>next');
-  assert.equal(sanitizeInlineHtml('<script>bad</script>'), '&lt;script&gt;bad&lt;/script&gt;');
+  assert.equal(sanitizeInlineHtml('<script>bad</script>'), '');
   const heading = [{ blockId: 'heading', type: 'heading', level: 6, text: 'Heading' }];
   assert.equal(serializeDescriptionBlocks(heading), '<h6>Heading</h6>');
   assert.equal(serializeDescriptionBlocks(heading, { maxHeadingLevel: 3 }), '<h3>Heading</h3>');
