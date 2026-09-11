@@ -5,6 +5,20 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { BlockPreview } from '../dist/react.js';
 
 const render = (value, mediaOptions = []) => renderToStaticMarkup(createElement(BlockPreview, { value, mediaOptions }));
+test('HTML fragments remain escaped source text, never executable markup', () => {
+  const value = [{ blockId: 'html', type: 'html_fragment', html: '<script>alert(1)</script><img src="https://private.invalid/image" onerror="bad()">' }];
+  const before = structuredClone(value), html = render(value);
+  assert.match(html, /<pre/); assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script|<img/); assert.deepEqual(value, before);
+});
+test('embed fallback exposes safe links and escaped captions without activating remote players', () => {
+  const html = render([{ blockId: 'embed', type: 'embed', title: '<Title>', label: 'Watch source', caption: '<Caption>', url: 'https://example.test/watch', payload: { provider: 'video', iframe: '<iframe src="https://private.invalid">' } },
+    { blockId: 'unsafe', type: 'embed', url: 'javascript:alert(1)', label: 'Unsafe' }]);
+  assert.match(html, /href="https:\/\/example.test\/watch"/);
+  assert.match(html, /rel="noopener noreferrer"/); assert.match(html, /&lt;Title&gt;/); assert.match(html, /&lt;Caption&gt;/);
+  assert.match(html, /Unsafe \(link unavailable\)/); assert.match(html, /Embedded playback is not available/);
+  assert.doesNotMatch(html, /href="javascript:|<iframe|private.invalid/);
+});
 test('explicit media renderer resolves admitted identities without receiving stored URLs', () => {
   const value = [
     { blockId: 'section', type: 'section', blocks: [
@@ -53,8 +67,8 @@ test('preview never embeds block URLs or raw HTML and labels unsupported content
   const html = render(value, [{ mediaId: 'asset', label: 'Private image', thumbnailUrl: 'https://remote.test/from-options' }]);
   assert.doesNotMatch(html, /<iframe|<img|href="javascript:|src="https:/);
   assert.match(html, /Unsafe \(link unavailable\)/);
-  assert.match(html, /html_fragment block is retained/);
-  assert.match(html, /embed block is retained/);
+  assert.match(html, /&lt;iframe/);
+  assert.match(html, /Embedded playback is not available/);
   assert.match(html, /Private image — image preview unavailable/);
 });
 

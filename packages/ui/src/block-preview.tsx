@@ -49,6 +49,10 @@ export function BlockPreview({ value, mediaOptions = [], label = 'Content previe
       }
       case 'quote': content = <blockquote>{inline(block)}{block.author && <cite>{block.author}</cite>}</blockquote>; break;
       case 'divider': content = <hr />; break;
+      case 'html_fragment': content = <pre style={{ overflowX: 'auto' }}>{block.html || ''}</pre>; break;
+      case 'embed': content = <figure>{block.title && <figcaption>{block.title}</figcaption>}
+        <p>{link(block)}</p>{(block.caption || block.text) && <p>{block.caption || block.text}</p>}
+        <p>Embedded playback is not available here.</p></figure>; break;
       case 'link': content = <p>{link(block)}</p>; break;
       case 'credit': content = <p>{block.author && <strong>{block.author}: </strong>}{block.text}{block.url && <> — {link(block)}</>}</p>; break;
       case 'image': case 'video': case 'audio': case 'file': case 'pdf_preview': {
