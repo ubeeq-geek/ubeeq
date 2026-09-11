@@ -50,6 +50,14 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
   readonly supportsExpectedCollectionOrder = true;
   constructor(private readonly local: LocalSqliteDatabase, private readonly options: { enqueueImageProcessing?: boolean; enqueueVideoProcessing?: boolean; enqueueAudioProcessing?: boolean; allowSquareCrop?: boolean } = {}) {}
 
+  /** Read-only preflight, not a reservation. Recheck through the mutation constraint at commit. */
+  async hasCreatorContentSlug(tenantId: string, creatorId: string, kind: 'work' | 'collection', slug: string): Promise<boolean> {
+    if (!['work', 'collection'].includes(kind) || [tenantId, creatorId, slug].some(value => typeof value !== 'string' || !value.trim() || value.length > 500)) throw new Error('Invalid slug lookup scope.');
+    const row = this.local.database.prepare(`SELECT NOT (${availableSlug}) AS taken`)
+      .get(this.local.configuration.cellId, tenantId, kind, creatorId, '', JSON.stringify([slug])) as { taken: number };
+    return row.taken === 1;
+  }
+
   private get<T>(tenantId: string, kind: string, id: string): T | null {
     const row = this.local.database.prepare("SELECT payload FROM ubeeq_creator_library WHERE cell_id = ? AND tenant_id = ? AND kind = ? AND id = ?")
       .get(this.local.configuration.cellId, tenantId, kind, id) as { payload: string } | undefined;
