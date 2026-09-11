@@ -127,3 +127,18 @@ test('loaded revision mismatch rejects before staging and all point reads reques
   assert.ok(f.commands.filter(command => command.constructor.name === 'GetCommand').every(command => command.input.ConsistentRead === true));
   assert.equal(f.commands.filter(command => command.constructor.name === 'TransactWriteCommand').length, before);
 });
+
+test('caught local revision conflicts abort companion writes rather than committing an incomplete operation', async () => {
+  for (const missing of [false, true]) {
+    const f = fixture();
+    await f.repositories.transaction(async () => { await f.repositories.federationActors.create({ id: 'versioned', label: 'original' }); });
+    const before = f.commands.filter(command => command.constructor.name === 'TransactWriteCommand').length;
+    await assert.rejects(f.repositories.transaction(async () => {
+      await f.repositories.federationActors.create({ id: 'companion' });
+      await assert.rejects(f.repositories.federationActors.update(missing ? 'missing' : 'versioned', 2, { label: 'bad' }), { name: 'OptimisticConcurrencyError' });
+    }), /aborted/);
+    assert.equal(f.commands.filter(command => command.constructor.name === 'TransactWriteCommand').length, before);
+    assert.equal(f.rows.has('federationActors#companion'), false);
+    assert.equal(f.rows.get('federationActors#versioned').value.label, 'original');
+  }
+});

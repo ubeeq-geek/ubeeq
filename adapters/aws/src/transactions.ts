@@ -4,14 +4,17 @@ import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, type Trans
 import type { PersistenceTransaction } from '@ubeeq/persistence';
 import { OptimisticConcurrencyError } from '@ubeeq/persistence';
 
-type Dynamo = Pick<DynamoDBDocumentClient, 'send'> & { assertTransaction?: (transaction: PersistenceTransaction) => void };
+type Dynamo = Pick<DynamoDBDocumentClient, 'send'> & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void };
 type State = { id: string; active: boolean; failed: boolean; writes: NonNullable<TransactWriteCommandInput['TransactItems']>; overlay: Map<string, Record<string, any> | undefined> };
 const keyOf = (table: string | undefined, key: Record<string, any>) => JSON.stringify([table, key.pk, key.sk]);
 
 /** Atomic repository write batches. Reads are not a serializable snapshot. */
 export const createTransactionalDynamo = (base: Dynamo) => {
   const context = new AsyncLocalStorage<State>();
-  const client: Dynamo = { assertTransaction: transaction => {
+  const client: Dynamo = { failTransaction: () => {
+    const state = context.getStore();
+    if (state?.active) state.failed = true;
+  }, assertTransaction: transaction => {
     const state = context.getStore();
     if (!state?.active || state.id !== transaction.id) {
       if (state) state.failed = true;

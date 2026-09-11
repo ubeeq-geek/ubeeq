@@ -22,3 +22,11 @@ remain unchanged. Point reads request strong consistency, and updates reject a
 loaded revision that differs from the caller's expected revision. Idempotency
 recovery still requires further work. Tests exercise
 command staging and failure boundaries with a mock, not deployed DynamoDB.
+
+Locally detected update revision conflicts (including a missing loaded record)
+also mark the active batch failed. Catching that conflict inside the callback
+does not permit companion writes to commit. Outside a transaction, the same
+typed conflict is returned without introducing transaction state. This does not
+make reads serializable, cover every caller-side validation error, or qualify
+live AWS behavior; durable idempotency and external-effect coordination remain
+separate acceptance work.
