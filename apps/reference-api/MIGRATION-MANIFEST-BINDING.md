@@ -16,4 +16,5 @@ Tests reject changed bytes/length, a different manifest checksum, foreign creato
 and foreign source home before repository access. The existing two-cell local
 transfer, rollback, retry and retirement test also passes. This does not add
 per-asset read-time integrity checks, immutable destination version binding,
-command authorization or atomic destination import. No live transfer is run.
+command authorization. Metadata atomicity is covered separately in
+`ATOMIC-REGIONAL-IMPORT.md`. No live transfer is run.
