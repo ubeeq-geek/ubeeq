@@ -2,6 +2,7 @@ import type { CreatorCollectionMembership, CreatorCollectionPort, CreatorCollect
 import { CreatorWorkError, CreatorCollectionError, CreatorAssetError, contentAssetReferences } from "@ubeeq/core";
 import { CreatorAssetRegenerationError, type CreatorAssetRegenerationRequest, type CreatorAssetRegenerationReceipt } from '@ubeeq/core';
 import type { CreatorPrimaryAssetCommit, CreatorAssetOrderCommit, CreatorAssetDetachmentCommit } from "@ubeeq/core";
+import { isPrivateStoredCreatorAsset, type CreatorExistingAssetCommit } from '@ubeeq/core';
 import type { CreatorAssetAttachment, CreatorAssetRecord, CreatorAssetProcessingCommit, CreatorAssetProcessingPort } from "@ubeeq/core";
 import type { LocalSqliteDatabase } from "./index.js";
 import { LocalSqliteJobQueue } from "./index.js";
@@ -275,6 +276,37 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
           payload: { tenantId: asset.tenantId, creatorId: asset.creatorId, workId: work.workId, assetId: asset.assetId, sourceVersionId: asset.storage.versionId },
           idempotencyKey: JSON.stringify(["creator-asset.process", asset.tenantId, asset.assetId, asset.storage.versionId]), maxAttempts: 3 });
       }
+    });
+  }
+  async commitExistingAssetAttachment(input: CreatorExistingAssetCommit): Promise<W> {
+    return this.local.transactionSync(() => {
+      const db = this.local.database, cell = this.local.configuration.cellId;
+      const target = this.get<W>(input.tenantId, 'work', input.workId);
+      const source = this.get<W>(input.tenantId, 'work', input.sourceWorkId);
+      const asset = this.get<CreatorAssetRecord>(input.tenantId, 'asset', input.assetId);
+      const sourceMembers = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.sourceWorkId) || [];
+      if (!target || !source || target.creatorId !== input.creatorId || source.creatorId !== input.creatorId ||
+        [target.status, source.status].some(status => status === 'deleted' || status === 'archived') ||
+        !asset || asset.creatorId !== input.creatorId || asset.tenantId !== input.tenantId || asset.status === 'deleted' ||
+        !isPrivateStoredCreatorAsset(asset) || asset.checksumSha256 !== input.checksum ||
+        asset.processing?.state !== 'completed' || asset.processing.sourceVersionId !== asset.storage.versionId ||
+        !sourceMembers.some(member => member.assetId === input.assetId && member.workId === input.sourceWorkId)) {
+        throw new CreatorAssetError('invalid_asset', 'Existing asset is not in current processed private custody.');
+      }
+      if (!Number.isSafeInteger(input.expectedRevision) || target.revision !== input.expectedRevision) {
+        throw new CreatorWorkError('revision_conflict', 'Work changed before existing asset attachment.');
+      }
+      const members = this.get<CreatorAssetAttachment[]>(input.tenantId, 'work_assets', input.workId) || [];
+      if (members.some(member => member.assetId === input.assetId)) return target;
+      const primaryAssetId = (target as W & { primaryAssetId?: string }).primaryAssetId || input.assetId;
+      const member: CreatorAssetAttachment = { workId: input.workId, assetId: input.assetId, position: members.length,
+        role: primaryAssetId === input.assetId ? 'primary' : 'content' };
+      const next = { ...target, primaryAssetId, revision: target.revision + 1, updatedAt: input.updatedAt };
+      db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'work_assets', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
+        .run(cell, input.tenantId, input.workId, input.creatorId, JSON.stringify([...members, member]));
+      db.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ?")
+        .run(JSON.stringify(next), cell, input.tenantId, input.workId);
+      return next;
     });
   }
   async listWorksByCreator(tenantId: string, creatorId: string, options: { includeDeleted?: boolean } = {}): Promise<W[]> {

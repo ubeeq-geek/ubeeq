@@ -4,7 +4,55 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalSqliteJobQueue } from "../dist/index.js";
-import { CreatorWorkService, CreatorCollectionService, CreatorAssetService } from "@ubeeq/core";
+import { CreatorWorkService, CreatorCollectionService, CreatorAssetService, CreatorExistingAssetService } from "@ubeeq/core";
+
+test('existing processed assets attach atomically without replacing custody or scheduling processing', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-existing-asset-'));
+  const config = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };
+  let local = new LocalSqliteDatabase(config);
+  try {
+    const store = new LocalCreatorLibraryStore(local, { enqueueImageProcessing: true });
+    const work = { tenantId: 'tenant', creatorId: 'creator', workId: 'source-work', title: 'Source', slug: 'source', slugHistory: ['source'], tags: [], status: 'draft', revision: 1, createdAt: 'now', updatedAt: 'now' };
+    for (const id of ['source-work', 'target', 'foreign']) await store.createWork({ ...work, workId: id, slug: id, slugHistory: [id], ...(id === 'foreign' ? { creatorId: 'other' } : {}) });
+    const asset = { tenantId: 'tenant', creatorId: 'creator', assetId: 'source', status: 'ready', mimeType: 'image/jpeg', sizeBytes: 1,
+      checksumSha256: 'a'.repeat(64), storage: { bucket: 'originals', key: 'source', versionId: 'version', contentType: 'image/jpeg', byteLength: 1, checksum: 'a'.repeat(64), scope: 'private' },
+      processing: { state: 'completed', sourceVersionId: 'version', completedAt: 'now', metadata: {}, renditions: [] }, createdAt: 'now', updatedAt: 'now' };
+    await new CreatorAssetService(store, async () => true).attach('tenant', 'source-work', asset);
+    const service = new CreatorExistingAssetService(store, async () => true);
+    const attach = () => service.attach('tenant', 'target', 'source-work', 'source', asset.checksumSha256);
+    await assert.rejects(new CreatorExistingAssetService(store, async () => false).attach('tenant', 'target', 'source-work', 'source', asset.checksumSha256), { code: 'access_denied' });
+    await assert.rejects(service.attach('tenant', 'foreign', 'source-work', 'source', asset.checksumSha256), { code: 'invalid_asset' });
+    await assert.rejects(service.attach('tenant', 'target', 'source-work', 'source', 'b'.repeat(64)), { code: 'invalid_asset' });
+    await assert.rejects(local.transaction(async () => { await attach(); throw Error('receipt failed'); }), /receipt failed/);
+    assert.deepEqual(await store.listCanonicalAssetsByWork('tenant', 'target'), []);
+    assert.equal((await store.getWork('tenant', 'target')).revision, 1);
+    const writeAsset = value => local.database.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE kind = 'asset' AND id = 'source'").run(JSON.stringify(value));
+    for (const changed of [{ ...asset, status: 'deleted' }, { ...asset, processing: undefined }, { ...asset, processing: { ...asset.processing, sourceVersionId: 'old' } }, { ...asset, creatorId: 'other' }]) {
+      writeAsset(changed); await assert.rejects(attach(), { code: 'invalid_asset' });
+    }
+    writeAsset(asset);
+    const source = await store.getWork('tenant', 'source-work');
+    await store.updateWork({ ...source, status: 'archived', revision: source.revision + 1 }); await assert.rejects(attach(), { code: 'invalid_asset' });
+    await store.updateWork({ ...source, revision: source.revision + 2 });
+    const commit = { tenantId: 'tenant', creatorId: 'creator', workId: 'target', sourceWorkId: 'source-work', assetId: 'source', checksum: asset.checksumSha256, expectedRevision: 99, updatedAt: 'later' };
+    await assert.rejects(store.commitExistingAssetAttachment(commit), { code: 'revision_conflict' });
+    const result = await local.transaction(attach); assert.equal(result.primaryAssetId, 'source'); assert.equal(result.revision, 2);
+    assert.equal((await attach()).revision, 2); // Repeating an attached membership is a no-op.
+    await store.createWork({ ...work, workId: 'has-primary', slug: 'has-primary', slugHistory: ['has-primary'], title: 'Keep creator title' });
+    await new CreatorAssetService(store, async () => true).attach('tenant', 'has-primary', { ...asset, assetId: 'existing-primary' });
+    const withPrimary = await service.attach('tenant', 'has-primary', 'source-work', 'source', asset.checksumSha256);
+    assert.equal(withPrimary.primaryAssetId, 'existing-primary'); assert.equal(withPrimary.title, 'Keep creator title');
+    assert.deepEqual((await store.listCanonicalAssetsByWork('tenant', 'has-primary')).map(item => [item.assetId, item.attachment.role, item.attachment.position]),
+      [['existing-primary', 'primary', 0], ['source', 'content', 1]]);
+    assert.deepEqual(await store.getProcessingAsset('tenant', 'source'), asset);
+    assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM ubeeq_jobs').get().count, 0);
+    local.database.close(); local = new LocalSqliteDatabase(config);
+    const restored = new LocalCreatorLibraryStore(local);
+    assert.equal((await restored.listCanonicalAssetsByWork('tenant', 'target'))[0].assetId, 'source');
+    local.database.prepare("UPDATE ubeeq_creator_library SET payload = '[]' WHERE kind = 'work_assets' AND id = 'source-work'").run();
+    await assert.rejects(restored.commitExistingAssetAttachment({ ...commit, expectedRevision: 2 }), { code: 'invalid_asset' });
+  } finally { local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 
 test('source import attachment, processing job and caller receipt share commit and rollback across restart', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-import-attachment-'));
