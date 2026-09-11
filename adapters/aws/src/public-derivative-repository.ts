@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { TransactGetCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
 export interface PublicDerivativePublication {
   id: string;
@@ -22,6 +22,8 @@ export interface PublicDerivativePublication {
 }
 
 export interface PublicDerivativeRepository {
+  /** Read-only receipt recovery; not admission or permission to deliver bytes. */
+  completedReceipt(publication: PublicDerivativePublication): Promise<{ createdAt: string; publishedAt: string } | undefined>;
   /** Must conditionally create the publication and reject an existing id. */
   begin(publication: PublicDerivativePublication): Promise<void>;
   /** Must atomically mark the Asset PUBLISHED and append its regional audit event. */
@@ -43,6 +45,24 @@ export const createDynamoPublicDerivativeRepository = (input: {
   metadataTableName: string;
   auditTableName: string;
 }): PublicDerivativeRepository => ({
+  completedReceipt: async publication => {
+    const result = await input.client.send(new TransactGetCommand({ TransactItems: [
+      { Get: { TableName: input.auditTableName, Key: { PK: publicDerivativePublicationKey(publication.id) } } },
+      { Get: { TableName: input.metadataTableName, Key: { PK: publicDerivativeAssetKey(publication.assetId) } } }
+    ] }));
+    const receipt = result.Responses?.[0]?.Item, asset = result.Responses?.[1]?.Item;
+    if (!receipt || !asset || receipt.state !== 'PUBLISHED' ||
+      typeof receipt.createdAt !== 'string' || !receipt.createdAt || typeof receipt.publishedAt !== 'string' || !receipt.publishedAt) return undefined;
+    for (const [field, expected] of Object.entries(publication)) {
+      if (!['state', 'createdAt', 'publishedAt'].includes(field) && receipt[field] !== expected) return undefined;
+    }
+    if (asset.product !== publication.product || asset.environment !== publication.environment ||
+      asset.dataHomeRegion !== publication.dataHomeRegion || asset.canonicalRegion !== publication.dataHomeRegion ||
+      asset.currentMediaVersionId !== publication.mediaVersionId || asset.currentScanGroupId !== publication.scanGroupId ||
+      asset.publicDeliveryState !== 'PUBLISHED' || asset.publicDerivativeKey !== publication.destinationObjectKey ||
+      asset.processingBillingState !== 'CONSUMED') return undefined;
+    return { createdAt: receipt.createdAt, publishedAt: receipt.publishedAt };
+  },
   begin: async (publication) => {
     await input.client.send(new TransactWriteCommand({ TransactItems: [
       {

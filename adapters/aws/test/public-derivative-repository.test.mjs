@@ -19,6 +19,38 @@ const checkScope = condition => {
   assert.equal(condition.ExpressionAttributeValues[':scanGroupId'], 'scan');
   assert.equal(condition.ExpressionAttributeValues[':mediaVersionId'], 'version');
 };
+test('completion recovery transactionally matches receipt and current asset without writes', async () => {
+  const f = fixture(); const commands = [];
+  const receipt = { ...publication, state: 'PUBLISHED', publishedAt: '2026-01-02T00:00:00Z' };
+  const asset = { product: 'fixture', environment: 'test', dataHomeRegion: 'region-a', canonicalRegion: 'region-a',
+    currentMediaVersionId: 'version', currentScanGroupId: 'scan', publicDeliveryState: 'PUBLISHED',
+    publicDerivativeKey: 'owned/key', processingBillingState: 'CONSUMED' };
+  let responses = [{ Item: receipt }, { Item: asset }];
+  f.client.send = async command => { commands.push(command); return { Responses: responses }; };
+  assert.deepEqual(await f.repository.completedReceipt({ ...publication, createdAt: 'new-attempt-time' }),
+    { createdAt: receipt.createdAt, publishedAt: receipt.publishedAt });
+  assert.deepEqual(commands[0].input.TransactItems, [
+    { Get: { TableName: 'audit', Key: { PK: 'PUBLICATION#receipt' } } },
+    { Get: { TableName: 'metadata', Key: { PK: 'ASSET#asset' } } }
+  ]);
+  for (const field of ['id', 'product', 'environment', 'dataHomeRegion', 'assetId', 'mediaVersionId', 'scanGroupId',
+    'sourceBucket', 'sourceObjectKey', 'destinationBucket', 'destinationObjectKey', 'contentHash', 'contentType', 'recordType']) {
+    responses = [{ Item: { ...receipt, [field]: 'different' } }, { Item: asset }];
+    assert.equal(await f.repository.completedReceipt(publication), undefined, field);
+  }
+  for (const field of Object.keys(asset)) {
+    responses = [{ Item: receipt }, { Item: { ...asset, [field]: 'different' } }];
+    assert.equal(await f.repository.completedReceipt(publication), undefined, field);
+  }
+  for (const invalid of [[], [{ Item: receipt }], [{}, { Item: asset }],
+    [{ Item: { ...receipt, state: 'FAILED' } }, { Item: asset }],
+    [{ Item: { ...receipt, publishedAt: undefined } }, { Item: asset }]]) {
+    responses = invalid; assert.equal(await f.repository.completedReceipt(publication), undefined);
+  }
+  assert.ok(commands.every(command => command.constructor.name === 'TransactGetCommand'));
+  const error = new Error('read unavailable'); f.client.send = async () => { throw error; };
+  await assert.rejects(f.repository.completedReceipt(publication), value => value === error);
+});
 test('begin retains legacy keys and atomically claims an eligible scoped version', async () => {
   const f = fixture(); await f.repository.begin(publication);
   const command = f.commands[0]; assert.equal(command.constructor.name, 'TransactWriteCommand');
