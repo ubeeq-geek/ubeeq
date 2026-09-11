@@ -41,8 +41,12 @@ export class CreatorClient {
   works(creatorId: string, query = '') { return this.call(`/studio/works?creatorId=${encodeURIComponent(creatorId)}&query=${encodeURIComponent(query)}`); }
   createWork(creatorId: string, title: string, description: string, tags?: string[], kind?: WorkKind) { return this.call('/studio/works', 'POST', { creatorId, title, description, ...(tags === undefined ? {} : { tags }), ...(kind === undefined ? {} : { kind }) }); }
   collections(creatorId: string) { return this.call(`/studio/collections?creatorId=${encodeURIComponent(creatorId)}`); }
-  createCollection(creatorId: string, title: string) { return this.call('/studio/collections', 'POST', { creatorId, title }); }
-  updateCollection(collectionId: string, title: string) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title }); }
+  createCollection(creatorId: string, title: string, metadata: { type?: 'collection' | 'gallery' | 'series' | 'playlist'; slug?: string; description?: string } = {}) {
+    return this.call('/studio/collections', 'POST', { creatorId, title, type: metadata.type, slug: metadata.slug, description: metadata.description });
+  }
+  updateCollection(collectionId: string, title: string, metadata: { slug?: string; description?: string } = {}) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { title, slug: metadata.slug, description: metadata.description });
+  }
   deleteCollection(collectionId: string) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'DELETE'); }
   replaceCollectionWorks(collectionId: string, workIds: string[], expectedWorkIds?: string[]) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}/works`, 'PUT', { workIds, expectedWorkIds }); }
   updateWork(workId: string, revision: number, title: string, description: string, tags?: string[]) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }) }); }
