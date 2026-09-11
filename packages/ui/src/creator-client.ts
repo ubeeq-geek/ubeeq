@@ -24,6 +24,26 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  profileImage(creatorId: string) { return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image`); }
+  removeProfileImage(creatorId: string, expectedRevision: number) {
+    return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?expectedRevision=${expectedRevision}`, 'DELETE');
+  }
+  async saveProfileImage(creatorId: string, expectedRevision: number, file: Blob, squareCrop?: CreatorAssetRegenerationRequest['squareCrop'], altText = '') {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision), altText });
+    if (squareCrop !== undefined) query.set('crop', JSON.stringify(squareCrop));
+    const response = await this.request(`${this.base}/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?${query}`, {
+      method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
+    const result = await response.json();
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error(result.message || 'Profile image save failed.'); }
+    return result;
+  }
+  async profileImagePreview(creatorId: string): Promise<Blob> {
+    const response = await this.request(`${this.base}/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image/square512`,
+      { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error('Profile image preview unavailable.'); }
+    if (response.headers.get('content-type') !== 'image/jpeg') throw new Error('Unexpected profile image preview format.');
+    return response.blob();
+  }
   publications(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`); }
   publishWork(workId: string, expectedRevision: number, idempotencyKey: string) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`, 'POST', { expectedRevision }, { idempotencyKey });
