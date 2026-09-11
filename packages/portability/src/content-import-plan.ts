@@ -7,6 +7,7 @@ export interface CreatorContentImportInventory {
   existingWorkIds: readonly string[];
   existingAssetIds: readonly string[];
   existingCollectionIds: readonly string[];
+  existingSourceFileIds?: readonly string[];
 }
 
 /** Read-only ID preflight. Neither this plan nor source storage references grant
@@ -14,7 +15,7 @@ export interface CreatorContentImportInventory {
 export const planCreatorContentImport = (json: string, inventory: CreatorContentImportInventory) => {
   const validId = (value: unknown): value is string => typeof value === 'string' && Boolean(value.trim()) && value.length <= 500;
   if (![inventory.targetTenantId, inventory.targetCreatorId].every(validId) ||
-    [inventory.existingWorkIds, inventory.existingAssetIds, inventory.existingCollectionIds].some(values =>
+    [inventory.existingWorkIds, inventory.existingAssetIds, inventory.existingCollectionIds, inventory.existingSourceFileIds ?? []].some(values =>
       !Array.isArray(values) || values.length > 100_000 || values.some(value => !validId(value)))) throw new Error('Invalid target import inventory.');
   const parsed = parseCreatorContentExport(json);
   const manifest = parsed.manifest;
@@ -22,9 +23,12 @@ export const planCreatorContentImport = (json: string, inventory: CreatorContent
   const assetIds: string[] = [...new Set<string>([...manifest.works.flatMap((entry: any) => entry.assets.map((asset: any) => asset.assetId)),
     ...(manifest.retainedAssets || []).map((asset: any) => asset.assetId)])];
   const collectionIds: string[] = manifest.collections.map((entry: any) => entry.collection.collectionId);
-  const conflicts: Array<{ resource: 'work' | 'asset' | 'collection'; id: string; reason: 'id_exists' }> = [];
+  const sourceFileIds: string[] = (manifest.sourceFiles ?? []).map((file: any) => file.fileId);
+  if (sourceFileIds.length && inventory.existingSourceFileIds === undefined) throw new Error('Source-file collision inventory is required.');
+  const conflicts: Array<{ resource: 'work' | 'asset' | 'collection' | 'sourceFile'; id: string; reason: 'id_exists' }> = [];
   for (const [resource, incoming, existing] of [
-    ['work', workIds, inventory.existingWorkIds], ['asset', assetIds, inventory.existingAssetIds], ['collection', collectionIds, inventory.existingCollectionIds]
+    ['work', workIds, inventory.existingWorkIds], ['asset', assetIds, inventory.existingAssetIds], ['collection', collectionIds, inventory.existingCollectionIds],
+    ['sourceFile', sourceFileIds, inventory.existingSourceFileIds ?? []]
   ] as const) {
     const existingIds = new Set(existing);
     for (const id of incoming) if (existingIds.has(id)) conflicts.push({ resource, id, reason: 'id_exists' });

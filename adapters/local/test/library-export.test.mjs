@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalFavoriteStore, readCreatorLibrarySnapshot } from '../dist/index.js';
+import { LocalSqliteDatabase, LocalCreatorLibraryStore, LocalFavoriteStore, LocalCreatorSourceFileStore, readCreatorLibrarySnapshot } from '../dist/index.js';
 import { CreatorAssetService } from '@ubeeq/core';
 
 test('library snapshot retains all metadata and relationships across restart without worker state', async () => {
@@ -27,7 +27,15 @@ test('library snapshot retains all metadata and relationships across restart wit
     const collection = { ...scope, collectionId: 'collection', title: 'Order', slug: 'order', status: 'draft', visibility: 'private', revision: 1 };
     await store.createCreatorCollection(collection);
     await store.replaceCollectionWorks('tenant', 'collection', [{ collectionId: 'collection', workId: 'work-1', position: 0 }, { collectionId: 'collection', workId: 'work-0', position: 1 }]);
+    const source = { fileId: 'source', creatorId: 'creator', sourceKind: 'document', mimeType: 'application/pdf', storageKey: 'private/source', createdAt: 'before', updatedAt: 'before', metadata: { label: 'retained' } };
+    const files = new LocalCreatorSourceFileStore(db, 'tenant');
+    await files.createSourceFile(source);
+    await files.createSourceFile({ ...source, fileId: 'foreign-source', creatorId: 'foreign' });
+    assert.equal(await files.hasSourceFileId('foreign-source'), true);
+    assert.equal(await files.hasSourceFileId('missing'), false);
+    assert.equal(await new LocalCreatorSourceFileStore(db, 'other').hasSourceFileId('source'), false);
     const snapshot = readCreatorLibrarySnapshot(db, scope);
+    assert.deepEqual(snapshot.sourceFiles, [source]);
     const favorite = { userId: 'actor', ownerProfileType: 'creator', ownerProfileId: 'creator', targetType: 'work', targetId: 'work-100', visibility: 'private', createdAt: 'before' };
     await new LocalFavoriteStore(db, 'tenant').addFavorite(favorite);
     await new LocalFavoriteStore(db, 'foreign').addFavorite(favorite);
