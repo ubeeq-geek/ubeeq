@@ -315,3 +315,4 @@ export * from './creator-profile';
 export * from './profile-content';
 export * from './content-slugs';
 export * from './creator-handle';
+export * from './creator-follows';
