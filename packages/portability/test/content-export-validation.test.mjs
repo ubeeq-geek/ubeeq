@@ -54,3 +54,27 @@ test('byte, node and depth budgets reject before a restore plan can be trusted',
   assert.throws(() => parseCreatorContentExport('{"number":1e400}'), /Non-finite/);
   assert.throws(() => parseCreatorContentExport('{broken'));
 });
+
+test('related identities preserve local and canonical shapes but reject duplicate or ambiguous restore targets', () => {
+  for (const accountKey of ['id', 'integrationAccountId', 'externalAccountId']) {
+    const value = fixture('id');
+    value.integrationAccounts = [{ [accountKey]: 'account', creatorId: 'creator' }];
+    value.works[0].publications = [{ publicationId: 'publication', workId: 'work' }];
+    value.works[0].publicationIntents = [{ publicationIntentId: 'intent', workId: 'work' }];
+    assert.deepEqual(parseCreatorContentExport(JSON.stringify(value)).manifest, value);
+  }
+  for (const change of [
+    x => { x.works[0].publications[0].id = ''; },
+    x => { delete x.works[0].publications[0].id; },
+    x => { x.works[0].publications[0].publicationId = 'different'; },
+    x => { x.works[0].publications.push({ ...x.works[0].publications[0] }); },
+    x => { x.works[0].publicationIntents = [{ id: 'intent', workId: 'work' }, { publicationIntentId: 'intent', workId: 'work' }]; },
+    x => { const second = structuredClone(x.works[0]); second.work.workId = 'other'; second.assets[0].attachment.workId = 'other'; second.publications[0].workId = 'other'; x.works.push(second); },
+    x => { x.integrationAccounts.push({ externalAccountId: 'account', creatorId: 'creator' }); },
+    x => { x.integrationAccounts[0].externalAccountId = 'different'; },
+    x => { delete x.integrationAccounts[0].id; }
+  ]) {
+    const value = fixture('id'); change(value);
+    assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /identity/);
+  }
+});
