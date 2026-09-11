@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+test('collection removal encodes the ID, sends credentials and accepts an empty response', async () => {
+  const calls = [];
+  const client = new CreatorClient(async (url, options) => {
+    calls.push({ url, options });
+    return url.endsWith('sign-in') ? Response.json({ token: 'session' }) : new Response(null, { status: 204 });
+  });
+  await client.signIn('owner@example.test', 'password');
+  await client.deleteCollection('collection/with space');
+  assert.equal(calls.at(-1).url, '/api/studio/collections/collection%2Fwith%20space');
+  assert.equal(calls.at(-1).options.method, 'DELETE');
+  assert.equal(calls.at(-1).options.headers.authorization, 'Bearer session');
+});
 test('client clears expired credentials and failed sign-out credentials', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => {
