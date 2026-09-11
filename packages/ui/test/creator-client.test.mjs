@@ -1,6 +1,37 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorClient } from '../dist/index.js';
+import { CreatorClient as BrowserCreatorClient } from '../dist/browser/creator-client.js';
+
+for (const [name, Client] of [['package', CreatorClient], ['browser', BrowserCreatorClient]]) {
+  test(`${name} crop requests preserve coordinates and retry identity without automatic retries`, async () => {
+    const calls = [];
+    let fail = true;
+    const client = new Client(async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith('sign-in')) return Response.json({ token: 'session' });
+      if (fail) throw new Error('ambiguous transport');
+      return Response.json({ state: 'queued', jobId: 'job' });
+    });
+    await client.signIn('owner@example.test', 'password');
+    const squareCrop = { x: 8, y: 0, size: 8 };
+    const pending = client.regenerateAsset('work/one', 'asset/two', 4, 'version', 'crop-key', squareCrop);
+    squareCrop.x = 0;
+    await assert.rejects(pending, /ambiguous transport/);
+    assert.equal(calls.length, 2, 'no hidden retry after an ambiguous response');
+    const sent = calls.at(-1);
+    assert.deepEqual(JSON.parse(sent.options.body), { expectedRevision: 4, sourceVersionId: 'version', squareCrop: { x: 8, y: 0, size: 8 } });
+    fail = false;
+    await client.regenerateAsset('work/one', 'asset/two', 4, 'version', 'crop-key', { x: 8, y: 0, size: 8 });
+    assert.deepEqual(calls.at(-1), sent);
+    assert.equal(sent.url, '/api/studio/works/work%2Fone/assets/asset%2Ftwo/regenerate');
+    assert.equal(sent.options.headers.authorization, 'Bearer session');
+    assert.equal(sent.options.headers['idempotency-key'], 'crop-key');
+    await client.regenerateAsset('work/one', 'asset/two', 4, 'version', 'default-key');
+    assert.deepEqual(JSON.parse(calls.at(-1).options.body), { expectedRevision: 4, sourceVersionId: 'version' });
+  });
+}
+
 test('regeneration client preserves source, revision and retry identity', async () => {
   const calls = [];
   const client = new CreatorClient(async (url, options) => { calls.push({ url, options }); return Response.json(url.endsWith('sign-in') ? { token: 'session' } : {}); });

@@ -1,5 +1,5 @@
 /** Same-origin creator API client. Credentials are kept in memory, never persisted. */
-import type { WorkKind } from '@ubeeq/core';
+import type { WorkKind, CreatorAssetRegenerationRequest } from '@ubeeq/core';
 export class CreatorClient {
   private token?: string;
   constructor(private readonly request: typeof fetch = fetch, private readonly base = '/api') {}
@@ -88,9 +88,12 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }
   assets(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/assets`); }
-  regenerateAsset(workId: string, assetId: string, expectedRevision: number, sourceVersionId: string, idempotencyKey: string) {
+  /** Explicit request only: callers retain the same crop and key for retries.
+   * The server remains authoritative for crop validation and admission. */
+  regenerateAsset(workId: string, assetId: string, expectedRevision: number, sourceVersionId: string, idempotencyKey: string,
+    squareCrop?: CreatorAssetRegenerationRequest['squareCrop']) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}/regenerate`,
-      'POST', { expectedRevision, sourceVersionId }, { idempotencyKey });
+      'POST', { expectedRevision, sourceVersionId, ...(squareCrop === undefined ? {} : { squareCrop }) }, { idempotencyKey });
   }
   detachAsset(workId: string, assetId: string, expectedRevision: number) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}`, 'DELETE', { expectedRevision });
