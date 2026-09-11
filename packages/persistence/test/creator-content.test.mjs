@@ -3,6 +3,22 @@ import test from "node:test";
 import { MemoryCreatorContentStore } from "../dist/index.js";
 
 const work = (tenantId, workId, extra = {}) => ({ tenantId, workId, creatorId: "creator", status: "draft", updatedAt: "2026-09-04T00:00:00Z", ...extra });
+test('atomic source commits append after sparse positions and reject stale positions', async () => {
+  const store = new MemoryCreatorContentStore();
+  await store.createWork(work('one', 'target', { revision: 1 }));
+  await store.attachAssetToWork('one', { workId: 'target', assetId: 'existing', position: 3 });
+  const asset = { tenantId: 'one', creatorId: 'creator', assetId: 'new', status: 'ready', checksumSha256: 'a'.repeat(64) };
+  const input = { previousRevision: 1, work: work('one', 'target', { revision: 2 }), asset, attachment: { workId: 'target', assetId: 'new', position: 4 } };
+  await assert.rejects(store.commitAssetAttachment({ ...input, attachment: { ...input.attachment, position: 1 } }));
+  await store.commitAssetAttachment(input);
+  await store.createWork(work('one', 'reuse-target', { revision: 1 }));
+  await store.attachAssetToWork('one', { workId: 'reuse-target', assetId: 'other', position: 8 });
+  const reuse = { previousRevision: 1, work: work('one', 'reuse-target', { revision: 2 }), sourceWorkId: 'target', expectedAsset: asset,
+    attachment: { workId: 'reuse-target', assetId: 'new', position: 9 }, receipt: { tenantId: 'one', creatorId: 'creator', workId: 'reuse-target', assetId: 'new', checksum: 'a'.repeat(64), receiptId: 'receipt', sourceIdentity: 'source' } };
+  await assert.rejects(store.commitSourceReuse({ ...reuse, attachment: { ...reuse.attachment, position: 1 } }));
+  await store.commitSourceReuse(reuse);
+  assert.equal((await store.getSourceReceipt('one', 'receipt')).assetId, 'new');
+});
 
 test('creator asset inventory includes detached records beyond a first page without leaking scope or mutable state', async () => {
   const store = new MemoryCreatorContentStore();
