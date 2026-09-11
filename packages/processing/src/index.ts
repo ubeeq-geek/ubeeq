@@ -3,6 +3,7 @@ export * from "./content-credentials.js";
 export * from "./creator-asset-worker.js";
 export * from "./image-crops.js";
 export * from "./video.js";
+export * from "./audio.js";
 export type UsageMeter = "storage_bytes" | "delivery_bytes" | "processing_units" | "transcode_seconds";
 
 export interface ProcessingRequest {
