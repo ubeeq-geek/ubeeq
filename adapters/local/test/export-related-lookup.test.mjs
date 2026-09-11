@@ -5,6 +5,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalSqliteDatabase, LocalExportRelatedLookup, createLocalRepositories } from '../dist/index.js';
 
+test('import identity checks cover the physical namespace without returning foreign records', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-import-identity-'));
+  const config = { databasePath: join(directory, 'db.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'local' };
+  const local = new LocalSqliteDatabase(config), foreign = new LocalSqliteDatabase({ ...config, cellId: 'foreign' });
+  try {
+    const lookup = new LocalExportRelatedLookup(local), own = createLocalRepositories(local), other = createLocalRepositories(foreign);
+    for (const repository of ['publications', 'publicationIntents', 'integrationAccounts']) {
+      await other[repository].create({ id: 'occupied', instanceId: 'other-tenant', homeCellId: 'foreign', workId: 'private-work', creatorId: 'private-creator', destination: 'local', status: 'removed', health: 'unknown', connectorId: 'example', idempotencyKey: 'key' });
+      assert.equal(await own[repository].get('occupied'), undefined);
+      assert.equal(await lookup.hasImportId(repository, 'occupied'), true);
+      assert.equal(await lookup.hasImportId(repository, 'absent'), false);
+      await assert.rejects(lookup.hasImportId(repository, ''), /identity lookup/);
+    }
+    await assert.rejects(lookup.hasImportId('users', 'occupied'), /identity lookup/);
+    assert.equal(await lookup.hasImportId('publications', "' OR 1=1 --"), false);
+  } finally { foreign.database.close(); local.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 for (const [repository, field] of [['publicationIntents', 'workId'], ['integrationAccounts', 'creatorId']]) {
   test(`${repository} pages isolate scope and retain complete records across restart`, async () => {
     const directory = mkdtempSync(join(tmpdir(), 'ubeeq-export-related-'));

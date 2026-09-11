@@ -4,6 +4,12 @@ import type { LocalSqliteDatabase } from './index.js';
 /** Scoped metadata reads. Authorization and removal of credentials belong to the caller. */
 export class LocalExportRelatedLookup {
   constructor(private readonly local: LocalSqliteDatabase) {}
+  /** Collision check against the physical key namespace, not permission to read a record. */
+  async hasImportId(repository: 'publications' | 'publicationIntents' | 'integrationAccounts', id: string): Promise<boolean> {
+    if (!['publications', 'publicationIntents', 'integrationAccounts'].includes(repository) ||
+      typeof id !== 'string' || !id.trim() || id.length > 500) throw new Error('Invalid import identity lookup.');
+    return Boolean(this.local.database.prepare('SELECT 1 FROM ubeeq_records WHERE repository = ? AND id = ?').get(repository, id));
+  }
   async publicationIntents(scope: { instanceId: string; workId: string }, request: PageRequest): Promise<Page<PublicationIntentRecord>> {
     return this.page('publicationIntents', 'workId', scope.instanceId, scope.workId, request);
   }
