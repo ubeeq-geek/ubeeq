@@ -336,6 +336,15 @@ remain outside SQLite atomicity, and cloud transaction parity is still pending.
 
 ## Remaining slices
 
+OAuth state issuance, envelope verification and deterministic compatibility PKCE
+derivation are available in `@ubeeq/integrations`. Issuance assigns a fresh nonce;
+the caller supplies a cryptographic codec with its algorithm/key/expiry policy.
+Verification only establishes a verified object envelope: provider claims, actor
+binding, redirects and durable one-time nonce consumption remain mandatory caller
+checks. PKCE accepts the existing key and domain separator to preserve in-flight
+flow compatibility. This does not add replay persistence or qualify live OAuth
+provider integrations.
+
 The creator client supports archiving collections and restoring them to draft.
 Its metadata update also supports changing among the four collection kinds,
 without sending product visibility or ownership fields.
