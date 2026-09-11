@@ -84,3 +84,4 @@ export { createPrivateMediaPlayback } from './private-media-playback.js';
 export { createSourceFileBrowser, type SourceFileBrowserOptions } from './source-file-browser.js';
 export { resolveYouTubeEmbedUrl } from './youtube-embed.js';
 export { createProfileLinkEditor, type ProfileLinkValue } from './profile-link-editor.js';
+export { validateProfileExternalLinks, type ProfileExternalLink, type ProfileExternalLinkValidationIssue } from './profile-external-links.js';
