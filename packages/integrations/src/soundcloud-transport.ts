@@ -1,4 +1,6 @@
 import { ExternalProviderError, parseRetryAfterSeconds } from './provider-errors.js';
+import { readBoundedResponseText } from './bounded-response-text.js';
+export interface SoundCloudTransportLimits { timeoutMs?: number; maxResponseBytes?: number }
 export interface SoundCloudCredentials { clientId: string; clientSecret: string; redirectUri: string; enabled?: boolean }
 export interface SoundCloudRequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE'; body?: URLSearchParams; emptyResponse?: boolean; ignoreNotFound?: boolean;
@@ -16,9 +18,33 @@ export const soundCloudResponseError = (status: number, payload: Record<string, 
 
 /** Explicitly invoked transport. No automatic retry, publication or persistence. */
 export class SoundCloudTransport {
-  constructor(private readonly credentials?: SoundCloudCredentials, private readonly fetcher: typeof fetch = (...args) => fetch(...args)) {}
+  private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
+  constructor(private readonly credentials?: SoundCloudCredentials, private readonly fetcher: typeof fetch = (...args) => fetch(...args), limits: SoundCloudTransportLimits = {}) {
+    this.timeoutMs = limits.timeoutMs ?? 10_000; this.maxResponseBytes = limits.maxResponseBytes ?? 4 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 300_000 ||
+      !Number.isSafeInteger(this.maxResponseBytes) || this.maxResponseBytes < 1 || this.maxResponseBytes > 16 * 1024 * 1024) throw new Error('Invalid SoundCloud transport limits.');
+  }
+  private async payload(response: Response, write: boolean): Promise<Record<string, unknown>> {
+    try {
+      const parsed: unknown = JSON.parse(await readBoundedResponseText(response, this.maxResponseBytes));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Expected object response.');
+      return record(parsed);
+    } catch (error) {
+      // Known HTTP failure status remains authoritative even if its body is malformed.
+      if (!response.ok) return {};
+      const timedOut = error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name);
+      throw new ExternalProviderError('SoundCloud response was incomplete, invalid or exceeded its byte limit', write ? 'ambiguous_submission' : timedOut ? 'temporarily_unavailable' : 'invalid_response');
+    }
+  }
   isConfigured(): boolean { return this.credentials?.enabled !== false && Boolean(this.credentials?.clientId && this.credentials.clientSecret && this.credentials.redirectUri); }
   private admit(): void { if (!this.isConfigured()) throw new ExternalProviderError('SoundCloud is disabled or OAuth is not configured', 'unsupported'); }
+  private async fetchResponse(url: string, options: RequestInit): Promise<Response> {
+    try { return await this.fetcher(url, options); }
+    catch {
+      throw new ExternalProviderError('SoundCloud request outcome could not be confirmed', options.method === 'GET' ? 'temporarily_unavailable' : 'ambiguous_submission');
+    }
+  }
   safeNextHref(value: unknown): string | undefined {
     if (value === undefined || value === null || value === '') return undefined;
     const href = string(value);
@@ -29,10 +55,10 @@ export class SoundCloudTransport {
   }
   async exchangeToken(params: Record<string, string>): Promise<{ accessToken: string; refreshToken?: string; expiresAt?: string }> {
     this.admit();
-    const response = await this.fetcher('https://secure.soundcloud.com/oauth/token', { method: 'POST', redirect: 'error',
+    const response = await this.fetchResponse('https://secure.soundcloud.com/oauth/token', { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs),
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ ...params, client_id: this.credentials!.clientId, client_secret: this.credentials!.clientSecret }).toString() });
-    const payload = record(await response.json().catch(() => ({})));
+    const payload = await this.payload(response, true);
     if (!response.ok) throw soundCloudResponseError(response.status, payload, response.headers.get('retry-after'));
     const accessToken = string(payload.access_token);
     if (!accessToken) throw new ExternalProviderError('SoundCloud did not return an access token', 'invalid_response');
@@ -43,11 +69,13 @@ export class SoundCloudTransport {
     this.admit();
     const url = pathOrUrl.startsWith('/') ? `${apiOrigin}${pathOrUrl}` : this.safeNextHref(pathOrUrl);
     if (!url) throw new ExternalProviderError('SoundCloud pagination URL was invalid', 'invalid_response');
-    const response = await this.fetcher(url, { method: options.method || 'GET', redirect: 'error',
+    const response = await this.fetchResponse(url, { method: options.method || 'GET', redirect: 'error', signal: AbortSignal.timeout(this.timeoutMs),
       headers: { Authorization: `OAuth ${accessToken}`, Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}) },
       ...(options.body ? { body: options.body.toString() } : {}) });
-    if (options.ignoreNotFound && response.status === 404) return {};
-    const payload = options.emptyResponse && response.ok ? {} : record(await response.json().catch(() => ({})));
+    if ((options.ignoreNotFound && response.status === 404) || (options.emptyResponse && response.ok)) {
+      await response.body?.cancel(); return {};
+    }
+    const payload = await this.payload(response, Boolean(options.method && options.method !== 'GET'));
     if (!response.ok) throw soundCloudResponseError(response.status, payload, response.headers.get('retry-after'));
     return payload;
   }
