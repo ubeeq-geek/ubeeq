@@ -25,6 +25,23 @@ function fixture(allowed = true) {
   return { service, store, collections, works, memberships, calls, writes: () => writes };
 }
 
+test('revisioned collection updates and removals require support and forward their preconditions', async () => {
+  const f = fixture();
+  await f.service.create(collection('one'));
+  await assert.rejects(f.service.update(collection('one'), undefined, 0), { code: 'revision_conflict' });
+  await assert.rejects(f.service.remove('tenant', 'one', 0), { code: 'revision_conflict' });
+  f.store.supportsExpectedCollectionRevision = true;
+  const calls = [];
+  const update = f.store.updateCreatorCollection;
+  f.store.updateCreatorCollection = async (record, status, revision) => { calls.push({ status, revision }); await update(record); };
+  assert.equal((await f.service.update(collection('one'), undefined, 4)).revision, 5);
+  await f.service.remove('tenant', 'one', 5);
+  assert.deepEqual(calls, [{ status: undefined, revision: 4 }, { status: undefined, revision: 5 }]);
+  for (const revision of [-1, 0.5, NaN, Number.MAX_SAFE_INTEGER]) {
+    await assert.rejects(f.service.update(collection('one'), undefined, revision), { code: 'revision_conflict' });
+  }
+});
+
 test('conditional ordering fails closed when the adapter does not support it', async () => {
   const f = fixture();
   await f.service.create(collection('one'));
