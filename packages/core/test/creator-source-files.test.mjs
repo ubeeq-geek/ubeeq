@@ -2,6 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { CreatorSourceFileService } from '../dist/index.js';
 const file = { fileId: 'file', creatorId: 'creator', sourceKind: 'document', mimeType: 'application/pdf', storageKey: 'private/key', createdAt: 'now', updatedAt: 'now', sizeBytes: 1, custom: { value: 'retained' } };
+test('scoped listing admits before reads, snapshots requests and rejects foreign adapter results', async () => {
+  let reads = 0, allowed = false, items = [file];
+  const input = { limit: 1 };
+  const service = new CreatorSourceFileService({ listCreatorSourceFiles: async (_id, page) => {
+    reads++; assert.equal(page.limit, 1); return { items };
+  } }, async () => { input.limit = 100; return allowed; });
+  await assert.rejects(service.listCreator('creator', { limit: 1 }), { code: 'access_denied' });
+  assert.equal(reads, 0); allowed = true; input.limit = 1;
+  const result = await service.listCreator('creator', input); result.items[0].custom.value = 'changed';
+  assert.equal(file.custom.value, 'retained');
+  items = [{ ...file, creatorId: 'other' }];
+  await assert.rejects(service.listCreator('creator', { limit: 1 }), { code: 'invalid_page' });
+  await assert.rejects(service.listCreator('creator', { limit: 0 }), { code: 'invalid_page' });
+});
 test('source catalogue filters by creator authority and isolates returned records', async () => {
   const records = [file, { ...file, fileId: 'two' }, { ...file, creatorId: 'foreign' }], calls = [];
   const service = new CreatorSourceFileService({ listAllSourceFiles: async () => records }, async (id, op) => { calls.push([id, op]); return id === 'creator'; });
