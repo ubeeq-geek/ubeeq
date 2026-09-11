@@ -12,6 +12,10 @@ export interface CommentPort<C extends CommentRecord> {
   createComment(comment: C): Promise<void>;
 }
 export interface CommentTarget { targetType: string; targetId: string }
+/** Raw tenant/cell-bound lookup, including hidden records. Product admission is required. */
+export interface CommentLookupPort<C extends CommentRecord> {
+  getComment(targetType: C['targetType'], targetId: string, commentId: string): Promise<C | null>;
+}
 /** Implementations must be bound to the caller's tenant/cell scope. */
 export interface CommentModerationPort {
   updateCommentVisibility(commentId: string, hidden: boolean): Promise<void>;
