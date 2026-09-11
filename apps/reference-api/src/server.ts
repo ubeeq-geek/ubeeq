@@ -8,7 +8,7 @@ import type { JobQueue } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
 import { repositoryItems, type Page, type PageRequest } from "@ubeeq/persistence";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
-import { createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
+import { createCreatorExport, planCreatorImport, validateCreatorExport, type CreatorExportManifest } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
@@ -33,6 +33,43 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
   request.on("end", () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); } catch { reject(new HttpError(400, "invalid_json", "Request body must be JSON")); } });
   request.on("error", reject);
 });
+const rewriteImportManifest = (manifest: CreatorExportManifest, targetCreatorId: string, preserveIds: boolean) => {
+  const idMap = new Map<string, string>();
+  const remap = (id: string): string => {
+    if (preserveIds) return id;
+    const mapped = idMap.get(id);
+    if (mapped) return mapped;
+    const next = randomUUID();
+    idMap.set(id, next);
+    return next;
+  };
+  const remapSubjectId = (id: string): string => id === manifest.creator.id ? targetCreatorId : remap(id);
+  return {
+    idMap,
+    manifest: {
+      ...manifest,
+      works: manifest.works.map((work) => ({ ...work, id: remap(work.id), creatorId: targetCreatorId, status: work.status === "published" ? "ready" : work.status })),
+      assets: manifest.assets.map((asset) => {
+        const { storage: _storage, originalStorage: _originalStorage, processing: _processing, renditions: _renditions, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processing?: unknown; renditions?: unknown; };
+        return { ...portableAsset, id: remap(asset.id), creatorId: targetCreatorId, workId: asset.workId ? remap(asset.workId) : undefined, status: "pending" };
+      }),
+      collections: manifest.collections.map((collection) => {
+        const workIds = (collection as typeof collection & { workIds?: string[] }).workIds;
+        return { ...collection, id: remap(collection.id), creatorId: targetCreatorId,
+          ...(workIds ? { workIds: workIds.map(remap) } : {}) };
+      }),
+      publications: manifest.publications.map((publication) => ({ ...publication, id: remap(publication.id), workId: remap(publication.workId) })),
+      publicationIntents: manifest.publicationIntents.map((intent) => ({ ...intent, id: remap(intent.id), workId: remap(intent.workId) })),
+      moderationEvidence: manifest.moderationEvidence.map((evidence) => ({ ...evidence, id: remap(evidence.id), subjectId: remapSubjectId(evidence.subjectId) })),
+      moderationHolds: manifest.moderationHolds.map((hold) => ({ ...hold, id: remap(hold.id), subjectId: remapSubjectId(hold.subjectId) })),
+      reviewCases: manifest.reviewCases.map((reviewCase) => ({ ...reviewCase, id: remap(reviewCase.id), subjectId: remapSubjectId(reviewCase.subjectId) })),
+      auditEvents: manifest.auditEvents.map((event) => ({ ...event, id: remap(event.id), subjectId: event.subjectId ? remapSubjectId(event.subjectId) : event.subjectId, actorId: undefined })),
+      usageEvents: manifest.usageEvents.map((event) => ({ ...event, id: remap(event.id), accountId: targetCreatorId })),
+      integrationAccounts: manifest.integrationAccounts.map((account) => ({ ...account, id: remap(account.id), creatorId: targetCreatorId, health: "blocked", credentialReference: undefined, credentialExcluded: undefined })),
+      objectInventory: manifest.objectInventory.map((entry) => ({ ...entry, assetId: remap(entry.assetId as string) })),
+    }
+  };
+};
 
 export type ReferenceAdapterSet = {
   repositories: UbeeqRepositories;
@@ -392,7 +429,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const objectInventory = assets.map((asset) => { const storage = (asset as AssetRecord & { storage?: { key?: string; versionId?: string; byteLength?: number; checksum?: string } }).storage; return { assetId: asset.id, key: storage?.key, versionId: storage?.versionId ?? asset.objectVersion, checksum: storage?.checksum ?? asset.checksum, byteLength: storage?.byteLength, transferState: "manifest_only" as const }; }); const processing = assets.map((asset) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, ...dataHomeOf(asset), state: asset.status }));
         const manifest = createCreatorExport({ exportedAt: new Date().toISOString(), creator, works, assets, collections, publications, publicationIntents, processing, moderationEvidence, moderationHolds, reviewCases, auditEvents, usageEvents, integrationAccounts, exportCheckpoints, importCheckpoints, objectInventory }); await repositories.exportManifests.create({ id: `export-${manifest.checksum}`, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, schemaVersion: manifest.schemaVersion, checksum: manifest.checksum, objectReference: `inline:${manifest.checksum}` }, { idempotencyKey: `export:${manifest.checksum}` }); await audit({ action: "creator.export_generated", actorId: identity.subject.id, subjectId: creator.id, payload: { checksum: manifest.checksum } }); return json(response, 200, { ...manifest, requestId }, requestId);
       }
-      if (method === "POST" && url.pathname === "/v1/imports/validate") { await session(request); const body = await parseBody(request); let manifest; try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); } const plan = planCreatorImport(manifest, { targetCreatorId: "validation", existingWorkIds: (await allRecords(repositories.works)).map(({ id }) => id), existingAssetIds: (await allRecords(repositories.assets)).map(({ id }) => id), existingCollectionIds: (await allRecords(repositories.collections)).map(({ id }) => id), existingIds: await existingImportIds() }); return json(response, 200, { plan, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/imports/validate") { await session(request); const body = await parseBody(request); let manifest; try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); } const preserveIds = body.preserveIds === true;
+        const plan = planCreatorImport(manifest, preserveIds ? { targetCreatorId: "validation", existingWorkIds: (await allRecords(repositories.works)).map(({ id }) => id), existingAssetIds: (await allRecords(repositories.assets)).map(({ id }) => id), existingCollectionIds: (await allRecords(repositories.collections)).map(({ id }) => id), existingIds: await existingImportIds() } : { targetCreatorId: "validation", existingWorkIds: [], existingAssetIds: [], existingCollectionIds: [] }); return json(response, 200, { plan, requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/imports") {
         const identity = await session(request); const body = await parseBody(request); let manifest;
         try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); }
@@ -407,28 +445,30 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const existing = await repositories.importCheckpoints.get(importId);
         if (existing) requireMatchingCheckpoint(existing);
         if (existing?.state === "completed") return json(response, 200, { importId, checkpoint: existing, idempotent: true, requestId }, requestId);
+        const preserveIds = body.preserveIds === true;
         const allWorks = (await allRecords(repositories.works)), allAssets = (await allRecords(repositories.assets)), allCollections = (await allRecords(repositories.collections));
-        const plan = planCreatorImport(manifest, { targetCreatorId: creator.id, existingWorkIds: allWorks.map(({ id }) => id), existingAssetIds: allAssets.map(({ id }) => id), existingCollectionIds: allCollections.map(({ id }) => id), existingIds: await existingImportIds() });
+        const plan = planCreatorImport(manifest, preserveIds ? { targetCreatorId: creator.id, existingWorkIds: allWorks.map(({ id }) => id), existingAssetIds: allAssets.map(({ id }) => id), existingCollectionIds: allCollections.map(({ id }) => id), existingIds: await existingImportIds() } : { targetCreatorId: creator.id, existingWorkIds: [], existingAssetIds: [], existingCollectionIds: [] });
         if (body.dryRun !== false || !plan.valid) return json(response, 200, { dryRun: true, plan, requestId }, requestId);
+        const rewritten = rewriteImportManifest(manifest, creator.id, preserveIds).manifest;
         const checkpoint = existing ?? await repositories.importCheckpoints.create({ id: importId, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, importId, state: "planned", cursor: manifest.checksum }, { idempotencyKey: `import:${importId}` });
         requireMatchingCheckpoint(checkpoint);
         const running = await repositories.importCheckpoints.update(checkpoint.id, checkpoint.revision, { state: "running", cursor: manifest.checksum });
         try {
           const completed = await repositories.transaction(async (transaction) => {
-            for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
-            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, processing: _processing, renditions: _renditions, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processing?: unknown; renditions?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
-            for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
-            for (const publication of manifest.publications) {
+            for (const work of rewritten.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
+            for (const asset of rewritten.assets) { const { storage: _storage, originalStorage: _originalStorage, processing: _processing, renditions: _renditions, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processing?: unknown; renditions?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
+            for (const collection of rewritten.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
+            for (const publication of rewritten.publications) {
               const { remoteId: _remoteId, ...portablePublication } = publication;
               await repositories.publications.create({ ...portablePublication, instanceId: creator.instanceId, ...dataHomeOf(creator), status: "draft" }, { transaction, idempotencyKey: `import:${importId}:publication:${publication.id}` });
             }
-            for (const intent of manifest.publicationIntents) await repositories.publicationIntents.create({ ...intent, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:intent:${intent.id}` });
-            for (const evidence of manifest.moderationEvidence) await repositories.moderationEvidence.create({ ...evidence, subjectId: evidence.subjectId === manifest.creator.id ? creator.id : evidence.subjectId, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:evidence:${evidence.id}` });
-            for (const hold of manifest.moderationHolds) await repositories.moderationHolds.create({ ...hold, subjectId: hold.subjectId === manifest.creator.id ? creator.id : hold.subjectId, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:hold:${hold.id}` });
-            for (const reviewCase of manifest.reviewCases) await repositories.reviewCases.create({ ...reviewCase, subjectId: reviewCase.subjectId === manifest.creator.id ? creator.id : reviewCase.subjectId, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:review:${reviewCase.id}` });
-            for (const event of manifest.auditEvents) await repositories.auditEvents.create({ ...event, subjectId: event.subjectId === manifest.creator.id ? creator.id : event.subjectId, instanceId: creator.instanceId, ...dataHomeOf(creator), actorId: undefined }, { transaction, idempotencyKey: `import:${importId}:audit:${event.id}` });
-            for (const event of manifest.usageEvents) await repositories.usageEvents.create({ ...event, instanceId: creator.instanceId, ...dataHomeOf(creator), accountId: creator.id }, { transaction, idempotencyKey: `import:${importId}:usage:${event.id}` });
-            for (const account of manifest.integrationAccounts) { const { credentialExcluded: _credentialExcluded, ...portableAccount } = account; await repositories.integrationAccounts.create({ ...portableAccount, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, health: "blocked", credentialReference: undefined }, { transaction, idempotencyKey: `import:${importId}:integration:${account.id}` }); }
+            for (const intent of rewritten.publicationIntents) await repositories.publicationIntents.create({ ...intent, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:intent:${intent.id}` });
+            for (const evidence of rewritten.moderationEvidence) await repositories.moderationEvidence.create({ ...evidence, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:evidence:${evidence.id}` });
+            for (const hold of rewritten.moderationHolds) await repositories.moderationHolds.create({ ...hold, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:hold:${hold.id}` });
+            for (const reviewCase of rewritten.reviewCases) await repositories.reviewCases.create({ ...reviewCase, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:review:${reviewCase.id}` });
+            for (const event of rewritten.auditEvents) await repositories.auditEvents.create({ ...event, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:audit:${event.id}` });
+            for (const event of rewritten.usageEvents) await repositories.usageEvents.create({ ...event, instanceId: creator.instanceId, ...dataHomeOf(creator), }, { transaction, idempotencyKey: `import:${importId}:usage:${event.id}` });
+            for (const account of rewritten.integrationAccounts) { const { credentialExcluded: _credentialExcluded, ...portableAccount } = account; await repositories.integrationAccounts.create({ ...portableAccount, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, health: "blocked", credentialReference: undefined }, { transaction, idempotencyKey: `import:${importId}:integration:${account.id}` }); }
             const completed = await repositories.importCheckpoints.update(running.id, running.revision, { state: 'completed', cursor: manifest.checksum }, { transaction });
             await repositories.auditEvents.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), action: 'creator.import_completed', actorId: identity.subject.id,
               subjectId: creator.id, payload: { importId, checksum: manifest.checksum, plan: plan.itemCounts, originalFilesTransferred: false } }, { transaction });

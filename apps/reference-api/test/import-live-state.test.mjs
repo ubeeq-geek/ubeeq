@@ -16,7 +16,7 @@ test('metadata-only HTTP import strips processing outputs and remote publication
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const request = async (path, body) => {
     const response = await fetch(`http://127.0.0.1:${api.server.address().port}${path}`, { method: 'POST',
-      headers: { authorization: 'Bearer owner', 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      headers: { authorization: 'Bearer owner', 'content-type': 'application/json' }, body: JSON.stringify({ preserveIds: true, ...body }) });
     return { status: response.status, body: await response.json() };
   };
   try {

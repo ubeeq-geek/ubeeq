@@ -1,4 +1,5 @@
 import { stableJson } from './index.js';
+import { contentAssetReferences } from '@ubeeq/core';
 type RecordValue = Record<string, any>;
 const object = (value: unknown, name: string): RecordValue => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid ${name} record.`);
@@ -90,6 +91,9 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       }
     }
     if (work.primaryAssetId && !localIds.has(work.primaryAssetId)) throw new Error('Dangling primary asset reference.');
+    if (contentAssetReferences(work.body, work.media).some(assetId => !localIds.has(assetId))) {
+      throw new Error('Dangling Work content asset reference.');
+    }
     for (const field of ['publications', 'publicationIntents']) {
       if (entry[field] === undefined) continue;
       for (const value of array(entry[field], field)) {

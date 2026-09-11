@@ -16,7 +16,7 @@ test('import checkpoints bind creator and manifest and commit atomically with im
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const request = async (path, body, actor = 'owner') => {
     const response = await fetch(`http://127.0.0.1:${api.server.address().port}${path}`, { method: 'POST',
-      headers: { authorization: `Bearer ${actor}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      headers: { authorization: `Bearer ${actor}`, 'content-type': 'application/json' }, body: JSON.stringify({ preserveIds: true, ...body }) });
     return { status: response.status, body: await response.json() };
   };
   try {

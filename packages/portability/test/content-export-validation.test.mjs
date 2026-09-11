@@ -63,6 +63,23 @@ test('explicit ordering is unique within each parent while sparse positions rema
     works: [{ collectionId: 'other', workId: 'second-work', position: 2 }] });
   assert.ok(parseCreatorContentExport(JSON.stringify(value)));
 });
+test('body and comparison asset references must belong to the same exported Work attachment set', () => {
+  const value = fixture('id');
+  const work = value.works[0].work;
+  work.body = [{ blockId: 'section', type: 'section', blocks: [{ blockId: 'image', type: 'image', mediaId: 'asset' }] }];
+  work.media = [{ mediaId: 'asset', comparison: { comparisonItem: { mediaId: 'asset' } } }];
+  assert.ok(parseCreatorContentExport(JSON.stringify(value)));
+  for (const missing of ['missing', 'detached']) {
+    work.body[0].blocks[0].mediaId = missing;
+    assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /content asset reference/);
+    work.body[0].blocks[0].mediaId = 'asset';
+    work.media[0].comparison.comparisonItem.mediaId = missing;
+    assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /content asset reference/);
+    work.media[0].comparison.comparisonItem.mediaId = 'asset';
+  }
+  work.body = [{ id: 'portable', type: 'video', assetId: 'missing' }];
+  assert.throws(() => parseCreatorContentExport(JSON.stringify(value)), /content asset reference/);
+});
 test('byte, node and depth budgets reject before a restore plan can be trusted', () => {
   const json = JSON.stringify(fixture('id'));
   assert.throws(() => parseCreatorContentExport(json, { maxBytes: 10 }), /byte budget/);

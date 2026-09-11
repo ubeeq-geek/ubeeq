@@ -7,5 +7,5 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node --test test/*.test.mjs" },
-  "dependencies": { "@ubeeq/persistence": "^0.1.0" }
+  "dependencies": { "@ubeeq/core": "^0.1.0", "@ubeeq/persistence": "^0.1.0" }
 }
