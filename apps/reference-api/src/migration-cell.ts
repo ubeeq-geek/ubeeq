@@ -35,8 +35,15 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       const manifestObject = command.checkpoint.objectInventory?.find((object) => object.id === "migration-manifest");
       if (!manifestObject) throw new Error("Migration manifest object is missing from the verified inventory.");
       const stored = await input.storage.get({ bucket: manifestObject.destination.bucket, key: manifestObject.destination.key });
-      const manifest = validateCreatorExport(JSON.parse(Buffer.from(stored.body).toString("utf8")));
+      const manifestBytes = Buffer.from(stored.body);
+      if (manifestBytes.byteLength !== manifestObject.byteLength || createHash('sha256').update(manifestBytes).digest('hex') !== manifestObject.checksum) {
+        throw new Error('Migration manifest bytes do not match the checkpoint inventory.');
+      }
+      const manifest = validateCreatorExport(JSON.parse(manifestBytes.toString("utf8")));
+      if (manifest.checksum !== command.checkpoint.manifestChecksum) throw new Error('Migration manifest checksum does not match its checkpoint.');
       if (manifest.creator.id !== command.checkpoint.creatorId) throw new Error("Migration manifest creator does not match its checkpoint.");
+      if (manifest.creator.homeCellId !== command.checkpoint.source.homeCellId
+        || manifest.creator.dataHomeRegion !== command.checkpoint.source.homeRegion) throw new Error('Migration manifest source home does not match its checkpoint.');
       const home = { homeCellId: input.cellId, dataHomeRegion: input.region, dataHomeAssignedAt: command.checkpoint.createdAt, routingRevision: command.checkpoint.source.routingRevision + 1 };
       const clean = (value: any) => { const { revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt, ...record } = value; return { ...record, instanceId: input.instanceId, ...home }; };
       const put = async (repository: any, value: any, key: string) => { if (!await repository.get(value.id)) await repository.create(clean(value), { idempotencyKey: `migration:${command.checkpoint.id}:${key}:${value.id}` }); };
