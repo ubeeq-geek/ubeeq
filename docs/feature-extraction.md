@@ -21,6 +21,17 @@ Features are complete only when a consuming application executes the shared impl
 
 ## Initial integration slice
 
+Publication preflight now lives in the integrations package with an injected
+capability declaration. It evaluates supported operations/media, supplied size
+limits, disclosure precision, connection state, scopes, holds and configured
+attestations. Provider catalogues and actual limit values remain product-owned.
+The consuming review endpoint and delivery worker use the shared evaluator while
+retaining their existing storage, policy lookup and provider execution boundaries.
+Static success is not authorization: omitted admission facts yield
+`admission.checked: false`. Preflight does not verify attestations, reserve quota,
+perform external writes or fence a concurrent policy change. Those execution
+guarantees and complete optional connector extraction remain unfinished.
+
 `projectIntegrationAccountHealth` now projects token expiry, active cooldowns,
 durable connection state, sync timestamps and issue metadata from a credential-free
 port. Callers supply their expiry warning window and may inject a clock. Provider
