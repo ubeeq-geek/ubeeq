@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+export { BlockPreview, type BlockPreviewMedia } from './block-preview.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
   createDescriptionBlock,
