@@ -337,6 +337,8 @@ remain outside SQLite atomicity, and cloud transaction parity is still pending.
 ## Remaining slices
 
 The creator client supports archiving collections and restoring them to draft.
+Its metadata update also supports changing among the four collection kinds,
+without sending product visibility or ownership fields.
 Consumers select admission and visibility rules. The local collection adapter
 supports expected-status and expected-revision writes to reject stale metadata and
 lifecycle snapshots atomically. Every local metadata/lifecycle write increments
