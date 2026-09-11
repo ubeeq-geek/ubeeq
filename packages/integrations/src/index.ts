@@ -1,5 +1,6 @@
 /** Product-neutral remote integration capabilities. */
 export * from "./recovery.js";
+export * from './provider-errors.js';
 export * from "./account-health.js";
 export * from "./publication-preflight.js";
 export * from "./announcement-publication.js";
