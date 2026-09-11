@@ -25,6 +25,11 @@ export class CreatorClient {
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
   profileImage(creatorId: string) { return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image`); }
+  recropProfileImage(creatorId: string, expectedRevision: number, squareCrop: NonNullable<CreatorAssetRegenerationRequest['squareCrop']>, altText?: string) {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision), crop: JSON.stringify(squareCrop) });
+    if (altText !== undefined) query.set('altText', altText);
+    return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?${query}`, 'PATCH');
+  }
   removeProfileImage(creatorId: string, expectedRevision: number) {
     return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?expectedRevision=${expectedRevision}`, 'DELETE');
   }
