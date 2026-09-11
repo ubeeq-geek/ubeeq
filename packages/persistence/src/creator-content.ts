@@ -1,3 +1,12 @@
+export interface CreatorContentListOptions { includeDeleted?: boolean; /** Optional evaluation ceiling; never return a silently truncated result. */ maxRecords?: number; }
+export class CreatorContentListBudgetError extends Error {
+  constructor() { super('Creator content list budget exceeded.'); this.name = 'CreatorContentListBudgetError'; }
+}
+export function creatorContentListBudget(options: CreatorContentListOptions): number {
+  if (options.maxRecords === undefined) return Infinity;
+  if (!Number.isSafeInteger(options.maxRecords) || options.maxRecords < 1) throw new Error('Invalid creator content list budget.');
+  return options.maxRecords;
+}
 /** Minimum storage keys. Products extend records with their own metadata and policy fields. */
 export interface CreatorContentRecords {
   work: { tenantId: string; creatorId: string; workId: string; status: string; updatedAt: string };
@@ -15,10 +24,12 @@ export interface CreatorContentRecords {
  * during extraction; transport authorization and product admission remain explicit.
  * List methods currently materialize results; scalable adapters must provide the
  * complete result until callers adopt a separately versioned paginated contract.
+ * An explicit maxRecords ceiling must fail with CreatorContentListBudgetError
+ * rather than silently truncate. Evaluation may include deleted/filtered records.
  */
 export interface CreatorContentStore<M extends CreatorContentRecords = CreatorContentRecords> {
   commitAssetAttachment(input: CreatorContentAssetCommit<M>): Promise<void>;
-  listWorksByCreator(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<M['work'][]>;
+  listWorksByCreator(tenantId: string, creatorId: string, options?: CreatorContentListOptions): Promise<M['work'][]>;
   getWork(tenantId: string, workId: string): Promise<M['work'] | null>;
   createWork(work: M['work']): Promise<void>;
   updateWork(work: M['work']): Promise<void>;
@@ -42,7 +53,7 @@ export interface CreatorContentStore<M extends CreatorContentRecords = CreatorCo
   upsertPublicationIntent(intent: M['intent']): Promise<void>;
   deletePublicationIntent(tenantId: string, publicationIntentId: string): Promise<void>;
 
-  listCreatorCollections(tenantId: string, creatorId: string, options?: { includeDeleted?: boolean }): Promise<M['collection'][]>;
+  listCreatorCollections(tenantId: string, creatorId: string, options?: CreatorContentListOptions): Promise<M['collection'][]>;
   getCreatorCollection(tenantId: string, collectionId: string): Promise<M['collection'] | null>;
   createCreatorCollection(collection: M['collection']): Promise<void>;
   updateCreatorCollection(collection: M['collection']): Promise<void>;
