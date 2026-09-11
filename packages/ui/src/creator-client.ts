@@ -51,6 +51,16 @@ export class CreatorClient {
   setCollectionArchived(collectionId: string, archived: boolean, expectedRevision?: number) {
     return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { status: archived ? 'archived' : 'draft', expectedRevision });
   }
+  setCollectionCover(collectionId: string, coverAssetId: string, expectedRevision: number) {
+    return this.call(`/studio/collections/${encodeURIComponent(collectionId)}`, 'PATCH', { coverAssetId, expectedRevision });
+  }
+  async collectionCover(collectionId: string): Promise<Blob> {
+    const response = await this.request(`${this.base}/studio/collections/${encodeURIComponent(collectionId)}/cover`,
+      { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error('Collection cover preview unavailable.'); }
+    if (response.headers.get('content-type') !== 'image/jpeg') throw new Error('Unexpected cover preview format.');
+    return response.blob();
+  }
   replaceCollectionWorks(collectionId: string, workIds: string[], expectedWorkIds?: string[]) { return this.call(`/studio/collections/${encodeURIComponent(collectionId)}/works`, 'PUT', { workIds, expectedWorkIds }); }
   updateWork(workId: string, revision: number, title: string, description: string, tags?: string[]) { return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, title, description, ...(tags === undefined ? {} : { tags }) }); }
   setWorkArchived(workId: string, revision: number, archived: boolean) {
