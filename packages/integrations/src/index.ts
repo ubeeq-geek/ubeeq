@@ -2,6 +2,7 @@
 export * from "./recovery.js";
 export * from './provider-errors.js';
 export * from './soundcloud-normalization.js';
+export * from './soundcloud-transport.js';
 export * from './bounded-response-text.js';
 export * from './deviantart-labels.js';
 export * from "./account-health.js";
