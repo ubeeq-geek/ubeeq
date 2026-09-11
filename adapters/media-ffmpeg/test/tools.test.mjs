@@ -41,6 +41,12 @@ if (args.includes('-show_format')) {
     assert.equal(args[args.indexOf('-ss') + 1], '10.249');
     assert.equal(args[args.indexOf('-i') + 1], input);
     assert.equal(args[args.indexOf('-vf') + 1], 'scale=min(1920\\,iw):-2');
+    await tools.extractLastFrame(input, output);
+    const last = JSON.parse(await readFile(output, 'utf8'));
+    for (const [option, value] of [['-protocol_whitelist', 'file'], ['-map', '0:v:0'], ['-update', '1'], ['-fps_mode', 'passthrough'], ['-map_metadata', '-1']]) assert.equal(last[last.indexOf(option) + 1], value);
+    for (const option of ['-an', '-sn', '-dn', '-nostdin']) assert.ok(last.includes(option));
+    assert.ok(!last.includes('-ss')); assert.ok(!last.includes('-frames:v'));
+    await assert.rejects(tools.extractLastFrame('https://example.test/video', output), /absolute local/);
     await new FfmpegVideoToolAdapter({ ffmpegPath: binary, ffprobePath: binary, maxFrameWidth: 1280 }).extractFrame(input, output, 1000);
     const configured = JSON.parse(await readFile(output, 'utf8'));
     assert.equal(configured[configured.indexOf('-vf') + 1], 'scale=min(1280\\,iw):-2');
