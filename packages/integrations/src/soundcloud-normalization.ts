@@ -15,6 +15,35 @@ const date = (value: unknown): string | undefined => {
   const parsed = Date.parse(raw); return Number.isFinite(parsed) ? new Date(parsed).toISOString() : undefined;
 };
 
+export const normalizeSoundCloudAccount = (value: unknown) => {
+  const user = record(value), externalUserId = string(user.urn) || identifier(user.id), externalUsername = string(user.username);
+  if (!externalUserId || !externalUsername) throw new ExternalProviderError('SoundCloud account identity response was incomplete', 'invalid_response');
+  return { externalUserId, externalUsername };
+};
+
+export const normalizeSoundCloudProfile = (value: unknown) => {
+  const user = record(value);
+  return {
+    profileUrl: string(user.permalink_url), avatarUrl: string(user.avatar_url), realName: string(user.full_name),
+    country: string(user.country), website: string(user.website), bio: string(user.description),
+    stats: { watchers: number(user.followers_count), friends: number(user.followings_count), deviations: number(user.track_count),
+      favourites: number(user.public_favorites_count), comments: number(user.comments_count) },
+    rawPayload: user
+  };
+};
+
+export const normalizeSoundCloudPlaylist = (value: unknown) => {
+  const playlist = record(value), externalCollectionId = string(playlist.urn) || identifier(playlist.id);
+  if (!externalCollectionId) return null;
+  return { externalCollectionId, name: string(playlist.title) || 'Untitled SoundCloud playlist',
+    description: string(playlist.description), size: number(playlist.track_count), rawMetadata: playlist };
+};
+
+export const normalizeSoundCloudFavouriteUser = (value: unknown) => {
+  const user = record(value), externalUserId = string(user.urn) || identifier(user.id), username = string(user.username);
+  return externalUserId && username ? { externalUserId, username, avatarUrl: string(user.avatar_url), rawPayload: user } : null;
+};
+
 /** Metadata-only external reference: never supplies a canonical audio source. */
 export const normalizeSoundCloudTrack = (value: unknown) => {
   const track = record(value), externalContentId = string(track.urn) || identifier(track.id);

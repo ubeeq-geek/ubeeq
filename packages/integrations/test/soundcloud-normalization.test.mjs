@@ -1,6 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeSoundCloudTrack as track, normalizeSoundCloudComment as comment, normalizeSoundCloudActivity as activity } from '../dist/index.js';
+import { normalizeSoundCloudAccount as account, normalizeSoundCloudProfile as profile, normalizeSoundCloudPlaylist as playlist,
+  normalizeSoundCloudFavouriteUser as favouriteUser } from '../dist/index.js';
+test('account and favourite-user normalization retain authoritative IDs with distinct missing-identity behavior', () => {
+  const input = Object.freeze({ urn: ' user:1 ', id: 2, username: ' Artist ', avatar_url: ' https://example.test/avatar ' });
+  assert.deepEqual(account(input), { externalUserId: 'user:1', externalUsername: 'Artist' });
+  assert.deepEqual(favouriteUser(input), { externalUserId: 'user:1', username: 'Artist', avatarUrl: 'https://example.test/avatar', rawPayload: input });
+  assert.equal(account({ id: 0, username: 'Zero' }).externalUserId, '0');
+  for (const value of [null, [], {}, { id: -1, username: 'Artist' }, { id: Number.MAX_SAFE_INTEGER + 1, username: 'Artist' }, { id: 1, username: ' ' }]) {
+    assert.throws(() => account(value), { code: 'invalid_response' });
+    assert.equal(favouriteUser(value), null);
+  }
+});
+test('profile normalization retains optional fields and existing metric coercion without inventing identity', () => {
+  const input = Object.freeze({ permalink_url: ' https://example.test/artist ', avatar_url: 'avatar', full_name: ' Name ', country: ' CA ',
+    website: 'website', description: ' Bio ', followers_count: '12', followings_count: 0, track_count: 'bad', public_favorites_count: 5, comments_count: null });
+  const result = profile(input);
+  assert.deepEqual(result, { profileUrl: 'https://example.test/artist', avatarUrl: 'avatar', realName: 'Name', country: 'CA', website: 'website', bio: 'Bio',
+    stats: { watchers: 12, friends: 0, deviations: undefined, favourites: 5, comments: 0 }, rawPayload: input });
+  assert.equal(result.rawPayload, input);
+  assert.equal(profile(null).profileUrl, undefined);
+  assert.equal(profile({}).stats.watchers, undefined);
+});
+test('playlist normalization preserves IDs, fallback title, size and raw metadata without loading tracks', () => {
+  const input = Object.freeze({ urn: 'playlist:1', id: 2, title: ' List ', description: ' Description ', track_count: '3', tracks: [{ id: 7 }] });
+  assert.deepEqual(playlist(input), { externalCollectionId: 'playlist:1', name: 'List', description: 'Description', size: 3, rawMetadata: input });
+  assert.equal(playlist({ id: 0 }).name, 'Untitled SoundCloud playlist');
+  for (const value of [null, [], {}, { id: -1 }, { id: Number.MAX_SAFE_INTEGER + 1 }]) assert.equal(playlist(value), null);
+});
 test('track normalization preserves external metadata, quoted tags and blocked state without an audio source', () => {
   const input = { urn: 'soundcloud:tracks:1', id: 2, title: ' Track ', tag_list: 'one "two words"', access: 'blocked', created_at: 1700000000, playback_count: '12', download_url: 'https://example.test/private-audio' };
   const result = track(input);
