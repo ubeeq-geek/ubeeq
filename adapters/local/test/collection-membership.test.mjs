@@ -6,6 +6,40 @@ import { tmpdir } from 'node:os';
 import { LocalSqliteDatabase, LocalCreatorLibraryStore } from '../dist/index.js';
 import { CreatorCollectionService } from '@ubeeq/core';
 
+test('collection membership joins an import transaction and rolls back all records on nested failure', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ubeeq-membership-import-'));
+  const database = new LocalSqliteDatabase({ databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' });
+  const store = new LocalCreatorLibraryStore(database);
+  const work = { tenantId: 'tenant', creatorId: 'creator', workId: 'work', title: 'Imported', slug: 'work', slugHistory: ['work'], tags: [], status: 'draft', revision: 1, createdAt: 'now', updatedAt: 'now' };
+  const collection = { tenantId: 'tenant', creatorId: 'creator', collectionId: 'collection', slug: 'collection', slugHistory: ['collection'], status: 'draft', updatedAt: 'now' };
+  const membership = { collectionId: 'collection', workId: 'work', position: 0, addedAt: 'now' };
+  const create = async () => { await store.createWork(work); await store.createCreatorCollection(collection); };
+  try {
+    await assert.rejects(database.transaction(async () => {
+      await create();
+      await store.replaceCollectionWorks('tenant', 'collection', [membership]);
+      throw Error('outer checkpoint failed');
+    }), /outer checkpoint failed/);
+    assert.equal(await store.getWork('tenant', 'work'), null);
+    assert.equal(await store.getCreatorCollection('tenant', 'collection'), null);
+    assert.deepEqual(await store.listCollectionWorks('tenant', 'collection'), []);
+
+    await assert.rejects(database.transaction(async () => {
+      await create();
+      // Even a caller catching the nested error cannot commit a partial import.
+      await assert.rejects(store.replaceCollectionWorks('tenant', 'collection', [{ ...membership, workId: 'missing' }]), { code: 'invalid_works' });
+    }), /rollback-only/);
+    assert.equal(await store.getWork('tenant', 'work'), null);
+    assert.equal(await store.getCreatorCollection('tenant', 'collection'), null);
+
+    await database.transaction(async () => { await create(); await store.replaceCollectionWorks('tenant', 'collection', [membership], []); });
+    assert.deepEqual(await store.listCollectionWorks('tenant', 'collection'), [membership]);
+    const competing = store.replaceCollectionWorks('tenant', 'collection', [], ['wrong']);
+    await assert.rejects(competing, { code: 'revision_conflict' });
+    assert.deepEqual(await store.listCollectionWorks('tenant', 'collection'), [membership]);
+  } finally { database.database.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('membership commit revalidates Works changed after service validation', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-membership-race-'));
   const configuration = { databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' };

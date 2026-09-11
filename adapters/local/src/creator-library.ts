@@ -350,8 +350,7 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
   }
   async replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[]): Promise<void> {
     const db = this.local.database;
-    db.exec('BEGIN IMMEDIATE');
-    try {
+    this.local.transactionSync(() => {
       const collection = this.get<C>(tenantId, 'collection', collectionId);
       if (!collection || collection.status === 'deleted') throw new CreatorCollectionError('not_found', 'Collection not found.');
       const current = this.get<CreatorCollectionMembership[]>(tenantId, 'membership', collectionId) || [];
@@ -366,7 +365,6 @@ implements CreatorWorkPort<W>, CreatorCollectionPort<C>, CreatorAssetProcessingP
       // Validate and replace without yielding or permitting another writer between them.
       db.prepare("INSERT INTO ubeeq_creator_library (cell_id, tenant_id, kind, id, creator_id, payload) VALUES (?, ?, 'membership', ?, ?, ?) ON CONFLICT(cell_id, tenant_id, kind, id) DO UPDATE SET payload = excluded.payload")
         .run(this.local.configuration.cellId, tenantId, collectionId, collection.creatorId, JSON.stringify(works));
-      db.exec('COMMIT');
-    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    });
   }
 }
