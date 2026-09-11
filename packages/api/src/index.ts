@@ -1,4 +1,5 @@
 import { type ExtensionContract, type ExtensionManifest, validateExtensionManifest } from "@ubeeq/extension-sdk";
+export * from './publication.js';
 import type { IdentityAdapter } from "@ubeeq/auth";
 import type { JobQueue } from "@ubeeq/jobs";
 import type { UbeeqRepositories } from "@ubeeq/persistence";
