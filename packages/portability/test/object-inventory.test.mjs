@@ -14,6 +14,16 @@ const make = () => {
       key: value.storage.key, versionId: value.storage.versionId, checksum: value.checksum, byteLength: 12, transferState: 'manifest_only' })) });
 };
 const resign = manifest => { const { checksum, ...unsigned } = manifest; return { ...unsigned, checksum: exportChecksum(unsigned) }; };
+test('inventory binds the active object checksum independently of the original asset checksum', () => {
+  const manifest = make();
+  manifest.assets[0].storage.checksum = 'b'.repeat(64);
+  assert.throws(() => validateCreatorExport(resign(manifest)), /object inventory/);
+  manifest.objectInventory[0].checksum = 'B'.repeat(64);
+  assert.ok(validateCreatorExport(resign(manifest)));
+  assert.equal(manifest.assets[0].checksum, 'a'.repeat(64));
+  manifest.assets[0].storage.checksum = 123;
+  assert.throws(() => validateCreatorExport(resign(manifest)), /object inventory/);
+});
 test('export inventory covers each asset exactly once and binds retained source metadata', () => {
   const manifest = make(); assert.equal(validateCreatorExport(manifest).checksum, manifest.checksum);
   for (const patch of [{ assetId: 'one' }, { assetId: 'missing' }, { versionId: 'other-version' }, { checksum: 'b'.repeat(64) },

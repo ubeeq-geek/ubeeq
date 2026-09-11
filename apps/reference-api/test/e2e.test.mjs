@@ -179,7 +179,7 @@ test("moves original objects only through an explicit migration executor, never 
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });
 
-test("migrates a creator through real source and destination cell endpoints", async () => {
+for (const rollback of [false, true]) test(`migrates a creator through real cell endpoints (${rollback ? 'rollback' : 'retirement'})`, async () => {
   const sourceDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-source-"));
   const destinationDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-destination-"));
   const source = createLocalAdapterSet({ databasePath: join(sourceDirectory, "state.sqlite"), dataDirectory: sourceDirectory, publicBaseUrl: "https://cell-a.example", cellId: "cell-a" });
@@ -188,14 +188,16 @@ test("migrates a creator through real source and destination cell endpoints", as
   const dataHome = { homeCellId: "cell-a", dataHomeRegion: "region-a", dataHomeAssignedAt: assignedAt, routingRevision: 1 };
   const bytes = Buffer.from("creator-original");
   const checksum = createHash("sha256").update(bytes).digest("hex");
+  const renditionBytes = Buffer.from("processed-creator-rendition");
+  const renditionChecksum = createHash("sha256").update(renditionBytes).digest("hex");
   const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
-  const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "public" };
+  const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: renditionBytes.length, checksum: renditionChecksum, scope: "public" };
   let clock = Date.parse(assignedAt);
   try {
     await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
     await source.repositories.works.create({ id: "work-1", instanceId: "source", ...dataHome, creatorId: "creator-1", title: "Migrating work", status: "ready" });
     await source.storage.put({ object: original, body: bytes });
-    await source.storage.put({ object: rendition, body: bytes });
+    await source.storage.put({ object: rendition, body: renditionBytes });
     await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: rendition, originalStorage: original });
     await source.repositories.integrationAccounts.create({ id: "integration-1", instanceId: "source", ...dataHome, creatorId: "creator-1", connectorId: "reference", health: "healthy", credentialReference: "must-not-migrate" });
     await source.routingDirectory.create({ creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: assignedAt });
@@ -228,6 +230,12 @@ test("migrates a creator through real source and destination cell endpoints", as
     assert.equal((await source.routingDirectory.get('creator-1')).homeCellId, 'cell-a');
     assert.equal((await source.migrationCheckpoints.get(requested.id)).state, 'transferred');
     destination.database.database.exec('DROP TRIGGER fail_destination_import');
+    const conflict = await destination.repositories.works.create({ id: 'work-1', instanceId: 'destination', ...dataHome, homeCellId: 'cell-b', dataHomeRegion: 'region-b', creatorId: 'another-creator', title: 'Unrelated work', status: 'ready' });
+    await assert.rejects(migration.resume(requested.id, 60), /Migration destination conflict for work work-1/);
+    assert.equal(await destination.repositories.creators.get('creator-1'), undefined);
+    assert.deepEqual(await destination.repositories.works.get('work-1'), conflict);
+    assert.equal((await source.routingDirectory.get('creator-1')).homeCellId, 'cell-a');
+    await destination.repositories.works.remove(conflict.id, conflict.revision);
     const cutOver = await migration.resume(requested.id, 60);
     assert.equal(cutOver.state, "cutover");
     assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-b");
@@ -240,17 +248,32 @@ test("migrates a creator through real source and destination cell endpoints", as
     assert.equal(importedAsset?.originalStorage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
     assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
     assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
-    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), bytes);
+    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), renditionBytes);
+    // Retrying the same verified import is a no-op, not a false ID conflict.
+    await destinationEndpoint.execute({ operation: 'import', checkpoint: cutOver });
+    assert.deepEqual(await destination.repositories.assets.get('asset-1'), importedAsset);
+    const importedWork = await destination.repositories.works.get('work-1');
+    const changedWork = await destination.repositories.works.update(importedWork.id, importedWork.revision, { title: 'Destination edit' });
+    await assert.rejects(destinationEndpoint.execute({ operation: 'import', checkpoint: cutOver }), /Migration destination conflict for work work-1/);
+    assert.deepEqual(await destination.repositories.works.get('work-1'), changedWork);
+    await destination.repositories.works.update(changedWork.id, changedWork.revision, { title: importedWork.title });
+    await destinationEndpoint.execute({ operation: 'import', checkpoint: cutOver });
+    if (rollback) {
     const rolledBack = await migration.rollback(requested.id);
     assert.equal(rolledBack.state, "rolled_back"); assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-a");
     const second = await migration.request({ id: "migration-2", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
-    await migration.resume(second.id, 1);
+    await assert.rejects(migration.resume(second.id, 1), /Migration destination conflict/);
+    assert.equal((await source.routingDirectory.get('creator-1')).homeCellId, 'cell-a');
+    assert.equal((await source.migrationCheckpoints.get(second.id)).state, 'transferred');
+    assert.deepEqual(await destination.repositories.assets.get('asset-1'), importedAsset);
+    } else {
     clock += 120_000;
-    const retired = await migration.retire(second.id);
+    const retired = await migration.retire(requested.id);
     assert.equal(retired.state, "retired");
     assert.equal(await source.repositories.creators.get("creator-1"), undefined);
     assert.equal(await source.repositories.assets.get("asset-1"), undefined);
     await assert.rejects(() => source.storage.get(original));
-    assert.equal((await source.repositories.auditEvents.get("regional_migration.source_retired:migration-2"))?.action, "regional_migration.source_retired");
+    assert.equal((await source.repositories.auditEvents.get("regional_migration.source_retired:migration-1"))?.action, "regional_migration.source_retired");
+    }
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });
