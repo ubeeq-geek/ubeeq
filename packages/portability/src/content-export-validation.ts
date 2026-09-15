@@ -52,6 +52,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const sourceFiles = manifest.sourceFiles === undefined ? [] : array(manifest.sourceFiles, 'source files');
   const sourceFileIds = new Set<string>();
   const workIds = new Set<string>(), assetIds = new Set<string>(), collectionIds = new Set<string>();
+  const relatedIds = { publications: [] as string[], publicationIntents: [] as string[], integrationAccounts: [] as string[] };
   const assetRecords = new Map<string, string>();
   const add = (set: Set<string>, value: unknown, name: string) => {
     const key = id(value, name); if (set.has(key)) throw new Error(`Duplicate ${name} identity.`); set.add(key); return key;
@@ -86,6 +87,8 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       if (entry[field] === undefined) continue;
       for (const value of array(entry[field], field)) {
         const record = object(value, field);
+        const relatedId = id(record.id, `${field} identity`);
+        (field === 'publications' ? relatedIds.publications : relatedIds.publicationIntents).push(relatedId);
         if (record.workId !== work.workId || (record.creatorId !== undefined && record.creatorId !== creatorId) ||
           (record.tenantId !== undefined && record.tenantId !== tenantId) || (record.instanceId !== undefined && record.instanceId !== tenantId)) throw new Error('Foreign publication relationship.');
       }
@@ -108,6 +111,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const secretKeys = new Set(['accessToken', 'refreshToken', 'password', 'clientSecret', 'credentialReference', 'credentials']);
   for (const value of accounts) {
     const account = object(value, 'integration account');
+    relatedIds.integrationAccounts.push(id(account.id, 'integration account identity'));
     if (['creatorId', 'creatorIdentityId'].some(key => account[key] !== undefined && account[key] !== creatorId) ||
       ['tenantId', 'instanceId'].some(key => account[key] !== undefined && account[key] !== tenantId)) throw new Error('Foreign integration account ownership.');
   }
@@ -119,6 +123,6 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       accountStack.push(child);
     }
   }
-  return { manifest, creatorId, tenantId, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
+  return { manifest, creatorId, tenantId, relatedIds, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
     ...(manifest.sourceFiles === undefined ? {} : { sourceFiles: sourceFileIds.size }) } };
 };
