@@ -4,6 +4,7 @@ export type DirectMessagingLinkChallenge = {
   challengeId: string;
   instanceId: string;
   receivingAccountId: string;
+  cellId: string;
   actorId: string;
   creatorId: string;
   digest: string;
