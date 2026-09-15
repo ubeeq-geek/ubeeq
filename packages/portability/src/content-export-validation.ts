@@ -1,4 +1,5 @@
 import { stableJson } from './index.js';
+import { contentAssetReferences } from '@ubeeq/core';
 type RecordValue = Record<string, any>;
 const object = (value: unknown, name: string): RecordValue => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Invalid ${name} record.`);
@@ -52,9 +53,15 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   const sourceFiles = manifest.sourceFiles === undefined ? [] : array(manifest.sourceFiles, 'source files');
   const sourceFileIds = new Set<string>();
   const workIds = new Set<string>(), assetIds = new Set<string>(), collectionIds = new Set<string>();
+  const publicationIds = new Set<string>(), intentIds = new Set<string>(), accountIds = new Set<string>();
   const assetRecords = new Map<string, string>();
   const add = (set: Set<string>, value: unknown, name: string) => {
     const key = id(value, name); if (set.has(key)) throw new Error(`Duplicate ${name} identity.`); set.add(key); return key;
+  };
+  const relatedIdentity = (record: RecordValue, keys: string[], name: string): string => {
+    const values = keys.filter((key) => record[key] !== undefined).map((key) => id(record[key], name));
+    if (!values.length || values.some((value) => value !== values[0])) throw new Error(`Missing or conflicting ${name} identity.`);
+    return values[0];
   };
   for (const value of sourceFiles) {
     const file = object(value, 'source file');
@@ -68,7 +75,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
     add(workIds, work.workId, 'work');
   }
   for (const entry of works) {
-    const work = entry.work, localIds = new Set<string>();
+    const work = entry.work, localIds = new Set<string>(), attachmentPositions = new Set<number>();
     for (const value of array(entry.assets, 'work assets')) {
       const asset = object(value, 'asset'); owned(asset, 'asset');
       const assetId = add(localIds, asset.assetId, 'attached asset'); assetIds.add(assetId);
@@ -79,13 +86,17 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       if (asset.attachment !== undefined) {
         const attachment = object(asset.attachment, 'attachment');
         if (attachment.assetId !== assetId || attachment.workId !== work.workId || !Number.isSafeInteger(attachment.position) || attachment.position < 0) throw new Error('Invalid asset attachment relationship.');
+        if (attachmentPositions.has(attachment.position)) throw new Error('Duplicate asset attachment position.');
+        attachmentPositions.add(attachment.position);
       }
     }
     if (work.primaryAssetId && !localIds.has(work.primaryAssetId)) throw new Error('Dangling primary asset reference.');
+    if (contentAssetReferences(work.body, work.media).some((assetId) => !localIds.has(assetId))) throw new Error('Dangling Work content asset reference.');
     for (const field of ['publications', 'publicationIntents']) {
       if (entry[field] === undefined) continue;
       for (const value of array(entry[field], field)) {
         const record = object(value, field);
+        add(field === 'publications' ? publicationIds : intentIds, relatedIdentity(record, ['id', field === 'publicationIntents' ? 'publicationIntentId' : 'publicationId'], field === 'publicationIntents' ? 'publication intent' : 'publication'), field === 'publicationIntents' ? 'publication intent' : 'publication');
         if (record.workId !== work.workId || (record.creatorId !== undefined && record.creatorId !== creatorId) ||
           (record.tenantId !== undefined && record.tenantId !== tenantId) || (record.instanceId !== undefined && record.instanceId !== tenantId)) throw new Error('Foreign publication relationship.');
       }
@@ -96,18 +107,21 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
   }
   for (const entry of collections) {
     const collection = object(object(entry, 'collection envelope').collection, 'collection'); owned(collection, 'collection');
-    const collectionId = add(collectionIds, collection.collectionId, 'collection'), members = new Set<string>();
+    const collectionId = add(collectionIds, collection.collectionId, 'collection'), members = new Set<string>(), positions = new Set<number>();
     for (const value of array(entry.works, 'collection works')) {
       const membership = object(value, 'collection membership');
       const workId = add(members, membership.workId, 'collection member');
       if (!workIds.has(workId) || (membership.collectionId !== undefined && membership.collectionId !== collectionId) ||
         !Number.isSafeInteger(membership.position) || membership.position < 0) throw new Error('Dangling or invalid collection relationship.');
+      if (positions.has(membership.position)) throw new Error('Duplicate collection membership position.');
+      positions.add(membership.position);
     }
     if (collection.coverAssetId && !assetIds.has(collection.coverAssetId)) throw new Error('Dangling collection cover reference.');
   }
   const secretKeys = new Set(['accessToken', 'refreshToken', 'password', 'clientSecret', 'credentialReference', 'credentials']);
   for (const value of accounts) {
     const account = object(value, 'integration account');
+    add(accountIds, relatedIdentity(account, ['id', 'integrationAccountId', 'externalAccountId'], 'integration account'), 'integration account');
     if (['creatorId', 'creatorIdentityId'].some(key => account[key] !== undefined && account[key] !== creatorId) ||
       ['tenantId', 'instanceId'].some(key => account[key] !== undefined && account[key] !== tenantId)) throw new Error('Foreign integration account ownership.');
   }
@@ -119,6 +133,6 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       accountStack.push(child);
     }
   }
-  return { manifest, creatorId, tenantId, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
+  return { manifest, creatorId, tenantId, relatedIds: { publications: [...publicationIds], publicationIntents: [...intentIds], integrationAccounts: [...accountIds] }, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
     ...(manifest.sourceFiles === undefined ? {} : { sourceFiles: sourceFileIds.size }) } };
 };

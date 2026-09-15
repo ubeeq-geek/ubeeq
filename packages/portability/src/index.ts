@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 export { assembleCreatorContentExport } from './content-export.js';
 export { parseCreatorContentExport } from './content-export-validation.js';
 export { planCreatorContentImport, type CreatorContentImportInventory } from './content-import-plan.js';
+export { findCreatorContentSlugConflicts, ImportSlugPreflightError, type ImportSlugConflict } from './content-import-slugs.js';
 import type { AssetRecord, AuditEventRecord, CollectionRecord, CreatorRecord, ExportManifestRecord, ImportCheckpointRecord, IntegrationAccountRecord, ModerationEvidenceRecord, ModerationHoldRecord, PublicationIntentRecord, PublicationRecord, ReviewCaseRecord, UsageEventRecord, WorkRecord } from "@ubeeq/persistence";
 
 export const CREATOR_EXPORT_SCHEMA_VERSION = "2" as const;
@@ -99,4 +101,69 @@ export const planCreatorImport = (manifest: CreatorExportManifest, input: { exis
   const addIds = (resource: Exclude<ImportConflict["resource"], "work" | "asset" | "collection">, records: readonly { id: string }[]) => records.forEach(({ id }) => { if (input.existingIds?.[resource]?.includes(id)) conflicts.push({ resource, id, reason: "id_exists" }); });
   addIds("publication", manifest.publications); addIds("publicationIntent", manifest.publicationIntents); addIds("moderationEvidence", manifest.moderationEvidence); addIds("moderationHold", manifest.moderationHolds); addIds("reviewCase", manifest.reviewCases); addIds("auditEvent", manifest.auditEvents); addIds("usageEvent", manifest.usageEvents); addIds("integrationAccount", manifest.integrationAccounts);
   return { valid: conflicts.length === 0, conflicts, itemCounts: { works: manifest.works.length, assets: manifest.assets.length, collections: manifest.collections.length, publications: manifest.publications.length, publicationIntents: manifest.publicationIntents.length, moderationRecords: manifest.moderationEvidence.length + manifest.moderationHolds.length + manifest.reviewCases.length, auditEvents: manifest.auditEvents.length, usageEvents: manifest.usageEvents.length, integrationAccounts: manifest.integrationAccounts.length } };
+};
+
+export interface CreatorImportIdMap {
+  creatorId: string;
+  works: Readonly<Record<string, string>>;
+  assets: Readonly<Record<string, string>>;
+  collections: Readonly<Record<string, string>>;
+  publications: Readonly<Record<string, string>>;
+  publicationIntents: Readonly<Record<string, string>>;
+  processing: Readonly<Record<string, string>>;
+  moderationEvidence: Readonly<Record<string, string>>;
+  moderationHolds: Readonly<Record<string, string>>;
+  reviewCases: Readonly<Record<string, string>>;
+  auditEvents: Readonly<Record<string, string>>;
+  usageEvents: Readonly<Record<string, string>>;
+  integrationAccounts: Readonly<Record<string, string>>;
+  exportCheckpoints: Readonly<Record<string, string>>;
+  importCheckpoints: Readonly<Record<string, string>>;
+}
+
+export type CreatorImportManifest = Omit<CreatorExportManifest, "checksum"> & { checksum: string };
+
+/**
+ * Creates a collision-safe import copy. Every portable record receives a new
+ * UUID (the destination creator ID is supplied by the destination), and all
+ * creator-owned relationships are rewritten through the same map. Provider
+ * IDs, checksums, and object versions remain unchanged.
+ */
+export const remapCreatorExportForImport = (
+  source: CreatorExportManifest,
+  input: { targetCreatorId: string; uuid?: () => string; now?: string },
+): { manifest: CreatorImportManifest; idMap: CreatorImportIdMap } => {
+  const sourceManifest = validateCreatorExport(source);
+  if (!input.targetCreatorId.trim()) throw new Error("A target creator ID is required.");
+  const makeId = input.uuid ?? randomUUID;
+  const mapRecords = <T extends { id: string }>(records: readonly T[]): Record<string, string> => Object.fromEntries(records.map((record) => [record.id, makeId()]));
+  const idMap: CreatorImportIdMap = {
+    creatorId: input.targetCreatorId,
+    works: mapRecords(sourceManifest.works), assets: mapRecords(sourceManifest.assets), collections: mapRecords(sourceManifest.collections),
+    publications: mapRecords(sourceManifest.publications), publicationIntents: mapRecords(sourceManifest.publicationIntents), processing: mapRecords(sourceManifest.processing),
+    moderationEvidence: mapRecords(sourceManifest.moderationEvidence), moderationHolds: mapRecords(sourceManifest.moderationHolds), reviewCases: mapRecords(sourceManifest.reviewCases),
+    auditEvents: mapRecords(sourceManifest.auditEvents), usageEvents: mapRecords(sourceManifest.usageEvents), integrationAccounts: mapRecords(sourceManifest.integrationAccounts),
+    exportCheckpoints: mapRecords(sourceManifest.exportCheckpoints), importCheckpoints: mapRecords(sourceManifest.importCheckpoints),
+  };
+  const map = (table: Readonly<Record<string, string>>, id: string): string => table[id] ?? id;
+  const creator = { ...sourceManifest.creator, id: input.targetCreatorId };
+  const works = sourceManifest.works.map((item) => ({ ...item, id: map(idMap.works, item.id), creatorId: input.targetCreatorId }));
+  const assets = sourceManifest.assets.map((item) => ({ ...item, id: map(idMap.assets, item.id), creatorId: input.targetCreatorId, workId: item.workId ? map(idMap.works, item.workId) : undefined }));
+  const collections = sourceManifest.collections.map((item) => ({ ...item, id: map(idMap.collections, item.id), creatorId: input.targetCreatorId }));
+  const publications = sourceManifest.publications.map((item) => ({ ...item, id: map(idMap.publications, item.id), workId: map(idMap.works, item.workId) }));
+  const publicationIntents = sourceManifest.publicationIntents.map((item) => ({ ...item, id: map(idMap.publicationIntents, item.id), workId: map(idMap.works, item.workId) }));
+  const processing = sourceManifest.processing.map((item) => ({ ...item, id: map(idMap.processing, item.id), assetId: map(idMap.assets, item.assetId) }));
+  const moderationEvidence = sourceManifest.moderationEvidence.map((item) => ({ ...item, id: map(idMap.moderationEvidence, item.id), subjectId: map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) }));
+  const moderationHolds = sourceManifest.moderationHolds.map((item) => ({ ...item, id: map(idMap.moderationHolds, item.id), subjectId: map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) }));
+  const reviewCases = sourceManifest.reviewCases.map((item) => ({ ...item, id: map(idMap.reviewCases, item.id), subjectId: map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) }));
+  const auditEvents = sourceManifest.auditEvents.map((item) => ({ ...item, id: map(idMap.auditEvents, item.id), subjectId: item.subjectId ? map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) : undefined }));
+  const usageEvents = sourceManifest.usageEvents.map((item) => ({ ...item, id: map(idMap.usageEvents, item.id) }));
+  const integrationAccounts = sourceManifest.integrationAccounts.map((item) => ({ ...item, id: map(idMap.integrationAccounts, item.id), creatorId: input.targetCreatorId }));
+  const exportCheckpoints = sourceManifest.exportCheckpoints.map((item) => ({ ...item, id: map(idMap.exportCheckpoints, item.id), creatorId: input.targetCreatorId }));
+  const importCheckpoints = sourceManifest.importCheckpoints.map((item) => ({ ...item, id: map(idMap.importCheckpoints, item.id), creatorId: input.targetCreatorId }));
+  const objectInventory = sourceManifest.objectInventory.map((item) => ({ ...item, assetId: map(idMap.assets, item.assetId), key: item.key?.replace(`/creators/${sourceManifest.creator.id}/`, `/creators/${input.targetCreatorId}/`) }));
+  const { checksum: _sourceChecksum, ...sourceUnsigned } = sourceManifest;
+  const unsigned = { ...sourceUnsigned, creator, works, assets, collections, publications, publicationIntents, processing, moderationEvidence, moderationHolds, reviewCases, auditEvents, usageEvents, integrationAccounts, exportCheckpoints, importCheckpoints, objectInventory, exportedAt: input.now ?? sourceManifest.exportedAt };
+  const manifest = { ...unsigned, checksum: exportChecksum(unsigned) };
+  return { manifest, idMap };
 };

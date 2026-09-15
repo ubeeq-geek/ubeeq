@@ -5,7 +5,14 @@
   "publishConfig": { "access": "public" },
   "files": ["dist"],
   "main": "dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "types": "dist/index.d.ts",
-  "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node --test test/*.test.mjs" },
+  "scripts": { "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/write-esm-package.mjs", "test": "npm run build && node --test test/*.test.mjs" },
   "dependencies": { "@ubeeq/persistence": "^0.1.0" }
 }
