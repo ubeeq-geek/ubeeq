@@ -447,6 +447,7 @@ export class LocalMigrationCheckpoints implements MigrationCheckpointStore {
 
 export * from './creator-members.js';
 export * from './creator-source-files.js';
+export * from './export-related-lookup.js';
 export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) => {
   const database = new LocalSqliteDatabase(configuration);
   const storage = new LocalFilesystemStorage(database);
