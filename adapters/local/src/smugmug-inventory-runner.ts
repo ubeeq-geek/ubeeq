@@ -112,8 +112,9 @@ export class LocalSmugMugInventoryRunner {
           }
         });
       } catch (error) {
-        const failure = { code: error instanceof SmugMugError ? error.code : 'inventory_step_failed', message: 'Inventory step failed; inspect connection and retry status.' };
-        if (error instanceof SmugMugError && error.status < 500) await this.jobs.deadLetter({ ...acknowledgement, error: failure });
+        const providerError = error instanceof SmugMugError || (typeof (error as { code?: unknown })?.code === 'string' && typeof (error as { status?: unknown })?.status === 'number');
+        const failure = { code: providerError ? (error as { code: string }).code : 'inventory_step_failed', message: 'Inventory step failed; inspect connection and retry status.' };
+        if ((error instanceof SmugMugError || typeof (error as { status?: unknown })?.status === 'number') && (error as { status: number }).status < 500) await this.jobs.deadLetter({ ...acknowledgement, error: failure });
         else await this.jobs.retry({ ...acknowledgement, error: failure, retryAt: new Date(Date.now() + 5_000).toISOString() });
       }
       return true;
