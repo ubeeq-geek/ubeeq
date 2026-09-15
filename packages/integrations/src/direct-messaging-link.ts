@@ -17,6 +17,23 @@ export interface DirectMessagingLinkStore {
   consume(challengeId: string, now: string): Promise<DirectMessagingLinkChallenge | null>;
 }
 
+export type DirectMessagingAccountLink = {
+  instanceId: string;
+  receivingAccountId: string;
+  senderId: string;
+  actorId: string;
+  creatorId: string;
+  cellId: string;
+  createdAt: string;
+  revokedAt?: string;
+};
+
+export interface DirectMessagingAccountLinkStore {
+  create(link: DirectMessagingAccountLink): Promise<void>;
+  resolve(input: { instanceId: string; receivingAccountId: string; senderId: string }): Promise<DirectMessagingAccountLink | null>;
+  revoke(input: { instanceId: string; receivingAccountId: string; senderId: string; actorId: string }): Promise<boolean>;
+}
+
 export const issueDirectMessagingLinkChallenge = async (
   store: DirectMessagingLinkStore,
   input: Omit<DirectMessagingLinkChallenge, 'challengeId' | 'digest' | 'expiresAt' | 'usedAt'>,
