@@ -42,6 +42,23 @@ export type WhatsAppTextSenderOptions = {
 
 export type WhatsAppTextSenderResult = { providerMessageId: string };
 
+export async function drainDirectMessagingOutbox(
+  store: DirectMessagingInboxOutbox,
+  now: string,
+  send: (record: DirectMessageOutboxRecord) => Promise<WhatsAppTextSenderResult>
+): Promise<DirectMessageOutboxRecord | null> {
+  const record = await store.claimOutbox(now);
+  if (!record) return null;
+  try {
+    await send(record);
+    await store.completeOutbox(record.outboxId, { state: 'sent' });
+  } catch (error) {
+    const uncertain = error instanceof DOMException && error.name === 'AbortError';
+    await store.completeOutbox(record.outboxId, { state: uncertain ? 'uncertain' : 'retry' });
+  }
+  return record;
+}
+
 /** Bounded, deadline-aware provider delivery. Hosts retain credentials and retry policy. */
 export async function sendWhatsAppText(options: WhatsAppTextSenderOptions): Promise<WhatsAppTextSenderResult> {
   const fetchImpl = options.fetchImpl || fetch;
