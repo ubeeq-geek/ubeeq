@@ -316,3 +316,4 @@ export * from './flickr-source-workflow.js';
 export * from './flickr-album-inventory.js';
 export * from './direct-messaging.js';
 export * from './whatsapp.js';
+export * from './direct-messaging-transport.js';
