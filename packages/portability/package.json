@@ -14,5 +14,5 @@
   },
   "types": "dist/index.d.ts",
   "scripts": { "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/write-esm-package.mjs", "test": "npm run build && node --test test/*.test.mjs" },
-  "dependencies": { "@ubeeq/persistence": "^0.1.0" }
+  "dependencies": { "@ubeeq/core": "^0.1.0", "@ubeeq/persistence": "^0.1.0" }
 }
