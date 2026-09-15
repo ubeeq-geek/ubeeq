@@ -27,6 +27,22 @@ export class LocalFlickrRepository implements FlickrRepository {
   }
   async putConnection(value: FlickrConnection) { this.put('connection', value.connectionId, value); }
   async getConnection(id: string) { return this.get<FlickrConnection>('connection', id); }
+  async listConnections(userId: string, creatorId: string, options: { limit?: number; cursor?: string } = {}) {
+    const limit = options.limit ?? 50;
+    const rows = this.local.database.prepare(`SELECT payload FROM ubeeq_flickr_state
+      WHERE cell_id = ? AND tenant_id = ? AND kind = 'connection'
+      AND json_extract(payload, '$.userId') = ? AND json_extract(payload, '$.creatorId') = ?
+      ORDER BY id`).all(this.cellId, this.tenantId, userId, creatorId) as Array<{ payload: string }>;
+    const values = rows.map(row => JSON.parse(row.payload) as FlickrConnection);
+    let offset = 0;
+    if (options.cursor !== undefined) {
+      const index = values.findIndex(value => value.connectionId === options.cursor);
+      if (index < 0) throw new Error('Invalid Flickr connection cursor');
+      offset = index + 1;
+    }
+    const items = values.slice(offset, offset + limit);
+    return { items, nextCursor: offset + items.length < values.length ? items.at(-1)?.connectionId : undefined };
+  }
   async putMigration(value: FlickrMigration) { this.put('migration', value.migrationId, value, value.connectionId); }
   async getMigration(id: string) { return this.get<FlickrMigration>('migration', id); }
   async getMigrationByConnection(connectionId: string): Promise<FlickrMigration | undefined> {
