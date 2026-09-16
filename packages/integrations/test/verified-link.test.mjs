@@ -53,3 +53,17 @@ test('atomic adapter predicate rejects altered challenge scope and invalid times
     assert.equal(canCommitVerifiedDirectMessagingLink({ ...f.record(), ...patch }, f.record(), link, now), false);
   }
 });
+
+test('expiry is checked again after asynchronous authorization', async () => {
+  const f = await fixture();
+  f.record().expiresAt = new Date(Date.now() + 200).toISOString();
+  let authorized = false;
+  const reply = await handleVerifiedDirectMessagingLinkCommand(f.message, 'instance', f.store, async () => {
+    authorized = true;
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return true;
+  });
+  assert.equal(authorized, true);
+  assert.match(reply, /not completed/);
+  assert.equal(f.link(), undefined);
+});

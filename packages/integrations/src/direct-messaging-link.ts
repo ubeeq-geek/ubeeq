@@ -28,23 +28,25 @@ export const handleVerifiedDirectMessagingLinkCommand = async (
   instanceId: string,
   store: VerifiedDirectMessagingLinkStore,
   authorize: (scope: MessagingScope) => Promise<boolean>,
-  now = new Date().toISOString()
+  now?: string
 ): Promise<string | null> => {
   if (!/^\/?link(?:\s|$)/i.test(message.text.trim())) return null;
   const match = /^\/?link ([a-f0-9]{32}) ([A-Za-z0-9_-]{43})$/.exec(message.text.trim());
   const rejected = 'Link not completed. Create a new link challenge in the dashboard and send its command here.';
   if (!match || !/^\d{1,20}$/.test(message.senderId)) return rejected;
   const challenge = await store.findChallenge(match[1]);
+  const checkedAt = now ?? new Date().toISOString();
   if (!challenge || challenge.usedAt || challenge.instanceId !== instanceId ||
-    challenge.receivingAccountId !== message.accountId || !Number.isFinite(Date.parse(now)) ||
-    !(Date.parse(challenge.expiresAt) > Date.parse(now))) return rejected;
+    challenge.receivingAccountId !== message.accountId || !Number.isFinite(Date.parse(checkedAt)) ||
+    !(Date.parse(challenge.expiresAt) > Date.parse(checkedAt))) return rejected;
   const expected = Buffer.from(challenge.digest, 'hex');
   const supplied = createHash('sha256').update(match[2]).digest();
   if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) return rejected;
   const scope = { instanceId, cellId: challenge.cellId, actorId: challenge.actorId, creatorId: challenge.creatorId };
   if (!await authorize(scope)) return rejected;
-  const link = { ...scope, receivingAccountId: message.accountId, senderId: message.senderId, createdAt: now, verifiedAt: now };
-  return await store.commitVerifiedLink(challenge, link, now)
+  const committedAt = now ?? new Date().toISOString();
+  const link = { ...scope, receivingAccountId: message.accountId, senderId: message.senderId, createdAt: committedAt, verifiedAt: committedAt };
+  return await store.commitVerifiedLink(challenge, link, committedAt)
     ? 'Creator linked. You can now request activity, comments or favourites.' : rejected;
 };
 
