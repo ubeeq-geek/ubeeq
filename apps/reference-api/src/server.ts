@@ -66,6 +66,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
   operatorAuthorization?: AuthorizationRequirement;
   diagnostics?: readonly DependencyDiagnostic[];
+  /** Optional host-composed deterministic activity interface; no LLM service. */
+  activityCommands?: { execute(principal: { actorId: string; profileId: string }, input: string): Promise<string> };
 }
 
 /** Shared process configuration for the reference API and its local worker. */
@@ -303,6 +305,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
 
       if (method === "POST" && url.pathname === "/v1/auth/sign-up") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const account = await adapters.localIdentity.register({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/activity/command") {
+        const identity = await session(request);
+        if (!configuration.activityCommands) throw new HttpError(404, "activity_unavailable", "Activity interface is not configured");
+        const body = await parseBody(request);
+        const command = requireString(body.command, "command");
+        if (command.length > 4096) throw new HttpError(400, "invalid_request", "Command exceeds 4096 characters");
+        const text = await configuration.activityCommands.execute({ actorId: identity.subject.id, profileId: "web" }, command);
+        response.setHeader("cache-control", "private, no-store");
+        return json(response, 200, { text, requestId }, requestId);
+      }
       if (method === "POST" && url.pathname === "/v1/auth/sign-in") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const result = await adapters.localIdentity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
 
       if (method === "POST" && url.pathname === "/v1/creators") { const identity = await session(request); const body = await parseBody(request); const creator = await repositories.creators.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, handle: requireString(body.handle, "handle"), displayName: requireString(body.displayName, "displayName"), subjectId: identity.subject.id }); return json(response, 201, { creator, requestId }, requestId); }

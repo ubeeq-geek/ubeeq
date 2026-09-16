@@ -455,3 +455,4 @@ export const createLocalAdapterSet = (configuration: LocalAdapterConfiguration) 
 };
 export { LocalSmugMugInventoryRunner, type LocalSmugMugInventoryRunnerOptions } from './smugmug-inventory-runner.js';
 export { LocalFlickrRepository } from './flickr-repository.js';
+export { LocalActivityWorkflowStore } from './activity-workflows.js';

@@ -318,3 +318,6 @@ export * from './direct-messaging.js';
 export * from './whatsapp.js';
 export * from './direct-messaging-transport.js';
 export * from './direct-messaging-link.js';
+export * from './activity-workflows.js';
+export * from './activity-commands.js';
+export * from './activity-health.js';
