@@ -26,6 +26,31 @@ ES/NF can implement these ports against their existing activity readers; self-ho
 
 Authenticated hosted routes and linking UI; persisted inbox/outbox and rate limits; paginated conversations; unread checkpoints; scheduled digests; explicit confirmation for writes; delegated API/MCP access. No automated reply generation or runtime LLM service is included.
 
+## Verified sender linking contract
+
+An authenticated dashboard issues a short-lived challenge for an authorized creator
+and the configured receiving account. It displays `/link <challengeId> <token>`;
+the user sends that command from their WhatsApp account to the configured business
+number. Do not accept a dashboard-supplied sender ID as proof of possession.
+
+After `decodeWhatsAppWebhook` verifies the original request signature and receiving
+account, pass each decoded message to `handleVerifiedDirectMessagingLinkCommand`.
+The helper checks the token, expiry, instance/account scope and current creator
+authorization. The sender is taken from the verified event. The host implements
+`VerifiedDirectMessagingLinkStore`: `commitVerifiedLink` must compare the current
+unused challenge and save its consumption and the verified link in one atomic
+operation. `canCommitVerifiedDirectMessagingLink` supplies the comparison predicate
+for use inside that transaction. Invalid tokens and foreign accounts must not burn
+valid challenges. Concurrent redemption must have one winner.
+
+Only links with `verifiedAt` set by that operation should authorize activity reads.
+Previously stored unverified links require relinking. Dashboard routes may revoke
+links but must not call the older generic consume/create operations to establish
+sender ownership. Do not log link commands, tokens or webhook bodies.
+
+This verifies sender possession; reliable inbox processing, delivery retries,
+quotas and provider activation validation remain separate host requirements.
+
 ## Protocol references
 
 - https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/components

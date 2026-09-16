@@ -1,4 +1,52 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import type { DirectMessage, MessagingScope } from './direct-messaging.js';
+
+export interface VerifiedDirectMessagingLinkStore {
+  findChallenge(challengeId: string): Promise<DirectMessagingLinkChallenge | null>;
+  /** Atomically compare the unused challenge, consume it and save the link.
+   * Return false on replay or a changed challenge; roll back both writes on failure. */
+  commitVerifiedLink(challenge: DirectMessagingLinkChallenge, link: DirectMessagingAccountLink, now: string): Promise<boolean>;
+}
+
+/** Use inside the adapter's transaction, against its current persisted record. */
+export const canCommitVerifiedDirectMessagingLink = (
+  current: DirectMessagingLinkChallenge | null,
+  expected: DirectMessagingLinkChallenge,
+  link: DirectMessagingAccountLink,
+  now: string
+): boolean => Boolean(current && !current.usedAt && Number.isFinite(Date.parse(now)) &&
+  Date.parse(current.expiresAt) > Date.parse(now) &&
+  (['challengeId', 'digest', 'expiresAt', 'instanceId', 'receivingAccountId', 'cellId', 'actorId', 'creatorId'] as const)
+    .every(key => current[key] === expected[key]) &&
+  (['instanceId', 'receivingAccountId', 'cellId', 'actorId', 'creatorId'] as const)
+    .every(key => current[key] === link[key]) && /^\d{1,20}$/.test(link.senderId) && !link.revokedAt && link.createdAt === now && link.verifiedAt === now);
+
+/** Call only for messages returned by the signature-verifying webhook decoder.
+ * Sender/account identity comes from that event, never from a dashboard body. */
+export const handleVerifiedDirectMessagingLinkCommand = async (
+  message: DirectMessage,
+  instanceId: string,
+  store: VerifiedDirectMessagingLinkStore,
+  authorize: (scope: MessagingScope) => Promise<boolean>,
+  now = new Date().toISOString()
+): Promise<string | null> => {
+  if (!/^\/?link(?:\s|$)/i.test(message.text.trim())) return null;
+  const match = /^\/?link ([a-f0-9]{32}) ([A-Za-z0-9_-]{43})$/.exec(message.text.trim());
+  const rejected = 'Link not completed. Create a new link challenge in the dashboard and send its command here.';
+  if (!match || !/^\d{1,20}$/.test(message.senderId)) return rejected;
+  const challenge = await store.findChallenge(match[1]);
+  if (!challenge || challenge.usedAt || challenge.instanceId !== instanceId ||
+    challenge.receivingAccountId !== message.accountId || !Number.isFinite(Date.parse(now)) ||
+    !(Date.parse(challenge.expiresAt) > Date.parse(now))) return rejected;
+  const expected = Buffer.from(challenge.digest, 'hex');
+  const supplied = createHash('sha256').update(match[2]).digest();
+  if (expected.length !== supplied.length || !timingSafeEqual(expected, supplied)) return rejected;
+  const scope = { instanceId, cellId: challenge.cellId, actorId: challenge.actorId, creatorId: challenge.creatorId };
+  if (!await authorize(scope)) return rejected;
+  const link = { ...scope, receivingAccountId: message.accountId, senderId: message.senderId, createdAt: now, verifiedAt: now };
+  return await store.commitVerifiedLink(challenge, link, now)
+    ? 'Creator linked. You can now request activity, comments or favourites.' : rejected;
+};
 
 export type DirectMessagingLinkChallenge = {
   challengeId: string;
@@ -25,6 +73,8 @@ export type DirectMessagingAccountLink = {
   creatorId: string;
   cellId: string;
   createdAt: string;
+  /** Set only by atomic redemption of a challenge from a verified provider event. */
+  verifiedAt?: string;
   revokedAt?: string;
 };
 
