@@ -51,6 +51,33 @@ sender ownership. Do not log link commands, tokens or webhook bodies.
 This verifies sender possession; reliable inbox processing, delivery retries,
 quotas and provider activation validation remain separate host requirements.
 
+## Opt-in reply delivery
+
+`prepareDirectMessagingReply` records the authorized creator scope alongside the
+reply and limits delivery to 15 minutes from the signed provider event timestamp.
+This is application freshness policy. Missing/future timestamps and legacy
+outbox entries without delivery context cannot authorize a send.
+
+`createDirectMessagingDeliveryWorker` processes one reply per tick without
+overlapping ticks. It checks the instance/account, expiry, current sender link
+and current creator permission before sending. Hosts control the tick interval,
+credentials and supported Graph API version. Public help/link replies contain no
+creator activity and can be sent without a creator link.
+
+HTTP 429 responses schedule exponential backoff with Retry-After and a five-attempt
+limit. Other 4xx responses fail; network failures, malformed success responses and
+5xx responses remain uncertain and are not automatically retried. Failure to
+persist a successful send is not converted into a retry. Durable host adapters
+must recover abandoned sending claims as uncertain, never pending. Synthetic
+provider tests cover these boundaries; no live provider validation is claimed.
+
+ES/NF local composition enables sending only with `WHATSAPP_DELIVERY_ENABLED=true`,
+the receiver settings, `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_GRAPH_API_VERSION`.
+It ticks every five seconds. This does not activate hosted deployment, dashboard
+UI or durable recovery of messages interrupted before outbox creation. Meta's
+current documentation returned HTTP 429 during this implementation; current
+provider requirements remain an activation gate.
+
 ## Protocol references
 
 - https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/components

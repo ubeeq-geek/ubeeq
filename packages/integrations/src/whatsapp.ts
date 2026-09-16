@@ -36,7 +36,9 @@ export function decodeWhatsAppWebhook(input: { rawBody: Uint8Array; signature?: 
         object(interactive.type === 'button_reply' ? interactive.button_reply : interactive.type === 'list_reply' ? interactive.list_reply : null).id : undefined;
       if (typeof text !== 'string' || !text.trim() || text.length > 4096) continue;
       seen.add(message.id);
-      messages.push({ channel: 'whatsapp', accountId: input.phoneNumberId, senderId: message.from, messageId: message.id, text });
+      const timestamp = typeof message.timestamp === 'string' && /^\d{1,12}$/.test(message.timestamp) ? Number(message.timestamp) * 1000 : NaN;
+      messages.push({ channel: 'whatsapp', accountId: input.phoneNumberId, senderId: message.from, messageId: message.id, text,
+        ...(Number.isFinite(timestamp) ? { sentAt: new Date(timestamp).toISOString() } : {}) });
     }
   }
   return messages;

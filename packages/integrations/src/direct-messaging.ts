@@ -7,7 +7,7 @@ export function parseActivityCommand(text: string): ActivityCommand {
 }
 export interface MessagingScope { instanceId: string; cellId: string; actorId: string; creatorId: string }
 export interface MessagingIdentity { channel: 'whatsapp'; accountId: string; senderId: string }
-export interface DirectMessage extends MessagingIdentity { messageId: string; text: string }
+export interface DirectMessage extends MessagingIdentity { messageId: string; text: string; sentAt?: string }
 export interface ActivitySnapshot {
   /** Timestamp of the stored snapshot, not the time this query ran. */
   asOf: string;
