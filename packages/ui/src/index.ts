@@ -1,4 +1,6 @@
-export { CreatorClient } from './creator-client.js';
+export { CreatorClient, type CreatorCoverImageControls, type CreatorCropSourcePreview, type CreatorImageCoordinateSpace } from './creator-client.js';
+export * from './crop-preview.js';
+export * from './image-orientation.js';
 export * from './block-content.js';
 export * from './asset-editor-options.js';
 export interface LocalizedText { defaultLocale: string; translations: Readonly<Record<string, string>>; }
@@ -79,3 +81,4 @@ export const validateAccessibleAction = (action: AccessibleAction): AccessibleAc
 };
 export { createPrivateMediaPlayback } from './private-media-playback.js';
 export { createSourceFileBrowser, type SourceFileBrowserOptions } from './source-file-browser.js';
+export { createProfileLinkEditor, type ProfileLinkValue } from './profile-link-editor.js';

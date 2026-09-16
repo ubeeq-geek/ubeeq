@@ -1,0 +1,36 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { CreatorClient as NodeClient } from '../dist/index.js';
+import { CreatorClient as BrowserClient } from '../dist/browser/creator-client.js';
+for (const Client of [NodeClient, BrowserClient]) test(`cover client snapshots controls and authenticates without retries (${Client === NodeClient ? 'node' : 'browser'})`, async () => {
+  const calls = []; let mode = 'ok';
+  const client = new Client(async (url, options) => {
+    if (url.endsWith('sign-in')) return Response.json({ token: 'synthetic' });
+    calls.push({ url, options });
+    if (mode === 'lost') throw new Error('Lost reply');
+    if (mode === 'unauthorized') return Response.json({ message: 'Expired' }, { status: 401 });
+    if (url.endsWith('/wide%2Fpreview')) return new Response('jpeg', { headers: { 'content-type': mode === 'bad-type' ? 'text/html' : 'image/jpeg' } });
+    return Response.json({ revision: 2, image: null });
+  });
+  await client.signIn('owner@example.test', 'password');
+  const controls = { focalPoint: { x: 0.25, y: 0.75 }, crops: { wide: { x: 1, y: 2, width: 20, height: 10 } }, altText: 'A & B' };
+  const file = new Blob(['image'], { type: 'image/png' });
+  const saving = client.saveCoverImage('creator/one', 1, file, controls);
+  controls.focalPoint.x = 1; controls.crops.wide.width = 999; await saving;
+  const request = calls[0], query = new URL(request.url, 'http://localhost').searchParams;
+  assert.match(request.url, /creator%2Fone\/branding\/cover-image/);
+  assert.equal(query.get('expectedRevision'), '1'); assert.equal(query.get('altText'), 'A & B');
+  assert.deepEqual(JSON.parse(query.get('focalPoint')), { x: 0.25, y: 0.75 });
+  assert.equal(JSON.parse(query.get('crops')).wide.width, 20);
+  assert.equal(request.options.body, file); assert.equal(request.options.headers.authorization, 'Bearer synthetic');
+  await client.recropCoverImage('creator/one', 2, { focalPoint: { x: 0, y: 0 } });
+  assert.equal(calls.at(-1).options.method, 'PATCH'); assert.equal(calls.at(-1).options.body, undefined);
+  assert.equal(new URL(calls.at(-1).url, 'http://localhost').searchParams.has('altText'), false);
+  await client.removeCoverImage('creator/one', 2); assert.equal(calls.at(-1).options.method, 'DELETE');
+  assert.equal((await client.coverImagePreview('creator/one', 'wide/preview')).type, 'image/jpeg');
+  mode = 'bad-type'; await assert.rejects(client.coverImagePreview('creator/one', 'wide/preview'), /Unexpected/);
+  mode = 'lost'; const count = calls.length;
+  await assert.rejects(client.saveCoverImage('creator/one', 2, file), /Lost reply/); assert.equal(calls.length, count + 1);
+  mode = 'unauthorized'; await assert.rejects(client.saveCoverImage('creator/one', 2, file), /Expired/);
+  mode = 'ok'; await client.coverImage('creator/one'); assert.equal(calls.at(-1).options.headers.authorization, undefined);
+});

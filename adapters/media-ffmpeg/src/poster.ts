@@ -18,15 +18,17 @@ const readPoster = async (outputPath: string, maxOutputBytes: number): Promise<U
 export const renderVideoPoster = async (source: Uint8Array, options: {
   tools: Pick<VideoToolAdapter, 'extractFrame'>; captureAtMs: number; maxOutputBytes: number;
 }): Promise<Uint8Array> => {
-  if (!source.byteLength) throw new Error('A nonempty video source is required');
+  if (!(source instanceof Uint8Array) || !source.byteLength) throw new Error('A nonempty video source is required');
   if (!Number.isSafeInteger(options.captureAtMs) || options.captureAtMs < 0) throw new Error('Poster timestamp must be non-negative integer milliseconds');
   if (!Number.isSafeInteger(options.maxOutputBytes) || options.maxOutputBytes < 1) throw new Error('Poster byte budget must be a positive integer');
+  source = new Uint8Array(source);
+  const { tools, captureAtMs, maxOutputBytes } = options;
   const directory = await mkdtemp(join(tmpdir(), 'video-poster-'));
   try {
     const sourcePath = join(directory, 'source'), outputPath = join(directory, 'poster.jpg');
     await writeFile(sourcePath, source, { flag: 'wx', mode: 0o600 });
-    await options.tools.extractFrame(sourcePath, outputPath, options.captureAtMs);
-    return await readPoster(outputPath, options.maxOutputBytes);
+    await tools.extractFrame(sourcePath, outputPath, captureAtMs);
+    return await readPoster(outputPath, maxOutputBytes);
   } finally { await rm(directory, { recursive: true, force: true }); }
 };
 
@@ -35,20 +37,23 @@ export class FfmpegPosterProcessor implements MediaProcessor {
   constructor(private readonly tools: VideoToolAdapter, private readonly profile: VideoValidationProfile,
     private readonly maxOutputBytes = 10 * 1024 * 1024) {
     if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1) throw new Error('Poster byte budget must be a positive integer');
+    this.profile = structuredClone(profile);
   }
   async process(input: Parameters<MediaProcessor['process']>[0]) {
-    if (!input.contentType.startsWith('video/') || !input.source.byteLength || !input.sourceVersionId) throw new Error('A versioned video source is required');
+    const { contentType, sourceVersionId } = input;
+    if (typeof contentType !== 'string' || !contentType.startsWith('video/') || !(input.source instanceof Uint8Array) || !input.source.byteLength || typeof sourceVersionId !== 'string' || !sourceVersionId.trim()) throw new Error('A versioned video source is required');
+    const source = new Uint8Array(input.source);
     const directory = await mkdtemp(join(tmpdir(), 'video-poster-'));
     try {
       const sourcePath = join(directory, 'source'), outputPath = join(directory, 'poster.jpg');
-      await writeFile(sourcePath, input.source, { flag: 'wx' });
+      await writeFile(sourcePath, source, { flag: 'wx', mode: 0o600 });
       const metadata = validateFfprobeOutput(await this.tools.probe(sourcePath), this.profile);
       await this.tools.extractFrame(sourcePath, outputPath, 0);
       const body = await readPoster(outputPath, this.maxOutputBytes);
-      return { metadata: { contentType: input.contentType, width: metadata.width, height: metadata.height,
+      return { metadata: { contentType, width: metadata.width, height: metadata.height,
         durationSeconds: metadata.durationSeconds, videoCodec: metadata.videoCodec, container: metadata.container,
         rotation: metadata.rotation, hasAudio: metadata.hasAudio, validationProfile: metadata.validationProfile },
-        renditions: [{ id: `poster:${input.sourceVersionId}`, sourceVersionId: input.sourceVersionId, role: 'poster' as const,
+        renditions: [{ id: `poster:${sourceVersionId}`, sourceVersionId, role: 'poster' as const,
           contentType: 'image/jpeg', byteLength: body.byteLength, body }], measuredUnits: 1 };
     } finally { await rm(directory, { recursive: true, force: true }); }
   }

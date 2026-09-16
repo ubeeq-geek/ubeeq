@@ -6,6 +6,33 @@ import { SharpImageRenditionProcessor } from '../dist/index.js';
 const source = (width, height) => sharp({ create: { width, height, channels: 3, background: '#8844aa' } }).png().toBuffer();
 const input = bytes => ({ assetId: 'asset', sourceVersionId: 'version', contentType: 'image/png', source: bytes });
 
+test('explicit square-only selection preserves recipes, crop and lineage without unwanted fitted outputs', async () => {
+  const request = { ...input(await source(80, 40)), squareCrop: { x: 60, y: 0, size: 20 } };
+  const complete = await new SharpImageRenditionProcessor().process(request);
+  const expected = complete.renditions.slice(4);
+  const selected = ['square1024', 'square256', 'square512'];
+  const processor = new SharpImageRenditionProcessor({ renditionNames: selected,
+    maxOutputBytes: expected.reduce((sum, item) => sum + item.byteLength, 0) });
+  selected.splice(0, selected.length, 'w320');
+  const result = await processor.process(request);
+  assert.deepEqual(result.renditions, expected);
+  assert.deepEqual(result.metadata, complete.metadata);
+  assert.equal(result.measuredUnits, 3);
+  const fitted = await new SharpImageRenditionProcessor({ renditionNames: ['w320'] }).process(request);
+  assert.deepEqual(fitted.renditions, complete.renditions.slice(0, 1));
+  assert.equal(fitted.measuredUnits, 1);
+});
+
+test('invalid recipe selection and resource budget violations reject before returning selected output', async () => {
+  for (const renditionNames of [[], ['unknown'], ['w320', 'w320'], null, 'square256', [1]]) {
+    assert.throws(() => new SharpImageRenditionProcessor({ renditionNames }), /Invalid image rendition selection/);
+  }
+  const request = input(await source(20, 20));
+  for (const limits of [{ maxInputPixels: 100 }, { maxSourceBytes: 1 }, { maxOutputBytes: 1 }]) {
+    await assert.rejects(new SharpImageRenditionProcessor({ renditionNames: ['square256'], ...limits }).process(request), /budget|pixel limit/);
+  }
+});
+
 test('seven rendition recipes preserve fitted dimensions, square crops and source lineage', async () => {
   const result = await new SharpImageRenditionProcessor().process(input(await source(2000, 1000)));
   assert.equal(result.renditions.length, 7);
@@ -51,4 +78,27 @@ test('malformed sources, missing lineage and finite resource budgets fail closed
   await assert.rejects(new SharpImageRenditionProcessor().process(input(Buffer.from('invalid'))));
   await assert.rejects(new SharpImageRenditionProcessor().process({ ...valid, assetId: '' }));
   await assert.rejects(new SharpImageRenditionProcessor().process({ ...valid, contentType: 'text/plain' }));
+});
+
+test('request crops override defaults without cross-request mutation and leave fitted recipes unchanged', async () => {
+  const red = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#ff0000' } }).png().toBuffer();
+  const blue = await sharp({ create: { width: 8, height: 8, channels: 3, background: '#0000ff' } }).png().toBuffer();
+  const bytes = await sharp({ create: { width: 16, height: 8, channels: 3, background: '#000000' } }).composite([
+    { input: red, left: 0, top: 0 }, { input: blue, left: 8, top: 0 }
+  ]).png().toBuffer();
+  const processor = new SharpImageRenditionProcessor({ squareCrop: { x: 0, y: 0, size: 8 } });
+  const crop = { x: 8, y: 0, size: 8 };
+  const rightPromise = processor.process({ ...input(bytes), squareCrop: crop });
+  crop.x = 0; crop.size = 1;
+  const [right, left] = await Promise.all([rightPromise, processor.process(input(bytes))]);
+  assert.equal(right.metadata.squareCropX, 8); assert.equal(right.metadata.squareCropSize, 8);
+  assert.equal(left.metadata.squareCropX, 0); assert.equal(left.metadata.squareCropSize, 8);
+  for (let i = 0; i < 4; i++) assert.deepEqual(right.renditions[i].body, left.renditions[i].body);
+  const rightPixel = await sharp(right.renditions[4].body).resize(1, 1).raw().toBuffer();
+  const leftPixel = await sharp(left.renditions[4].body).resize(1, 1).raw().toBuffer();
+  assert.ok(rightPixel[2] > 240 && rightPixel[0] < 15);
+  assert.ok(leftPixel[0] > 240 && leftPixel[2] < 15);
+  for (const squareCrop of [{ x: NaN, y: 0, size: 1 }, { x: 0, y: 0 }, { x: 0, y: Infinity, size: 1 }]) {
+    await assert.rejects(processor.process({ ...input(bytes), squareCrop }), /Invalid square crop/);
+  }
 });

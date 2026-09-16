@@ -26,3 +26,16 @@ decoder memory/CPU. The host must supply those limits and a total job deadline/l
 strategy. A failed attempt can leave partial output files; callers own cleanup and
 must not publish incomplete results. This is sampling, not moderation approval or
 playback transcoding. Container/codec/duration admission belongs to supplied profiles.
+# Sampled frames
+
+The opt-in `FfmpegFrameProcessor` provides source-version-bound sampled JPEG
+previews with explicit source, per-frame, aggregate-byte and frame-count budgets.
+See `FRAMES.md` in the source repository for the contract and remaining caller
+responsibilities. It does not change the default poster processor.
+
+# MP4 renditions
+
+The opt-in `FfmpegVideoProcessor` produces source-version-bound H.264 MP4 previews
+with optional AAC audio and explicit source, output, dimension and admission
+budgets. See `VIDEO.md` in the source repository for validation and isolation
+limits. It does not enable publication or change the default poster processor.

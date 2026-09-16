@@ -1,5 +1,15 @@
 /** Same-origin creator API client. Credentials are kept in memory, never persisted. */
-import type { WorkKind } from '@ubeeq/core';
+import type { WorkKind, CreatorAssetRegenerationRequest } from '@ubeeq/core';
+export type CreatorImageCoordinateSpace = 'raw' | 'oriented';
+export interface CreatorCoverImageControls {
+  focalPoint?: { x: number; y: number };
+  crops?: Readonly<Record<string, { x: number; y: number; width: number; height: number }>>;
+  altText?: string;
+}
+export interface CreatorCropSourcePreview {
+  revision: number; imageId: string; sourceWidth: number; sourceHeight: number; orientation: number;
+  width: number; height: number; preview: Blob;
+}
 export class CreatorClient {
   private token?: string;
   constructor(private readonly request: typeof fetch = fetch, private readonly base = '/api') {}
@@ -24,6 +34,78 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  async brandingCropSource(creatorId: string, kind: 'profile' | 'cover'): Promise<CreatorCropSourcePreview> {
+    if (kind !== 'profile' && kind !== 'cover') throw new Error('Invalid branding image kind.');
+    const value = await this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/${kind}-image/crop-source`);
+    if (!value || typeof value.imageId !== 'string' || !value.imageId || value.imageId.length > 200 ||
+      ![value.revision, value.sourceWidth, value.sourceHeight, value.width, value.height, value.byteLength].every(n => Number.isSafeInteger(n) && n > 0) ||
+      !Number.isInteger(value.orientation) || value.orientation < 1 || value.orientation > 8 || value.contentType !== 'image/jpeg' || value.byteLength > 2 * 1024 * 1024 ||
+      typeof value.previewBase64 !== 'string' || value.previewBase64.length !== Math.ceil(value.byteLength / 3) * 4 ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(value.previewBase64)) throw new Error('Invalid crop source preview.');
+    const bytes = Uint8Array.from(atob(value.previewBase64), character => character.charCodeAt(0));
+    if (bytes.byteLength !== value.byteLength) throw new Error('Invalid crop source preview length.');
+    return { revision: value.revision, imageId: value.imageId, sourceWidth: value.sourceWidth, sourceHeight: value.sourceHeight,
+      orientation: value.orientation, width: value.width, height: value.height, preview: new Blob([bytes], { type: 'image/jpeg' }) };
+  }
+  private setImageCoordinateSpace(query: URLSearchParams, coordinateSpace?: CreatorImageCoordinateSpace) {
+    if (coordinateSpace === undefined) return;
+    if (coordinateSpace !== 'raw' && coordinateSpace !== 'oriented') throw new Error('Invalid image coordinate space.');
+    query.set('coordinateSpace', coordinateSpace);
+  }
+  private coverImagePath(creatorId: string, expectedRevision?: number, controls?: CreatorCoverImageControls, coordinateSpace?: CreatorImageCoordinateSpace) {
+    const query = new URLSearchParams();
+    this.setImageCoordinateSpace(query, coordinateSpace);
+    if (expectedRevision !== undefined) query.set('expectedRevision', String(expectedRevision));
+    if (controls?.focalPoint !== undefined) query.set('focalPoint', JSON.stringify(controls.focalPoint));
+    if (controls?.crops !== undefined) query.set('crops', JSON.stringify(controls.crops));
+    if (controls?.altText !== undefined) query.set('altText', controls.altText);
+    return `/studio/creators/${encodeURIComponent(creatorId)}/branding/cover-image${query.size ? `?${query}` : ''}`;
+  }
+  coverImage(creatorId: string) { return this.call(this.coverImagePath(creatorId)); }
+  removeCoverImage(creatorId: string, expectedRevision: number) { return this.call(this.coverImagePath(creatorId, expectedRevision), 'DELETE'); }
+  recropCoverImage(creatorId: string, expectedRevision: number, controls: CreatorCoverImageControls) {
+    return this.call(this.coverImagePath(creatorId, expectedRevision, controls), 'PATCH');
+  }
+  async saveCoverImage(creatorId: string, expectedRevision: number, file: Blob, controls: CreatorCoverImageControls = {}, coordinateSpace?: CreatorImageCoordinateSpace) {
+    const response = await this.request(`${this.base}${this.coverImagePath(creatorId, expectedRevision, controls, coordinateSpace)}`, {
+      method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
+    const result = await response.json();
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error(result.message || 'Cover image save failed.'); }
+    return result;
+  }
+  async coverImagePreview(creatorId: string, variant: string): Promise<Blob> {
+    const response = await this.request(`${this.base}${this.coverImagePath(creatorId)}/${encodeURIComponent(variant)}`,
+      { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error('Cover image preview unavailable.'); }
+    if (response.headers.get('content-type') !== 'image/jpeg') throw new Error('Unexpected cover image preview format.');
+    return response.blob();
+  }
+  profileImage(creatorId: string) { return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image`); }
+  recropProfileImage(creatorId: string, expectedRevision: number, squareCrop: NonNullable<CreatorAssetRegenerationRequest['squareCrop']>, altText?: string) {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision), crop: JSON.stringify(squareCrop) });
+    if (altText !== undefined) query.set('altText', altText);
+    return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?${query}`, 'PATCH');
+  }
+  removeProfileImage(creatorId: string, expectedRevision: number) {
+    return this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?expectedRevision=${expectedRevision}`, 'DELETE');
+  }
+  async saveProfileImage(creatorId: string, expectedRevision: number, file: Blob, squareCrop?: CreatorAssetRegenerationRequest['squareCrop'], altText = '', coordinateSpace?: CreatorImageCoordinateSpace) {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision), altText });
+    this.setImageCoordinateSpace(query, coordinateSpace);
+    if (squareCrop !== undefined) query.set('crop', JSON.stringify(squareCrop));
+    const response = await this.request(`${this.base}/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image?${query}`, {
+      method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream', ...(this.token ? { authorization: `Bearer ${this.token}` } : {}) }, body: file });
+    const result = await response.json();
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error(result.message || 'Profile image save failed.'); }
+    return result;
+  }
+  async profileImagePreview(creatorId: string): Promise<Blob> {
+    const response = await this.request(`${this.base}/studio/creators/${encodeURIComponent(creatorId)}/branding/profile-image/square512`,
+      { headers: this.token ? { authorization: `Bearer ${this.token}` } : {} });
+    if (!response.ok) { if (response.status === 401) this.token = undefined; throw new Error('Profile image preview unavailable.'); }
+    if (response.headers.get('content-type') !== 'image/jpeg') throw new Error('Unexpected profile image preview format.');
+    return response.blob();
+  }
   publications(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`); }
   publishWork(workId: string, expectedRevision: number, idempotencyKey: string) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/publications`, 'POST', { expectedRevision }, { idempotencyKey });
@@ -88,9 +170,12 @@ export class CreatorClient {
     return this.call(`/studio/works/${encodeURIComponent(workId)}`, 'PATCH', { expectedRevision: revision, body });
   }
   assets(workId: string) { return this.call(`/studio/works/${encodeURIComponent(workId)}/assets`); }
-  regenerateAsset(workId: string, assetId: string, expectedRevision: number, sourceVersionId: string, idempotencyKey: string) {
+  /** Explicit request only: callers retain the same crop and key for retries.
+   * The server remains authoritative for crop validation and admission. */
+  regenerateAsset(workId: string, assetId: string, expectedRevision: number, sourceVersionId: string, idempotencyKey: string,
+    squareCrop?: CreatorAssetRegenerationRequest['squareCrop']) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}/regenerate`,
-      'POST', { expectedRevision, sourceVersionId }, { idempotencyKey });
+      'POST', { expectedRevision, sourceVersionId, ...(squareCrop === undefined ? {} : { squareCrop }) }, { idempotencyKey });
   }
   detachAsset(workId: string, assetId: string, expectedRevision: number) {
     return this.call(`/studio/works/${encodeURIComponent(workId)}/assets/${encodeURIComponent(assetId)}`, 'DELETE', { expectedRevision });
