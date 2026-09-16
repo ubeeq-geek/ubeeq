@@ -84,3 +84,24 @@ test('lost lease cannot report retry success when the queue rejects its token', 
   await assert.rejects(value.run(), /lease token rejected/);
   assert.equal(value.calls.writes.length, 1);
 });
+
+test('crop-enabled workers snapshot the durable request and pass it to processing', async () => {
+  const value = setup();
+  value.options.allowSquareCrop = true; value.scope.squareCrop = { x: 2, y: 3, size: 4 };
+  const get = value.options.assets.getProcessingAsset;
+  value.options.assets.getProcessingAsset = async () => { value.scope.squareCrop.x = 99; return get(); };
+  value.options.processor.process = async input => { assert.deepEqual(input.squareCrop, { x: 2, y: 3, size: 4 }); return value.output; };
+  assert.equal((await value.run()).state, 'completed');
+  assert.deepEqual(value.calls.commits[0].squareCrop, { x: 2, y: 3, size: 4 });
+});
+
+test('disabled, malformed or non-image crop jobs fail before source reads', async () => {
+  for (const kind of ['disabled', 'malformed', 'video']) {
+    const value = setup(); value.scope.squareCrop = { x: 0, y: 0, size: 2 };
+    value.options.allowSquareCrop = kind !== 'disabled';
+    if (kind === 'malformed') value.scope.squareCrop.size = NaN;
+    if (kind === 'video') value.asset.mimeType = 'video/mp4';
+    assert.equal((await value.run()).state, 'retry_scheduled');
+    assert.equal(value.calls.reads, 0); assert.equal(value.calls.writes.length, 0); assert.equal(value.calls.commits.length, 0);
+  }
+});
