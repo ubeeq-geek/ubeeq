@@ -1,3 +1,4 @@
+export { startPeriodicWorkers } from './periodic-workers.js';
 /** Durable scheduling and queue ports. In-process execution is an adapter choice, not a production default. */
 export * from "./retry-backoff.js";
 export type JobState = "queued" | "leased" | "completed" | "retry_scheduled" | "dead_lettered" | "cancelled";
