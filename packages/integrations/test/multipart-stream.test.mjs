@@ -30,3 +30,29 @@ test('header injection and invalid boundaries are rejected and release supplied 
     assert.equal(source.destroyed, true);
   }
 });
+
+test('typed JSON and multiple binary files round-trip through a multipart consumer in order', async () => {
+  const files = [Buffer.from([0, 255, 1]), Buffer.from('second file')];
+  const form = createMultipartStream([['json', '{"selected":["image0","image1"]}', 'application/json']], files.map((bytes, index) => ({
+    fieldName: `image${index}`, filename: `${index}.png`, contentType: 'image/png', source: Readable.from([bytes])
+  })), 'multi-file');
+  const chunks = []; for await (const chunk of form.body) chunks.push(Buffer.from(chunk));
+  const body = Buffer.concat(chunks);
+  assert.ok(body.toString().includes('Content-Type: application/json\r\n'));
+  const parsed = await new Response(body, { headers: { 'content-type': form.contentType } }).formData();
+  assert.deepEqual([...parsed.keys()], ['json', 'image0', 'image1']);
+  assert.equal(parsed.get('json'), '{"selected":["image0","image1"]}');
+  for (let index = 0; index < files.length; index++) assert.deepEqual(Buffer.from(await parsed.get(`image${index}`).arrayBuffer()), files[index]);
+});
+
+test('a failed file closes later sources and duplicate field identifiers are rejected', async () => {
+  const later = Readable.from(['later']);
+  const files = [{ fieldName: 'one', filename: 'one', contentType: 'image/png', source: { async *[Symbol.asyncIterator]() { throw new Error('failed'); } } },
+    { fieldName: 'two', filename: 'two', contentType: 'image/png', source: later }];
+  const form = createMultipartStream([], files);
+  await assert.rejects(async () => { for await (const chunk of form.body) void chunk; }, /failed/);
+  assert.equal(later.destroyed, true);
+  const duplicate = Readable.from(['bytes']);
+  assert.throws(() => createMultipartStream([['json', '{}', 'application/json']], { fieldName: 'json', filename: 'x', contentType: 'image/png', source: duplicate }), /Invalid multipart/);
+  assert.equal(duplicate.destroyed, true);
+});
