@@ -10,6 +10,11 @@
       "import": "./dist/esm/index.js",
       "require": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./mcp-control-plane": {
+      "import": "./dist/esm/mcp-control-plane.js",
+      "require": "./dist/mcp-control-plane.js",
+      "types": "./dist/mcp-control-plane.d.ts"
     }
   },
   "types": "dist/index.d.ts",
