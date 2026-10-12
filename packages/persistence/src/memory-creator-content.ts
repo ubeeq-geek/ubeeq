@@ -1,4 +1,5 @@
 import type { CreatorContentRecords, CreatorContentStore } from "./creator-content.js";
+import { validateCreatorContentRestore, type CreatorContentRestore, type CreatorContentRestoreReceipt } from './creator-content-restore.js';
 import { CreatorContentCommitError, type CreatorContentAssetCommit } from "./creator-content.js";
 import type { CreatorContentSourceReceipt, CreatorContentReuseCommit, CreatorContentSourceReuseStore } from './creator-content.js';
 
@@ -8,6 +9,35 @@ import type { CreatorContentSourceReceipt, CreatorContentReuseCommit, CreatorCon
  * implement the same content port. The enumerable arrays retain snapshot compatibility.
  */
 export class MemoryCreatorContentStore<M extends CreatorContentRecords = CreatorContentRecords> implements CreatorContentStore<M>, CreatorContentSourceReuseStore<M> {
+  contentRestores: CreatorContentRestoreReceipt[] = [];
+  async getContentRestore(tenantId: string, restoreId: string): Promise<CreatorContentRestoreReceipt | null> {
+    return structuredClone(this.contentRestores.find(row => row.tenantId === tenantId && row.restoreId === restoreId) || null);
+  }
+  async commitContentRestore(input: CreatorContentRestore<M>): Promise<CreatorContentRestoreReceipt> {
+    validateCreatorContentRestore(input);
+    const existing = this.contentRestores.find(row => row.tenantId === input.tenantId && row.restoreId === input.restoreId);
+    if (existing) {
+      if (existing.fingerprint !== input.fingerprint || existing.creatorId !== input.creatorId) throw new CreatorContentCommitError('Restore identity was already used for different content.');
+      return structuredClone(existing);
+    }
+    for (const [incoming, current, key] of [[input.works, this.works, 'workId'], [input.assets, this.canonicalAssets, 'assetId'],
+      [input.collections, this.creatorCollections, 'collectionId'], [input.publications, this.publications, 'publicationId'],
+      [input.intents, this.publicationIntents, 'publicationIntentId']] as const) {
+      const stored = new Set((current as any[]).filter(row => row.tenantId === input.tenantId).map(row => row[key]));
+      if ((incoming as any[]).some(row => stored.has(row[key]))) throw new CreatorContentCommitError('Restore conflicts with existing content.');
+    }
+    const receipt = { restoreId: input.restoreId, fingerprint: input.fingerprint, tenantId: input.tenantId, creatorId: input.creatorId, completedAt: new Date().toISOString() };
+    const prepared = structuredClone({ works: [...this.works, ...input.works], assets: [...this.canonicalAssets, ...input.assets],
+      attachments: [...this.workAssets, ...input.attachments.map(row => ({ ...row, tenantId: input.tenantId }))],
+      publications: [...this.publications, ...input.publications], intents: [...this.publicationIntents, ...input.intents],
+      collections: [...this.creatorCollections, ...input.collections], collectionWorks: [...this.collectionWorks, ...input.collectionWorks.map(row => ({ ...row, tenantId: input.tenantId }))],
+      discovery: [...this.workDiscovery, ...input.discovery], receipts: [...this.contentRestores, receipt] });
+    // Complete validation and cloning before one synchronous state transition.
+    this.works = prepared.works; this.canonicalAssets = prepared.assets; this.workAssets = prepared.attachments;
+    this.publications = prepared.publications; this.publicationIntents = prepared.intents; this.creatorCollections = prepared.collections;
+    this.collectionWorks = prepared.collectionWorks; this.workDiscovery = prepared.discovery; this.contentRestores = prepared.receipts;
+    return structuredClone(receipt);
+  }
   works: M['work'][] = [];
   canonicalAssets: M['asset'][] = [];
   workAssets: Array<M['attachment'] & { tenantId: string }> = [];

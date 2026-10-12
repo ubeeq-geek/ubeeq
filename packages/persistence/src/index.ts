@@ -1,5 +1,6 @@
 /** Provider-neutral durable persistence contracts. Provider implementations belong in adapter packages. */
 export * from "./creator-content.js";
+export * from './creator-content-restore.js';
 export * from "./memory-creator-content.js";
 
 export interface RevisionedRecord {
