@@ -208,3 +208,4 @@ export const verifyCellScopedRepositoryContract = async (harness: { repository: 
     if (!rejected) throw new Error("Cell repository contract violation: foreign mutation was accepted.");
   }
 };
+export * from './publication-copies.js';
