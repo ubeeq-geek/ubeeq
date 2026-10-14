@@ -2,18 +2,29 @@
   "name": "@ubeeq/integrations",
   "version": "0.1.0",
   "private": false,
-  "publishConfig": { "access": "public" },
-  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
   "main": "dist/index.js",
   "exports": {
     ".": {
       "import": "./dist/esm/index.js",
       "require": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./bunny-upload": {
+      "import": "./dist/esm/bunny-upload.js",
+      "require": "./dist/bunny-upload.js",
+      "types": "./dist/bunny-upload.d.ts"
     }
   },
   "types": "dist/index.d.ts",
-  "dependencies": { "@ubeeq/storage": "0.1.0" },
+  "dependencies": {
+    "@ubeeq/storage": "0.1.0"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/write-esm-package.mjs",
     "test": "node --test test/*.test.mjs"
