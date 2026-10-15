@@ -59,3 +59,25 @@ test('convenience publisher returns collection receipts', async () => {
   assert.equal(result.status, 'published');
   assert.equal(result.receipts[0].remoteId, 't3_collection');
 });
+
+test('rejects private literal destinations and malformed runtime payloads', () => {
+  for (const host of ['localhost.', '[::1]', '127.1', '10.0.0.1', '192.168.1.1', '[::ffff:127.0.0.1]']) {
+    assert.throws(() => planRedditPublication({ type: 'announcement', subreddit: 'art', title: 'News', publicUrl: `https://${host}/news` }), RedditApiError);
+  }
+  assert.throws(() => planRedditPublication({ type: 'announcement', subreddit: 'art', title: 'News', text: 123 }), RedditApiError);
+  assert.throws(() => planRedditPublication({ type: 'other', subreddit: 'art' }), RedditApiError);
+});
+
+test('snapshots the entire confirmed plan before sending the first post', async () => {
+  const plan = planRedditPublication({ type: 'works', subreddit: 'art', works: [
+    { workId: 'w1', title: 'One', publicUrl: 'https://creator.example/1' },
+    { workId: 'w2', title: 'Two', publicUrl: 'https://creator.example/2' }
+  ] });
+  const called = [];
+  await publishRedditPlan({ async submit(_token, submission) {
+    called.push(submission.title);
+    plan[1].submission.title = 'Unconfirmed edit';
+    return { id: 't3_one', url: 'https://reddit.com/r/art/comments/one/' };
+  } }, 'token', plan);
+  assert.deepEqual(called, ['One', 'Two']);
+});

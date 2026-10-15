@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { RedditApiError, type RedditSubmission } from './reddit.js';
 
 export interface RedditPublishableWork {
@@ -47,7 +48,11 @@ const requireText = (value: string, label: string, maximum: number): string => {
 const publicUrl = (value: string): string => {
   let url: URL;
   try { url = new URL(value); } catch { throw new RedditApiError('Use a public HTTPS link.', 422); }
-  if (url.protocol !== 'https:' || url.username || url.password || url.hash || ['localhost', '127.0.0.1', '::1'].includes(url.hostname)) {
+  const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  const ip = isIP(host);
+  // Links are sent to Reddit; this contract requires public destinations.
+  const privateHost = host === 'localhost' || host.endsWith('.localhost') || (ip === 4 && /^(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)) || (ip === 6 && (/^(?:::|f[cd]|fe[89ab])/.test(host)));
+  if (privateHost || url.protocol !== 'https:' || url.username || url.password || url.hash || ['localhost', '127.0.0.1', '::1'].includes(url.hostname)) {
     throw new RedditApiError('Use a public HTTPS link.', 422);
   }
   return url.href;
@@ -78,13 +83,14 @@ export function planRedditPublication(request: RedditPublicationRequest): readon
       return [{ submission: { ...common, kind: 'link', url: publicUrl(request.publicUrl) } }];
     }
     const text = request.text === undefined ? '' : request.text;
-    if (text.length > 40_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) throw new RedditApiError('Reddit announcement text is invalid.', 422);
+    if (typeof text !== 'string' || text.length > 40_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) throw new RedditApiError('Reddit announcement text is invalid.', 422);
     return [{ submission: { ...common, kind: 'self', text } }];
   }
   if (request.type === 'collection') {
     const id = requireText(request.collection.collectionId, 'Collection ID', 200);
     return [{ source: { type: 'collection', id }, submission: link(subreddit, request.collection) }];
   }
+  if (request.type !== 'works' || !Array.isArray(request.works) || request.works.length > 100) throw new RedditApiError('Select up to 100 works to publish.', 422);
   if (!request.works.length) throw new RedditApiError('Select at least one work to publish.', 422);
   const seen = new Set<string>();
   return request.works.map((work) => {
@@ -107,11 +113,13 @@ export interface RedditSubmissionPort {
 export async function publishRedditPlan(client: RedditSubmissionPort, token: string, plan: readonly RedditPlannedSubmission[]): Promise<RedditPublicationResult> {
   if (!token.trim()) throw new RedditApiError('A Reddit access token is required.', 401);
   if (!plan.length) throw new RedditApiError('A Reddit publication plan cannot be empty.', 422);
+  // Snapshot before the first await so UI edits cannot change confirmed later posts.
+  const snapshot = structuredClone(plan);
   const receipts: RedditPublicationReceipt[] = [];
-  for (let index = 0; index < plan.length; index += 1) {
+  for (let index = 0; index < snapshot.length; index += 1) {
     try {
-      const remote = await client.submit(token, structuredClone(plan[index]!.submission));
-      receipts.push({ ...(plan[index]!.source ? { source: structuredClone(plan[index]!.source) } : {}), remoteId: remote.id, remoteUrl: remote.url });
+      const remote = await client.submit(token, structuredClone(snapshot[index]!.submission));
+      receipts.push({ ...(snapshot[index]!.source ? { source: structuredClone(snapshot[index]!.source) } : {}), remoteId: remote.id, remoteUrl: remote.url });
     } catch (cause) {
       const error = cause instanceof RedditApiError ? cause : new RedditApiError('Reddit publication failed.', undefined, undefined, true);
       return { status: receipts.length ? 'partially_published' : 'failed', receipts, failedIndex: index, error };
