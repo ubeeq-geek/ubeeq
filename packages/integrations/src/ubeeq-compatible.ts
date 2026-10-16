@@ -95,6 +95,7 @@ const capabilities = new Set<UbeeqCapability>(['inventory.read', 'assets.origina
 
 /** Validate untrusted discovery metadata before authorization or credential use. */
 export const validateUbeeqDiscovery = (input: unknown, options: DiscoveryValidationOptions): UbeeqDiscoveryDocument => {
+  if (options.production && options.allowPrivateNetwork) throw new Error('Private-network exceptions are limited to nonproduction connections.');
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Discovery must be an object.');
   const document = input as Record<string, unknown>;
   const instanceId = text(document.instanceId, 'Discovery instanceId', 200);

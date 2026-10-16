@@ -26,6 +26,7 @@ test("three catalog choices use one connector and generic discovery recognizes v
 
 test("discovery negotiates versions and rejects unsafe managed-host endpoints", () => {
   assert.equal(validateUbeeqDiscovery(discovery, { requestedOrigin: "https://example.test", production: true }).instanceId, "instance-es-1");
+  assert.throws(() => validateUbeeqDiscovery(discovery, { requestedOrigin: 'https://example.test', production: true, allowPrivateNetwork: true }), /nonproduction/);
   assert.throws(() => validateUbeeqDiscovery({ ...discovery, protocolVersions: ["2.0"] }, { requestedOrigin: "https://example.test" }), /Unsupported/);
   assert.throws(() => validateUbeeqDiscovery({ ...discovery, apiBaseUrl: "http://127.0.0.1/api" }, { requestedOrigin: "https://example.test" }), /Private-network/);
   assert.throws(() => validateUbeeqDiscovery(discovery, { requestedOrigin: "https://example.test", resolvedAddresses: ["169.254.169.254"] }), /private-network/);
