@@ -1,5 +1,6 @@
 /** Product-neutral remote integration capabilities. */
 export * from "./ubeeq-compatible.js";
+export * from './youtube-upload.js';
 export * from "./recovery.js";
 export * from './provider-errors.js';
 export * from './soundcloud-normalization.js';
@@ -324,5 +325,6 @@ export * from './activity-workflows.js';
 export * from './activity-commands.js';
 export * from './activity-health.js';
 export * from './reddit.js';
+export * from './reddit-publication.js';
 
 export * from "./bunny.js";
