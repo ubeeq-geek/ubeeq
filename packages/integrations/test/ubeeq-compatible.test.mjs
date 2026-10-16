@@ -7,7 +7,7 @@ import {
 } from "../dist/index.js";
 
 const discovery = {
-  instanceId: "instance-es-1", canonicalOrigin: "https://example.test", apiBaseUrl: "https://api.example.test/v1",
+  instanceId: "instance-es-1", canonicalOrigin: "https://example.test", apiBaseUrl: "https://example.test/v1",
   authorizationEndpoint: "https://example.test/oauth/authorize", protocolVersions: ["1.0"], service: "service-a",
   capabilities: ["inventory.read", "publications.create"]
 };
@@ -59,7 +59,8 @@ const job = { jobId: "j", connectionId: "c", instanceId: "i", remoteAccountId: "
 test("ambiguous creates resume and completed remote results are not duplicated", () => {
   assert.equal(resolveUbeeqIdempotentJob(undefined, job), "submit");
   assert.equal(resolveUbeeqIdempotentJob(job, job), "resume");
-  assert.equal(resolveUbeeqIdempotentJob({ ...job, remoteResultId: "publication-1" }, job), "return_existing");
+  assert.equal(resolveUbeeqIdempotentJob({ ...job, remoteResultId: "publication-1" }, job), "resume");
+  assert.equal(resolveUbeeqIdempotentJob({ ...job, status: "completed", remoteResultId: "publication-1" }, job), "return_existing");
   assert.throws(() => resolveUbeeqIdempotentJob(job, { ...job, payloadFingerprint: "sha256:y" }), /reused/);
   assert.throws(() => resolveUbeeqIdempotentJob(job, { ...job, remoteAccountId: "other" }), /reused/);
 });
@@ -68,4 +69,38 @@ test("premium publication never falls back to public and activation waits for re
   assert.throws(() => requireSafePublicationActivation({ requestedAccess: "premium", supportedAccess: ["public"], assetsReady: true, accessSettingsReady: true, supportsStagingOrDraft: true }), /does not support/);
   assert.throws(() => requireSafePublicationActivation({ requestedAccess: "premium", supportedAccess: ["premium"], assetsReady: true, accessSettingsReady: false, supportsStagingOrDraft: true }), /cannot be activated/);
   assert.doesNotThrow(() => requireSafePublicationActivation({ requestedAccess: "premium", supportedAccess: ["premium"], assetsReady: true, accessSettingsReady: true, supportsStagingOrDraft: true }));
+});
+
+
+test('rejects malformed discovery, spoofed origins, and special network addresses', () => {
+  for (const input of [null, [], {}, { ...discovery, instanceId: 7 }, { ...discovery, capabilities: 'inventory.read' },
+    { ...discovery, protocolVersions: ['1.garbage'] }, { ...discovery, extensions: { x: {} } }])
+    assert.throws(() => validateUbeeqDiscovery(input, { requestedOrigin: 'https://example.test' }));
+  for (const hostname of ['0.0.0.0', '127.1', 'localhost.', 'a.localhost', '100.64.0.1', '198.18.0.1',
+    '[::ffff:127.0.0.1]', '[::ffff:a00:1]', '[fe90::1]', '[ff02::1]', '[2001:db8::1]'])
+    assert.throws(() => validateUbeeqDiscovery({ ...discovery, apiBaseUrl: `https://${hostname}/api` }, { requestedOrigin: 'https://example.test' }), /Private-network/);
+  assert.throws(() => validateUbeeqDiscovery({ ...discovery, canonicalOrigin: 'https://attacker.test' }, { requestedOrigin: 'https://example.test' }), /Canonical/);
+  assert.throws(() => validateUbeeqDiscovery({ ...discovery, authorizationEndpoint: 'https://attacker.test/auth' }, { requestedOrigin: 'https://example.test' }), /approval/);
+  assert.throws(() => validateUbeeqDiscovery({ ...discovery, canonicalOrigin: 'https://example.test/path' }, { requestedOrigin: 'https://example.test' }), /origins/);
+  const validated = validateUbeeqDiscovery({ ...discovery, capabilities: ['inventory.read', 'future.read'], authorizationEndpoint: 'https://auth.example.test/authorize' },
+    { requestedOrigin: 'https://example.test', trustedEndpointOrigins: ['https://auth.example.test'] });
+  assert.deepEqual(validated.capabilities, ['inventory.read']);
+  assert.equal(validateUbeeqDiscovery({ ...discovery, apiBaseUrl: 'https://fc.example.test/api' }, { requestedOrigin: 'https://example.test', trustedEndpointOrigins: ['https://fc.example.test'] }).instanceId, discovery.instanceId);
+  assert.throws(() => validateUbeeqDiscovery(discovery, { requestedOrigin: 'https://example.test', resolvedAddresses: ['not-an-ip'] }), /valid IP/);
+});
+test('idempotency includes the connection and direction and resumes unfinished remote results', () => {
+  for (const change of [{ connectionId: 'other' }, { direction: 'import' }])
+    assert.throws(() => resolveUbeeqIdempotentJob(job, { ...job, ...change }), /reused/);
+  assert.equal(resolveUbeeqIdempotentJob({ ...job, status: 'partially_completed', remoteResultId: 'draft' }, job), 'resume');
+});
+test('activation requires actual boolean readiness flags at runtime', () => {
+  const ready = { requestedAccess: 'private', supportedAccess: ['private'], assetsReady: true, accessSettingsReady: true, supportsStagingOrDraft: true };
+  for (const field of ['assetsReady', 'accessSettingsReady', 'supportsStagingOrDraft'])
+    assert.throws(() => requireSafePublicationActivation({ ...ready, [field]: 'false' }));
+});
+
+test('mapping guards reject empty identities and unknown lifecycle states', () => {
+  const mapping = { instanceId: 'i', remoteAccountId: 'a', remoteSpaceId: 's', localPublicationId: 'p', remotePublicationId: 'r', remoteRevision: '1', lifecycle: 'active' };
+  assert.throws(() => assertUbeeqPublicationMappings([{ ...mapping, remoteAccountId: '' }]), /mapping/);
+  assert.throws(() => assertUbeeqPublicationMappings([{ ...mapping, lifecycle: 'unknown' }]), /lifecycle/);
 });
