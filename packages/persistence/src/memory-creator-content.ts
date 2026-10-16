@@ -29,6 +29,11 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
       const stored = new Set((current as any[]).filter(row => row.tenantId === input.tenantId).map(row => row[key]));
       if ((incoming as any[]).some(row => stored.has(row[key]))) throw new CreatorContentCommitError('Restore conflicts with existing content.');
     }
+    const incomingWorks = new Set(input.works.map(row => row.workId)), incomingCollections = new Set(input.collections.map(row => row.collectionId));
+    if (this.workAssets.some(row => row.tenantId === input.tenantId && incomingWorks.has(row.workId))
+      || this.collectionWorks.some(row => row.tenantId === input.tenantId && incomingCollections.has(row.collectionId))
+      || this.workDiscovery.some(row => row.tenantId === input.tenantId && incomingWorks.has(row.workId)))
+      throw new CreatorContentCommitError('Restore conflicts with existing content relationships.');
     const receipt = { restoreId: input.restoreId, fingerprint: input.fingerprint, tenantId: input.tenantId, creatorId: input.creatorId, completedAt: new Date().toISOString() };
     const prepared = structuredClone({ works: [...this.works, ...input.works], assets: [...this.canonicalAssets, ...input.assets],
       attachments: [...this.workAssets, ...input.attachments.map(row => ({ ...row, tenantId: input.tenantId }))],

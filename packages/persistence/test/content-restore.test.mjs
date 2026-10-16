@@ -24,3 +24,13 @@ test('dangling edges, duplicate positions, foreign ownership and changed restore
   const store = new MemoryCreatorContentStore(); await store.commitContentRestore(graph());
   await assert.rejects(store.commitContentRestore({ ...graph(), fingerprint: 'b'.repeat(64) }));
 });
+test('rejects dangling primary, inline, and collection cover asset references before committing', async () => {
+  for (const mutate of [input => input.works[0].primaryAssetId = 'missing', input => input.works[0].body = [{ type: 'image', assetId: 'missing' }], input => input.collections[0].coverAssetId = 'missing']) {
+    const store = new MemoryCreatorContentStore(), input = graph(); mutate(input);
+    await assert.rejects(store.commitContentRestore(input)); assert.equal(store.works.length, 0); assert.equal(store.contentRestores.length, 0);
+  }
+});
+test('rejects collisions with orphaned relationship rows atomically', async () => {
+  const store = new MemoryCreatorContentStore(); store.workDiscovery.push({ tenantId: 'tenant', workId: 'work' });
+  await assert.rejects(store.commitContentRestore(graph())); assert.equal(store.works.length, 0); assert.equal(store.contentRestores.length, 0);
+});

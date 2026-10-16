@@ -41,13 +41,17 @@ export class YouTubeUploadClient {
     if (response.status === 308 || response.ok) return response;
     await response.body?.cancel().catch(() => undefined);
     const retry = Number(response.headers.get('retry-after'));
-    const code = response.status === 401 ? 'AUTHENTICATION' : response.status === 429 ? 'RATE_LIMIT'
+    const code = initiating && response.status >= 500 ? 'AMBIGUOUS_INITIATION' : response.status === 401 ? 'AUTHENTICATION' : response.status === 429 ? 'RATE_LIMIT'
       : response.status === 404 || response.status === 410 ? 'SESSION_EXPIRED' : response.status >= 500 ? 'TRANSIENT' : 'REJECTED';
     throw new YouTubeUploadError(code, response.status, Number.isFinite(retry) && retry > 0 ? retry : undefined);
   }
   async initiate(token: string, size: number, mimeType: string, metadata: YouTubeUploadMetadata): Promise<string> {
     positiveSize(size);
-    if (!metadata.title.trim() || metadata.title.length > 100 || metadata.description.length > 5000
+    if (typeof metadata.title !== 'string' || typeof metadata.description !== 'string' || !Array.isArray(metadata.tags)
+      || metadata.tags.length > 100 || metadata.tags.some(tag => typeof tag !== 'string' || !tag.trim() || tag.length > 500)
+      || metadata.tags.map(tag => tag.includes(' ') ? `"${tag}"` : tag).join(',').length > 500
+      || metadata.containsSyntheticMedia !== undefined && typeof metadata.containsSyntheticMedia !== 'boolean'
+      || !metadata.title.trim() || metadata.title.length > 100 || metadata.description.length > 5000
       || !/^\d+$/.test(metadata.categoryId) || !['private', 'unlisted', 'public'].includes(metadata.privacy)
       || typeof metadata.madeForKids !== 'boolean' || typeof metadata.notifySubscribers !== 'boolean'
       || !/^video\/[a-z0-9.+-]+$/i.test(mimeType)) throw new Error('Invalid YouTube upload metadata.');
@@ -61,7 +65,8 @@ export class YouTubeUploadClient {
     const location = response.headers.get('location');
     await response.body?.cancel().catch(() => undefined);
     if (!location) throw new YouTubeUploadError('AMBIGUOUS_INITIATION');
-    return validateYouTubeUploadSession(location);
+    try { return validateYouTubeUploadSession(location); }
+    catch { throw new YouTubeUploadError('AMBIGUOUS_INITIATION'); }
   }
   private async progress(response: Response, size: number): Promise<YouTubeUploadProgress> {
     if (response.status === 308) {
@@ -85,7 +90,7 @@ export class YouTubeUploadClient {
   }
   async uploadChunk(token: string, session: string, size: number, offset: number, body: Uint8Array): Promise<YouTubeUploadProgress> {
     positiveSize(size);
-    if (!Number.isSafeInteger(offset) || offset < 0 || !body.byteLength || offset + body.byteLength > size
+    if (!Number.isSafeInteger(offset) || offset < 0 || !body.byteLength || body.byteLength > 8 * 1024 * 1024 || offset + body.byteLength > size
       || (offset + body.byteLength < size && body.byteLength % (256 * 1024) !== 0)) throw new Error('Invalid YouTube upload range.');
     return this.progress(await this.send(validateYouTubeUploadSession(session), {
       method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream',
@@ -121,7 +126,8 @@ export async function transferYouTubeUpload(input: {
     const bytes = await input.source.read(progress.offset, length);
     if (bytes.byteLength !== length) throw new Error('Source video changed or was truncated.');
     const next = await input.client.uploadChunk(input.token, input.session, input.source.size, progress.offset, bytes);
-    if (next.offset < progress.offset || (!next.videoId && next.offset !== progress.offset + length)) throw new YouTubeUploadError('INVALID_RESPONSE');
+    if (next.offset < progress.offset || (!next.videoId && next.offset > progress.offset + length)) throw new YouTubeUploadError('INVALID_RESPONSE');
+    if (!next.videoId && next.offset === progress.offset) throw new YouTubeUploadError('TRANSIENT');
     progress = next; await input.onProgress(progress);
   }
   return progress;

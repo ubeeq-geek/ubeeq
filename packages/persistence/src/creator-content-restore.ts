@@ -1,3 +1,4 @@
+import { contentAssetReferences } from '@ubeeq/core';
 import type { CreatorContentRecords } from './creator-content.js';
 import { CreatorContentCommitError } from './creator-content.js';
 
@@ -41,5 +42,10 @@ export function validateCreatorContentRestore<M extends CreatorContentRecords>(i
       if (positions.has(position) || members.has(member)) fail(); positions.add(position); members.add(member);
     }
   }
+  for (const work of input.works as any[]) {
+    const attached = new Set(input.attachments.filter(row => row.workId === work.workId).map(row => row.assetId));
+    if ((work.primaryAssetId !== undefined && !attached.has(work.primaryAssetId)) || contentAssetReferences(work.body, work.media).some(id => !attached.has(id))) fail();
+  }
+  if ((input.collections as any[]).some(collection => collection.coverAssetId !== undefined && !assets.has(collection.coverAssetId))) fail();
   if ([...input.publications, ...input.intents, ...input.discovery].some(record => !works.has(record.workId))) fail();
 }
