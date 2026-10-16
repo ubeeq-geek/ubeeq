@@ -9,6 +9,7 @@ export * from "./content-asset-references.js";
 export * from "./content-media.js";
 export * from "./creator-members.js";
 export * from "./organizations.js";
+export * from "./workspaces.js";
 export type EntityId = string & { readonly __entityId: unique symbol };
 
 /** The single authoritative regional cell for creator-owned mutable data. */

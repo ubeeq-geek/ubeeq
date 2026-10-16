@@ -1,8 +1,8 @@
 /** Product-neutral organization and workspace ownership contracts. */
 export const ORGANIZATION_ROLES = ["owner", "administrator", "member", "billing_manager"] as const;
 export type OrganizationRole = typeof ORGANIZATION_ROLES[number];
-export const WORKSPACE_ROLES = ["manager", "publisher", "editor", "viewer"] as const;
-export type WorkspaceRole = typeof WORKSPACE_ROLES[number];
+export const WORKSPACE_GRANT_ROLES = ["manager", "publisher", "editor", "viewer"] as const;
+export type WorkspaceGrantRole = typeof WORKSPACE_GRANT_ROLES[number];
 export type OrganizationState = "active" | "suspended" | "closing" | "closed";
 export type MembershipStatus = "active" | "suspended" | "ended";
 
@@ -39,7 +39,7 @@ export interface WorkspaceGrant {
   id: string;
   workspaceId: string;
   membershipId: string;
-  role: WorkspaceRole;
+  role: WorkspaceGrantRole;
   revision: number;
 }
 
@@ -48,7 +48,7 @@ export interface OrganizationInvitation {
   organizationId: string;
   normalizedRecipientAddress: string;
   proposedRole: Exclude<OrganizationRole, "owner">;
-  proposedWorkspaceGrants: readonly { workspaceId: string; role: WorkspaceRole }[];
+  proposedWorkspaceGrants: readonly { workspaceId: string; role: WorkspaceGrantRole }[];
   inviterMembershipId: string;
   tokenHash: string;
   expiresAt: string;
@@ -60,7 +60,7 @@ export type WorkspaceCapability =
   | "read" | "edit" | "download_original" | "publish" | "manage_connections"
   | "manage_schedules" | "export" | "delete_content" | "assign_workspace_roles";
 
-const WORKSPACE_CAPABILITIES: Readonly<Record<WorkspaceRole, readonly WorkspaceCapability[]>> = {
+const WORKSPACE_CAPABILITIES: Readonly<Record<WorkspaceGrantRole, readonly WorkspaceCapability[]>> = {
   manager: ["read", "edit", "download_original", "publish", "manage_connections", "manage_schedules", "export", "delete_content", "assign_workspace_roles"],
   publisher: ["read", "edit", "download_original", "publish"],
   editor: ["read", "edit", "download_original"],
@@ -93,10 +93,20 @@ export const prepareOrganizationCreation = (input: {
   };
 };
 
-const active = (membership: OrganizationMembership | undefined): membership is OrganizationMembership => membership?.status === "active";
+const identifier = (value: unknown): value is string => typeof value === "string" && Boolean(value.trim());
+const revision = (value: number): boolean => Number.isSafeInteger(value) && value >= 1;
+const validMembership = (m: OrganizationMembership): boolean =>
+  [m.id, m.organizationId, m.userId].every(identifier) && revision(m.revision)
+  && ORGANIZATION_ROLES.includes(m.role) && ["active", "suspended", "ended"].includes(m.status);
+const active = (membership: OrganizationMembership | undefined): membership is OrganizationMembership =>
+  Boolean(membership && validMembership(membership) && membership.status === "active");
+const validGrant = (grant: WorkspaceGrant): boolean =>
+  [grant.id, grant.workspaceId, grant.membershipId].every(identifier) && revision(grant.revision) && WORKSPACE_GRANT_ROLES.includes(grant.role);
 
 export const validateWorkspaceOwnership = (ownership: WorkspaceOwnership): WorkspaceOwnership => {
-  if (!ownership.workspaceId || !Number.isSafeInteger(ownership.revision) || ownership.revision < 1
+  if (!identifier(ownership.workspaceId) || !revision(ownership.revision)
+    || (ownership.personalOwnerUserId !== undefined && !identifier(ownership.personalOwnerUserId))
+    || (ownership.ownerOrganizationId !== undefined && !identifier(ownership.ownerOrganizationId))
     || Boolean(ownership.personalOwnerUserId) === Boolean(ownership.ownerOrganizationId)) {
     throw new OrganizationDomainError("scope_mismatch", "A workspace must have exactly one valid administrative owner.");
   }
@@ -107,17 +117,20 @@ export const validateWorkspaceOwnership = (ownership: WorkspaceOwnership): Works
 export const hasWorkspaceCapability = (input: {
   actorUserId: string;
   ownership: WorkspaceOwnership;
+  organization?: Organization;
   membership?: OrganizationMembership;
   grant?: WorkspaceGrant;
   capability: WorkspaceCapability;
 }): boolean => {
-  const { actorUserId, ownership, membership, grant, capability } = input;
+  const { actorUserId, ownership, organization, membership, grant, capability } = input;
   validateWorkspaceOwnership(ownership);
+  if (!identifier(actorUserId) || !WORKSPACE_CAPABILITIES.manager.includes(capability)) return false;
   if (ownership.personalOwnerUserId === actorUserId) return true;
-  if (!ownership.ownerOrganizationId || !active(membership) || membership.userId !== actorUserId
+  if (!ownership.ownerOrganizationId || organization?.id !== ownership.ownerOrganizationId || organization.state !== "active"
+    || !active(membership) || membership.userId !== actorUserId
     || membership.organizationId !== ownership.ownerOrganizationId) return false;
   if (membership.role === "owner" || membership.role === "administrator") return true;
-  if (membership.role === "billing_manager" || !grant || grant.workspaceId !== ownership.workspaceId
+  if (membership.role !== "member" || !grant || !validGrant(grant) || grant.workspaceId !== ownership.workspaceId
     || grant.membershipId !== membership.id) return false;
   return WORKSPACE_CAPABILITIES[grant.role].includes(capability);
 };
@@ -133,7 +146,7 @@ export const validateWorkspaceGrant = (
   membership: OrganizationMembership
 ): WorkspaceGrant => {
   validateWorkspaceOwnership(ownership);
-  if (!active(membership) || ownership.workspaceId !== grant.workspaceId || !ownership.ownerOrganizationId
+  if (!validGrant(grant) || !active(membership) || ownership.workspaceId !== grant.workspaceId || !ownership.ownerOrganizationId
     || membership.organizationId !== ownership.ownerOrganizationId || membership.id !== grant.membershipId
     || membership.role !== "member") {
     throw new OrganizationDomainError("scope_mismatch", "Workspace grants require an active ordinary membership in the owning organization.");
@@ -154,10 +167,13 @@ export const prepareInvitationAcceptance = (input: {
 }): { membership: OrganizationMembership; grants: WorkspaceGrant[]; invitation: OrganizationInvitation } => {
   const { invitation, organization, inviter, recipient, existingMembership, workspaceOwnership } = input;
   const timestamp = Date.parse(input.now);
-  if (!Number.isFinite(timestamp) || invitation.state !== "pending" || Date.parse(invitation.expiresAt) <= timestamp) {
+  if (!Number.isFinite(timestamp) || invitation.state !== "pending" || !Number.isFinite(Date.parse(invitation.expiresAt)) || Date.parse(invitation.expiresAt) <= timestamp) {
     throw new OrganizationDomainError("invitation_expired", "The invitation is expired or no longer pending.");
   }
-  if (organization.state !== "active" || invitation.organizationId !== organization.id || !active(inviter)
+  if (![invitation.id, invitation.organizationId, invitation.inviterMembershipId, invitation.tokenHash, invitation.normalizedRecipientAddress, recipient.userId, recipient.tokenHash, input.newMembershipId].every(identifier)
+    || !revision(invitation.revision) || !revision(organization.revision)
+    || !["administrator", "member", "billing_manager"].includes(invitation.proposedRole)
+    || organization.state !== "active" || invitation.organizationId !== organization.id || !active(inviter)
     || inviter.id !== invitation.inviterMembershipId || inviter.organizationId !== organization.id
     || !["owner", "administrator"].includes(inviter.role) || recipient.normalizedVerifiedAddress !== invitation.normalizedRecipientAddress
     || recipient.tokenHash !== invitation.tokenHash
@@ -165,7 +181,7 @@ export const prepareInvitationAcceptance = (input: {
     throw new OrganizationDomainError("permission_denied", "Invitation authority or recipient proof is no longer valid.");
   }
   if (existingMembership && (existingMembership.organizationId !== organization.id || existingMembership.userId !== recipient.userId
-    || existingMembership.status === "active")) {
+    || !validMembership(existingMembership) || existingMembership.status !== "ended")) {
     throw new OrganizationDomainError("scope_mismatch", "Invitation membership conflicts with current organization state.");
   }
   const membership: OrganizationMembership = {
@@ -194,6 +210,8 @@ export const validateMembershipChange = (input: {
   const { actor, current, next, activeOwnerCount } = input;
   if (!active(actor) || actor.organizationId !== current.organizationId || current.id !== next.id
     || current.organizationId !== next.organizationId || current.userId !== next.userId) throw new OrganizationDomainError("scope_mismatch", "Membership change is outside its organization scope.");
+  if (!validMembership(current) || !validMembership(next) || !Number.isSafeInteger(activeOwnerCount) || activeOwnerCount < 1) throw new OrganizationDomainError("scope_mismatch", "Invalid membership or owner count.");
+  if (!["owner", "administrator"].includes(actor.role)) throw new OrganizationDomainError("permission_denied", "Organization administration is required.");
   if (next.revision !== current.revision + 1) throw new OrganizationDomainError("revision_conflict", "Membership revision is stale.");
   const changesPrivilegedRole = current.role !== next.role && ([current.role, next.role].some(role => role === "owner" || role === "administrator"));
   if (actor.role !== "owner" && (changesPrivilegedRole || current.role !== "member" && current.role !== "billing_manager")) {
@@ -213,7 +231,7 @@ export interface OwnershipTransferPlan {
   receivingOrganizationRevision: number;
   initiatedByUserId: string;
   acceptedByOwnerMembershipId: string;
-  postTransferRole: WorkspaceRole;
+  postTransferRole: WorkspaceGrantRole;
   state: "planned" | "accepted" | "committed" | "blocked";
 }
 
@@ -227,7 +245,7 @@ export const validateOwnershipTransferCommit = (input: {
 }): void => {
   const { plan, ownership, organization, acceptingMembership } = input;
   validateWorkspaceOwnership(ownership);
-  if (plan.state !== "accepted" || !input.recentAuthentication || !input.dependenciesReady || organization.state !== "active") {
+  if (!identifier(plan.id) || !identifier(plan.personalOwnerUserId) || !WORKSPACE_GRANT_ROLES.includes(plan.postTransferRole) || plan.state !== "accepted" || !input.recentAuthentication || !input.dependenciesReady || organization.state !== "active") {
     throw new OrganizationDomainError("transfer_blocked", "Transfer is not accepted or its dependencies are not ready.");
   }
   if (ownership.workspaceId !== plan.workspaceId || ownership.revision !== plan.workspaceRevision

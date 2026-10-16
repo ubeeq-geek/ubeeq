@@ -2,7 +2,7 @@
 
 This document records the repository mapping for the first product-neutral
 organization foundation. It deliberately defines core contracts rather than an
-Eversally- or Nightframe-specific policy or user interface.
+hosted-product-specific policy or user interface.
 
 ## Existing model mapping
 
@@ -24,10 +24,11 @@ durable adapter must enforce the following in its own transaction and schema:
    database constraint rather than relying only on application validation.
 2. Organization creation writes the organization and first active Owner
    membership atomically.
-3. A current membership is unique by organization and user. Workspace grants
+3. A current membership is unique by organization and user. Workspace grants (`WorkspaceGrantRole` / `WORKSPACE_GRANT_ROLES`, distinct from
+   the professional-publishing compatibility `WorkspaceRole`)
    reference active ordinary memberships in the workspace's owning organization.
 4. Invitation acceptance compares the invitation, inviter authority,
-   organization state, recipient's verified normalized address, and every
+   organization state, finite expiry, recipient's verified normalized address, and every
    workspace owner before atomically writing the membership, grants, and consumed
    invitation revision. Store only a cryptographic token hash.
 5. Membership changes use compare-and-swap revisions and lock the active owner
@@ -46,7 +47,7 @@ Administrators inherit workspace-manager capabilities. Active ordinary Members
 receive only their explicit `WorkspaceGrant`. Billing managers receive no content
 capability. The exported `hasWorkspaceCapability` and
 `requireWorkspaceCapability` functions implement this matrix from records loaded
-by the server; client-provided organization or workspace identifiers are never
+by the server, including the current active Organization for organization-owned workspaces; client-provided organization or workspace identifiers are never
 evidence of access.
 
 Organization Administrators may manage ordinary Members and billing managers,
@@ -73,7 +74,7 @@ directions must return `feature_unavailable` at the API boundary.
 This schema is additive. Existing personal creator behavior remains valid and no
 organization is inferred from email domains, creator names, credits, or provider
 administrators. Deployment feature flags may disable creation and transfer, but
-must never bypass ownership authorization for existing records. Nightframe must
+must never bypass ownership authorization for existing records. Other downstream products must
 leave organization activation disabled until its separate rollout is approved.
 
 Before a persistence or API implementation enables onboarding, it must add and
@@ -82,3 +83,8 @@ offboarding/handover, job-dispatch race, export/import, and resumable migration
 tests. The pure core tests cover the shared role matrix, scope checks, revisions,
 invitation proposal, and transfer preconditions; they do not replace those
 integration tests.
+
+Suspended memberships cannot be reactivated by accepting a fresh invitation.
+Ordinary Members and billing managers cannot administer any membership, including
+their own. Invitations cannot promote Owners; applications must implement the
+separate explicit Owner acceptance flow before exposing that operation.

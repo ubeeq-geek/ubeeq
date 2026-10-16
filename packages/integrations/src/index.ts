@@ -1,4 +1,5 @@
 /** Product-neutral remote integration capabilities. */
+export * from "./ubeeq-compatible.js";
 export * from './youtube-upload.js';
 export * from "./recovery.js";
 export * from './provider-errors.js';
@@ -16,6 +17,7 @@ export * from './oauth-replay.js';
 export * from './wordpress-renderer.js';
 export * from './wordpress-contracts.js';
 export * from './ghost-content.js';
+export * from './professional-publishing.js';
 export const INTEGRATION_CAPABILITIES = [
   "connect", "catalogue_import", "source_migration", "publish", "remote_update",
   "remote_delete", "engagement_read", "engagement_write", "webhook_receive", "reconcile"
