@@ -1,4 +1,5 @@
 /** Product-neutral remote integration capabilities. */
+export * from "./ubeeq-compatible.js";
 export * from './youtube-upload.js';
 export * from "./recovery.js";
 export * from './provider-errors.js';
