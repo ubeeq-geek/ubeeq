@@ -20,13 +20,14 @@ export * from './ghost-content.js';
 export * from './professional-publishing.js';
 export const INTEGRATION_CAPABILITIES = [
   "connect", "catalogue_import", "source_migration", "publish", "remote_update",
-  "remote_delete", "engagement_read", "engagement_write", "webhook_receive", "reconcile"
+  "remote_delete", "engagement_read", "engagement_write", "webhook_receive", "reconcile", "announcement_import"
 ] as const;
 export type IntegrationCapability = (typeof INTEGRATION_CAPABILITIES)[number];
 
 export type IntegrationOperation =
   | "connect"
   | "import"
+  | "import_announcements"
   | "migrate_source"
   | "publish"
   | "update_remote"
@@ -45,7 +46,7 @@ export interface IntegrationDefinition {
 }
 
 const requiredCapability: Record<IntegrationOperation, IntegrationCapability> = {
-  connect: "connect", import: "catalogue_import", migrate_source: "source_migration", publish: "publish",
+  connect: "connect", import: "catalogue_import", import_announcements: "announcement_import", migrate_source: "source_migration", publish: "publish",
   update_remote: "remote_update", delete_remote: "remote_delete", read_engagement: "engagement_read",
   write_engagement: "engagement_write", receive_webhook: "webhook_receive", reconcile: "reconcile"
 };
@@ -329,3 +330,7 @@ export * from './reddit.js';
 export * from './reddit-publication.js';
 
 export * from "./bunny.js";
+
+export * from "./import-capabilities.js";
+
+export * from "./historical-posts.js";
