@@ -1,4 +1,5 @@
 /** Product-neutral remote integration capabilities. */
+export * from './youtube-upload.js';
 export * from "./recovery.js";
 export * from './provider-errors.js';
 export * from './soundcloud-normalization.js';
