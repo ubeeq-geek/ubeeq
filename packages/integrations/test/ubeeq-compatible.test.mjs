@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   assertUbeeqPublicationMappings, availableUbeeqCapabilities, createUbeeqCompatibleCatalog,
   presetForDiscoveredService, requireSafePublicationActivation, resolveUbeeqIdempotentJob,
-  ubeeqPublicationMappingKey, validateUbeeqDiscovery
+  ubeeqPublicationMappingKey, validateUbeeqDiscovery, UBEEQ_INVENTORY_PATH
 } from "../dist/index.js";
 
 const discovery = {
@@ -103,4 +103,10 @@ test('mapping guards reject empty identities and unknown lifecycle states', () =
   const mapping = { instanceId: 'i', remoteAccountId: 'a', remoteSpaceId: 's', localPublicationId: 'p', remotePublicationId: 'r', remoteRevision: '1', lifecycle: 'active' };
   assert.throws(() => assertUbeeqPublicationMappings([{ ...mapping, remoteAccountId: '' }]), /mapping/);
   assert.throws(() => assertUbeeqPublicationMappings([{ ...mapping, lifecycle: 'unknown' }]), /lifecycle/);
+});
+
+test('normalized discovery base and relative endpoint paths preserve deployment API prefixes', () => {
+  const validated = validateUbeeqDiscovery(discovery, { requestedOrigin: 'https://example.test' });
+  assert.equal(new URL(UBEEQ_INVENTORY_PATH, validated.apiBaseUrl).href, 'https://example.test/v1/inventory');
+  assert.throws(() => validateUbeeqDiscovery({ ...discovery, apiBaseUrl: 'https://example.test/v1?token=secret' }, { requestedOrigin: 'https://example.test' }), /query/);
 });

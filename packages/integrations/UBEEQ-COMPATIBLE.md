@@ -21,9 +21,10 @@ cannot accidentally belong to two active mappings.
 
 ## Host responsibilities
 
-Hosts expose `/.well-known/ubeeq`, the account/space-specific capability check,
-paginated inventory, staged or draft publication writes, conditional revision
-updates, and durable idempotency lookup. Authorization must be enforced again
+Hosts expose `/.well-known/ubeeq` and the account/space-specific capability check.
+They implement paginated inventory, staged or draft publication writes,
+conditional revision updates, and durable idempotency lookup only for the
+capabilities they actually advertise. Authorization must be enforced again
 for every operation. Products own endpoint DNS/redirect enforcement, vault
 storage, policy and quota decisions, persistence, and user-facing conflict or
 partial-result workflows.
@@ -58,7 +59,9 @@ reconcile under the product's durable worker policy, never blindly create again.
 
 ## Read-only host profile (v1)
 
-Discovery `apiBaseUrl` is the base for `GET /capabilities?remoteSpaceId=...` and
+Validation normalizes `apiBaseUrl` with a trailing slash and rejects queries.
+Resolve the exported relative path constants with `new URL(path, apiBaseUrl)`;
+this preserves deployment API path prefixes. The base is used for `GET /capabilities?remoteSpaceId=...` and
 `GET /inventory?remoteSpaceId=...&limit=...&cursor=...`. The capability response
 is `UbeeqTargetCapabilities`; inventory is `UbeeqInventoryPage`. IDs are opaque
 and always accompanied by instance/account/space. The account is derived from

@@ -109,6 +109,8 @@ export const validateUbeeqDiscovery = (input: unknown, options: DiscoveryValidat
   const canonical = parsedUrl(document.canonicalOrigin, 'Canonical origin');
   const api = parsedUrl(document.apiBaseUrl, 'API base URL');
   const authorization = parsedUrl(document.authorizationEndpoint, 'Authorization endpoint');
+  if (api.search) throw new Error('API base URL must not contain a query.');
+  if (!api.pathname.endsWith('/')) api.pathname += '/';
   for (const url of [requested, canonical]) {
     if (url.pathname !== '/' || url.search) throw new Error('Requested and canonical origins must be origins without paths or queries.');
   }
@@ -235,8 +237,8 @@ export const requireSafePublicationActivation = (input: {
 };
 
 /** Read-only v1 host profile. Paths are relative to the discovered API base URL. */
-export const UBEEQ_CAPABILITIES_PATH = '/capabilities';
-export const UBEEQ_INVENTORY_PATH = '/inventory';
+export const UBEEQ_CAPABILITIES_PATH = 'capabilities';
+export const UBEEQ_INVENTORY_PATH = 'inventory';
 export interface UbeeqTargetCapabilities extends UbeeqRemoteTarget {
   capabilities: readonly UbeeqCapability[];
 }
