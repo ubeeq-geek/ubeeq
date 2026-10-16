@@ -198,6 +198,10 @@ export interface PublicationReconciliationField {
 }
 
 export interface Publication extends CellOwned {
+  copy?: import("./publication-copy.js").PublicationCopyIdentity;
+  activeOperationId?: EntityId;
+  /** CAS revision for copy-aware operations; legacy records have no revision. */
+  revision?: number;
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -229,6 +233,8 @@ export interface Publication extends CellOwned {
 }
 
 export interface PublicationIntent extends CellOwned {
+  publicationId?: EntityId;
+  slotId?: string;
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;
@@ -323,3 +329,5 @@ export * from './release-timing';
 export { FavoriteService, FavoriteError, type FavoriteTarget, type FavoriteRecord, type FavoritePort } from './favorites.js';
 export * from './creator-source-files.js';
 export * from './shared-viewing.js';
+
+export * from "./publication-copy.js";

@@ -1,3 +1,6 @@
+import type { CopyOperationCommit } from './publication-copies.js';
+import type { PublicationOperation } from '@ubeeq/core';
+import { validateCopyCreation, validateCopyOperation, assertCopyIdentityUnchanged, PublicationCopyConflict, type CopyPublication, type CopyCreation, type PublicationClaim } from './publication-copies.js';
 import type { CreatorContentRecords, CreatorContentStore } from "./creator-content.js";
 import { validateCreatorContentRestore, type CreatorContentRestore, type CreatorContentRestoreReceipt } from './creator-content-restore.js';
 import { CreatorContentCommitError, type CreatorContentAssetCommit } from "./creator-content.js";
@@ -177,11 +180,58 @@ export class MemoryCreatorContentStore<M extends CreatorContentRecords = Creator
   }
 
   async getPublication(tenantId: string, publicationId: string): Promise<M['publication'] | null> {
-    return this.publications.find((publication) => publication.tenantId === tenantId && publication.publicationId === publicationId) || null;
+    return structuredClone(this.publications.find((publication) => publication.tenantId === tenantId && publication.publicationId === publicationId) || null);
+  }
+
+  publicationClaims: PublicationClaim[] = [];
+  async getPublicationClaim(tenantId: string, key: string): Promise<PublicationClaim | null> {
+    return structuredClone(this.publicationClaims.find(row => row.tenantId === tenantId && row.key === key) || null);
+  }
+  async commitPublicationCopy(input: CopyCreation<M['publication'] & CopyPublication>): Promise<void> {
+    validateCopyCreation(input);
+    // Clone before touching state; there is no await between checks and commit.
+    const { publication: p, request, slot, existing } = structuredClone(input);
+    const fail = () => { throw new PublicationCopyConflict('Publication, slot, request or Work changed concurrently.'); };
+    const work = this.works.find(row => row.tenantId === p.tenantId && row.workId === p.workId);
+    if (!work || work.creatorId !== p.creatorId || ['deleted', 'archived'].includes(work.status)) return fail();
+    const current = this.publications.find(row => row.tenantId === p.tenantId && row.publicationId === p.publicationId);
+    const slotClaim = this.publicationClaims.find(row => row.tenantId === p.tenantId && row.key === slot.key);
+    if (this.publicationClaims.some(row => row.tenantId === p.tenantId && row.key === request.key)) return fail();
+    if (existing ? (!current || !slotClaim || slotClaim.publicationId !== p.publicationId || slotClaim.fingerprint !== slot.fingerprint)
+      : (current || slotClaim)) return fail();
+    if (!existing) { this.publications.push(p); this.publicationClaims.push(slot); }
+    this.publicationClaims.push(request);
+  }
+
+  publicationOperations: PublicationOperation[] = [];
+  async getPublicationOperation(tenantId: string, operationId: string): Promise<PublicationOperation | null> {
+    return structuredClone(this.publicationOperations.find(row => row.tenantId === tenantId && row.operationId === operationId) || null);
+  }
+  async commitPublicationOperation(input: CopyOperationCommit<M['publication'] & CopyPublication>): Promise<void> {
+    validateCopyOperation(input);
+    const { previous, next, operation, previousOperation, remoteClaim } = structuredClone(input);
+    const fail = () => { throw new PublicationCopyConflict('Publication, operation, remote binding or Work changed concurrently.'); };
+    const work = this.works.find(row => row.tenantId === next.tenantId && row.workId === next.workId) as (M['work'] & { revision?: number }) | undefined;
+    const current = this.publications.find(row => row.tenantId === previous.tenantId && row.publicationId === previous.publicationId) as CopyPublication | undefined;
+    const saved = this.publicationOperations.find(row => row.tenantId === operation.tenantId && row.operationId === operation.operationId);
+    if (!current || JSON.stringify(current) !== JSON.stringify(previous) || next.revision !== previous.revision! + 1
+      || !work || work.creatorId !== next.creatorId || ['deleted', 'archived'].includes(work.status)
+      || (operation.state === 'IN_FLIGHT' && work.revision !== operation.sourceRevision)
+      || JSON.stringify(saved || null) !== JSON.stringify(previousOperation)) return fail();
+    if (remoteClaim) {
+      const binding = this.publicationClaims.find(row => row.tenantId === remoteClaim.tenantId && row.key === remoteClaim.key);
+      if (binding && binding.publicationId !== next.publicationId) return fail();
+    }
+    this.publications = this.publications.map(row => row === current ? next : row);
+    this.publicationOperations = [...this.publicationOperations.filter(row => !(row.tenantId === operation.tenantId && row.operationId === operation.operationId)), operation];
+    if (remoteClaim && !this.publicationClaims.some(row => row.tenantId === remoteClaim.tenantId && row.key === remoteClaim.key)) this.publicationClaims.push(remoteClaim);
   }
 
   async upsertPublication(publication: M['publication']): Promise<void> {
+    assertCopyIdentityUnchanged(this.publications.find(row => row.tenantId === publication.tenantId && row.publicationId === publication.publicationId) as CopyPublication || null, publication as CopyPublication);
     await this.validatePublication(await this.getPublication(publication.tenantId, publication.publicationId), publication);
+    // Recheck after the async product validation hook before replacing state.
+    assertCopyIdentityUnchanged(this.publications.find(row => row.tenantId === publication.tenantId && row.publicationId === publication.publicationId) as CopyPublication || null, publication as CopyPublication);
     this.publications = this.publications.filter((item) => !(item.tenantId === publication.tenantId && item.publicationId === publication.publicationId));
     this.publications.push(publication);
   }
