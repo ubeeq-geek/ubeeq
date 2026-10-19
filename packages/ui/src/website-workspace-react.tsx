@@ -6,15 +6,15 @@ import { createWebsiteWorkspace, type WebsiteWorkspaceClient, type WebsiteWorksp
 
 /** Website pages use the shared block editor, including its media insertion controls. */
 export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOptions}: {client:WebsiteWorkspaceClient;mediaOptions?:BlockEditorMediaOption[];options?:WebsiteWorkspaceOptions}) {
-  const root=useRef<HTMLDivElement>(null),pendingUploads=useRef(0),activeClient=useRef(client);activeClient.current=client;
+  const root=useRef<HTMLDivElement>(null),pendingUploads=useRef(0),failedPreviews=useRef(new Set<string>()),activeClient=useRef(client);activeClient.current=client;
   const [editor,setEditor]=useState<{host:HTMLElement;document:WebsiteDocument;change:(document:WebsiteDocument)=>void}|null>(null);
   const [images,setImages]=useState<BlockEditorMediaOption[]>(mediaOptions),[libraryError,setLibraryError]=useState('');
   const [options,setOptions]=useState<{pages:{id:string;title:string}[];publications:{id:string;title:string}[];creators:{id:string;title:string}[]}>({pages:[],publications:[],creators:[]});
   useEffect(()=>{
     if(!root.current)return;
-    setImages(mediaOptions);let generation=0,disposed=false;
+    setImages(mediaOptions);setOptions({pages:[],publications:[],creators:[]});failedPreviews.current.clear();let generation=0,disposed=false;
     const workspace=createWebsiteWorkspace(root.current,{...client,pendingUploads:()=>pendingUploads.current>0},(host,document,change)=>{
-      const current=++generation;setLibraryError('');
+      const current=++generation;setLibraryError('');failedPreviews.current.clear();
       void Promise.all([client.get(),client.catalogue?.()??Promise.resolve([]),client.media?.()??Promise.resolve([]),client.creators?.()??Promise.resolve([])]).then(([site,catalogue,library,creators])=>{
         if(disposed||current!==generation)return;
         setImages(previous=>{const result=new Map(previous.map(image=>[image.mediaId,image]));for(const image of library){const old=result.get(image.id);result.set(image.id,{...old,mediaId:image.id,label:image.title,assetType:'image'});}return [...result.values()];});
@@ -29,7 +29,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
     if(!editor||!client.mediaPreview)return;
     let active=true;const ids=new Set<string>(),blocks=[...editor.document.blocks];
     while(blocks.length){const block=blocks.pop()!;if(block.type==='image'&&(block.assetId||block.fileId))ids.add(block.assetId??block.fileId!);if(block.children)blocks.push(...block.children);}
-    for(const id of ids)if(!images.find(image=>image.mediaId===id)?.thumbnailUrl)void client.mediaPreview(id).then(url=>{if(active)setImages(previous=>{const known=previous.find(image=>image.mediaId===id);return [...previous.filter(image=>image.mediaId!==id),{...known,mediaId:id,label:known?.label??'Page image',assetType:'image',thumbnailUrl:url}];});}).catch(()=>{});
+    for(const id of ids)if(!images.find(image=>image.mediaId===id)?.thumbnailUrl&&!failedPreviews.current.has(id))void client.mediaPreview(id).then(url=>{if(active)setImages(previous=>{const known=previous.find(image=>image.mediaId===id);return [...previous.filter(image=>image.mediaId!==id),{...known,mediaId:id,label:known?.label??'Page image',assetType:'image',thumbnailUrl:url}];});}).catch(()=>{if(active){failedPreviews.current.add(id);setLibraryError('A page image could not be previewed. Check its availability or choose another image.');}});
     return()=>{active=false;};
   },[client,editor?.document,images]);
   const upload=client.uploadMedia?async(file:File)=>{
