@@ -23,7 +23,7 @@ entire supplied specification or managed deployment as complete.
 | Local storage | `SqliteWebsiteStore`, separate private SQLite database under the local data directory |
 | Reference API | `/v1/websites`, normal bearer-session authentication, existing durable job queue and worker |
 | Product composition | Supply `WebsiteServicePorts`; optional `ReferenceApiConfiguration.websiteService` replaces local reference composition |
-| Managed publication | Versioned adapter/capability interfaces only; no provider, target API, activation coordinator or rollback implementation |
+| Managed publication | Added in the stacked [hosting implementation](website-hosting.md); see its validation and open release gates |
 
 The local reference maps its existing personal Creator to a personal website
 workspace. It does not invent organization onboarding. Other ownership models

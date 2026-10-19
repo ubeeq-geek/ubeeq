@@ -1,6 +1,12 @@
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
 import { WebsiteError, normalizeContentSlug } from '@ubeeq/core';
+import { handleWebsiteHostingRequest } from './website-hosting.js';
+import { handleHostingConnectionRequest } from './website-hosting-connections.js';
+import { WebsiteHostingConnections, NetlifyWebsiteHostingAdapter, CloudflarePagesWebsiteHostingAdapter, SftpWebsiteHostingAdapter, connectWebsiteSftp } from '@ubeeq/integrations';
+import { createHostingPublicProbe } from '@ubeeq/integrations';
+import { NativeWebsiteHostingAdapter, type NativeWebsiteHostingProfile } from '@ubeeq/adapter-local';
+import { WebsitePublishingService } from '@ubeeq/portability';
 import { handleWebsiteRequest } from './websites.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -73,6 +79,10 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Optional host-composed deterministic activity interface; no LLM service. */
   /** Trusted product composition may supply catalogue/rendition and policy ports. */
   websiteService?: WebsiteService;
+  websitePublishing?: WebsitePublishingService;
+  nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
+  /** Explicit outbound policy is required before any external hosting connection is enabled. */
+  websiteHostingExternal?:{authorizeUrl:(url:URL)=>Promise<void>;authorizeSftpHost:(host:string,port:number)=>Promise<void>;netlify?:{clientId:string;redirectUri:string}};
   activityCommands?: { execute(principal: { actorId: string; profileId: string }, input: string): Promise<string> };
 }
 
@@ -89,6 +99,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
     region: environment.UBEEQ_CELL_REGION ?? "local",
     operator: environment.UBEEQ_CELL_OPERATOR ?? "self-hosted",
     credentialEncryptionKey: environment.UBEEQ_CREDENTIAL_ENCRYPTION_KEY,
+    nativeWebsiteProfiles:environment.UBEEQ_WEBSITE_HOSTING_ROOT&&environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE?[{id:'local',root:environment.UBEEQ_WEBSITE_HOSTING_ROOT,publicUrlTemplate:environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE,persistent:true,writerMode:'single'}]:[],
   };
 };
 
@@ -279,7 +290,47 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     enqueue: async payload => { await adapters.jobs.enqueue({ cellId, type: 'website.build', payload, idempotencyKey: payload.idempotencyKey, maxAttempts: 3 }); },
     audit: async event => { await audit({ action: event.action, actorId: event.actor.actorId, subjectId: event.websiteId, payload: { buildId: event.buildId, artifactDigest: event.artifactDigest, result: event.result } }); }
   }) : undefined);
+  const nativeProfiles=configuration.nativeWebsiteProfiles??[];
+  const nativeProbe=createHostingPublicProbe({authorizeUrl:async url=>{if(!nativeProfiles.some(p=>{const template=new URL(p.publicUrlTemplate.replace('{site}','a'.repeat(32)));return url.origin===template.origin;}))throw new WebsiteError('unsafe_probe','Public probe origin is outside the administrator profiles.');}});
+  const nativeHosting=nativeProfiles.map(p=>new NativeWebsiteHostingAdapter(p,nativeProbe));
+  const authorizeHostingManager=async(actor:{workspaceId:string;actorId:string})=>{const creator=await repositories.creators.get(actor.workspaceId);if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);};
+  const external=configuration.websiteHostingExternal;
+  if(external&&localAdapters&&!configuration.credentialEncryptionKey)throw new WebsiteError('hosting_vault_key_required','External hosting requires an explicit credential vault encryption key.');
+  const hostingConnections=external&&websiteStore&&localAdapters?new WebsiteHostingConnections({cellId,vault:localAdapters.credentials,states:websiteStore.hostingOAuthStates,authorize:authorizeHostingManager,get:(w,id)=>websiteStore.getConnection(w,id),list:w=>websiteStore.listConnections(w),save:(c,r)=>websiteStore.saveConnection(c,r),netlify:external.netlify}):undefined;
+  const externalProbe=external?createHostingPublicProbe({authorizeUrl:external.authorizeUrl}):undefined;
+  const hostingAdapters:import('@ubeeq/core').WebsiteHostingAdapter[]=[...nativeHosting];
+  if(hostingConnections&&externalProbe&&external&&websiteStore){
+    const credential=(c:import('@ubeeq/core').HostingConnection)=>hostingConnections.credential(c);
+    if(external.netlify)hostingAdapters.push(new NetlifyWebsiteHostingAdapter({credential,probe:externalProbe}));
+    hostingAdapters.push(new CloudflarePagesWebsiteHostingAdapter({credential,probe:externalProbe}));
+    for(const mode of ['pointer','in_place'] as const)hostingAdapters.push(new SftpWebsiteHostingAdapter(mode,{probe:externalProbe,connect:async(target,connection)=>connectWebsiteSftp({target,credential:JSON.parse(await credential(connection)),authorizeHost:external.authorizeSftpHost}),managedFiles:async target=>{
+      const files=new Set<string>();for(const attempt of await websiteStore.listAttempts(target.workspaceId,target.websiteId)){if(attempt.targetId!==target.id||!attempt.artifactDigest)continue;const artifact=await websiteStore.getArtifact(target.workspaceId,attempt.artifactDigest);for(const file of artifact?.files.keys()??[])files.add(file);}return [...files];
+    }}));
+  }
+  const websitePolicyActor='website-policy:'+cellId;
+  const publishing=configuration.websitePublishing??(websiteStore&&websites?new WebsitePublishingService({websites,store:websiteStore,artifacts:websiteStore,adapters:hostingAdapters,
+    authorize:async(actor,action,target)=>{const creator=await repositories.creators.get(actor.workspaceId);if(actor.actorId===websitePolicyActor&&action==='publish'&&target&&creator?.homeCellId===cellId)return;if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);},
+    enqueue:async payload=>{await adapters.jobs.enqueue({cellId,type:'website.deploy',payload,idempotencyKey:payload.idempotencyKey,maxAttempts:20});},
+    audit:async event=>{await audit({action:event.action,actorId:event.actor.actorId,subjectId:event.targetId??event.intentId??event.actor.workspaceId,payload:{generation:event.generation,digest:event.digest,result:event.result}});}
+  }):undefined);
+  let lastWebsitePolicyScan=0;
   const runNextJob = async (workerId: string) => {
+    // Recover policy changes from authoritative hold records, even if the process crashed after the hold committed.
+    if(publishing&&websiteStore&&!configuration.websitePublishing&&Date.now()-lastWebsitePolicyScan>=5000){
+      const subjects=(await allRecords(repositories.moderationHolds)).filter(h=>h.state==='active').map(h=>h.subjectId);
+      if(subjects.length)for(const creator of await allRecords(repositories.creators))if(creator.homeCellId===cellId)await publishing.suspendDependencies({workspaceId:creator.id,actorId:websitePolicyActor},subjects);
+      lastWebsitePolicyScan=Date.now();
+    }
+
+    if(publishing){
+      await publishing.recoverOutbox();
+      const lease=await adapters.jobs.lease<{workspaceId:string;attemptId:string}>({cellId,types:['website.deploy'],leaseDurationSeconds:120,workerId});
+      if(lease){try{if(lease.job.cellId!==cellId)throw new Error('Foreign website deployment rejected.');const attempt=await publishing.execute(lease.job.payload.workspaceId,lease.job.payload.attemptId);
+        if(['busy','unknown','verifying'].includes(attempt.state))await adapters.jobs.retry({id:lease.job.id,leaseToken:lease.leaseToken,retryAt:new Date(Date.now()+30000).toISOString(),error:{code:'website_reconciliation_pending',message:'Waiting for serving evidence or the prior writer.'}});
+        else await adapters.jobs.complete({id:lease.job.id,leaseToken:lease.leaseToken});return {attempt};
+      }catch(error){await adapters.jobs.retry({id:lease.job.id,leaseToken:lease.leaseToken,retryAt:new Date(Date.now()+30000).toISOString(),error:{code:'website_deployment_pending',message:'Hosting deployment requires recovery.'}});throw error;}}
+    }
+
     if (websites) {
       const websiteLease = await adapters.jobs.lease<{ workspaceId: string; buildId: string }>({ cellId, types: ['website.build'], leaseDurationSeconds: 120, workerId });
       if (websiteLease) {
@@ -356,6 +407,11 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         if (!websites) throw new HttpError(404, 'websites_unavailable', 'Website publishing is not configured.');
         const identity = await session(request), creator = await creatorFor(identity.subject.id);
         requireHomeCell({ cellId }, creator);
+        if(url.pathname==='/v1/websites/hosting-connections'||url.pathname.startsWith('/v1/websites/hosting-connections/')){
+          if(!hostingConnections||!websiteStore||!publishing)throw new HttpError(404,'hosting_unavailable','External hosting connections require installation configuration.');
+          const result=await handleHostingConnectionRequest({actor:{actorId:identity.subject.id,workspaceId:creator.id},service:hostingConnections,store:websiteStore,publishing,adapters:hostingAdapters,parts:url.pathname.split('/').filter(Boolean).slice(2),method,body:()=>parseBody(request)});
+          return json(response,method==='POST'?202:200,{...result,requestId},requestId);
+        }
         if(method==='GET' && url.pathname==='/v1/websites/catalogue' && websiteStore) {
           const publications=[];
           for await(const publication of repositoryItems(request=>repositories.publications.list(request))) {
@@ -366,6 +422,11 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             catch(error) { if(error instanceof HttpError || error instanceof AdmissionBlockedError) continue; throw error; }
           }
           return json(response,200,{publications,requestId},requestId);
+        }
+        if(url.pathname.split('/')[4]==='hosting'){
+          if(!publishing)throw new HttpError(404,'hosting_unavailable','Hosting is not configured.');
+          const result=await handleWebsiteHostingRequest({service:publishing,actor:{actorId:identity.subject.id,workspaceId:creator.id},method,parts:url.pathname.split('/').filter(Boolean).slice(2),body:()=>parseBody(request),native:nativeHosting});
+          return json(response,method==='POST'?202:200,{...result,requestId},requestId);
         }
         const result = await handleWebsiteRequest({ service: websites, actor: { actorId: identity.subject.id, workspaceId: creator.id }, request, response, url, body: () => parseBody(request) });
         if (!response.writableEnded) return json(response, method === 'POST' ? 202 : 200, { ...result as object, requestId }, requestId);
@@ -464,7 +525,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && recoverJobMatch) { const identity = await session(request); const existingJob = await adapters.jobs.get(recoverJobMatch[1]); if (!existingJob) throw new HttpError(404, "job_not_found", "Job was not found"); if (existingJob.cellId !== cellId) throw new CellRoutingError(cellId, existingJob.cellId); const job = await adapters.jobs.recover({ id: existingJob.id }); await audit({ action: "job.recovered", actorId: identity.subject.id, subjectId: job.id, payload: { type: job.type } }); return json(response, 200, { job, requestId }, requestId); }
       const cancelJobMatch = url.pathname.match(/^\/v1\/operations\/jobs\/([^/]+)\/cancel$/);
       if (method === "POST" && cancelJobMatch) { const identity = await session(request); const body = await parseBody(request); const job = await adapters.jobs.get(cancelJobMatch[1]); if (!job) throw new HttpError(404, "job_not_found", "Job was not found"); if (job.cellId !== cellId) throw new CellRoutingError(cellId, job.cellId); await adapters.jobs.cancel({ id: job.id, reason: typeof body.reason === "string" ? body.reason : undefined }); await audit({ action: "job.cancelled", actorId: identity.subject.id, subjectId: job.id }); return json(response, 204, undefined, requestId); }
-      if (method === "POST" && url.pathname === "/v1/operations/holds") { const identity = await session(request); const body = await parseBody(request); const hold = await repositories.moderationHolds.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, subjectType: requireString(body.subjectType, "subjectType"), subjectId: requireString(body.subjectId, "subjectId"), state: "active", reason: typeof body.reason === "string" ? body.reason : undefined }); await audit({ action: "moderation.hold_created", actorId: identity.subject.id, subjectId: hold.subjectId, payload: { holdId: hold.id, reason: hold.reason } }); return json(response, 201, { hold, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/operations/holds") { const identity = await session(request); const body = await parseBody(request); const hold = await repositories.moderationHolds.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, subjectType: requireString(body.subjectType, "subjectType"), subjectId: requireString(body.subjectId, "subjectId"), state: "active", reason: typeof body.reason === "string" ? body.reason : undefined }); lastWebsitePolicyScan=0;await audit({ action: "moderation.hold_created", actorId: identity.subject.id, subjectId: hold.subjectId, payload: { holdId: hold.id, reason: hold.reason } }); return json(response, 201, { hold, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/operations/holds") { await session(request); const page = await repositories.moderationHolds.list(pageRequest(url)); return json(response, 200, { cell: { cellId, region, routingRevision: 1 }, holds: page.items, nextCursor: page.nextCursor, requestId }, requestId); }
       const releaseHoldMatch = url.pathname.match(/^\/v1\/operations\/holds\/([^/]+)\/release$/);
       if (method === "POST" && releaseHoldMatch) { const identity = await session(request); const hold = await repositories.moderationHolds.get(releaseHoldMatch[1]); if (!hold) throw new HttpError(404, "hold_not_found", "Moderation hold was not found"); requireHomeCell({ cellId }, hold); const released = await repositories.moderationHolds.update(hold.id, hold.revision, { state: "released" }); await audit({ action: "moderation.hold_released", actorId: identity.subject.id, subjectId: released.subjectId, payload: { holdId: released.id } }); return json(response, 200, { hold: released, requestId }, requestId); }

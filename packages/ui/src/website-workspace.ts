@@ -1,6 +1,15 @@
-import type { Website, WebsiteDocument } from '@ubeeq/core';
+import type { Website, WebsiteDocument, WebsiteHostingTarget, HostingCapabilities } from '@ubeeq/core';
 
 export interface WebsiteWorkspaceClient {
+  hostingConnections?():Promise<readonly {id:string;family:string;accountId:string;state:string}[]>;
+  hostingConnectionAction?(action:string,body:Record<string,unknown>):Promise<any>;
+  hostingChoices?():Promise<readonly {id:string;family:string;capabilities:HostingCapabilities}[]>;
+  hostingHistory?():Promise<{targets:readonly WebsiteHostingTarget[];bindings?:readonly {id:string;revision:number;label:string;enabled:boolean;targetIds:readonly string[]}[];domains?:readonly {id:string;targetId:string;hostname:string;state:string;instructions:readonly string[]}[];attempts:readonly {id:string;targetId:string;state:string;generation:number;errorCode?:string;verification?:{publicConfirmed:boolean;reasons:readonly string[]}}[]}>;
+  createNativeTarget?(adapterId:string,label:string):Promise<void>;
+  reviewBinding?(id:string,bindingRevision:number,websiteRevision:number):Promise<{planId:string;fingerprint:string;expiresAt:string}>;
+  reviewPublication?(revision:number,targetIds:readonly string[]):Promise<{planId:string;fingerprint:string;expiresAt:string}>;
+  publishWebsite?(planId:string,fingerprint:string,key:string):Promise<void>;
+  hostingAction?(action:string,id:string,body?:unknown):Promise<void>;
   catalogue?(): Promise<readonly {id:string;title:string}[]>;
   get(): Promise<Website>;
   save(website: Website, expectedRevision: number): Promise<Website>;
@@ -27,6 +36,48 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const save=async()=>{const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
   const show=async(tab:string)=>{
     cleanupEditor?.();cleanupEditor=undefined;content.replaceChildren(element('h2',tab));
+    if(tab==='Publishing'&&client.hostingChoices&&client.hostingHistory){
+      const choices=await client.hostingChoices(),history=await client.hostingHistory();
+      content.append(element('p','Publish captures the approved saved content for the selected destinations. Later draft edits stay out of this release. Provider propagation and public verification may take time.'));
+      if(!choices.length)content.append(element('p','Hosting has not been enabled by the installation administrator. Exact candidate ZIP download remains available below.'));
+      for(const choice of choices){
+        content.append(element('p',`${choice.family}: staging ${choice.capabilities.staging}; activation ${choice.capabilities.activation}; domains ${choice.capabilities.domains}.`));
+        if(choice.family==='native'&&client.createNativeTarget)content.append(button('Create native destination',async()=>{await client.createNativeTarget!(choice.id,site.title);await show('Publishing');}));
+      }
+      if(client.hostingConnections&&client.hostingConnectionAction&&choices.some(c=>['netlify','cloudflare-pages','sftp'].includes(c.family))){
+        const connections=await client.hostingConnections(),action=client.hostingConnectionAction.bind(client);
+        const connect=element('details');connect.append(element('summary','Connect a hosting account'));
+        if(choices.some(c=>c.family==='netlify')){let accountId='';field(connect,'Netlify team account ID','',v=>accountId=v);connect.append(button('Authorize Netlify',async()=>{const result=await action('netlify-authorize',{accountId});globalThis.location.assign(result.authorizationUrl);}));}
+        if(choices.some(c=>c.family==='cloudflare-pages')){let accountId='',token='';field(connect,'Cloudflare account ID','',v=>accountId=v);const secret=field(connect,'Restricted Pages API token','',v=>token=v);secret.type='password';secret.autocomplete='off';connect.append(button('Connect Cloudflare Pages',async()=>{await action('cloudflare-pages',{accountId,token});token='';secret.value='';await show('Publishing');}));}
+        if(choices.some(c=>c.family==='sftp')){let accountId='',username='',privateKey='';field(connect,'SFTP account label','',v=>accountId=v);field(connect,'SFTP username','',v=>username=v);const label=element('label','SSH private key'),key=element('textarea');key.autocomplete='off';key.onchange=()=>privateKey=key.value;label.append(key);connect.append(label,button('Save SFTP key connection',async()=>{await action('sftp',{accountId,username,privateKey});privateKey='';key.value='';await show('Publishing');}));}
+        content.append(connect);
+        for(const connection of connections){const group=element('details');group.append(element('summary',`${connection.family}: ${connection.accountId} (${connection.state})`),button('Disconnect account',async()=>{await action('disconnect',{connectionId:connection.id});await show('Publishing');}));
+          if(['netlify','cloudflare-pages'].includes(connection.family)){let name='';field(group,'New provider site/project name','',v=>name=v);group.append(button('Create provider site/project',async()=>{await action('provision',{connectionId:connection.id,name});status.textContent='Provider site created. Reload the site catalogue to select it.';}),button('Load sites/projects',async()=>{const catalogue=await action('catalogue',{connectionId:connection.id});for(const remote of catalogue.sites){const row=element('div');row.append(element('p',remote.name));let handoff=false;const label=element('label','Confirm replacement of this site and any Git deployment handoff'),check=element('input');check.type='checkbox';check.onchange=()=>handoff=check.checked;label.append(check);row.append(label,button('Use '+remote.name,async()=>{if(!handoff)throw new Error('Confirm management of the selected site.');await action('target',{connectionId:connection.id,websiteId:site.id,remoteId:remote.id,label:remote.name,publicUrl:remote.publicUrl,ownershipConfirmed:true,config:connection.family==='cloudflare-pages'?{projectName:remote.name,productionBranch:remote.productionBranch}:{gitHandoff:'confirmed'}});await show('Publishing');}));group.append(row);}}));}
+          if(connection.family==='sftp'){const config:Record<string,string>={port:'22'};for(const [key,label] of [['hostname','SFTP hostname'],['port','SFTP port'],['root','Dedicated absolute managed root'],['hostKeyFingerprint','Independently verified SHA256 host fingerprint']])field(group,label,config[key]??'',v=>config[key]=v);let publicUrl='',owned=false;field(group,'Public HTTPS URL for this root','',v=>publicUrl=v);const label=element('label','I authorize replacement of files in this dedicated managed root'),check=element('input');check.type='checkbox';check.onchange=()=>owned=check.checked;label.append(check);group.append(label,element('p','In-place copying can expose mixed files during interruptions. Pointer profiles require operator setup and a successful protocol probe.'),button('Validate and use in-place SFTP',async()=>{if(!owned)throw new Error('Confirm management of the dedicated root.');await action('target',{connectionId:connection.id,adapterId:'sftp-in_place',websiteId:site.id,label:connection.accountId,publicUrl,config,ownershipConfirmed:true});await show('Publishing');}));}
+          content.append(group);
+        }
+      }
+      const selected=new Set<string>();
+      for(const target of history.targets){const label=element('label',target.label),check=element('input');check.type='checkbox';check.onchange=()=>check.checked?selected.add(target.id):selected.delete(target.id);label.append(check);content.append(label,element('p',`Desired generation ${target.desiredGeneration}; active ${target.activeGeneration}; serving ${target.serving}.`));if(target.servingRemovalRequired)content.append(element('p','Policy requires serving removal. The provider/server operator must complete withdrawal; serving is not confirmed disabled.'));const link=element('a','Open public website');link.href=target.publicUrl;link.target='_blank';link.rel='noopener noreferrer';content.append(link);
+        if(['suspended','unpublished'].includes(target.serving)&&target.capabilities.emergencySuspension&&target.activeGeneration>0)content.append(button('Resume eligible serving',async()=>{await client.hostingAction!('resume',target.id);await show('Publishing');}));
+        if(target.capabilities.unpublish==='confirmed')content.append(button('Unpublish '+target.label,async()=>{await client.hostingAction!('unpublish',target.id,{idempotencyKey:crypto.randomUUID()});await show('Publishing');}));
+        else content.append(element('p','Serving removal requires the provider or server operator.'));
+        let hostname='';field(content,'Custom hostname for '+target.label,'',v=>hostname=v);content.append(button('Request domain',async()=>{await client.hostingAction!('domains',target.id,{hostname,mode:'alias'});await show('Publishing');}));
+        for(const domain of history.domains?.filter(d=>d.targetId===target.id)??[]){content.append(element('p',`${domain.hostname}: ${domain.state}. ${domain.instructions.join(' ')}`),button('Verify '+domain.hostname,async()=>{await client.hostingAction!('domain-verify',target.id,{domainId:domain.id});await show('Publishing');}),button('Remove '+domain.hostname,async()=>{await client.hostingAction!('domain-remove',target.id,{domainId:domain.id});await show('Publishing');}));}
+
+      }
+      let bindingLabel='';field(content,'Saved destination selection name','',v=>bindingLabel=v);content.append(button('Save destination binding',async()=>{await client.hostingAction!('binding','',{label:bindingLabel,targetIds:[...selected],expectedRevision:0,enabled:true});await show('Publishing');}));
+      for(const binding of history.bindings??[])if(binding.enabled&&client.reviewBinding)content.append(button('Review Publish to '+binding.label,async()=>{const plan=await client.reviewBinding!(binding.id,binding.revision,site.revision);content.append(element('p',`Approved source review for ${binding.label}; expires ${plan.expiresAt}.`),button('Publish approved '+binding.label,async()=>{await client.publishWebsite!(plan.planId,plan.fingerprint,crypto.randomUUID());await show('Publishing');}));}));
+      content.append(button('Review Publish',async()=>{if(!selected.size)throw new Error('Select a publishing destination.');const plan=await client.reviewPublication!(site.revision,[...selected]);const review=element('section');review.append(element('p',`Saved website revision ${site.revision}; ${selected.size} destination(s). Review expires ${plan.expiresAt}. Staged external deploy URLs can be public.`),button('Publish approved release',async()=>{await client.publishWebsite!(plan.planId,plan.fingerprint,crypto.randomUUID());status.textContent='Publish accepted. The worker will generate and deploy the approved release.';await show('Publishing');}));content.append(review);}));
+      content.append(button('Refresh publishing status',async()=>show('Publishing')));
+      for(const attempt of history.attempts){const row=element('div');row.append(element('p',`${history.targets.find(t=>t.id===attempt.targetId)?.label??'Website'}: generation ${attempt.generation}: ${attempt.state}${attempt.errorCode?' ('+attempt.errorCode+')':''}`));
+        if(attempt.verification)row.append(element('p',attempt.verification.publicConfirmed?'Public release verified':`Verification pending: ${attempt.verification.reasons.join(', ')}`));
+        if(['failed','reconnect_required'].includes(attempt.state))row.append(button('Retry deployment',async()=>{await client.hostingAction!('retry',attempt.id,{idempotencyKey:crypto.randomUUID()});await show('Publishing');}));
+        if(['unknown','verifying'].includes(attempt.state))row.append(button('Reconcile serving status',async()=>{await client.hostingAction!('reconcile',attempt.id);await show('Publishing');}));
+        if(['queued','generating','uploading'].includes(attempt.state))row.append(button('Cancel deployment',async()=>{await client.hostingAction!('cancel',attempt.id);await show('Publishing');}));
+        if(attempt.state==='published')row.append(button('Restore this retained release',async()=>{await client.hostingAction!('rollback',attempt.targetId,{attemptId:attempt.id,idempotencyKey:crypto.randomUUID()});await show('Publishing');}));content.append(row);
+      }
+    }
     if(tab==='Pages') {
       content.append(element('p','Hidden pages included in an export remain publicly reachable. Shared document edits affect every destination listed below.'));
       for(const p of site.pages) {
@@ -107,7 +158,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       }
       content.append(button('Build website',async()=>{const b=await client.requestBuild(site.revision,globalThis.crypto.randomUUID());currentBuild=b.id;status.textContent=`Build ${b.state}. Refresh status after the worker completes.`;}));
       content.append(button('Refresh build status',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const b=await client.build(currentBuild);status.textContent=`Build ${b.state}${b.stale?' — newer or restricted sources exist':''}. ${b.errorCode??''} ${b.warnings.join(' ')}`;}));
-      if(tab==='Publishing') content.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);status.textContent='Exported. Upload the files to your hosting provider to publish.';}));
+      if(tab==='Publishing') content.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);status.textContent='Exact candidate ZIP downloaded.';}));
       if(tab==='Preview') {
         const frame=element('iframe');frame.title='Private website candidate';frame.setAttribute('sandbox','');frame.style.width='100%';frame.style.height='600px';
         const select=element('select');select.setAttribute('aria-label','Preview page');const option=element('option','Home');option.value='index.html';select.append(option);

@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { WebsiteWorkspace, type BlockEditorMediaOption } from '@ubeeq/ui/react';
 import { WebsiteClient } from '@ubeeq/ui';
 
+// The documented Netlify implicit OAuth response is immediately removed from browser history.
+const hostingOAuthReturn=(()=>{const params=new URLSearchParams(location.hash.slice(1));if(!params.has('access_token'))return undefined;const result={state:params.get('state')??'',accessToken:params.get('access_token')??''};history.replaceState(null,'',location.pathname+location.search);return result;})();
 function Websites() {
   const [token]=useState(()=>localStorage.getItem('ubeeq.reference.token')??'');
   const [sites,setSites]=useState<{id:string;title:string}[]>([]),[id,setId]=useState(''),[title,setTitle]=useState('My website'),[status,setStatus]=useState(''),[media,setMedia]=useState<BlockEditorMediaOption[]>([]);
@@ -12,6 +14,7 @@ function Websites() {
     const response=await fetch('/api/v1/'+path,{method,headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',redirect:'error'});
     const result=await response.json();if(!response.ok)throw new Error(result.error?.message??'Website operation failed.');return result;
   };
+  useEffect(()=>{if(token&&hostingOAuthReturn){const payload={...hostingOAuthReturn};hostingOAuthReturn.accessToken='';void api('websites/hosting-connections/netlify-callback','POST',payload).then(()=>setStatus('Netlify connected. Select a provider site in Publishing.')).catch(e=>setStatus(e.message));}},[token]);
   useEffect(()=>{let active=true;if(token)void api('websites').then(r=>{if(active){setSites(r.websites);setId(r.websites[0]?.id??'');}}).catch(e=>setStatus(e.message));return()=>{active=false;};},[token]);
   useEffect(()=>{if(token)void api('websites/catalogue').then(r=>{setPublications(r.publications);setMedia(r.publications.flatMap((p:{assets:{id:string;label:string}[]})=>p.assets.map(a=>({mediaId:a.id,label:a.label,assetType:'image' as const}))));}).catch(e=>setStatus(e.message));},[token]);
   const create=async()=>{

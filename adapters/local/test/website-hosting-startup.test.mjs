@@ -1,0 +1,7 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {spawn} from 'node:child_process';import {mkdtemp,rm} from 'node:fs/promises';import {tmpdir} from 'node:os';import {join} from 'node:path';
+test('API and publisher processes can initialize the same persistent database concurrently',async t=>{
+ const dir=await mkdtemp(join(tmpdir(),'ubeeq-concurrent-startup-'));t.after(()=>rm(dir,{recursive:true,force:true}));const config={databasePath:join(dir,'state.sqlite'),dataDirectory:dir,publicBaseUrl:'http://localhost',cellId:'cell'};
+ const program=`import {LocalSqliteDatabase} from ${JSON.stringify(new URL('../dist/index.js',import.meta.url).href)};const local=new LocalSqliteDatabase(JSON.parse(process.argv[1]));process.stdout.write(String(local.database.prepare('SELECT COUNT(*) AS count FROM ubeeq_schema_migrations').get().count));local.database.close();`;
+ const start=()=>new Promise((resolve,reject)=>{const child=spawn(process.execPath,['--input-type=module','-e',program,JSON.stringify(config)],{stdio:['ignore','pipe','pipe']});let output='',errors='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>errors+=b);child.on('error',reject);child.on('exit',code=>code===0?resolve(Number(output)):reject(new Error(errors)));});
+ const counts=await Promise.all(Array.from({length:6},start));assert.ok(counts[0]>=18);assert.ok(counts.every(count=>count===counts[0]));
+});
