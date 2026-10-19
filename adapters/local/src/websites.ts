@@ -29,13 +29,18 @@ export class SqliteWebsiteStore implements WebsiteStore {
       const result=this.db.prepare('INSERT OR IGNORE INTO website_records(workspace,kind,id,revision,payload) VALUES(?,?,?,?,?)').run(workspace,kind,value.id,value.revision,JSON.stringify(value));
       if(!result.changes) throw new WebsiteError('revision_conflict','Record already exists.');
     } else {
-      const result=this.db.prepare('UPDATE website_records SET revision=?,payload=? WHERE workspace=? AND kind=? AND id=? AND revision=?').run(value.revision,JSON.stringify(value),workspace,kind,value.id,expected);
+      const result=this.db.prepare("UPDATE website_records SET revision=?,payload=? WHERE workspace=? AND kind=? AND id=? AND revision=? AND json_extract(payload, '$.deletedAt') IS NULL").run(value.revision,JSON.stringify(value),workspace,kind,value.id,expected);
       if(!result.changes) throw new WebsiteError('revision_conflict','Record changed concurrently.');
     }
   }
-  async getWebsite(workspace:string,id:string) { return this.read<Website>(workspace,'website',id); }
-  async listWebsites(workspace:string) { return this.list<Website>(workspace,'website'); }
+  async getWebsite(workspace:string,id:string) { const site=this.read<Website & {deletedAt?:string}>(workspace,'website',id);return site?.deletedAt?undefined:site; }
+  async listWebsites(workspace:string) { return this.list<Website & {deletedAt?:string}>(workspace,'website').filter(site=>!site.deletedAt); }
   async saveWebsite(value:Website,expected:number) { this.save(value.workspaceId,'website',value,expected); }
+  async deleteWebsite(workspace:string,id:string,expected:number) {
+    const site=await this.getWebsite(workspace,id);if(!site)throw new WebsiteError('website_not_found','Website was not found.');
+    this.save(workspace,'website',{...site,revision:expected+1,deletedAt:new Date().toISOString()} as Website,expected);
+  }
+  async listWorkspaceBuilds(workspace:string) { return this.list<WebsiteBuildRecord>(workspace,'build'); }
   async getDocument(workspace:string,id:string) { return this.read<WebsiteDocument>(workspace,'document',id); }
   async saveDocument(value:WebsiteDocument,expected:number) { this.save(value.workspaceId,'document',value,expected); }
   async getBuild(workspace:string,id:string) { return this.read<WebsiteBuildRecord>(workspace,'build',id); }

@@ -15,6 +15,9 @@ export interface WebsiteStore {
   getWebsite(workspaceId: string, id: string): Promise<Website | undefined>;
   listWebsites(workspaceId: string): Promise<readonly Website[]>;
   saveWebsite(website: Website, expectedRevision: number): Promise<void>;
+  /** Irreversible, revision-checked removal; retained builds remain subject to artifact retention. */
+  deleteWebsite?(workspaceId: string, id: string, expectedRevision: number): Promise<void>;
+  listWorkspaceBuilds?(workspaceId: string): Promise<readonly WebsiteBuildRecord[]>;
   getDocument(workspaceId: string, id: string): Promise<WebsiteDocument | undefined>;
   saveDocument(document: WebsiteDocument, expectedRevision: number): Promise<void>;
   getBuild(workspaceId: string, id: string): Promise<WebsiteBuildRecord | undefined>;

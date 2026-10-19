@@ -173,3 +173,20 @@ test('a Galleries landing page coexists with generated galleries while nested au
  snapshot.website.pages.push(page('nested','nested',{parentId:'galleries'}));
  assert.throws(()=>websiteRoutes(snapshot.website),/reserved/);
 });
+
+test('website removal is revision checked, blocks retained builds, and cannot be undone by stale saves',async t=>{
+ const h=await harness();t.after(()=>h.store.close());
+ const {service,actor,snapshot,store}=h,site=snapshot.website;
+ const b=await service.requestBuild(actor,site.id,1,'delete');await service.execute(actor.workspaceId,b.id);
+ await assert.rejects(service.remove(actor,site.id,2),{code:'revision_conflict'});
+ await assert.rejects(service.save(actor,{...site,revision:2,deletedAt:'now'},1),{code:'invalid_website'});
+ await service.remove(actor,site.id,1);
+ assert.deepEqual(await service.list(actor),[]);
+ await assert.rejects(service.export(actor,b.id),{code:'website_not_found'});
+ await assert.rejects(service.preview(actor,b.id,'index.html'),{code:'website_not_found'});
+ await assert.rejects(service.save(actor,{...site,revision:3},2),{code:'revision_conflict'});
+ assert.equal((await store.listWorkspaceBuilds(actor.workspaceId)).length,1);
+ assert.ok(await store.getDocument(actor.workspaceId,site.pages[0].documentId));
+ const editor=await harness({role:'editor'});t.after(()=>editor.store.close());
+ await assert.rejects(editor.service.remove(editor.actor,editor.snapshot.website.id,1),{code:'authorization_denied'});
+});

@@ -49,8 +49,16 @@ export class WebsiteService {
     if(!site) throw new WebsiteError('website_not_found','Website was not found.');
     return site;
   }
+  async remove(actor:WebsiteActor,id:string,expectedRevision:number) {
+    await this.authorize(actor,'export',[id]);
+    if(!await this.ports.store.getWebsite(actor.workspaceId,id))return;
+    if(!this.ports.store.deleteWebsite)throw new WebsiteError('delete_unavailable','Website deletion is unavailable.');
+    await this.ports.store.deleteWebsite(actor.workspaceId,id,expectedRevision);
+    await this.ports.audit({actor,action:'website.deleted',websiteId:id,result:'deleted'});
+  }
   async save(actor: WebsiteActor, site: Website, expectedRevision: number) {
     const candidate=structuredClone(site);
+    if('deletedAt' in candidate)throw new WebsiteError('invalid_website','Website deletion requires the delete operation.');
     await this.authorize(actor,'edit',[candidate.id,...candidate.pages.map(p=>p.documentId)]);
     if(candidate.workspaceId!==actor.workspaceId || candidate.revision!==expectedRevision+1) throw new WebsiteError('revision_conflict','Website workspace or revision does not match.');
     if(!await this.ports.creatorIdentityAllowed(actor,candidate.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is outside this workspace.');
@@ -144,7 +152,8 @@ export class WebsiteService {
     if(!build) throw new WebsiteError('build_not_found','Build was not found.');
     await this.authorize(actor,'view',this.resources(build.websiteId,build.dependencies));
     const current=await this.ports.store.getWebsite(actor.workspaceId,build.websiteId);
-    let stale=current?.revision!==build.websiteRevision;
+    if(!current)throw new WebsiteError('website_not_found','Website was deleted or is unavailable.');
+    let stale=current.revision!==build.websiteRevision;
     for(const dep of build.dependencies.filter(d=>d.kind==='document')) {
       if(String((await this.ports.store.getDocument(actor.workspaceId,dep.id))?.revision)!==dep.revision) stale=true;
     }
