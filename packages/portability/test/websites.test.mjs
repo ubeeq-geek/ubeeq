@@ -161,3 +161,15 @@ test('full rebuilds remove obsolete files without modifying canonical documents 
   const b=await h.service.requestBuild(h.actor,current.id,2,'second');assert.equal((await h.service.execute(h.actor.workspaceId,b.id)).state,'ready');
   const next=unzip(Buffer.from((await h.service.export(h.actor,b.id)).bytes));assert.ok(!next.has('galleries/autumn/index.html'));assert.ok(unzip(Buffer.from(old.bytes)).has('galleries/autumn/index.html'));assert.equal((await h.service.document(h.actor,doc.id)).document.revision,2);
 });
+
+test('a Galleries landing page coexists with generated galleries while nested authored routes remain reserved',()=>{
+ const snapshot=fixture();
+ snapshot.website.pages.push(page('galleries','galleries',{kind:'portfolio'}));
+ snapshot.documents.push({id:'doc-galleries',workspaceId:snapshot.website.workspaceId,revision:1,blocks:[block('gallery_list')]});
+ assert.equal(websiteRoutes(snapshot.website).get('galleries'),'/galleries/');
+ const artifact=buildWebsiteArtifact(snapshot,limits);
+ assert.ok(artifact.files.has('galleries/index.html'));
+ assert.ok(artifact.files.has('galleries/autumn/index.html'));
+ snapshot.website.pages.push(page('nested','nested',{parentId:'galleries'}));
+ assert.throws(()=>websiteRoutes(snapshot.website),/reserved/);
+});

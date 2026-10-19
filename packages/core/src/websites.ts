@@ -145,7 +145,7 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     if (page.kind !== 'home' && (!page.slug || page.slug.includes('/'))) throw new WebsiteError('invalid_path', 'Each editorial slug must be one path segment.');
     if (page.kind === 'update' && page.parentId) throw new WebsiteError('invalid_hierarchy', 'Update routes cannot have an editorial parent.');
     const route = page.kind === 'home' ? '/' : websitePath(page.kind === 'update' ? `/updates/${page.slug}` : `${parent ? '/' + parent.slug : ''}/${page.slug}`);
-    if (page.kind !== 'update' && /^\/(galleries|updates|assets|page)\//.test(route)) throw new WebsiteError('reserved_route', 'This route namespace is reserved for generated content.');
+    if (page.kind !== 'update' && route !== '/galleries/' && /^\/(galleries|updates|assets|page)\//.test(route)) throw new WebsiteError('reserved_route', 'This route namespace is reserved for generated content.');
     if (occupied.has(route)) throw new WebsiteError('route_collision', `Duplicate normalized route: ${route}`);
     occupied.add(route); routes.set(page.id, route);
   }
