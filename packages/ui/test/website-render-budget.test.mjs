@@ -31,3 +31,5 @@ test('mixed galleries expose static creator filters and independently paginated 
  const single=Buffer.from(renderStaticWebsite(input).files.get('index.html')).toString();assert.doesNotMatch(single,/Filter gallery by creator/);assert.doesNotMatch(single,/Work 0/);assert.match(single,/Work 3/);
  input.limits={maxPages:2,maxBytes:50*1024*1024};input.documents.set('doc',{blocks:[{type:'gallery_list',data:{pageSize:10}}]});assert.throws(()=>renderStaticWebsite(input),{code:'quota_exceeded'});
 });
+
+test('connected creators remain filterable even when their gallery is empty',()=>{const input=fixture();input.website.creatorIdentityId='one';input.creatorIdentities=[{id:'one',title:'First artist'},{id:'two',title:'Second artist'}];input.documents.set('doc',{blocks:[{type:'gallery_list'}]});const files=renderStaticWebsite(input).files;assert.match(Buffer.from(files.get('index.html')).toString(),/Second artist/);assert.match(Buffer.from(files.get('creator/1/two/index.html')).toString(),/No entries yet/);});

@@ -12,6 +12,7 @@ export interface WebsitePublicAsset {
   approvedPublic: boolean; metadataStripped: boolean;
 }
 export interface WebsiteSnapshot {
+  creatorIdentities?:readonly {id:string;title:string}[];
   apiVersion: '1'; website: Website; documents: readonly WebsiteDocument[];
   galleries: readonly WebsiteGallery[]; mappings: readonly WebsitePublicationMapping[];
   assets: readonly WebsitePublicAsset[]; dependencies: readonly WebsiteDependency[];
@@ -91,6 +92,7 @@ export const validateWebsiteFiles = (site: Website, files: ReadonlyMap<string, U
 export const validateWebsiteSnapshotBudget = (raw: WebsiteSnapshot, limits: {maxPages:number;maxAssets:number;maxBytes:number}) => {
   if (raw.apiVersion !== '1') throw new WebsiteError('unsupported_schema','Unsupported website snapshot version.');
   for (const limit of [limits.maxPages, limits.maxAssets, limits.maxBytes]) if (!Number.isSafeInteger(limit) || limit < 1) throw new WebsiteError('invalid_limits','Build limits must be positive integers.');
+  if(raw.creatorIdentities&&(raw.creatorIdentities.length>51||new Set(raw.creatorIdentities.map(creator=>creator.id)).size!==raw.creatorIdentities.length||raw.creatorIdentities.some(creator=>![raw.website.creatorIdentityId,...raw.website.contributingCreatorIds??[]].includes(creator.id)||typeof creator.title!=='string'||!creator.title.trim()||creator.title.length>500)))throw new WebsiteError('invalid_contributors','Resolve only the connected public creator identities.');
   if (raw.website.pages.length > limits.maxPages || raw.assets.length > limits.maxAssets || raw.galleries.length > 1000) throw new WebsiteError('quota_exceeded','Website page, gallery or media quota exceeded.');
   // Bound the source projection before cloning it or allocating rendered output.
   let sourceBytes=Buffer.byteLength(JSON.stringify(raw.website));
@@ -133,7 +135,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',website:site,routes,documents,galleries,media});
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',website:site,routes,documents,galleries,media,creatorIdentities:snapshot.creatorIdentities});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');

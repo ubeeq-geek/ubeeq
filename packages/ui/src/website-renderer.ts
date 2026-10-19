@@ -17,6 +17,7 @@ export interface StaticWebsiteMedia {
 }
 export interface StaticWebsiteGallery extends WebsiteGallery { href?: string; local: boolean; }
 export interface StaticWebsiteInput {
+  creatorIdentities?:readonly {id:string;title:string}[];
   limits?: { maxPages: number; maxBytes: number };
   apiVersion: '1'; website: Website; routes: ReadonlyMap<string, string>;
   documents: ReadonlyMap<string, WebsiteDocument>;
@@ -176,7 +177,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
           const max = Number(block.data?.maxResults ?? 1000);
           if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new WebsiteError('invalid_query', 'Maximum results must be 1–1000.');
           selected=selected.slice(0,max);
-          const identities=new Map(selected.map(g=>[g.creatorIdentityId??site.creatorIdentityId,g.creatorName??'Creator']));
+          const identities=input.creatorIdentities?new Map(input.creatorIdentities.filter(creator=>!Array.isArray(creators)||!creators.length||creators.includes(creator.id)).map(creator=>[creator.id,creator.title])):new Map(selected.map(g=>[g.creatorIdentityId??site.creatorIdentityId,g.creatorName??'Creator']));
           if(identities.size<2)return paginated(selected.map(g=>card(g)));
           const filterPath=(id:string)=>`${path}creator/${index}/${encodeURIComponent(id)}/`;
           const filter=(active?:string)=>`<nav class="gallery-creator-filter" aria-label="Filter gallery by creator"><a href="${e(url(path))}"${!active?' aria-current="page"':''}>All creators</a> ${[...identities].map(([id,name])=>`<a href="${e(url(filterPath(id)))}"${active===id?' aria-current="page"':''}>${e(name)}</a>`).join(' ')}</nav>`;
