@@ -55,3 +55,14 @@ test('description input has one total budget rather than per-paragraph bypasses'
   assert.throws(() => parseDescriptionBlocks('<br>'.repeat(50001)), /structure budget/);
   assert.throws(() => parseDescriptionBlocks('<span>'.repeat(257) + 'text' + '</span>'.repeat(257)), /structure budget/);
 });
+
+test('browser Enter paragraphs retain separation while inline Shift-Enter stays a single break', () => {
+  const html = sanitizeInlineHtml('First paragraph.<div><strong>Second</strong> paragraph.</div><div>Third paragraph.</div>');
+  assert.equal(html, 'First paragraph.<br><br><strong>Second</strong> paragraph.<br><br>Third paragraph.');
+  assert.equal(sanitizeInlineHtml(html), html);
+  assert.equal(sanitizeInlineHtml('First<br>second'), 'First<br>second');
+  assert.equal(sanitizeInlineHtml('<p>First</p><p>Second</p>'), 'First<br><br>Second');
+  const blocks = normalizeDescriptionBlocks([{ blockId: 'one', type: 'paragraph', html }]);
+  assert.equal(blocks[0].text, 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.');
+  assert.equal(serializeDescriptionBlocks(blocks), `<p>${html}</p>`);
+});

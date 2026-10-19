@@ -16,6 +16,7 @@ export interface StaticWebsiteMedia {
 }
 export interface StaticWebsiteGallery extends WebsiteGallery { href?: string; local: boolean; }
 export interface StaticWebsiteInput {
+  limits?: { maxPages: number; maxBytes: number };
   apiVersion: '1'; website: Website; routes: ReadonlyMap<string, string>;
   documents: ReadonlyMap<string, WebsiteDocument>;
   galleries: readonly StaticWebsiteGallery[];
@@ -37,11 +38,22 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
   const absolute = (path: string) => site.publicBaseUrl ? new URL(url(path), site.publicBaseUrl).href : undefined;
   const files = new Map<string, string>(), warnings: string[] = [];
   const pages = site.pages.filter(p => p.state === 'ready');
+  const limits = input.limits ?? { maxPages: 200, maxBytes: 50 * 1024 * 1024 };
+  if (![limits.maxPages, limits.maxBytes].every(n => Number.isSafeInteger(n) && n > 0)) throw new WebsiteError('invalid_limits', 'Render limits must be positive integers.');
+  let plannedPages = pages.length + galleries.filter(g => g.local).length + site.redirects.length + 1;
+  if (plannedPages > limits.maxPages) throw new WebsiteError('quota_exceeded', 'Generated page limit exceeded.');
+  let outputBytes = 0;
+  const write = (name: string, content: string) => {
+    const bytes = new TextEncoder().encode(content).byteLength;
+    if (bytes > limits.maxBytes - outputBytes) throw new WebsiteError('quota_exceeded', 'Generated website byte limit exceeded.');
+    outputBytes += bytes;
+    files.set(name, content);
+  };
   const pathFile = (path: string) => path === '/' ? 'index.html' : decodeURIComponent(path.slice(1)) + 'index.html';
   const add = (path: string, html: string) => {
     const name = pathFile(path);
     if (files.has(name)) throw new WebsiteError('route_collision', `Duplicate generated route: ${path}`);
-    files.set(name, html);
+    write(name, html);
   };
   const link = (value: string, contact = true): string => {
     if (value.startsWith('#')) {
@@ -94,7 +106,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     const path = routes.get(page.id)!, doc = documents.get(page.documentId);
     if (!doc) throw new WebsiteError('missing_document', 'Page document was not resolved.');
     let blockNumber = 0;
-    const extraPages: { path: string; title: string; body: string }[] = [];
+    const extraPages: { path: string; title: string; body: () => string }[] = [];
     const renderBlocks = (blocks: readonly ContentBlock[]): string => blocks.map(block => {
       const index = ++blockNumber;
       if (!(block.type in STATIC_BLOCK_SUPPORT)) throw new WebsiteError('unsupported_block', `Unsupported static block: ${block.type}`);
@@ -109,9 +121,11 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         if (!Number.isSafeInteger(size) || size < 1 || size > 100) throw new WebsiteError('invalid_query', 'Page size must be 1–100.');
         if (!items.length) return block.data?.empty === 'omit' ? '' : `<p>${e(String(block.data?.emptyMessage ?? 'No entries yet.'))}</p>`;
         const count = Math.ceil(items.length / size);
+        if (count - 1 > limits.maxPages - plannedPages) throw new WebsiteError('quota_exceeded', 'Generated pagination exceeds the page limit.');
+        plannedPages += count - 1;
         const listPath = (n: number) => n === 1 ? path : `${path}page/${index}/${n}/`;
         const content = (n: number) => `<div class="grid">${items.slice((n-1)*size,n*size).join('')}</div>${count > 1 ? `<nav aria-label="List pages">${Array.from({length:count},(_,i) => `<a href="${e(url(listPath(i+1)))}"${n === i+1 ? ' aria-current="page"' : ''}>Page ${i+1}</a>`).join(' ')}</nav>` : ''}`;
-        for (let n=2;n<=count;n++) extraPages.push({path:listPath(n),title:`${page.title} — Page ${n}`,body:content(n)});
+        for (let n=2;n<=count;n++) extraPages.push({path:listPath(n),title:`${page.title} — Page ${n}`,body:()=>content(n)});
         return content(1);
       };
       switch (block.type) {
@@ -151,7 +165,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
       }
     }).join('');
     add(path, shell(page.title, renderBlocks(doc.blocks), path, page));
-    for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body, extra.path));
+    for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body(), extra.path));
   }
   for (const g of galleries.filter(g => g.local)) {
     const path = websitePath(`/galleries/${g.slug}`);
@@ -162,12 +176,12 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     add(path, shell('Page moved', `<p><a href="${e(to)}">Continue to the new page</a></p>`,path,{noindex:true}));
     warnings.push('Portable redirects are HTML link pages, not HTTP 301/308 responses.');
   }
-  files.set('404.html', shell('Page not found', `<p><a href="${e(url('/'))}">Return Home</a></p>`, '/404/', {noindex:true}));
-  files.set('assets/theme.css', css+(site.theme.settings.font==='serif'?'body{font-family:Georgia,serif}':'')+(site.theme.settings.accentColor?`body.light,body.dark,body.system{--color-action:${site.theme.settings.accentColor};--color-focus:${site.theme.settings.accentColor}}`:''));
-  files.set('robots.txt', `User-agent: *\n${site.noindex ? 'Disallow: /' : 'Allow: /'}\n${site.publicBaseUrl ? `Sitemap: ${absolute('/sitemap.xml')}\n` : ''}`);
-  files.set('redirects.json',JSON.stringify({apiVersion:'1',redirects:site.redirects.map(r=>({from:url(websitePath(r.from)),to:r.to.startsWith('/')?url(websitePath(r.to)):websiteExternalUrl(r.to),status:r.status}))},null,2)+'\n');
+  write('404.html', shell('Page not found', `<p><a href="${e(url('/'))}">Return Home</a></p>`, '/404/', {noindex:true}));
+  write('assets/theme.css', css+(site.theme.settings.font==='serif'?'body{font-family:Georgia,serif}':'')+(site.theme.settings.accentColor?`body.light,body.dark,body.system{--color-action:${site.theme.settings.accentColor};--color-focus:${site.theme.settings.accentColor}}`:''));
+  write('robots.txt', `User-agent: *\n${site.noindex ? 'Disallow: /' : 'Allow: /'}\n${site.publicBaseUrl ? `Sitemap: ${absolute('/sitemap.xml')}\n` : ''}`);
+  write('redirects.json',JSON.stringify({apiVersion:'1',redirects:site.redirects.map(r=>({from:url(websitePath(r.from)),to:r.to.startsWith('/')?url(websitePath(r.to)):websiteExternalUrl(r.to),status:r.status}))},null,2)+'\n');
   const sitemapPaths = [...files.keys()].filter(name => name.endsWith('index.html')).map(name => name === 'index.html' ? '/' : '/' + name.slice(0,-10).split('/').map(encodeURIComponent).join('/')).filter(path => !pages.some(p => routes.get(p.id) === path && p.noindex) && !site.redirects.some(r => websitePath(r.from) === path));
-  files.set('sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${!site.noindex && site.publicBaseUrl ? sitemapPaths.map(path => `<url><loc>${e(absolute(path)!)}</loc></url>`).join('') : ''}</urlset>`);
-  files.set('README.txt', `Static website\n\nServe this directory with a generic static HTTP server at ${websitePath(site.basePath)}.\nNo application runtime is required. Directory index files must be enabled.\nMedia mode: ${site.mediaMode}. ${site.mediaMode === 'linked' ? 'Public media depends on its configured delivery provider.' : 'Public media is bundled.'}\nExternal links and accepted embed links require their destinations to be available.\nRedirect pages provide links; configure HTTP redirects separately if required.\nDownloading this archive does not confirm a live deployment.\n`);
+  write('sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${!site.noindex && site.publicBaseUrl ? sitemapPaths.map(path => `<url><loc>${e(absolute(path)!)}</loc></url>`).join('') : ''}</urlset>`);
+  write('README.txt', `Static website\n\nServe this directory with a generic static HTTP server at ${websitePath(site.basePath)}.\nNo application runtime is required. Directory index files must be enabled.\nMedia mode: ${site.mediaMode}. ${site.mediaMode === 'linked' ? 'Public media depends on its configured delivery provider.' : 'Public media is bundled.'}\nExternal links and accepted embed links require their destinations to be available.\nRedirect pages provide links; configure HTTP redirects separately if required.\nDownloading this archive does not confirm a live deployment.\n`);
   return { files, warnings };
 };

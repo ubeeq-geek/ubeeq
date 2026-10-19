@@ -11,6 +11,8 @@ export interface WebsiteWorkspaceClient {
   previewPages?(id:string): Promise<readonly string[]>;
   build(id: string): Promise<{ id: string; state: string; errorCode?: string; warnings: readonly string[]; stale?: boolean }>;
   export(id: string): Promise<Blob>;
+  /** Product downloads may use a short-lived private storage URL to avoid gateway response limits. */
+  download?(id: string): Promise<void>;
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
@@ -107,7 +109,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       }
       content.append(button('Build website',async()=>{const b=await client.requestBuild(site.revision,globalThis.crypto.randomUUID());currentBuild=b.id;status.textContent=`Build ${b.state}. Refresh status after the worker completes.`;}));
       content.append(button('Refresh build status',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const b=await client.build(currentBuild);status.textContent=`Build ${b.state}${b.stale?' — newer or restricted sources exist':''}. ${b.errorCode??''} ${b.warnings.join(' ')}`;}));
-      if(tab==='Publishing') content.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);status.textContent='Exported. Upload the files to your hosting provider to publish.';}));
+      if(tab==='Publishing') content.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');if(client.download)await client.download(currentBuild);else{const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}status.textContent='Exported. Upload the files to your hosting provider to publish.';}));
       if(tab==='Preview') {
         const frame=element('iframe');frame.title='Private website candidate';frame.setAttribute('sandbox','');frame.style.width='100%';frame.style.height='600px';
         const select=element('select');select.setAttribute('aria-label','Preview page');const option=element('option','Home');option.value='index.html';select.append(option);

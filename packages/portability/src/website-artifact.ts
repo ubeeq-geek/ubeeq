@@ -133,7 +133,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({apiVersion:'1',website:site,routes,documents,galleries,media});
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',website:site,routes,documents,galleries,media});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');

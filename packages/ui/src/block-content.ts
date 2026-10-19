@@ -38,6 +38,9 @@ const inlineContent = (value: string, plainText: boolean): string => {
   const root = parseFragment(value);
   const stack: Array<DefaultTreeAdapterMap['node'] | string> = [...root.childNodes].reverse();
   const output: string[] = [];
+  // HTML parsing replaces null characters in source text, so this internal
+  // marker cannot collide with text supplied by the editor.
+  const paragraphBoundary = '\u0000paragraph\u0000';
   let visited = 0;
   while (stack.length) {
     const node = stack.pop()!;
@@ -49,10 +52,10 @@ const inlineContent = (value: string, plainText: boolean): string => {
     if (['script', 'style', 'template', 'iframe', 'object', 'embed', 'noscript'].includes(tag)) continue;
     if (tag === 'br') { output.push(plainText ? '\n' : '<br>'); continue; }
     let start = '', end = '';
-    if (!plainText) {
+    if (tag === 'div' || tag === 'p') { start = paragraphBoundary; end = paragraphBoundary; }
+    else if (!plainText) {
       const normalized = ({ b: 'strong', strong: 'strong', i: 'em', em: 'em', u: 'u', s: 's', strike: 's', code: 'code' } as Record<string, string>)[tag];
       if (normalized) { start = '<' + normalized + '>'; end = '</' + normalized + '>'; }
-      else if (tag === 'div' || tag === 'p') end = '<br>';
       else if (tag === 'li') { start = '• '; end = '<br>'; }
       else if (tag === 'a') {
         const href = node.attrs.find(attribute => attribute.name === 'href')?.value || '';
@@ -63,7 +66,12 @@ const inlineContent = (value: string, plainText: boolean): string => {
     if (end) stack.push(end);
     for (let index = node.childNodes.length - 1; index >= 0; index--) stack.push(node.childNodes[index]);
   }
-  return output.join('');
+  const content = output.join('');
+  if (!content.includes(paragraphBoundary)) return content;
+  return content.split(paragraphBoundary)
+    .map(part => plainText ? part.replace(/^\n+|\n+$/g, '') : part.replace(/^(?:<br>)+|(?:<br>)+$/g, ''))
+    .filter(part => part.trim())
+    .join(plainText ? '\n\n' : '<br><br>');
 };
 
 export const sanitizeInlineHtml = (value: string): string => inlineContent(value, false);
