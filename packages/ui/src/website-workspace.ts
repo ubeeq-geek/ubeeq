@@ -25,6 +25,23 @@ export interface WebsiteWorkspaceClient {
   preview(id: string,file?:string): Promise<string>;
 }
 export interface WebsiteWorkspaceOptions { previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
+  popup.opener=null;popup.document.title='Opening website preview';popup.document.body.textContent='Preparing the saved website preview…';
+  try {
+    const saved=await client.get(),page=saved.pages.find(p=>p.id===(pageId??saved.homePageId));
+    if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
+    let buildId:string|undefined;
+    for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
+    if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Open Preview again once the build is ready.');buildId=build.id;}
+    const route=websiteRoutes(saved).get(page.id);if(!route)throw new Error('This page is unavailable in the saved website.');
+    if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
+    const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
+    const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
+    if(popup.closed)return buildId;
+    if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
+    return buildId;
+  }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}
+};
 /** Shared editor injection keeps the authoritative block format and existing editor. */
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void)) => {
   const d=root.ownerDocument;
@@ -66,24 +83,9 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.offsetTop+first.offsetHeight/2}px`);};
   const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
   const previewPage=async(pageId:string)=>{
-    if(previewPending)throw new Error('A page preview is already opening.');
-    const popup=win?.open('about:blank','_blank');
-    if(!popup)throw new Error('Allow pop-ups to open this preview in a new tab.');
-    popup.opener=null;popup.document.title='Opening page preview';popup.document.body.textContent='Preparing the saved page preview…';previewPending=true;
-    try {
-      const saved=await client.get(),page=saved.pages.find(p=>p.id===pageId);
-      if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
-      let buildId:string|undefined;
-      for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
-      if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Open Preview again once the build is ready.');buildId=build.id;}
-      currentBuild=buildId;const route=websiteRoutes(saved).get(pageId);if(!route)throw new Error('This page is unavailable in the saved website.');
-      if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
-      const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
-      const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
-      if(popup.closed)return;
-      if(options.previewPath){const target=new URL(options.previewPath,win!.location.href);if(target.origin!==win!.location.origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
-      status.textContent='Preview opened in a new tab using saved changes.';
-    }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}finally{previewPending=false;}
+    if(previewPending)throw new Error('A website preview is already opening.');
+    const popup=win?.open('about:blank','_blank');if(!popup)throw new Error('Allow pop-ups to open this preview in a new tab.');previewPending=true;
+    try{currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';}finally{previewPending=false;}
   };
   const show=async(tab:string)=>{
     const generation=++renderGeneration;
