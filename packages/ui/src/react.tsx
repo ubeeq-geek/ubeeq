@@ -29,6 +29,7 @@ export type BlockEditorProps = {
   helpText?: string;
   mediaOptions?: BlockEditorMediaOption[];
   allowMedia?: boolean;
+  uploadMedia?: (file:File)=>Promise<BlockEditorMediaOption>;
   allowStructured?: boolean;
   websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
@@ -80,24 +81,29 @@ export function BlockEditor({
   helpText = 'Build structured content that can be adapted for each connected platform.',
   mediaOptions = [],
   allowMedia = false,
+  uploadMedia,
   allowStructured = false,
   websiteOptions,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
   const blocks = value.length ? value : [emptyBlock];
+  const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
+  const uploadPending=useRef(false),mounted=useRef(true);useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
+  const blocksRef=useRef(blocks);blocksRef.current=blocks;
   const editableRefs = useRef(new Map<string, HTMLDivElement>());
   const [activeBlockId, setActiveBlockId] = useState(blocks[0]?.blockId || '');
   useEffect(() => {
     if (!blocks.some(block => block.blockId === activeBlockId)) setActiveBlockId(blocks[0]?.blockId || '');
   }, [blocks, activeBlockId]);
 
+  const activeBlockRef=useRef(activeBlockId);activeBlockRef.current=activeBlockId;
   const activeBlock = useMemo(() => blocks.find((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const activeBlockIndex = useMemo(() => blocks.findIndex((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const canFormat = Boolean(activeBlock && textBlockTypes.has(activeBlock.type));
 
   const replaceBlock = (blockId: string, next: PostBlock) => {
-    onChange(blocks.map((block) => block.blockId === blockId ? next : block));
+    onChange(blocksRef.current.map((block) => block.blockId === blockId ? next : block));
   };
 
   const updateTextBlock = (block: PostBlock, htmlValue: string) => {
@@ -122,8 +128,8 @@ export function BlockEditor({
     window.setTimeout(() => editableRefs.current.get(block.blockId)?.focus(), 0);
   };
 
-  const addMediaBlock = (mediaId: string) => {
-    const media = mediaOptions.find((item) => item.mediaId === mediaId);
+  const addMediaBlock = (mediaId: string,uploaded?:BlockEditorMediaOption) => {
+    const media = uploaded??mediaOptions.find((item) => item.mediaId === mediaId);
     if (!media) return;
     const block: PostBlock = {
       blockId: typeof globalThis.crypto?.randomUUID === 'function' ? globalThis.crypto.randomUUID() : `block-${Date.now()}`,
@@ -132,9 +138,9 @@ export function BlockEditor({
       ...(media.assetType === 'file' ? { label: media.label, mimeType: media.mimeType } : {}),
       caption: ''
     };
-    const activeIndex = blocks.findIndex((item) => item.blockId === activeBlockId);
-    const next = [...blocks];
-    next.splice(activeIndex >= 0 ? activeIndex + 1 : blocks.length, 0, block);
+    const current=blocksRef.current;const activeIndex = current.findIndex((item) => item.blockId === activeBlockRef.current);
+    const next = [...current];
+    next.splice(activeIndex >= 0 ? activeIndex + 1 : current.length, 0, block);
     onChange(next);
     setActiveBlockId(block.blockId);
   };
@@ -238,7 +244,7 @@ export function BlockEditor({
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
                 <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
                   label={block.title || 'Section'} onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
               </div>}
               {block.type === 'link' && <div>
@@ -301,11 +307,16 @@ export function BlockEditor({
             const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12}: {})})}};
             onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
           }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
+          {allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
+            const input=event.currentTarget,file=input.files?.[0];if(!file||uploadPending.current)return;uploadPending.current=true;setUploadBusy(true);setUploadError('');
+            try{const image=await uploadMedia(file);if(mounted.current)addMediaBlock(image.mediaId,image);}catch(error){if(mounted.current)setUploadError(error instanceof Error?error.message:'The image could not be uploaded.');}finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);input.value='';}}
+          }}/></label>}
+          {uploadError&&<p role="alert">{uploadError}</p>}
           {allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
             addMediaBlock(event.target.value);
             event.target.value = '';
-          }} aria-label="Add media block">
-            <option value="">Add attached media or file…</option>
+          }} aria-label={websiteOptions?"Add image from existing Works or uploads":"Add media block"}>
+            <option value="">{websiteOptions?"Choose an existing Work image or upload…":"Add attached media or file…"}</option>
             {mediaOptions.map((media) => <option key={media.mediaId} value={media.mediaId}>{media.label}</option>)}
           </select>}
         </div>}
