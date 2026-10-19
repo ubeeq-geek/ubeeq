@@ -12,10 +12,11 @@ rmSync(output, { recursive: true, force: true });
 mkdirSync(output, { recursive: true });
 copy(join(api, "dist"), output);
 copy(join(root, "apps", "web-reference", "src"), join(output, "web-reference"));
+if (existsSync(join(root, "apps", "web-reference", "dist"))) copy(join(root, "apps", "web-reference", "dist"), join(output, "dist"));
 
 // AWS SDK v3 is explicitly packaged rather than assumed from a Lambda runtime image.
 for (const scope of ["@aws", "@aws-sdk", "@smithy"]) copy(join(root, "node_modules", scope), join(output, "node_modules", scope));
-for (const dependency of ["bowser", "mnemonist", "obliterator", "tslib"]) copy(join(root, "node_modules", dependency), join(output, "node_modules", dependency));
+for (const dependency of ["bowser", "mnemonist", "obliterator", "tslib", "parse5", "entities"]) copy(join(root, "node_modules", dependency), join(output, "node_modules", dependency));
 
 // Workspace adapters are real production dependencies of the Lambda entry
 // point.  Keep them beside core packages in the artifact so Node can resolve

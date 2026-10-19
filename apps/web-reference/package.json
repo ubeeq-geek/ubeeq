@@ -5,10 +5,17 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "build": "esbuild src/websites.tsx --bundle --platform=browser --outfile=dist/websites.js --minify --jsx=automatic",
+    "prestart": "npm run build"
   },
   "dependencies": {
     "@ubeeq/extension-sdk": "file:../../packages/extension-sdk",
-    "@ubeeq/ui": "file:../../packages/ui"
+    "@ubeeq/ui": "file:../../packages/ui",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12"
   }
 }

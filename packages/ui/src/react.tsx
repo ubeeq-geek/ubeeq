@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 export { CropCanvas } from './crop-canvas.js';
 export { PrivateMediaPlayer, type PrivateMediaPlayerProps } from './private-media-player.js';
 export { BlockPreview, type BlockPreviewMedia, type BlockMediaRenderer } from './block-preview.js';
+export { WebsiteWorkspace } from './website-workspace-react.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
   createDescriptionBlock,
@@ -29,6 +30,7 @@ export type BlockEditorProps = {
   mediaOptions?: BlockEditorMediaOption[];
   allowMedia?: boolean;
   allowStructured?: boolean;
+  websiteOptions?: { pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
 };
 
@@ -79,6 +81,7 @@ export function BlockEditor({
   mediaOptions = [],
   allowMedia = false,
   allowStructured = false,
+  websiteOptions,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
@@ -235,7 +238,7 @@ export function BlockEditor({
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
                 <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} allowStructured={allowStructured}
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
                   label={block.title || 'Section'} onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
               </div>}
               {block.type === 'link' && <div>
@@ -247,7 +250,21 @@ export function BlockEditor({
                 <label>Credit text<textarea value={block.text || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, text: event.target.value })} /></label>
                 <label>Credit URL<input value={block.url || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, url: event.target.value })} /></label>
               </div>}
-              {!isTextBlock && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit'].includes(block.type) && <p>Preserved {block.type} block — dedicated controls are not available yet.</p>}
+              {websiteOptions && ['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].includes(block.type) && <fieldset disabled={readOnly}>
+                <legend>{block.type.replaceAll('_',' ')}</legend>
+                {block.type === 'premium_promotion' && <p>Only approved public previews are exported. Access remains at the external destination.</p>}
+                {block.type === 'page_link' ? <label>Page<select value={String(block.payload?.pageId ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageId:event.target.value}})}>
+                  <option value="">Choose a page</option>{websiteOptions.pages.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
+                </select></label> : block.type !== 'update_list' && <label>Publications<select multiple={['selected_portfolio','gallery_list'].includes(block.type)} value={['selected_portfolio','gallery_list'].includes(block.type)?(block.payload?.publicationIds as string[] ?? []):String((block.payload?.publicationIds as string[] ?? [])[0] ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,publicationIds:Array.from(event.target.selectedOptions).map(o=>o.value).filter(Boolean)}})}>
+                  {!['selected_portfolio','gallery_list'].includes(block.type)&&<option value="">Choose the intended publication</option>}{websiteOptions.publications.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
+                </select></label>}
+                {['gallery_list','update_list'].includes(block.type)&&<>
+                  <label>Page size<input type="number" min={1} max={100} value={Number(block.payload?.pageSize ?? 12)} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageSize:Number(event.target.value)}})}/></label>
+                  <label>Empty message<input value={String(block.payload?.emptyMessage ?? 'No entries yet.')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,emptyMessage:event.target.value}})}/></label>
+                </>}
+                {block.type==='gallery_list'&&<label>Tags (comma separated)<input value={((block.payload?.tags as string[])??[]).join(', ')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,tags:event.target.value.split(',').map(t=>t.trim()).filter(Boolean)}})}/></label>}
+              </fieldset>}
+              {!isTextBlock && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit', ...(websiteOptions?['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link']:[])].includes(block.type) && <p>Preserved {block.type} block — static export requires an explicit renderer or accepted fallback.</p>}
               {block.type === 'file' && <div className="portable-block-editor-file">
                 <p>Attached file: {media?.label || block.label || block.fileId || block.mediaId || 'Unavailable reference'}</p>
                 <label>File label<input value={block.label || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, label: event.target.value })} /></label>
@@ -278,6 +295,11 @@ export function BlockEditor({
             <button type="button" onClick={() => addTextBlock('link')}>Link block</button>
             <button type="button" onClick={() => addTextBlock('credit')}>Credit</button>
           </>}
+          {websiteOptions && <select defaultValue="" aria-label="Add website block" onChange={event=>{
+            const type=event.target.value as PostBlock['type'];if(!type)return;
+            const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12}: {})})}};
+            onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
+          }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
           {allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
             addMediaBlock(event.target.value);
             event.target.value = '';

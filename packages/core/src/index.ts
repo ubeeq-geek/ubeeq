@@ -272,7 +272,13 @@ export type ContentBlockType =
   | "grouping"
   | "carousel"
   | "pdf_preview"
-  | "html_fragment";
+  | "html_fragment"
+  | "gallery_preview"
+  | "premium_promotion"
+  | "selected_portfolio"
+  | "gallery_list"
+  | "update_list"
+  | "page_link";
 
 /** A portable, structured content tree. Rendering and sanitization are adapter responsibilities. */
 export interface ContentBlock {
@@ -335,3 +341,5 @@ export * from './shared-viewing.js';
 export * from "./publication-copy.js";
 
 export * from "./historical-announcements.js";
+
+export * from "./websites.js";

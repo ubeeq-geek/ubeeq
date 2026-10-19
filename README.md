@@ -4,6 +4,8 @@ Ubeeq is a brand-neutral, self-hostable platform for creator work, assets, integ
 
 Hosted products consume Ubeeq through versioned packages and extension contracts. This repository intentionally contains no hosted-product branding, pricing, policy decisions, credentials, or operational runbooks.
 
+Native website export and its integration boundaries are documented in [Native static websites](docs/native-static-websites.md). The local reference web app exposes the shared editor at `/websites`.
+
 ## Local development
 
 The reference instance runs entirely on the local machine: SQLite state,

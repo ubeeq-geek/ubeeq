@@ -21,6 +21,11 @@ test("serves a neutral workspace and proxies only to the configured reference AP
   });
   const workspace = await fetch(`http://127.0.0.1:${address.port}/workspace`);
   assert.match(await workspace.text(), /Ubeeq reference workspace/);
+  const websites = await fetch(`http://127.0.0.1:${address.port}/websites`);
+  assert.match(await websites.text(), /website-editor.js/);
+  const editor = await fetch(`http://127.0.0.1:${address.port}/website-editor.js`);
+  assert.equal(editor.status, 200);
+  assert.match(editor.headers.get('content-type'), /javascript/);
   const configuration = await fetch(`http://127.0.0.1:${address.port}/api-configuration`);
   assert.deepEqual(await configuration.json(), { apiPath: "/api", referenceApiUrl: `http://127.0.0.1:${upstream.address().port}` });
   const proxied = await fetch(`http://127.0.0.1:${address.port}/api/health`);
