@@ -245,3 +245,18 @@ test('Discord retains Markdown, polls, components and sticker metadata without s
  const input={...discord,content:'**Bold** and _italic_ [read](https://example.com/read?id=42#part)',poll:{question:{text:'Choose'},answers:[{answer_id:1,poll_media:{text:'A'}}],results:{answer_counts:[{id:1,count:3}]}},components:[{type:1,components:[{type:2,label:'Read',url:'https://example.com/read?id=42#part'}]}],sticker_items:[{id:'123',name:'Party',format_type:1}]};
  const result=normalizeDiscordHistoricalMessage(input,'guild','channel');assert.equal(result.completeness,'full');assert.equal(result.snapshot.blocks[0].syntax,'discord_markdown');const source=JSON.parse(result.snapshot.sourceData.json);assert.equal(source.poll.results.answer_counts[0].count,3);assert.equal(source.components[0].components[0].label,'Read');assert.ok(!result.snapshot.sourceData.json.includes('signature'));
 });
+
+test('DeviantArt retains journal formatting and media with inert sanitized provider evidence', async () => {
+  const { normalizeDeviantArtHistoricalPost } = await import('../dist/index.js');
+  const { validateHistoricalSnapshot, historicalSourceContentHash } = await import('../../core/dist/index.js');
+  const raw={deviationid:'journal-id',title:'An update',author:{userid:'artist',username:'Artist'},published_time:'2026-10-15T12:00:00Z',html:'<p>Hello <b>friends</b></p><img src="https://images.example.wixmp.com/image.png?token=SECRET">',stats:{comments:3,favourites:4}};
+  const post=normalizeDeviantArtHistoricalPost(raw,'journal');
+  validateHistoricalSnapshot(post.snapshot);
+  assert.equal(post.completeness,'full');assert.equal(post.postedAt,'2026-10-15T12:00:00.000Z');
+  assert.ok(post.snapshot.blocks.some(block=>block.text==='Hello friends' && block.formatting.some(format=>format.type==='bold')));
+  assert.equal(post.snapshot.attachments[0].sourceUrl,'https://images.example.wixmp.com/image.png');
+  assert.equal(JSON.stringify(post.snapshot).includes('SECRET'),false);
+  const source={...post,identity:{tenantId:'tenant',ownerId:'creator',provider:'deviantart',providerOrigin:'https://www.deviantart.com',containers:[{kind:'account',id:'artist'}],remoteId:'journal-id'}};
+  const changed=normalizeDeviantArtHistoricalPost({...raw,stats:{comments:30,favourites:40}},'journal');
+  assert.equal(await historicalSourceContentHash(source),await historicalSourceContentHash({...source,snapshot:changed.snapshot}));
+});
