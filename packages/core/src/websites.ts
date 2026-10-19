@@ -30,6 +30,7 @@ export interface GalleryDestinationRule {
 /** A selected publication, never a Work-level alias. Data comes from existing catalogues. */
 export interface WebsiteGallery {
   publicationId: string; workId: string; workspaceId: string; revision: number;
+  creatorIdentityId?: string; creatorName?: string;
   title: string; slug: string; description?: string; tags: readonly string[];
   collectionIds: readonly string[]; date: string; premium: boolean;
   previewAssetIds: readonly string[]; publicAssetIds: readonly string[];
@@ -46,6 +47,10 @@ export interface WebsiteGallerySettings {
 }
 export interface Website {
   id: string; workspaceId: string; creatorIdentityId: string; revision: number;
+  /** Identities explicitly authorized to contribute public Works; ownership remains in workspaceId. */
+  contributingCreatorIds?: readonly string[];
+  /** Optional grants to editor members of connected identities, never ownership or export authority. */
+  editingCreatorIds?: readonly string[];
   title: string; locale: string; homePageId: string;
   theme: { id: WebsiteThemeId; version: '1'; settings: { colorMode?: 'light' | 'dark' | 'system'; width?: 'reading' | 'wide'; footer?: string; logoAssetId?: string; faviconAssetId?: string; font?: 'system' | 'serif'; accentColor?: string; headerLayout?:'split'|'centered'|'stacked'; footerLayout?:'split'|'centered'|'minimal'; showWordmark?:boolean } };
   galleryDefault: GalleryDestinationRule; mediaMode: 'bundled' | 'linked';
@@ -102,6 +107,8 @@ export const websiteExternalUrl = (value: string, contact = false): string => {
 };
 export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   if (!site.id || !site.workspaceId || !site.creatorIdentityId || !Number.isSafeInteger(site.revision) || site.revision < 1 || !site.title?.trim() || !/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(site.locale)) throw new WebsiteError('invalid_website', 'Website identity, revision, title and locale are required.');
+  if(site.contributingCreatorIds!==undefined&&(!Array.isArray(site.contributingCreatorIds)||site.contributingCreatorIds.length>50||site.contributingCreatorIds.some(id=>typeof id!=='string'||! /^[a-zA-Z0-9_:-]{1,160}$/.test(id)||id===site.creatorIdentityId)||new Set(site.contributingCreatorIds).size!==site.contributingCreatorIds.length))throw new WebsiteError('invalid_contributors','Choose up to 50 distinct contributing creator identities.');
+  if(site.editingCreatorIds!==undefined&&(!Array.isArray(site.editingCreatorIds)||site.editingCreatorIds.some(id=>!site.contributingCreatorIds?.includes(id))||new Set(site.editingCreatorIds).size!==site.editingCreatorIds.length))throw new WebsiteError('invalid_contributors','Website editors must be connected contributing identities.');
   websitePath(site.basePath);
   if (site.publicBaseUrl) { const url = new URL(websiteExternalUrl(site.publicBaseUrl)); if (url.pathname !== '/' || url.search || url.hash) throw new WebsiteError('invalid_url', 'Public base URL must be an origin; configure the base path separately.'); }
   if (!WEBSITE_THEMES.some(theme=>theme.id===site.theme.id) || site.theme.version !== '1' || Object.keys(site.theme.settings).some(key => !['colorMode','width','footer','logoAssetId','faviconAssetId','font','accentColor','headerLayout','footerLayout','showWordmark'].includes(key)) || (site.theme.settings.colorMode && !['light','dark','system'].includes(site.theme.settings.colorMode)) || (site.theme.settings.width && !['reading','wide'].includes(site.theme.settings.width)) || (site.theme.settings.font && !['system','serif'].includes(site.theme.settings.font))) throw new WebsiteError('unsupported_theme', 'Unsupported theme or settings.');

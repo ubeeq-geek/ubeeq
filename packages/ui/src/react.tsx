@@ -30,7 +30,7 @@ export type BlockEditorProps = {
   mediaOptions?: BlockEditorMediaOption[];
   allowMedia?: boolean;
   allowStructured?: boolean;
-  websiteOptions?: { pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
+  websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
 };
 
@@ -262,6 +262,7 @@ export function BlockEditor({
                   <label>Page size<input type="number" min={1} max={100} value={Number(block.payload?.pageSize ?? 12)} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageSize:Number(event.target.value)}})}/></label>
                   <label>Empty message<input value={String(block.payload?.emptyMessage ?? 'No entries yet.')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,emptyMessage:event.target.value}})}/></label>
                 </>}
+                {block.type==='gallery_list'&&websiteOptions.creators&&<label>Creator identities · leave unselected for all<select multiple value={(block.payload?.creatorIdentityIds as string[])??[]} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,creatorIdentityIds:Array.from(event.target.selectedOptions).map(option=>option.value)}})}>{[...websiteOptions.creators,...((block.payload?.creatorIdentityIds as string[])??[]).filter(id=>!websiteOptions.creators!.some(creator=>creator.id===id)).map(id=>({id,title:'Disconnected identity · '+id}))].map(creator=><option key={creator.id} value={creator.id}>{creator.title}</option>)}</select></label>}
                 {block.type==='gallery_list'&&<label>Tags (comma separated)<input value={((block.payload?.tags as string[])??[]).join(', ')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,tags:event.target.value.split(',').map(t=>t.trim()).filter(Boolean)}})}/></label>}
               </fieldset>}
               {!isTextBlock && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit', ...(websiteOptions?['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link']:[])].includes(block.type) && <p>Preserved {block.type} block — static export requires an explicit renderer or accepted fallback.</p>}

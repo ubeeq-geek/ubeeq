@@ -63,11 +63,12 @@ export class WebsiteService {
     if(candidate.workspaceId!==actor.workspaceId || candidate.revision!==expectedRevision+1) throw new WebsiteError('revision_conflict','Website workspace or revision does not match.');
     if(!await this.ports.creatorIdentityAllowed(actor,candidate.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is outside this workspace.');
     websiteRoutes(candidate);
+    const old=await this.ports.store.getWebsite(actor.workspaceId,site.id);
+    for(const id of candidate.contributingCreatorIds??[])if(!old?.contributingCreatorIds?.includes(id)&&!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is unavailable or not authorized.');
     for(const page of candidate.pages) {
       const document=await this.ports.store.getDocument(actor.workspaceId,page.documentId);
       if(!document || document.workspaceId!==actor.workspaceId) throw new WebsiteError('missing_document','Save the page document in this workspace first.');
     }
-    const old=await this.ports.store.getWebsite(actor.workspaceId,site.id);
     if(old && old.pages.some(p=>!candidate.pages.some(next=>next.id===p.id) && old.pages.some(child=>child.parentId===p.id && candidate.pages.some(next=>next.id===child.id && next.parentId===p.id)))) throw new WebsiteError('parent_has_children','Resolve child pages before removing their parent.');
     await this.ports.store.saveWebsite(candidate,expectedRevision);
     await this.ports.audit({actor,action:'website.saved',websiteId:site.id,result:'saved'});
@@ -121,6 +122,7 @@ export class WebsiteService {
       if(!caps.export) throw new WebsiteError('export_unavailable','Export is disabled.');
       if(site.revision!==build.websiteRevision) throw new WebsiteError('revision_conflict','Requested website revision is no longer current.');
       if(!await this.ports.creatorIdentityAllowed(actor,site.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is no longer available in this workspace.');
+      for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
       const resolved=await this.ports.resolveSnapshot(actor,structuredClone(site));
       validateWebsiteSnapshotBudget(resolved,caps);
       const snapshot=structuredClone(resolved);

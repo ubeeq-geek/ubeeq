@@ -17,6 +17,8 @@ export class SqliteWebsiteStore implements WebsiteStore {
     this.db.exec('CREATE TABLE IF NOT EXISTS website_renditions(workspace TEXT NOT NULL,source TEXT NOT NULL,bytes BLOB NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,PRIMARY KEY(workspace,source))');
     this.db.exec('CREATE TABLE IF NOT EXISTS website_images(workspace TEXT NOT NULL,id TEXT NOT NULL,metadata TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(workspace,id))');
   }
+  async setWebsiteShare(identityId:string,ownerId:string,websiteId:string,enabled:boolean){const id=ownerId+':'+websiteId;if(enabled)this.db.prepare('INSERT OR REPLACE INTO website_records(workspace,kind,id,revision,payload) VALUES(?,?,?,?,?)').run(identityId,'share',id,1,JSON.stringify({ownerId,websiteId}));else this.db.prepare('DELETE FROM website_records WHERE workspace=? AND kind=? AND id=?').run(identityId,'share',id);}
+  async listWebsiteShares(identityId:string):Promise<readonly {ownerId:string;websiteId:string}[]>{return this.list(identityId,'share');}
   close() { this.db.close(); }
   async putWebsiteImage(image:WebsiteImageRecord,bytes:Uint8Array) {
     if(image.id!==`website-image-${image.checksum}`||createHash('sha256').update(bytes).digest('hex')!==image.checksum||bytes.length!==image.sizeBytes)throw new WebsiteError('invalid_media','Image integrity check failed.');

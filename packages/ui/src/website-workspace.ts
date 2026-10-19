@@ -1,10 +1,11 @@
-import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
 export interface WebsiteWorkspaceClient {
   media?(query?:string):Promise<readonly WebsiteMediaOption[]>;
   uploadMedia?(file:File):Promise<WebsiteMediaOption>;
   mediaPreview?(id:string):Promise<string>;
+  creators?():Promise<readonly {id:string;title:string}[]>;
   catalogue?(): Promise<readonly {id:string;title:string}[]>;
   get(): Promise<Website>;
   save(website: Website, expectedRevision: number): Promise<Website>;
@@ -20,12 +21,13 @@ export interface WebsiteWorkspaceClient {
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
-export interface WebsiteWorkspaceOptions { destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+export interface WebsiteWorkspaceOptions { exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
 /** Shared editor injection keeps the authoritative block format and existing editor. */
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}) => {
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,pageMode:'settings'|'content'='settings',renderGeneration=0;
   const documentDrafts=new Map<string,WebsiteDocument>();
+  let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false;
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
   const status=element('p'); status.setAttribute('role','status');
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
@@ -60,6 +62,24 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const win=d.defaultView;let measureFrame=0;
   const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.offsetTop+first.offsetHeight/2}px`);};
   const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
+  const previewPage=async(pageId:string)=>{
+    if(previewPending)throw new Error('A page preview is already opening.');
+    const popup=win?.open('about:blank','_blank');
+    if(!popup)throw new Error('Allow pop-ups to open this preview in a new tab.');
+    popup.opener=null;popup.document.title='Opening page preview';popup.document.body.textContent='Preparing the saved page preview…';previewPending=true;
+    try {
+      const saved=await client.get(),page=saved.pages.find(p=>p.id===pageId);
+      if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
+      let buildId:string|undefined;
+      for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
+      if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Check its status in Preview.');buildId=build.id;}
+      currentBuild=buildId;const route=websiteRoutes(saved).get(pageId);if(!route)throw new Error('This page is unavailable in the saved website.');
+      const html=await client.preview(buildId,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
+      if(popup.closed)return;
+      popup.document.title=page.title+' · Website preview';const frame=popup.document.createElement('iframe');frame.title=page.title+' preview';frame.setAttribute('sandbox','');frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';frame.srcdoc=html;popup.document.body.replaceChildren(frame);
+      status.textContent='Preview opened in a new tab using saved changes.';
+    }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}finally{previewPending=false;}
+  };
   const show=async(tab:string)=>{
     const generation=++renderGeneration;
     cleanupEditor?.();cleanupEditor=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
@@ -68,7 +88,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       const workspace=element('div'),selector=element('nav'),divider=element('div'),handle=element('div'),surface=element('div');
       workspace.className='website-page-workspace'+(pageSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-pages-'+site.id;selector.setAttribute('aria-label','Website pages');selector.tabIndex=0;selector.hidden=!pageSelectorExpanded;surface.className='website-page-surface';
       for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){
-        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));choice.append(element('small',page.id===site.homePageId?'Homepage':page.state==='ready'?'Ready':page.state));selector.append(choice);
+        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));choice.append(element('small',page.id===site.homePageId?'Homepage':page.state==='ready'?'Ready':page.state));const item=element('div');item.append(choice,button('Preview in new tab',()=>previewPage(page.id)));selector.append(item);
       }
       selector.append(button('New page',async()=>{selectedPage='new';pageMode='settings';await show('Pages');}),button('Redirects',async()=>{selectedPage='redirects';pageMode='settings';await show('Pages');}));
       divider.className='website-page-divider';handle.className='website-page-handle-viewport';const toggle=button('',async()=>{pageSelectorExpanded=!pageSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!pageSelectorExpanded);selector.hidden=!pageSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
@@ -124,17 +144,33 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       const themes=element('div');themes.className='website-theme-grid';
       for(const theme of WEBSITE_THEMES){const choice=button(theme.title,async()=>{site={...site,theme:{...site.theme,id:theme.id}};status.textContent='Theme selected. Save appearance to keep this theme.';for(const b of Array.from(themes.querySelectorAll('button')))b.setAttribute('aria-pressed',String(b===choice));});choice.setAttribute('aria-pressed',String(site.theme.id===theme.id));choice.className='website-theme-choice';for(const palette of [theme.light,theme.dark]){const swatch=element('span','Aa');swatch.className='website-theme-swatch';swatch.setAttribute('aria-hidden','true');swatch.style.background=palette.canvas;swatch.style.color=palette.text;swatch.style.borderColor=palette.action;choice.append(swatch);}themes.append(choice);}content.append(element('h3','Theme'),themes,element('p','Every theme supports light, dark, and system modes. Save appearance, then rebuild to preview the website.'));
       const setting=<K extends keyof Website['theme']['settings']>(key:K,value:Website['theme']['settings'][K])=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,[key]:value}}};
-      const layout=(name:string,key:'headerLayout'|'footerLayout',values:string[])=>{const l=element('label',name),select=element('select');select.setAttribute('aria-label',name);for(const value of values){const o=element('option',value==='split'?'Brand left · navigation right':value==='centered'?(key==='headerLayout'?'Centered wordmark · no logo':'Centered navigation'):value==='stacked'?'Centered brand · navigation below':'Compact footer');o.value=value;select.append(o);}select.value=site.theme.settings[key]??'split';select.onchange=()=>setting(key,select.value as 'split'|'centered');l.append(select);content.append(l);};
-      layout('Header layout','headerLayout',['split','centered','stacked']);layout('Footer layout','footerLayout',['split','centered','minimal']);
-      const wordmarkLabel=element('label','Show site wordmark beside logo'),wordmark=element('input');wordmark.type='checkbox';wordmark.checked=site.theme.settings.showWordmark!==false;wordmark.onchange=()=>setting('showWordmark',wordmark.checked);wordmarkLabel.append(wordmark);content.append(wordmarkLabel);
-      if(client.media){content.append(element('p','Images used here are included in your exported website. Centered wordmark headers hide the logo.'));await mediaField(content,'Logo',site.theme.settings.logoAssetId,id=>setting('logoAssetId',id));await mediaField(content,'Favicon',site.theme.settings.faviconAssetId,id=>setting('faviconAssetId',id));}
-      for(const key of ['navigationLinks','footerLinks'] as const){const l=element('label',key==='navigationLinks'?'Extra header links · Label | https://… or mailto:… per line':'Extra footer links · Label | https://… or mailto:… per line'),textarea=element('textarea');textarea.value=(site[key]??[]).map(link=>link.label+' | '+link.url).join('\n');textarea.onchange=()=>{site={...site,[key]:textarea.value.split('\n').filter(line=>line.trim()).map(line=>{const at=line.indexOf('|');return {label:line.slice(0,at).trim(),url:line.slice(at+1).trim()};})};};l.append(textarea);content.append(l);}
-      field(content,'Site title',site.title,v=>site={...site,title:v});field(content,'Footer text',site.theme.settings.footer??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,footer:v}}});
-      if(options.showAssetIds!==false)field(content,'Logo public asset ID',site.theme.settings.logoAssetId??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,logoAssetId:v||undefined}}});
-      if(options.showAssetIds!==false)field(content,'Favicon public asset ID',site.theme.settings.faviconAssetId??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,faviconAssetId:v||undefined}}});
+      if(client.media)await mediaField(content,'Favicon',site.theme.settings.faviconAssetId,id=>setting('faviconAssetId',id));
       field(content,'Accent color (six-digit hex; contrast checked on save)',site.theme.settings.accentColor??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,accentColor:v||undefined}}});
       const font=element('select');font.setAttribute('aria-label','Font preset');for(const value of ['system','serif']){const option=element('option',value);option.value=value;font.append(option);}font.value=site.theme.settings.font??'system';font.onchange=()=>{site={...site,theme:{...site.theme,settings:{...site.theme.settings,font:font.value as 'system'|'serif'}}};};content.append(font);
       const select=element('select');select.setAttribute('aria-label','Color mode');for(const mode of ['light','dark','system'] as const){const o=element('option',mode);o.value=mode;select.append(o);}select.value=site.theme.settings.colorMode??'light';select.onchange=()=>{site={...site,theme:{...site.theme,settings:{...site.theme.settings,colorMode:select.value as 'light'|'dark'|'system'}}};};content.append(select,button('Save appearance',save));
+    }
+    if(tab==='Layout') {
+      const workspace=element('div'),selector=element('nav'),divider=element('div'),surface=element('div');
+      workspace.className='website-page-workspace'+(layoutSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-layout-'+site.id;selector.setAttribute('aria-label','Website layout');selector.hidden=!layoutSelectorExpanded;surface.className='website-page-surface';
+      for(const name of ['Header','Footer','Navigation']){const choice=button(name,async()=>{selectedLayout=name;await show('Layout');});choice.className='website-page-choice';choice.setAttribute('aria-pressed',String(selectedLayout===name));selector.append(choice);}
+      divider.className='website-page-divider';const handle=element('div');handle.className='website-page-handle-viewport';const toggle=button('',async()=>{layoutSelectorExpanded=!layoutSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!layoutSelectorExpanded);selector.hidden=!layoutSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
+      const updateToggle=()=>{toggle.textContent=layoutSelectorExpanded?'‹':'›';toggle.setAttribute('aria-label',layoutSelectorExpanded?'Collapse layout selector':'Expand layout selector');toggle.setAttribute('aria-expanded',String(layoutSelectorExpanded));};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);surface.append(element('h2',selectedLayout));
+      const setting=<K extends keyof Website['theme']['settings']>(key:K,value:Website['theme']['settings'][K])=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,[key]:value}}};
+      const layout=(name:string,key:'headerLayout'|'footerLayout',values:string[])=>{const l=element('label',name),select=element('select');select.setAttribute('aria-label',name);for(const value of values){const o=element('option',value==='split'?'Brand left · navigation right':value==='centered'?(key==='headerLayout'?'Centered wordmark · no logo':'Centered navigation'):value==='stacked'?'Centered brand · navigation below':'Compact footer');o.value=value;select.append(o);}select.value=site.theme.settings[key]??'split';select.onchange=()=>setting(key,select.value as 'split'|'centered');l.append(select);surface.append(l);};
+      if(selectedLayout==='Header')layout('Header layout','headerLayout',['split','centered','stacked']);
+      if(selectedLayout==='Footer')layout('Footer layout','footerLayout',['split','centered','minimal']);
+      if(selectedLayout==='Header'){const wordmarkLabel=element('label','Show site wordmark beside logo'),wordmark=element('input');wordmark.type='checkbox';wordmark.checked=site.theme.settings.showWordmark!==false;wordmark.onchange=()=>setting('showWordmark',wordmark.checked);wordmarkLabel.append(wordmark);surface.append(wordmarkLabel);
+      if(client.media){surface.append(element('p','Images used here are included in your exported website. Centered wordmark headers hide the logo.'));await mediaField(surface,'Logo',site.theme.settings.logoAssetId,id=>setting('logoAssetId',id));}
+      }
+      if(selectedLayout==='Navigation')for(const key of ['navigationLinks','footerLinks'] as const){const l=element('label',key==='navigationLinks'?'Extra header links · Label | https://… or mailto:… per line':'Extra footer links · Label | https://… or mailto:… per line'),textarea=element('textarea');textarea.value=(site[key]??[]).map(link=>link.label+' | '+link.url).join('\n');textarea.onchange=()=>{site={...site,[key]:textarea.value.split('\n').filter(line=>line.trim()).map(line=>{const at=line.indexOf('|');return {label:line.slice(0,at).trim(),url:line.slice(at+1).trim()};})};};l.append(textarea);surface.append(l);}
+      if(selectedLayout==='Header')field(surface,'Site title',site.title,v=>site={...site,title:v});if(selectedLayout==='Footer')field(surface,'Footer text',site.theme.settings.footer??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,footer:v}}});
+      if(selectedLayout==='Header'&&options.showAssetIds!==false)field(surface,'Logo public asset ID',site.theme.settings.logoAssetId??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,logoAssetId:v||undefined}}});
+
+      if(selectedLayout==='Navigation'){
+        surface.append(element('p','Choose which pages appear in the header and footer. Child pages use dropdown navigation. Change page order and parents in Pages.'));
+        for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){const row=element('fieldset');row.append(element('legend',page.title));for(const key of ['navigation','footerNavigation'] as const){const label=element('label',key==='navigation'?'Header navigation':'Footer navigation'),check=element('input');check.type='checkbox';check.checked=page[key]??page.navigation;check.onchange=()=>{site={...site,pages:site.pages.map(p=>p.id===page.id?{...p,[key]:check.checked,revision:p.revision+1}:p)};};label.append(check);row.append(label);}surface.append(row);}
+      }
+      surface.append(button('Save '+selectedLayout.toLowerCase(),save));
     }
     if(tab==='Gallery destinations') {
       content.append(element('p',options.destinationModes&&!options.destinationModes.includes('connected')?'Select public Works to include in this website. Each Work can have its own title and link destination.':'Gallery blocks select exact publication IDs. A missing connected mapping blocks the build unless an explicit fallback or omission rule is configured.'));
@@ -182,7 +218,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     }
     if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
-  for(const tab of ['Pages','Appearance','Gallery destinations','Preview','Publishing'])tabs.append(button(tab,async()=>{if(!disposed)await show(tab);}));
+  for(const tab of ['Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed)await show(tab);}));
   const ready=client.get().then(async value=>{if(!disposed){site=value;await show('Pages');}}).catch(error=>{status.textContent=String(error);});
   return {ready,destroy(){disposed=true;win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();root.replaceChildren();}};
 };

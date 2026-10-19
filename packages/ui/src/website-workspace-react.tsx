@@ -9,11 +9,11 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
   const root=useRef<HTMLDivElement>(null);
   const [editor,setEditor]=useState<{host:HTMLElement;document:WebsiteDocument;change:(document:WebsiteDocument)=>void}|null>(null);
   const [images,setImages]=useState<BlockEditorMediaOption[]>(mediaOptions);
-  const [options,setOptions]=useState<{pages:{id:string;title:string}[];publications:{id:string;title:string}[]}>({pages:[],publications:[]});
+  const [options,setOptions]=useState<{pages:{id:string;title:string}[];publications:{id:string;title:string}[];creators:{id:string;title:string}[]}>({pages:[],publications:[],creators:[]});
   useEffect(()=>{
     if(!root.current)return;
     const workspace=createWebsiteWorkspace(root.current,client,(host,document,change)=>{
-      void Promise.all([client.get(),client.catalogue?.()??Promise.resolve([]),client.media?.()??Promise.resolve([])]).then(([site,catalogue,library])=>{setImages([...mediaOptions,...library.filter(image=>!mediaOptions.some(m=>m.mediaId===image.id)).map(image=>({mediaId:image.id,label:image.title,assetType:'image' as const}))]);setOptions({pages:site.pages.map(p=>({id:p.id,title:p.title})),publications:site.galleryPublicationIds.map(id=>({id,title:site.gallerySettings?.find(s=>s.publicationId===id)?.title??catalogue.find(p=>p.id===id)?.title??id}))});}).catch(()=>{});
+      void Promise.all([client.get(),client.catalogue?.()??Promise.resolve([]),client.media?.()??Promise.resolve([]),client.creators?.()??Promise.resolve([])]).then(([site,catalogue,library,creators])=>{setImages([...mediaOptions,...library.filter(image=>!mediaOptions.some(m=>m.mediaId===image.id)).map(image=>({mediaId:image.id,label:image.title,assetType:'image' as const}))]);setOptions({creators:[...creators],pages:site.pages.map(p=>({id:p.id,title:p.title})),publications:site.galleryPublicationIds.map(id=>({id,title:site.gallerySettings?.find(s=>s.publicationId===id)?.title??catalogue.find(p=>p.id===id)?.title??id}))});}).catch(()=>{});
       setEditor({host,document,change});
       return ()=>setEditor(null);
     },workspaceOptions);

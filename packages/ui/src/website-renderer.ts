@@ -116,7 +116,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
       : `<${expected} controls preload="metadata" src="${source}"><a href="${source}">Open ${expected}</a></${expected}>`;
     return `<figure>${content}${caption ? `<figcaption>${e(caption)}</figcaption>` : ''}</figure>`;
   };
-  const card = (g: StaticWebsiteGallery, promotion = false) => !g.href ? '' : `<article class="card">${g.previewAssetIds[0] ? image(g.previewAssetIds[0]) : ''}<h2><a href="${e(g.href.startsWith('/') ? url(g.href) : g.href)}">${e(g.title)}</a></h2>${g.description ? `<p>${e(g.description)}</p>` : ''}${promotion ? '<p>View access options at the linked destination.</p>' : ''}</article>`;
+  const card = (g: StaticWebsiteGallery, promotion = false) => !g.href ? '' : `<article class="card">${g.previewAssetIds[0] ? image(g.previewAssetIds[0]) : ''}<h2><a href="${e(g.href.startsWith('/') ? url(g.href) : g.href)}">${e(g.title)}</a></h2>${g.creatorName?`<p class="work-creator">${e(g.creatorName)}</p>`:''}${g.description ? `<p>${e(g.description)}</p>` : ''}${promotion ? '<p>View access options at the linked destination.</p>' : ''}</article>`;
   for (const page of pages) {
     const path = routes.get(page.id)!, doc = documents.get(page.documentId);
     if (!doc) throw new WebsiteError('missing_document', 'Page document was not resolved.');
@@ -131,15 +131,15 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) throw new WebsiteError('invalid_block', 'Gallery blocks require publication IDs.');
         return ids.map(id => { const g = galleries.find(g => g.publicationId === id); if (!g) throw new WebsiteError('missing_publication', 'Block publication is not in the eligible website pool.'); return g; });
       };
-      const paginated = (items: readonly string[]) => {
+      const paginated = (items: readonly string[],base=path,prefix='') => {
         const size = Number(block.data?.pageSize ?? 12);
         if (!Number.isSafeInteger(size) || size < 1 || size > 100) throw new WebsiteError('invalid_query', 'Page size must be 1–100.');
-        if (!items.length) return block.data?.empty === 'omit' ? '' : `<p>${e(String(block.data?.emptyMessage ?? 'No entries yet.'))}</p>`;
+        if (!items.length) return prefix+(block.data?.empty === 'omit' ? '' : `<p>${e(String(block.data?.emptyMessage ?? 'No entries yet.'))}</p>`);
         const count = Math.ceil(items.length / size);
         if (count - 1 > limits.maxPages - plannedPages) throw new WebsiteError('quota_exceeded', 'Generated pagination exceeds the page limit.');
         plannedPages += count - 1;
-        const listPath = (n: number) => n === 1 ? path : `${path}page/${index}/${n}/`;
-        const content = (n: number) => `<div class="grid">${items.slice((n-1)*size,n*size).join('')}</div>${count > 1 ? `<nav aria-label="List pages">${Array.from({length:count},(_,i) => `<a href="${e(url(listPath(i+1)))}"${n === i+1 ? ' aria-current="page"' : ''}>Page ${i+1}</a>`).join(' ')}</nav>` : ''}`;
+        const listPath = (n: number) => n === 1 ? base : `${base}page/${index}/${n}/`;
+        const content = (n: number) => `${prefix}<div class="grid">${items.slice((n-1)*size,n*size).join('')}</div>${count > 1 ? `<nav aria-label="List pages">${Array.from({length:count},(_,i) => `<a href="${e(url(listPath(i+1)))}"${n === i+1 ? ' aria-current="page"' : ''}>Page ${i+1}</a>`).join(' ')}</nav>` : ''}`;
         for (let n=2;n<=count;n++) extraPages.push({path:listPath(n),title:`${page.title} — Page ${n}`,body:()=>content(n)});
         return content(1);
       };
@@ -164,17 +164,24 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         case 'selected_portfolio': return `<div class="grid">${refs().map(g => card(g)).join('')}</div>`;
         case 'gallery_list': {
           let selected = galleries.filter(g => g.href);
-          const tags = block.data?.tags, collections = block.data?.collectionIds, publications = block.data?.publicationIds;
-          for (const filter of [tags, collections, publications]) if (filter !== undefined && (!Array.isArray(filter) || filter.some(v => typeof v !== 'string'))) throw new WebsiteError('invalid_query', 'Query filters must be string arrays.');
+          const tags = block.data?.tags, collections = block.data?.collectionIds, publications = block.data?.publicationIds,creators=block.data?.creatorIdentityIds;
+          for (const filter of [tags, collections, publications,creators]) if (filter !== undefined && (!Array.isArray(filter) || filter.some(v => typeof v !== 'string'))) throw new WebsiteError('invalid_query', 'Query filters must be string arrays.');
           if (Array.isArray(tags)) selected = selected.filter(g => tags.every(t => g.tags.includes(t)));
           if (Array.isArray(collections) && collections.length) selected = selected.filter(g => collections.some(c => g.collectionIds.includes(c)));
           if (Array.isArray(publications) && publications.length) selected = selected.filter(g => publications.includes(g.publicationId));
+          if(Array.isArray(creators)&&creators.length)selected=selected.filter(g=>creators.includes(g.creatorIdentityId??site.creatorIdentityId));
           const sort = block.data?.sort ?? 'newest';
           if (!['newest','oldest','title'].includes(String(sort))) throw new WebsiteError('invalid_query', 'Unsupported gallery sort.');
           selected.sort((a,b) => (sort === 'title' ? a.title.localeCompare(b.title,'en') : sort === 'oldest' ? a.date.localeCompare(b.date) : b.date.localeCompare(a.date)) || a.publicationId.localeCompare(b.publicationId,'en'));
           const max = Number(block.data?.maxResults ?? 1000);
           if (!Number.isSafeInteger(max) || max < 1 || max > 1000) throw new WebsiteError('invalid_query', 'Maximum results must be 1–1000.');
-          return paginated(selected.slice(0,max).map(g => card(g)));
+          selected=selected.slice(0,max);
+          const identities=new Map(selected.map(g=>[g.creatorIdentityId??site.creatorIdentityId,g.creatorName??'Creator']));
+          if(identities.size<2)return paginated(selected.map(g=>card(g)));
+          const filterPath=(id:string)=>`${path}creator/${index}/${encodeURIComponent(id)}/`;
+          const filter=(active?:string)=>`<nav class="gallery-creator-filter" aria-label="Filter gallery by creator"><a href="${e(url(path))}"${!active?' aria-current="page"':''}>All creators</a> ${[...identities].map(([id,name])=>`<a href="${e(url(filterPath(id)))}"${active===id?' aria-current="page"':''}>${e(name)}</a>`).join(' ')}</nav>`;
+          for(const [id,name] of identities){if(++plannedPages>limits.maxPages)throw new WebsiteError('quota_exceeded','Creator filters exceed the page limit.');const body=paginated(selected.filter(g=>(g.creatorIdentityId??site.creatorIdentityId)===id).map(g=>card(g)),filterPath(id),filter(id));extraPages.push({path:filterPath(id),title:page.title+' — '+name,body:()=>body});}
+          return paginated(selected.map(g => card(g)),path,filter());
         }
         case 'update_list': return paginated(pages.filter(p => p.kind === 'update').sort((a,b) => (b.date ?? '').localeCompare(a.date ?? '') || a.id.localeCompare(b.id,'en')).map(p => `<article><h2><a href="${e(url(routes.get(p.id)!))}">${e(p.title)}</a></h2>${p.date ? `<time datetime="${e(p.date)}">${e(p.date)}</time>` : ''}<p>${e(p.excerpt ?? '')}</p></article>`));
       }
@@ -184,7 +191,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
   }
   for (const g of galleries.filter(g => g.local)) {
     const path = websitePath(`/galleries/${g.slug}`);
-    add(path, shell(g.title, `<p>${e(g.description ?? '')}</p><div class="grid">${g.publicAssetIds.map(id => image(id)).join('')}</div>`, path, { canonicalUrl: g.canonicalUrl }));
+    add(path, shell(g.title, `${g.creatorName?`<p class="work-creator">${e(g.creatorName)}</p>`:''}<p>${e(g.description ?? '')}</p><div class="grid">${g.publicAssetIds.map(id => image(id)).join('')}</div>`, path, { canonicalUrl: g.canonicalUrl }));
   }
   for (const redirect of site.redirects) {
     const path = websitePath(redirect.from), to = redirect.to.startsWith('/') ? url(websitePath(redirect.to)) : websiteExternalUrl(redirect.to);

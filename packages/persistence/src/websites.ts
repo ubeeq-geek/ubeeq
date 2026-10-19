@@ -16,6 +16,8 @@ export interface WebsiteBuildRecord {
 }
 /** CAS writes are atomic. Stores return copies; private artifacts never get a public URL. */
 export interface WebsiteStore {
+  setWebsiteShare?(identityId:string,ownerId:string,websiteId:string,enabled:boolean):Promise<void>;
+  listWebsiteShares?(identityId:string):Promise<readonly {ownerId:string;websiteId:string}[]>;
   putWebsiteImage?(image:WebsiteImageRecord,bytes:Uint8Array):Promise<void>;
   getWebsiteImage?(workspaceId:string,id:string):Promise<{image:WebsiteImageRecord;bytes:Uint8Array}|undefined>;
   listWebsiteImages?(workspaceId:string):Promise<readonly WebsiteImageRecord[]>;
