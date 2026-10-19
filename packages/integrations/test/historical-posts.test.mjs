@@ -81,13 +81,13 @@ test("reblog trails retain original attribution and content without implying own
     result.snapshot.blocks.some((b) => b.text?.includes("Original author")),
   );
 });
-test("unsupported blocks become explicit partial warnings; unsafe numeric IDs are rejected", () => {
+test("unfamiliar source blocks are retained without stopping import; unsafe numeric IDs are rejected", () => {
   assert.equal(
     normalizeTumblrHistoricalPost(
       { ...tumblr, content: [{ type: "paywall" }] },
       { id: "blog", name: "Brand" },
     ).completeness,
-    "partial",
+    "full",
   );
   assert.throws(() =>
     normalizeTumblrHistoricalPost(
@@ -226,5 +226,22 @@ test("channel history permissions require View Channel and Read Message History 
 
 test('signed URLs in text are sanitized while meaningful public video identifiers remain intact',()=>{
  const result=normalizeDiscordHistoricalMessage({...discord,content:'Media https://cdn.discordapp.com/attachments/channel/attachment/photo.png?hm=PRIVATE-SIGNATURE. Video https://www.youtube.com/watch?v=dQw4w9WgXcQ',attachments:[]},'guild','channel');
- assert.ok(!JSON.stringify(result.snapshot).includes('PRIVATE-SIGNATURE'));assert.ok(result.snapshot.links.includes('https://www.youtube.com/watch?v=dQw4w9WgXcQ'));assert.equal(result.completeness,'partial');
+ assert.ok(!JSON.stringify(result.snapshot).includes('PRIVATE-SIGNATURE'));assert.ok(result.snapshot.links.includes('https://www.youtube.com/watch?v=dQw4w9WgXcQ'));assert.equal(result.completeness,'full');
+});
+
+test('Tumblr retains styles, Unicode ranges, links, subtypes, and original platform structure',()=>{
+ const input={...tumblr,content:[{type:'text',text:'🌳 Styled link',subtype:'heading2',formatting:[{type:'bold',start:2,end:8},{type:'italic',start:4,end:8},{type:'color',start:2,end:8,hex:'#ff492f'},{type:'link',start:9,end:13,url:'https://example.com/read?id=42#chapter'},{type:'mention',start:2,end:8,blog:{name:'artist',url:'https://artist.tumblr.com/'}}]}]};
+ const result=normalizeTumblrHistoricalPost(input,{id:'blog',name:'Artist'});assert.equal(result.completeness,'full');assert.equal(result.snapshot.blocks[0].subtype,'heading2');assert.equal(result.snapshot.blocks[0].formatting.length,5);assert.equal(result.snapshot.blocks[0].formatting[0].start,2);assert.equal(result.snapshot.blocks[0].formatting[3].url,'https://example.com/read?id=42#chapter');assert.deepEqual(JSON.parse(result.snapshot.sourceData.json).content,input.content);
+});
+test('legacy Tumblr inline styles and full public links survive normalization',()=>{
+ const result=normalizeTumblrHistoricalPost({id_string:'legacy',timestamp:1792051200,body:'<p>Hello <strong>bold</strong> and <em>italic</em> <a href="https://example.com/read?id=3#part">read</a>.</p>'},{id:'blog',name:'Artist'});
+ assert.equal(result.completeness,'full');assert.ok(result.snapshot.blocks[0].formatting.some(format=>format.type==='bold'));assert.ok(result.snapshot.blocks[0].formatting.some(format=>format.type==='italic'));assert.ok(result.snapshot.links.includes('https://example.com/read?id=3#part'));
+});
+test('unknown Tumblr blocks, layouts, and external media are retained without blocking imports',()=>{
+ const result=normalizeTumblrHistoricalPost({...tumblr,content:[{type:'future-poll',question:'Pick one',answers:['A','B']},{type:'video',url:'https://video.example/watch?id=42#start'}],layout:[{type:'ask',blocks:[0],attribution:{blog:{name:'reader'}}}]},{id:'blog',name:'Artist'});
+ assert.equal(result.completeness,'full');const source=JSON.parse(result.snapshot.sourceData.json);assert.equal(source.content[0].answers[1],'B');assert.equal(source.layout[0].type,'ask');assert.ok(result.snapshot.links.includes('https://video.example/watch?id=42#start'));
+});
+test('Discord retains Markdown, polls, components and sticker metadata without storing signed retrieval URLs',()=>{
+ const input={...discord,content:'**Bold** and _italic_ [read](https://example.com/read?id=42#part)',poll:{question:{text:'Choose'},answers:[{answer_id:1,poll_media:{text:'A'}}],results:{answer_counts:[{id:1,count:3}]}},components:[{type:1,components:[{type:2,label:'Read',url:'https://example.com/read?id=42#part'}]}],sticker_items:[{id:'123',name:'Party',format_type:1}]};
+ const result=normalizeDiscordHistoricalMessage(input,'guild','channel');assert.equal(result.completeness,'full');assert.equal(result.snapshot.blocks[0].syntax,'discord_markdown');const source=JSON.parse(result.snapshot.sourceData.json);assert.equal(source.poll.results.answer_counts[0].count,3);assert.equal(source.components[0].components[0].label,'Read');assert.ok(!result.snapshot.sourceData.json.includes('signature'));
 });

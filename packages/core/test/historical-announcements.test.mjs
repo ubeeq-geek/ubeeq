@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import {
   importedSourceKey,
+  historicalPublicUrl, sanitizeHistoricalSourceData, validateHistoricalSnapshot,
   planHistoricalAnnouncementImport,
   validateImportedSourcePost,
   historicalSourceContentHash,
@@ -375,4 +376,41 @@ test("observation hash ignores reconnection, job and local media outcomes while 
     hash,
     await historicalSourceContentHash({ ...observed, postedAt: now }),
   );
+});
+
+test('authorized replies require explicit inclusion and keep reply attribution, while system events remain excluded', () => {
+  const reply={...source,attribution:{...source.attribution,kind:'reply'}};
+  const result=planHistoricalAnnouncementImport({...input,source:reply,includeReplies:true});
+  assert.equal(result.kind,'create_announcement');
+  assert.equal(reply.attribution.kind,'reply');
+  assert.equal(planHistoricalAnnouncementImport({...input,source:{...reply,attribution:{...reply.attribution,kind:'system'}},includeReplies:true,includeAttributedMaterial:true}).kind,'skip');
+});
+
+test('public navigation retains query parameters and fragments while media references stay unsigned',()=>{
+ const url='https://example.com/read?id=123&chapter=two#section-3';assert.equal(historicalPublicUrl(url),url);
+ validateHistoricalSnapshot({...snapshot,blocks:[{kind:'text',text:'🌳 Read',formatting:[{type:'bold',start:2,end:6},{type:'link',start:2,end:6,url}]}],links:[url]});
+ assert.throws(()=>validateHistoricalSnapshot({...snapshot,attachments:[{id:'image',position:0,kind:'source_attachment',mediaType:'image',archive:'pending',sourceUrl:'https://cdn.example/image.png?signature=secret'}]}));
+ assert.throws(()=>validateHistoricalSnapshot({...snapshot,blocks:[{kind:'text',text:'🌳',formatting:[{type:'bold',start:0,end:2}]}]}));
+});
+test('retained source JSON preserves new platform fields without retaining credentials or active markup',()=>{
+ const input={content:[{type:'future-type',html:'<script>alert(1)</script>',custom:{votes:3}}],access_token:'TOP-SECRET',media:[{url:'https://cdn.example/image.png?signature=TOP-SECRET'}],url:'https://example.com/read?id=3#chapter'};
+ const retained=sanitizeHistoricalSourceData(input);assert.equal(retained.truncated,false);assert.ok(!retained.json.includes('TOP-SECRET'));assert.equal(JSON.parse(retained.json).content[0].custom.votes,3);assert.equal(JSON.parse(retained.json).url,input.url);
+ validateHistoricalSnapshot({...snapshot,sourceData:{format:'tumblr',...retained}});
+ assert.throws(()=>validateHistoricalSnapshot({...snapshot,sourceData:{format:'tumblr',json:JSON.stringify(input),truncated:false}}));
+ assert.ok(input.access_token==='TOP-SECRET');
+ const nested=historicalPublicUrl('https://example.com/go?redirect='+encodeURIComponent('https://other.example/read?id=2&access_token=TOP-SECRET#chapter'));
+ assert.ok(!decodeURIComponent(nested).includes('TOP-SECRET'));assert.ok(decodeURIComponent(nested).includes('id=2'));
+});
+test('source retention bounds are explicit and the resulting JSON remains valid and sanitized',()=>{
+ const retained=sanitizeHistoricalSourceData({content:Array.from({length:100},()=>({text:'é'.repeat(100000)}))});assert.equal(retained.truncated,true);assert.ok(new TextEncoder().encode(retained.json).length<=1048576);
+ validateHistoricalSnapshot({...snapshot,sourceData:{format:'tumblr',...retained}});
+});
+
+test('engagement changes do not revise post content while original evidence and actual edits remain distinguishable',async()=>{
+ const raw={content:[{type:'text',text:'Post body'}],note_count:1,notes:[{type:'like'}],reactions:[{count:1}],poll:{question:{text:'Question'},results:{answer_counts:[1]}}};
+ const make=value=>({...source,snapshot:{...source.snapshot,sourceData:{format:'tumblr',...sanitizeHistoricalSourceData(value)}}});
+ const original=make(raw),hash=await historicalSourceContentHash(original);
+ assert.equal(hash,await historicalSourceContentHash(make({...raw,note_count:20,notes:[],reactions:[{count:8}],poll:{...raw.poll,results:{answer_counts:[9]}}})));
+ assert.notEqual(hash,await historicalSourceContentHash(make({...raw,content:[{type:'text',text:'Edited body'}]})));
+ assert.equal(JSON.parse(original.snapshot.sourceData.json).note_count,1);
 });

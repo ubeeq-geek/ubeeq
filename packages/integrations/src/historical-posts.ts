@@ -1,4 +1,4 @@
-import { historicalPublicQueryParameter } from "@ubeeq/core";
+import { historicalPublicQueryParameter, historicalPublicUrl, sanitizeHistoricalSourceData } from "@ubeeq/core";
 import { createHash } from "node:crypto";
 import type {
   HistoricalContentSnapshot,
@@ -42,6 +42,7 @@ export function unsignedHistoricalUrl(
   value: unknown,
   publicLink = false,
 ): string | undefined {
+  if(publicLink)return historicalPublicUrl(value);
   try {
     const url = new URL(String(value));
     if (url.protocol !== "https:" || url.username || url.password) return;
@@ -90,6 +91,28 @@ const plain = (html: unknown): string =>
         })[entity] || "",
     )
     .trim();
+function legacyFormattedText(value:unknown) {
+  const html=text(value,100000).replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi,"");
+  let result="";const formatting:Row[]=[],open:{tag:string;type:string;start:number;url?:string;hex?:string}[]=[];
+  const count=()=>Array.from(result).length;
+  const decode=(part:string)=>part.replace(/&#(x[0-9a-f]+|[0-9]+);|&(amp|lt|gt|quot|apos|nbsp);/gi,(_,number:string,name:string)=>{
+    if(number){const code=number[0].toLowerCase()==="x"?parseInt(number.slice(1),16):Number(number);return code>0&&code<=0x10ffff?String.fromCodePoint(code):"�";}
+    return ({amp:"&",lt:"<",gt:">",quot:'"',apos:"'",nbsp:" "} as Record<string,string>)[name.toLowerCase()]||"";
+  });
+  for(const token of html.match(/<[^>]*>|[^<]+/g)||[]){
+    if(!token.startsWith("<")){result+=decode(token);continue;}
+    const tag=token.match(/^<\/?([a-z0-9]+)/i)?.[1].toLowerCase();if(!tag)continue;
+    const closing=token.startsWith("</");
+    if(tag==="br"){result+="\n";continue;}
+    if(["p","div","li","h1","h2","h3","h4","h5","h6","blockquote","pre"].includes(tag)&&result&&!result.endsWith("\n"))result+="\n";
+    if(tag==="li"&&!closing)result+="• ";
+    if(closing){const index=open.map(mark=>mark.tag).lastIndexOf(tag);if(index>=0){const mark=open.splice(index,1)[0];if(count()>mark.start)formatting.push({...mark,end:count()});}continue;}
+    const type=({b:"bold",strong:"bold",i:"italic",em:"italic",s:"strikethrough",strike:"strikethrough",del:"strikethrough",u:"underline",small:"small",code:"code",a:"link"} as Record<string,string>)[tag];
+    if(type){const url=tag==="a"?decode(token.match(/href\s*=\s*["']([^"']*)["']/i)?.[1]||""):undefined;open.push({tag,type,start:count(),...(url?{url}:{})});}
+  }
+  for(const mark of open)if(count()>mark.start)formatting.push({...mark,end:count()});
+  return {text:result.replace(/\n+$/,""),formatting:formatting.map(({tag,...format})=>format)};
+}
 function builder() {
   const snapshot: HistoricalContentSnapshot = {
       blocks: [],
@@ -105,29 +128,26 @@ function builder() {
     attachments =
       snapshot.attachments as HistoricalContentSnapshot["attachments"][number][],
     links = snapshot.links as string[];
-  const addText = (value: unknown) => {
-    const content = text(value, 100000).replace(
-      /https?:\/\/[^\s<>"()]+/g,
-      (original) => {
-        const normalized = unsignedHistoricalUrl(
-          original.replace(/[.,;!?]+$/, ""),
-          true,
-        );
-        if (!normalized) {
-          reasons.push("unsupported_link");
-          return "[unsupported link]";
-        }
-        if (normalized !== original.replace(/[.,;!?]+$/, ""))
-          reasons.push("link_query_or_fragment_not_retained");
-        return normalized;
-      },
-    );
-    if (content && blocks.length < 100) {
-      blocks.push({ kind: "text", text: content });
-      for (const value of content.match(/https:\/\/[^\s<>"()]+/g) || []) {
-        const url = unsignedHistoricalUrl(value.replace(/[.,;!?]+$/, ""), true);
-        if (url && links.length < 100 && !links.includes(url)) links.push(url);
-      }
+  const addText = (value: unknown,options:Row={}) => {
+    const original=text(value,100000),edits:{start:number;end:number;size:number}[]=[];
+    const content=original.replace(/https?:\/\/[^\s<>"()]+/g,(match:string,index:number)=>{
+      const suffix=match.match(/[.,;!?]+$/)?.[0]||"",link=match.slice(0,match.length-suffix.length),url=unsignedHistoricalUrl(link,true);
+      const replacement=(url||"[invalid link]")+suffix;
+      if(replacement!==match){edits.push({start:Array.from(original.slice(0,index)).length,end:Array.from(original.slice(0,index+match.length)).length,size:Array.from(replacement).length});reasons.push(url?"public_link_normalized":"unsupported_link");}
+      return replacement;
+    });
+    const remap=(position:number)=>{let shift=0;for(const edit of edits){if(position>=edit.end)shift+=edit.size-(edit.end-edit.start);else if(position>edit.start)return edit.start+shift+Math.min(position-edit.start,edit.size);}return position+shift;};
+    const formatting=[];
+    for(const format of list(options.formatting).slice(0,1000)){
+      if(!Number.isInteger(format.start)||!Number.isInteger(format.end)||format.start<0||format.end<=format.start||format.end>Array.from(original).length){reasons.push("source_formatting_retained");continue;}
+      const start=remap(format.start),end=remap(format.end);if(end<=start)continue;
+      const url=["link","mention"].includes(format.type)?unsignedHistoricalUrl(format.type==="mention"?row(format.blog).url:format.url,true):undefined;
+      formatting.push({type:text(format.type,100)||"unknown",start,end,...(url?{url}:{}),...(format.type==="color" && /^#[0-9a-f]{6}$/i.test(format.hex)?{color:format.hex}:{})});
+    }
+    if((content || options.subtype) && blocks.length<100){
+      blocks.push({kind:"text",text:content,...(options.subtype?{subtype:text(options.subtype,100)}:{}),...(Number.isInteger(options.indent_level)?{indent:Math.max(0,Math.min(20,options.indent_level))}:{}),...(formatting.length?{formatting}:{}),...(options.syntax==="discord_markdown"?{syntax:"discord_markdown" as const}:{})});
+      for(const match of content.match(/https?:\/\/[^\s<>"()]+/g)||[]){const url=unsignedHistoricalUrl(match.replace(/[.,;!?]+$/,""),true);if(url&&links.length<100&&!links.includes(url))links.push(url);}
+      for(const format of formatting)if(format.url && links.length<100 && !links.includes(format.url))links.push(format.url);
     }
   };
   const addLink = (
@@ -137,9 +157,9 @@ function builder() {
   ) => {
     const url = unsignedHistoricalUrl(value, true);
     if (typeof value === "string" && url && url !== value)
-      reasons.push("link_query_or_fragment_not_retained");
+      reasons.push("public_link_normalized");
     if (url && links.length < 100 && blocks.length < 100) {
-      links.push(url);
+      if(!links.includes(url))links.push(url);
       blocks.push({ kind, url, text: text(label) });
     }
   };
@@ -206,6 +226,8 @@ export function normalizeTumblrHistoricalPost(
     b = builder(),
     remoteId = remotePostId(post.id_string) || remotePostId(post.id);
   if (!remoteId) throw Error("Tumblr post has no lossless remote identity.");
+  b.snapshot.sourceData={format:"tumblr",...sanitizeHistoricalSourceData(post)};
+  if(b.snapshot.sourceData.truncated)b.reasons.push("source_data_limit");
   const trail = list(post.trail),
     reblog = Boolean(
       post.reblogged_from_id || post.reblogged_root_id || trail.length,
@@ -222,14 +244,10 @@ export function normalizeTumblrHistoricalPost(
     for (const block of content.slice(0, 100)) {
       mappedIndexes.push(b.blocks.length);
       if (block.type === "text") {
-        b.addText(block.text);
-        for (const format of list(block.formatting))
-          if (format.type === "link") b.addLink(format.url);
-          else if (format.type !== "mention")
-            b.unsupported("unsupported_inline_formatting");
+        b.addText(block.text,block);
       } else if (block.type === "image")
         b.media(
-          { ...row(list(block.media)[0]), alt_text: block.alt_text },
+          { ...row(list(block.media).find(media=>unsignedHistoricalUrl(media.url)) || list(block.media)[0]), alt_text: block.alt_text },
           "source_attachment",
           "image",
         );
@@ -239,15 +257,22 @@ export function normalizeTumblrHistoricalPost(
           : row(block.media);
         if (media.url) b.media(media, "source_attachment", block.type);
         else {
-          b.addLink(block.url, block.title, "embed");
-          b.unsupported("external_media_not_archived");
+          const embedded=typeof block.embed_html==="string"?block.embed_html.match(/src=["'](https?:\/\/[^"']+)["']/i)?.[1]:undefined;
+          b.addLink(block.url || row(block.embed_iframe).url || embedded, block.title, "embed");
+          if(block.title)b.addText(block.title);
+          if(!block.url && !embedded && !row(block.embed_iframe).url)b.unsupported("source_content_retained");
+          b.reasons.push("external_media_reference_retained");
         }
       } else if (block.type === "link") {
         b.addLink(block.url, block.title, "embed");
         if (row(block.poster).url)
           b.media(row(block.poster), "embed_preview", "image");
-      } else
-        b.unsupported(`unsupported_npf_${text(block.type, 50) || "block"}`);
+      } else {
+        if(block.title)b.addText(block.title);
+        if(block.text)b.addText(block.text);
+        if(block.url)b.addLink(block.url,block.title);
+        b.unsupported("source_content_retained");
+      }
     }
     for (const layout of list(post.layout).slice(0, 100)) {
       if (layout.type === "rows")
@@ -268,20 +293,13 @@ export function normalizeTumblrHistoricalPost(
             blockIndexes: indexes,
           });
         }
-      else b.unsupported(`unsupported_layout_${text(layout.type, 50)}`);
+      else b.reasons.push("source_layout_retained");
     }
     if (content.length > 100) b.unsupported("block_limit");
   } else {
     b.addText(plain(post.title));
-    b.addText(
-      plain(
-        post.body ||
-          post.caption ||
-          post.description ||
-          post.text ||
-          post.answer,
-      ),
-    );
+    const legacy=legacyFormattedText(post.body || post.caption || post.description || post.text || post.answer);
+    b.addText(legacy.text,legacy);
     for (const photo of list(post.photos).slice(0, 50))
       b.media(row(photo.original_size), "source_attachment", "image");
     if (post.audio_url)
@@ -289,11 +307,9 @@ export function normalizeTumblrHistoricalPost(
     if (post.video_url)
       b.media({ url: post.video_url }, "source_attachment", "video");
     b.addLink(post.url, post.title);
-    for (const match of text(
-      post.body || post.caption || post.description,
-      100000,
-    ).matchAll(/href=["'](https:\/\/[^"']+)["']/gi))
-      b.addLink(match[1]);
+    for(const match of text(post.body || post.caption || post.description,100000).matchAll(/<img\b[^>]*src=["'](https?:\/\/[^"']+)["'][^>]*>/gi)){
+      b.addLink(match[1],"Embedded image","embed");b.reasons.push("external_media_reference_retained");
+    }
     if (post.type === "chat")
       for (const line of list(post.dialogue).slice(0, 50))
         b.addText(`${text(line.name)}: ${text(line.phrase)}`);
@@ -324,14 +340,14 @@ export function normalizeTumblrHistoricalPost(
               ![
                 "legacy_format_normalized",
                 "attributed_reblog",
-                "posted_time_unknown",
+                "posted_time_unknown", "public_link_normalized", "source_formatting_retained", "source_content_retained", "source_layout_retained", "external_media_reference_retained",
               ].includes(r),
           )
         ? "partial"
         : "full";
   return {
     remoteId,
-    sourceUrl: unsignedHistoricalUrl(post.post_url),
+    sourceUrl: unsignedHistoricalUrl(post.post_url,true),
     attribution: {
       authorId:
         post.is_submission && !post.post_author
@@ -387,7 +403,16 @@ export function normalizeDiscordHistoricalMessage(
         : post.type !== 0 || ((Number(post.flags) || 0) & 2) !== 0
           ? "system"
           : "original";
-  b.addText(post.content);
+  b.snapshot.sourceData={format:"discord",...sanitizeHistoricalSourceData(post)};
+  if(b.snapshot.sourceData.truncated)b.reasons.push("source_data_limit");
+  b.addText(post.content,{syntax:"discord_markdown"});
+  const reference = row(post.message_reference);
+  if (kind === "reply" && remotePostId(reference.message_id)
+    && (!reference.guild_id || reference.guild_id === guildId)
+    && (!reference.channel_id || reference.channel_id === channelId)) {
+    b.addLink(`https://discord.com/channels/${guildId}/${channelId}/${remotePostId(reference.message_id)}`, "Reply to message", "link");
+  }
+
   for (const attachment of list(post.attachments).slice(0, 50)) {
     const mime = text(attachment.content_type, 100),
       mediaType = mime.startsWith("image/")
@@ -402,7 +427,7 @@ export function normalizeDiscordHistoricalMessage(
   for (const embed of list(post.embeds).slice(0, 10)) {
     b.addText(row(embed.author).name);
     b.addText(embed.title);
-    b.addText(embed.description);
+    b.addText(embed.description,{syntax:"discord_markdown"});
     b.addText(row(embed.footer).text);
     b.addLink(row(embed.video).url, undefined, "embed");
     b.addLink(embed.url, embed.title, "embed");
@@ -413,12 +438,14 @@ export function normalizeDiscordHistoricalMessage(
     if (row(embed.thumbnail).url)
       b.media(row(embed.thumbnail), "embed_preview", "image");
   }
-  if (
-    list(post.sticker_items).length ||
-    post.poll ||
-    list(post.components).length
-  )
-    b.unsupported("unsupported_discord_components");
+  for(const sticker of list(post.sticker_items)){
+    b.addText(sticker.name);
+    if(remotePostId(sticker.id))b.addLink(`https://cdn.discordapp.com/stickers/${sticker.id}.${sticker.format_type===3?"json":sticker.format_type===4?"gif":"png"}`,sticker.name,"embed");
+  }
+  if(post.poll)b.unsupported("source_content_retained");
+  const component=(item:Row,depth=0)=>{if(depth>10)return;if(item.label)b.addText(item.label);if(item.content)b.addText(item.content,{syntax:"discord_markdown"});if(item.url)b.addLink(item.url,item.label);for(const child of list(item.components))component(child,depth+1);};
+  for(const item of list(post.components))component(item);
+  if(list(post.components).length && !b.blocks.length)b.unsupported("source_content_retained");
   if (kind === "forwarded") b.unsupported("forwarded_content_not_archived");
   if (
     !Array.isArray(post.attachments) ||
@@ -444,7 +471,7 @@ export function normalizeDiscordHistoricalMessage(
       ? "unavailable"
       : !b.blocks.length
         ? "metadata_only"
-        : b.reasons.length
+        : b.reasons.some(reason=>!["public_link_normalized","source_content_retained","external_media_reference_retained"].includes(reason))
           ? "partial"
           : "full",
     reasons: b.reasons,

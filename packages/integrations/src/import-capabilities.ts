@@ -105,6 +105,7 @@ export interface AnnouncementImportScope {
   authorIds: readonly string[];
   includeAttachments: boolean;
   includeAttributedMaterial: boolean;
+  includeReplies?: boolean;
   includeMetadataOnly: boolean;
   limits: { pages: number; candidates: number; elapsedMilliseconds: number };
 }
@@ -127,6 +128,7 @@ export function validateAnnouncementImportScope(
     ) &&
     new Set(values).size === values.length;
   if (
+    (scope.includeReplies !== undefined && typeof scope.includeReplies !== "boolean") ||
     !Number.isFinite(from) ||
     !Number.isFinite(to) ||
     from >= to ||

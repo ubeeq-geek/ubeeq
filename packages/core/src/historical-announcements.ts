@@ -20,13 +20,18 @@ export interface ImportedSourceAttribution {
   originalAuthorId?: string;
   originalAuthorName?: string;
 }
+export interface HistoricalTextFormat {
+  type:string; start:number; end:number; url?:string; color?:string;
+}
 export interface HistoricalContentBlock {
-  /** Plain text only; render through text nodes. Do not interpret mentions or HTML. */
+  /** Text stays inert; render explicit formatting or bounded Markdown without executing HTML. */
   kind: "text" | "link" | "attachment" | "embed" | "unsupported";
   text?: string;
   url?: string;
   attachmentId?: string;
   reason?: string;
+  subtype?:string; indent?:number; formatting?:readonly HistoricalTextFormat[];
+  syntax?:"discord_markdown";
 }
 export interface HistoricalAttachment {
   id: string;
@@ -45,6 +50,8 @@ export interface HistoricalAttachment {
   reason?: string;
 }
 export interface HistoricalContentSnapshot {
+  /** Provider structure is retained as inert, credential-free JSON, never executable HTML. */
+  sourceData?:{format:"tumblr"|"discord";json:string;truncated:boolean};
   blocks: readonly HistoricalContentBlock[];
   attachments: readonly HistoricalAttachment[];
   layout: readonly {
@@ -170,54 +177,62 @@ export function importedSourceKey(identity: ImportedSourceIdentity): string {
     identity.remoteId,
   ]);
 }
-/** Public video identifiers/timestamps are not access credentials. Other query parameters stay out of historical snapshots. */
-export function historicalPublicQueryParameter(
-  host: string,
-  path: string,
-  key: string,
-  value: string,
-): boolean {
-  if (
-    !["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"].includes(
-      host,
-    )
-  )
-    return false;
-  if (
-    host === "youtu.be"
-      ? !/^\/[a-zA-Z0-9_-]{11}$/.test(path)
-      : !["/watch", "/playlist"].includes(path)
-  )
-    return false;
-  return key === "v"
-    ? /^[a-zA-Z0-9_-]{11}$/.test(value)
-    : key === "t"
-      ? /^[0-9hms]{1,20}$/.test(value)
-      : ["list", "index"].includes(key) && /^[a-zA-Z0-9_-]{1,100}$/.test(value);
+/** Reject credential fields while preserving ordinary public navigation parameters. */
+export function historicalPublicQueryParameter(host:string,_path:string,key:string,value:string):boolean {
+  const name=key.replace(/^(?:amp;)+/i,"");
+  return key.length<=200 && value.length<=8192
+    && !/^(?:access[_-]?token|refresh[_-]?token|token|authorization|auth|password|passwd|secret|client[_-]?secret|api[_-]?key|key|signature|sig|policy|key-pair-id|session(?:id|[_-]id)?|oauth.*|x-amz-.*|x-goog-.*|jwt|credential|code)$/i.test(name)
+    && !((host.endsWith("discordapp.com")||host.endsWith("discordapp.net")) && ["ex","is","hm"].includes(name));
 }
-/** Snapshot references are never delivery authorizations. Signed URLs cannot be persisted here. */
-const safeUrl = (value: string): boolean => {
+export function historicalPublicUrl(value:unknown,depth=0):string|undefined {
   try {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      !url.username &&
-      !url.password &&
-      (!url.search ||
-        Array.from(url.searchParams).every(([key, value]) =>
-          historicalPublicQueryParameter(
-            url.hostname,
-            url.pathname,
-            key,
-            value,
-          ),
-        )) &&
-      !url.hash
-    );
-  } catch {
-    return false;
-  }
-};
+    const raw=String(value),url=new URL(raw.startsWith("//")?`https:${raw}`:raw);
+    if(!["http:","https:","mailto:","tel:"].includes(url.protocol)||url.username||url.password||url.href.length>16384)return;
+    for(const [key,value] of Array.from(url.searchParams)){
+      if(!historicalPublicQueryParameter(url.hostname,url.pathname,key,value)){url.searchParams.delete(key);continue;}
+      if(/^https?:\/\//i.test(value)){const nested=depth<4?historicalPublicUrl(value,depth+1):undefined;if(nested)url.searchParams.set(key,nested);else url.searchParams.delete(key);}
+    }
+    if(url.protocol==="mailto:" && (!url.pathname.includes("@") || /%0[ad]/i.test(url.href)))return;
+    if(url.protocol==="tel:" && !/^\+?[0-9(). -]+$/.test(url.pathname))return;
+    if(/(?:access[_-]?token|refresh[_-]?token|token|secret|authorization|password|signature|session)=/i.test(decodeURIComponent(url.hash)))url.hash="";
+    return url.toString();
+  }catch{return;}
+}
+/** Retain received provider data without retaining transport credentials or executing embeds. */
+export function sanitizeHistoricalSourceData(input:unknown):{json:string;truncated:boolean} {
+  let budget=1048576,nodes=0,truncated=false;
+  const bytes=(value:string)=>new TextEncoder().encode(value).length;
+  const visit=(value:unknown,depth:number,media=false):unknown=>{
+    if(depth>16 || ++nodes>20000 || budget<=0){truncated=true;return null;}
+    budget-=10;
+    if(value===null || typeof value==="boolean" || typeof value==="number" && Number.isFinite(value))return value;
+    if(typeof value==="string"){
+      const limit=Math.max(0,Math.min(100000,budget));if(value.length>limit)truncated=true;
+      let result=value.slice(0,limit).replace(/https?:\/\/[^\s<>"']+/g,original=>{
+        const suffix=original.match(/[.,;!?)]+$/)?.[0]||"",link=original.slice(0,original.length-suffix.length);
+        const publicUrl=historicalPublicUrl(link);if(!publicUrl)return "[invalid link]";
+        const url=new URL(publicUrl);if(media){url.search="";url.hash="";}return url.toString()+suffix;
+      });
+      let low=0,high=result.length;
+      if(bytes(JSON.stringify(result))>budget){truncated=true;while(low<high){const middle=Math.ceil((low+high)/2);if(bytes(JSON.stringify(result.slice(0,middle)))<=budget)low=middle;else high=middle-1;}result=result.slice(0,low);}
+      budget-=bytes(JSON.stringify(result));return result;
+    }
+    if(Array.isArray(value)){const result:unknown[]=[];if(value.length>1000)truncated=true;for(const item of value.slice(0,1000)){if(budget<=10){truncated=true;break;}result.push(visit(item,depth+1,media));}return result;}
+    if(value && typeof value==="object"){
+      const result:Record<string,unknown>=Object.create(null);
+      for(const [key,item] of Object.entries(value)){
+        if(!historicalPublicQueryParameter("","",key,"") || ["__proto__","prototype","constructor"].includes(key))continue;
+        if(budget<=0){truncated=true;break;}
+        if(key.length>200){truncated=true;continue;}
+        if(budget<=bytes(JSON.stringify(key))+10){truncated=true;break;}budget-=bytes(JSON.stringify(key));result[key]=visit(item,depth+1,media||["media","attachments","poster","thumbnail","image","video","audio","proxy_url"].includes(key));
+      }return result;
+    }return null;
+  };
+  const data=visit(input,0),json=JSON.stringify(data);
+  return {json,truncated};
+}
+const safeUrl=(value:string):boolean=>historicalPublicUrl(value)===value;
+const safeMediaUrl=(value:string):boolean=>{try{const url=new URL(value);return url.protocol==="https:" && !url.username && !url.password && !url.search && !url.hash;}catch{return false;}};
 export function validateHistoricalSnapshot(
   snapshot: HistoricalContentSnapshot,
 ): void {
@@ -225,8 +240,8 @@ export function validateHistoricalSnapshot(
     Object.keys(value).every((key) => fields.includes(key));
   if (
     !snapshot ||
-    !only(snapshot, ["blocks", "attachments", "layout", "links", "tags"]) ||
-    new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > 524288
+    !only(snapshot, ["blocks", "attachments", "layout", "links", "tags", "sourceData"]) ||
+    new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > 2097152
   )
     throw new Error(
       "Historical snapshots must contain only bounded normalized content.",
@@ -244,6 +259,12 @@ export function validateHistoricalSnapshot(
     snapshot.layout.length > 100
   )
     throw new Error("Historical content exceeds snapshot bounds.");
+  if(snapshot.sourceData){
+    const data=snapshot.sourceData;
+    if(!only(data,["format","json","truncated"]) || !["tumblr","discord"].includes(data.format) || typeof data.json!=="string" || data.json.length>1048576 || typeof data.truncated!=="boolean")throw Error("Invalid retained source data.");
+    let parsed:unknown;try{parsed=JSON.parse(data.json);}catch{throw Error("Invalid retained source JSON.");}
+    if(sanitizeHistoricalSourceData(parsed).json!==data.json)throw Error("Retained source data must be sanitized.");
+  }
   const ids = new Set<string>(),
     positions = new Set<number>();
   for (const attachment of snapshot.attachments) {
@@ -274,7 +295,7 @@ export function validateHistoricalSnapshot(
       !["not_requested", "pending", "archived", "failed", "excluded"].includes(
         attachment.archive,
       ) ||
-      (attachment.sourceUrl !== undefined && !safeUrl(attachment.sourceUrl)) ||
+      (attachment.sourceUrl !== undefined && !safeMediaUrl(attachment.sourceUrl)) ||
       (attachment.archive === "archived"
         ? !nonempty(attachment.managedAssetId)
         : attachment.managedAssetId !== undefined) ||
@@ -287,13 +308,19 @@ export function validateHistoricalSnapshot(
   }
   for (const block of snapshot.blocks) {
     if (
-      !only(block, ["kind", "text", "url", "attachmentId", "reason"]) ||
+      !only(block, ["kind", "text", "url", "attachmentId", "reason", "subtype", "indent", "formatting", "syntax"]) ||
       !["text", "link", "attachment", "embed", "unsupported"].includes(
         block.kind,
       ) ||
       (block.text !== undefined &&
         (typeof block.text !== "string" || block.text.length > 100000)) ||
       (block.url !== undefined && !safeUrl(block.url)) ||
+      (block.subtype!==undefined && (typeof block.subtype!=="string" || block.subtype.length>100)) ||
+      (block.indent!==undefined && (!Number.isInteger(block.indent)||block.indent<0||block.indent>20)) ||
+      (block.syntax!==undefined && block.syntax!=="discord_markdown") ||
+      (block.formatting!==undefined && (!Array.isArray(block.formatting)||block.formatting.length>1000||block.formatting.some((format:HistoricalTextFormat)=>
+        !only(format,["type","start","end","url","color"]) || !nonempty(format.type) || !Number.isInteger(format.start)||!Number.isInteger(format.end)||format.start<0||format.end<=format.start||format.end>Array.from(block.text||"").length ||
+        (format.url!==undefined && !safeUrl(format.url)) || (format.color!==undefined && !/^#[0-9a-f]{6}$/i.test(format.color))))) ||
       (block.attachmentId !== undefined && !ids.has(block.attachmentId)) ||
       (block.kind === "attachment" && !block.attachmentId) ||
       (block.kind === "unsupported" && !nonempty(block.reason))
@@ -449,6 +476,7 @@ export function planHistoricalAnnouncementImport(input: {
   authorAuthorized: boolean;
   restrictionsRepresentable: boolean;
   includeAttributedMaterial?: boolean;
+  includeReplies?: boolean;
   includeMetadataOnly?: boolean;
   excluded?: boolean;
   restoreExcluded?: boolean;
@@ -502,8 +530,8 @@ export function planHistoricalAnnouncementImport(input: {
   if (source.completeness === "metadata_only" && !input.includeMetadataOnly)
     return { kind: "skip", reason: "metadata_selection_required" };
   if (
-    ["reply", "system"].includes(source.attribution.kind) ||
-    (source.attribution.kind !== "original" && !input.includeAttributedMaterial)
+    source.attribution.kind === "system" ||
+    (source.attribution.kind === "reply" ? !input.includeReplies : source.attribution.kind !== "original" && !input.includeAttributedMaterial)
   )
     return { kind: "skip", reason: "author_excluded" };
   if (input.existingAnnouncement) {
@@ -613,8 +641,21 @@ export async function historicalSourceContentHash(
               .map(([k, v]) => [k, canonical(v)]),
           )
         : value;
+  // Keep provider evidence intact; engagement updates do not revise the post body.
+  const sourceData=source.snapshot.sourceData;
+  let contentData=sourceData;
+  if(sourceData){
+    const raw=JSON.parse(sourceData.json);
+    if(raw && typeof raw==='object' && !Array.isArray(raw)){
+      for(const key of ['note_count','notes','liked','like_count','reblog_count','reply_count','reactions'])delete raw[key];
+      if(raw.poll && typeof raw.poll==='object')delete raw.poll.results;
+      if(raw.thread && typeof raw.thread==='object')for(const key of ['message_count','member_count','total_message_sent'])delete raw.thread[key];
+      contentData={...sourceData,json:JSON.stringify(canonical(raw))};
+    }
+  }
   const snapshot = {
     ...source.snapshot,
+    ...(contentData?{sourceData:contentData}:{}),
     attachments: source.snapshot.attachments.map(
       ({
         archive: _archive,
