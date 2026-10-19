@@ -58,3 +58,25 @@ test('personal website API persists pages, queues builds, isolates previews and 
   await call('/v1/operations/holds','POST',{subjectId:'document',subjectType:'document',reason:'rights_review'});
   assert.equal((await call('/v1/websites/builds/'+id+'/export')).status,400);
 });
+
+test('hosting HTTP API accepts a review once, worker publishes without export, and repeated Publish updates the same target',async t=>{
+  const {createServer}=await import('node:http');const {createNativeWebsiteHandler}=await import('@ubeeq/adapter-local');
+  const dir=mkdtempSync(join(tmpdir(),'ubeeq-hosting-api-')),staticServer=createServer();await new Promise(r=>staticServer.listen(0,'127.0.0.1',r));
+  const profile={id:'local',root:join(dir,'hosting'),publicUrlTemplate:`http://127.0.0.1:${staticServer.address().port}/sites/{site}/`,persistent:true,writerMode:'single'};staticServer.on('request',createNativeWebsiteHandler([profile]));
+  const api=createReferenceApi({databasePath:join(dir,'app.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',nativeWebsiteProfiles:[profile]});await new Promise(r=>api.server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+api.server.address().port;
+  t.after(async()=>{await api.close();await new Promise(r=>staticServer.close(r));rmSync(dir,{recursive:true,force:true});});let token;
+  const call=async(path,method='GET',body)=>{const r=await fetch(origin+path,{method,headers:{'content-type':'application/json',...(token?{authorization:'Bearer '+token}:{})},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,body:await r.json()};};
+  await call('/v1/auth/sign-up','POST',{email:'hosting@example.test',password:'long-safe-password'});token=(await call('/v1/auth/sign-in','POST',{email:'hosting@example.test',password:'long-safe-password'})).body.token;
+  const {creator}=(await call('/v1/creators','POST',{handle:'hosting-owner',displayName:'Hosting owner'})).body,w=creator.id;
+  await call('/v1/websites/documents/doc','PUT',{expectedRevision:0,document:{id:'doc',workspaceId:w,revision:1,blocks:[{id:'p',type:'paragraph',text:'Approved release'}]}});
+  await call('/v1/websites/site','PUT',{expectedRevision:0,website:{id:'site',workspaceId:w,creatorIdentityId:w,revision:1,title:'Hosting',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'local'}},mediaMode:'bundled',basePath:'/',pages:[{id:'home',workspaceId:w,websiteId:'site',documentId:'doc',revision:1,kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]}});
+  const route='/v1/websites/site/hosting/';assert.equal((await call(route+'choices')).body.choices[0].id,'native:local');
+  const created=await call(route+'native-target','POST',{adapterId:'native:local',label:'Main website',ownershipConfirmed:true});assert.equal(created.status,202,JSON.stringify(created.body));const target=created.body.target;
+  for(let i=1;i<=2;i++){const review=(await call(route+'review','POST',{expectedRevision:1,targetIds:[target.id]})).body;
+    const published=await call(route+'publish','POST',{planId:review.planId,fingerprint:review.fingerprint,idempotencyKey:'publish-'+i});assert.equal(published.status,202,JSON.stringify(published.body));
+    const result=await api.runNextJob('hosting-worker');assert.equal(result.attempt.state,'published',JSON.stringify(result));assert.equal((await call(route+'history')).body.targets[0].activeGeneration,i);
+  }
+  assert.match(await(await fetch(target.publicUrl)).text(),/Approved release/);
+  const history=(await call(route+'history')).body;assert.equal(history.targets.length,1);assert.equal(history.attempts.length,2);
+  await call(route+'unpublish/'+target.id,'POST',{idempotencyKey:'remove'});assert.equal((await api.runNextJob('hosting-worker')).attempt.state,'unpublished');assert.equal((await fetch(target.publicUrl)).status,410);
+});

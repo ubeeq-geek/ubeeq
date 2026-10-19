@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 export * from './website-artifact.js';
 export * from './website-service.js';
+export * from './website-publishing.js';
 import { randomUUID } from "node:crypto";
 export { assembleCreatorContentExport } from './content-export.js';
 export { parseCreatorContentExport } from './content-export-validation.js';

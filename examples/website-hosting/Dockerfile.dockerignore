@@ -1,0 +1,7 @@
+*
+!apps/
+apps/*
+!apps/reference-api/
+apps/reference-api/*
+!apps/reference-api/lambda-package/
+!apps/reference-api/lambda-package/**
