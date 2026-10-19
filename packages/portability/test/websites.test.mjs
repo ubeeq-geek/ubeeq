@@ -190,3 +190,17 @@ test('website removal is revision checked, blocks retained builds, and cannot be
  const editor=await harness({role:'editor'});t.after(()=>editor.store.close());
  await assert.rejects(editor.service.remove(editor.actor,editor.snapshot.website.id,1),{code:'authorization_denied'});
 });
+
+test('page designs bundle cover/background images and every theme supports light, dark and system exports',()=>{
+ for(const theme of ['neutral','ink','ocean','plum'])for(const mode of ['light','dark','system']){
+  const snapshot=fixture();snapshot.website.theme={id:theme,version:'1',settings:{colorMode:mode,headerLayout:'split',footerLayout:'centered',logoAssetId:snapshot.assets[0].id}};
+  Object.assign(snapshot.website.pages[0],{template:'cover',coverAssetId:snapshot.assets[0].id,backgroundAssetId:snapshot.assets[0].id,coverPosition:{x:.2,y:.8}});
+  const output=buildWebsiteArtifact(snapshot,limits),html=Buffer.from(output.files.get('index.html')).toString(),css=Buffer.from(output.files.get('assets/theme.css')).toString();
+  assert.match(html,/template-cover/);assert.match(html,/page-cover/);assert.match(html,/page-background/);assert.match(html,/image-position-20-80/);assert.match(css,/object-position:20% 80%/);assert.match(html,/site-header split/);assert.match(html,/site-footer centered/);
+  assert.match(html,/<details class="nav-dropdown"><summary>portfolio/);assert.match(html,/aria-label="Footer"/);assert.match(css,/prefers-color-scheme:dark/);assert.match(css,/nav details\[open\]/);
+  assert.ok([...output.files.keys()].some(path=>path.startsWith('assets/')&&path.endsWith('.png')));
+ }
+ const centered=fixture();centered.website.theme.settings={headerLayout:'centered',logoAssetId:centered.assets[0].id};
+ const html=Buffer.from(buildWebsiteArtifact(centered,limits).files.get('index.html')).toString();assert.match(html,/site-header centered/);assert.doesNotMatch(html,/class="site-logo"/);
+ for(const patch of [{template:'unsafe'},{coverPosition:{x:2,y:.5}},{backgroundAssetId:'../secret'}]){const invalid=fixture();Object.assign(invalid.website.pages[0],patch);assert.throws(()=>websiteRoutes(invalid.website));}
+});

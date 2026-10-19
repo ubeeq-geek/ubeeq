@@ -1,4 +1,5 @@
 import type { ContentBlock } from './index.js';
+import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, type WebsiteThemeId, type WebsitePageTemplate } from './website-design.js';
 
 export const WEBSITE_API_VERSION = '1' as const;
 export class WebsiteError extends Error {
@@ -15,6 +16,8 @@ export interface WebsitePage {
   state: 'draft' | 'ready' | 'archived'; navigation: boolean; navigationLabel?: string;
   description?: string; date?: string; excerpt?: string; noindex?: boolean; canonicalUrl?: string;
   seoTitle?: string; socialAssetId?: string; layout?: 'reading' | 'wide';
+  template?: WebsitePageTemplate; coverAssetId?: string; backgroundAssetId?: string;
+  coverPosition?: {x:number;y:number}; backgroundPosition?: {x:number;y:number}; footerNavigation?: boolean;
 }
 export type WebsiteDestination =
   | { mode: 'local' }
@@ -44,7 +47,7 @@ export interface WebsiteGallerySettings {
 export interface Website {
   id: string; workspaceId: string; creatorIdentityId: string; revision: number;
   title: string; locale: string; homePageId: string;
-  theme: { id: 'neutral'; version: '1'; settings: { colorMode?: 'light' | 'dark' | 'system'; width?: 'reading' | 'wide'; footer?: string; logoAssetId?: string; faviconAssetId?: string; font?: 'system' | 'serif'; accentColor?: string } };
+  theme: { id: WebsiteThemeId; version: '1'; settings: { colorMode?: 'light' | 'dark' | 'system'; width?: 'reading' | 'wide'; footer?: string; logoAssetId?: string; faviconAssetId?: string; font?: 'system' | 'serif'; accentColor?: string; headerLayout?:'split'|'centered'|'stacked'; footerLayout?:'split'|'centered'|'minimal'; showWordmark?:boolean } };
   galleryDefault: GalleryDestinationRule; mediaMode: 'bundled' | 'linked';
   basePath: string; publicBaseUrl?: string; noindex?: boolean;
   pages: readonly WebsitePage[]; galleryPublicationIds: readonly string[];
@@ -101,12 +104,14 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   if (!site.id || !site.workspaceId || !site.creatorIdentityId || !Number.isSafeInteger(site.revision) || site.revision < 1 || !site.title?.trim() || !/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(site.locale)) throw new WebsiteError('invalid_website', 'Website identity, revision, title and locale are required.');
   websitePath(site.basePath);
   if (site.publicBaseUrl) { const url = new URL(websiteExternalUrl(site.publicBaseUrl)); if (url.pathname !== '/' || url.search || url.hash) throw new WebsiteError('invalid_url', 'Public base URL must be an origin; configure the base path separately.'); }
-  if (site.theme.id !== 'neutral' || site.theme.version !== '1' || Object.keys(site.theme.settings).some(key => !['colorMode','width','footer','logoAssetId','faviconAssetId','font','accentColor'].includes(key)) || (site.theme.settings.colorMode && !['light','dark','system'].includes(site.theme.settings.colorMode)) || (site.theme.settings.width && !['reading','wide'].includes(site.theme.settings.width)) || (site.theme.settings.font && !['system','serif'].includes(site.theme.settings.font))) throw new WebsiteError('unsupported_theme', 'Unsupported theme or settings.');
+  if (!WEBSITE_THEMES.some(theme=>theme.id===site.theme.id) || site.theme.version !== '1' || Object.keys(site.theme.settings).some(key => !['colorMode','width','footer','logoAssetId','faviconAssetId','font','accentColor','headerLayout','footerLayout','showWordmark'].includes(key)) || (site.theme.settings.colorMode && !['light','dark','system'].includes(site.theme.settings.colorMode)) || (site.theme.settings.width && !['reading','wide'].includes(site.theme.settings.width)) || (site.theme.settings.font && !['system','serif'].includes(site.theme.settings.font))) throw new WebsiteError('unsupported_theme', 'Unsupported theme or settings.');
+  if(site.theme.settings.headerLayout&&!['split','centered','stacked'].includes(site.theme.settings.headerLayout)||site.theme.settings.footerLayout&&!['split','centered','minimal'].includes(site.theme.settings.footerLayout)||site.theme.settings.showWordmark!==undefined&&typeof site.theme.settings.showWordmark!=='boolean')throw new WebsiteError('invalid_theme','Choose a supported header and footer layout.');
   if (site.theme.settings.accentColor) {
     const color=site.theme.settings.accentColor;
     if(!/^#[a-f0-9]{6}$/i.test(color)) throw new WebsiteError('invalid_theme','Accent color must be a six-digit hexadecimal value.');
     const luminance=(hex:string) => [1,3,5].map(i=>parseInt(hex.slice(i,i+2),16)/255).map(c=>c<=.04045?c/12.92:((c+.055)/1.055)**2.4).reduce((sum,c,i)=>sum+c*[.2126,.7152,.0722][i],0);
-    for(const background of site.theme.settings.colorMode==='dark'?['#181e1a']:site.theme.settings.colorMode==='system'?['#fafaf9','#181e1a']:['#fafaf9']) {
+    const palette=WEBSITE_THEMES.find(theme=>theme.id===site.theme.id)!;
+    for(const background of site.theme.settings.colorMode==='dark'?[palette.dark.canvas]:site.theme.settings.colorMode==='system'?[palette.light.canvas,palette.dark.canvas]:[palette.light.canvas]) {
       const a=luminance(color),b=luminance(background);
       if((Math.max(a,b)+.05)/(Math.min(a,b)+.05)<4.5) throw new WebsiteError('theme_contrast','Accent color needs at least 4.5:1 contrast against the selected canvas. Choose another color or color mode.');
     }
@@ -138,6 +143,10 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   const routes = new Map<string, string>(), occupied = new Set<string>();
   for (const page of site.pages) {
     if (page.websiteId !== site.id || page.workspaceId !== site.workspaceId || !page.id || !page.documentId || !page.title?.trim() || !Number.isSafeInteger(page.revision) || page.revision < 1 || !Number.isFinite(page.order) || !['home','page','portfolio','update'].includes(page.kind) || !['draft','ready','archived'].includes(page.state)) throw new WebsiteError('invalid_page', 'Pages and documents must belong to this website and workspace.');
+    if(page.template&&!WEBSITE_PAGE_TEMPLATES.some(t=>t.id===page.template))throw new WebsiteError('invalid_template','Choose a supported page template.');
+    for(const position of [page.coverPosition,page.backgroundPosition])if(position&&(!Number.isFinite(position.x)||!Number.isFinite(position.y)||position.x<0||position.x>1||position.y<0||position.y>1))throw new WebsiteError('invalid_position','Image positions must be between zero and one.');
+    for(const id of [page.coverAssetId,page.backgroundAssetId])if(id&&(typeof id!=='string'||!/^[-a-zA-Z0-9_:]{1,160}$/.test(id)))throw new WebsiteError('invalid_media','Choose an image from the library.');
+    if(page.footerNavigation!==undefined&&typeof page.footerNavigation!=='boolean')throw new WebsiteError('invalid_navigation','Choose whether this page appears in the footer.');
     if (page.canonicalUrl) websiteExternalUrl(page.canonicalUrl);
     if (page.kind === 'home' && (page.parentId || page.slug || page.state !== 'ready')) throw new WebsiteError('invalid_home', 'Home must be ready, without a parent or slug.');
     const parent = page.parentId ? pages.get(page.parentId) : undefined;

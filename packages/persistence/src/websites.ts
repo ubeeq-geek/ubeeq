@@ -1,4 +1,8 @@
 import type { Website, WebsiteDocument, WebsiteDependency } from '@ubeeq/core';
+export interface WebsiteImageRecord {
+  id:string;workspaceId:string;revision:number;title:string;mimeType:'image/webp';
+  checksum:string;sizeBytes:number;width:number;height:number;
+}
 
 export interface WebsiteBuildRecord {
   id: string; workspaceId: string; websiteId: string; websiteRevision: number;
@@ -12,6 +16,9 @@ export interface WebsiteBuildRecord {
 }
 /** CAS writes are atomic. Stores return copies; private artifacts never get a public URL. */
 export interface WebsiteStore {
+  putWebsiteImage?(image:WebsiteImageRecord,bytes:Uint8Array):Promise<void>;
+  getWebsiteImage?(workspaceId:string,id:string):Promise<{image:WebsiteImageRecord;bytes:Uint8Array}|undefined>;
+  listWebsiteImages?(workspaceId:string):Promise<readonly WebsiteImageRecord[]>;
   getWebsite(workspaceId: string, id: string): Promise<Website | undefined>;
   listWebsites(workspaceId: string): Promise<readonly Website[]>;
   saveWebsite(website: Website, expectedRevision: number): Promise<void>;

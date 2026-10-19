@@ -1,4 +1,5 @@
 import { WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
+import { websiteDesignCss } from './website-design-css.js';
 import { parseFragment, serialize } from 'parse5';
 import { sanitizeInlineHtml, textToInlineHtml } from './block-content.js';
 
@@ -36,7 +37,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
   const base = websitePath(site.basePath).replace(/\/$/, '');
   const url = (path: string) => base + path;
   const absolute = (path: string) => site.publicBaseUrl ? new URL(url(path), site.publicBaseUrl).href : undefined;
-  const files = new Map<string, string>(), warnings: string[] = [];
+  const files = new Map<string, string>(), warnings: string[] = [], imagePositions=new Map<string,string>();
   const pages = site.pages.filter(p => p.state === 'ready');
   const limits = input.limits ?? { maxPages: 200, maxBytes: 50 * 1024 * 1024 };
   if (![limits.maxPages, limits.maxBytes].every(n => Number.isSafeInteger(n) && n > 0)) throw new WebsiteError('invalid_limits', 'Render limits must be positive integers.');
@@ -77,19 +78,33 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     }
     return serialize(root);
   };
-  const nav = (current: string) => {
-    const visible = pages.filter(p => p.navigation && p.kind !== 'update').sort((a,b) => a.order-b.order || a.id.localeCompare(b.id, 'en'));
+  const nav = (current: string, footer=false) => {
+    const visible = pages.filter(p => (footer?(p.footerNavigation??p.navigation):p.navigation) && p.kind !== 'update').sort((a,b) => a.order-b.order || a.id.localeCompare(b.id, 'en'));
     const item = (p: WebsitePage) => `<a href="${e(url(routes.get(p.id)!))}"${routes.get(p.id) === current ? ' aria-current="page"' : ''}>${e(p.navigationLabel ?? p.title)}</a>`;
-    return `<nav aria-label="Main"><ul>${visible.filter(p => !p.parentId).map(p => `<li>${item(p)}${visible.some(child => child.parentId === p.id) ? `<ul>${visible.filter(child => child.parentId === p.id).map(child => `<li>${item(child)}</li>`).join('')}</ul>` : ''}</li>`).join('')}${(site.navigationLinks??[]).map(item=>`<li><a href="${e(websiteExternalUrl(item.url,true))}">${e(item.label)}</a></li>`).join('')}</ul></nav>`;
+    const entries=visible.filter(p=>!p.parentId||!visible.some(parent=>parent.id===p.parentId)).map(p=>{
+      const children=visible.filter(child=>child.parentId===p.id);
+      return `<li>${children.length?`<details class="nav-dropdown"><summary>${e(p.navigationLabel??p.title)}</summary><ul><li>${item(p)}</li>${children.map(child=>`<li>${item(child)}</li>`).join('')}</ul></details>`:item(p)}</li>`;
+    }).join('');
+    const extra=footer?site.footerLinks:site.navigationLinks;
+    return `<nav aria-label="${footer?'Footer':'Main'}"><ul>${entries}${(extra??[]).map(item=>`<li><a href="${e(websiteExternalUrl(item.url,true))}">${e(item.label)}</a></li>`).join('')}</ul></nav>`;
   };
-  const shell = (title: string, body: string, path: string, meta: { description?: string; canonicalUrl?: string; noindex?: boolean; seoTitle?: string; socialAssetId?: string; layout?: 'reading'|'wide' } = {}) => {
+  const shell = (title: string, body: string, path: string, meta: { description?: string; canonicalUrl?: string; noindex?: boolean; seoTitle?: string; socialAssetId?: string; layout?: 'reading'|'wide';template?:WebsitePage['template'];coverAssetId?:string;backgroundAssetId?:string;coverPosition?:WebsitePage['coverPosition'];backgroundPosition?:WebsitePage['backgroundPosition'] } = {}) => {
     const canonical = meta.canonicalUrl ?? absolute(path);
     const logo=site.theme.settings.logoAssetId?media.get(site.theme.settings.logoAssetId):undefined;
     const favicon=site.theme.settings.faviconAssetId?media.get(site.theme.settings.faviconAssetId):undefined;
     const social=meta.socialAssetId?media.get(meta.socialAssetId):undefined;
     for(const asset of [logo,favicon,social]) if(asset&&!asset.mimeType.startsWith('image/')) throw new WebsiteError('invalid_media','Logo, favicon and social previews must be public images.');
+    const designImage=(id:string|undefined,position:{x:number;y:number}|undefined,cover:boolean)=>{
+      if(!id)return '';const asset=media.get(id);if(!asset||!asset.mimeType.startsWith('image/'))throw new WebsiteError('missing_media','A page design image is unavailable.');
+      const coordinate=(value:number|undefined)=>Number.isFinite(value)?Math.round(Math.max(0,Math.min(1,value!))*100):50;
+      const x=coordinate(position?.x),y=coordinate(position?.y),name=`image-position-${x}-${y}`;imagePositions.set(name,`.${name}{object-position:${x}% ${y}%}`);
+      return `<img class="${name}" src="${e(asset.src)}" alt="${cover?e(asset.alt):''}"${cover?' loading="eager"':''}>`;
+    };
+    const cover=designImage(meta.coverAssetId,meta.coverPosition,true),background=designImage(meta.backgroundAssetId,meta.backgroundPosition,false);
+    const header=site.theme.settings.headerLayout??'split',footer=site.theme.settings.footerLayout??'split';
+    const brand=(header!=='centered'&&logo?`<img class="site-logo" src="${e(logo.src)}" alt="${e(site.title)}">`:'')+(header==='centered'||!logo||site.theme.settings.showWordmark!==false?`<span class="site-wordmark">${e(site.title)}</span>`:'');
     const socialUrl=social?(site.publicBaseUrl?new URL(social.src,site.publicBaseUrl).href:social.src):undefined;
-    return `<!doctype html><html lang="${e(site.locale)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(meta.seoTitle??title)} — ${e(site.title)}</title>${favicon?`<link rel="icon" href="${e(favicon.src)}">`:""}${socialUrl?`<meta property="og:image" content="${e(socialUrl)}">`:""}<meta property="og:title" content="${e(meta.seoTitle??title)}">${meta.description ? `<meta name="description" content="${e(meta.description)}">` : ''}${site.noindex || meta.noindex ? '<meta name="robots" content="noindex,nofollow">' : ''}${canonical ? `<link rel="canonical" href="${e(canonical)}">` : ''}<link rel="stylesheet" href="${e(url('/assets/theme.css'))}"></head><body class="${e(site.theme.settings.colorMode ?? 'light')} ${site.theme.settings.width === 'reading' ? 'reading' : ''}"><a class="skip" href="#main">Skip to content</a><header><a href="${e(url('/'))}">${logo?`<img class="site-logo" src="${e(logo.src)}" alt="${e(site.title)}">`:e(site.title)}</a>${nav(path)}</header><main id="main"${meta.layout==='reading'?' class="reading"':''}><h1>${e(title)}</h1>${body}</main><footer>${e(site.theme.settings.footer ?? '')}${site.footerLinks?.length?`<nav aria-label="Footer"><ul>${site.footerLinks.map(item=>`<li><a href="${e(websiteExternalUrl(item.url,true))}">${e(item.label)}</a></li>`).join('')}</ul></nav>`:''}</footer></body></html>`;
+    return `<!doctype html><html lang="${e(site.locale)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(meta.seoTitle??title)} — ${e(site.title)}</title>${favicon?`<link rel="icon" href="${e(favicon.src)}">`:""}${socialUrl?`<meta property="og:image" content="${e(socialUrl)}">`:""}<meta property="og:title" content="${e(meta.seoTitle??title)}">${meta.description ? `<meta name="description" content="${e(meta.description)}">` : ''}${site.noindex || meta.noindex ? '<meta name="robots" content="noindex,nofollow">' : ''}${canonical ? `<link rel="canonical" href="${e(canonical)}">` : ''}<link rel="stylesheet" href="${e(url('/assets/theme.css'))}"></head><body class="${e(site.theme.settings.colorMode ?? 'light')} ${site.theme.settings.width === 'reading' ? 'reading' : ''}"><a class="skip" href="#main">Skip to content</a><header class="site-header ${header}"><a class="site-brand" href="${e(url('/'))}">${brand}</a>${nav(path)}</header><main id="main" class="template-${e(meta.template??'standard')} ${meta.layout==='reading'?'reading':''} ${background?'has-background':''} ${cover?'has-cover':''}">${background?`<div class="page-background" aria-hidden="true">${background}</div>`:''}<div class="page-surface">${cover?`<figure class="page-cover">${cover}</figure>`:''}<div class="page-heading"><h1>${e(title)}</h1></div><div class="page-content">${body}</div></div></main><footer class="site-footer ${footer}"><p>${e(site.theme.settings.footer ?? site.title)}</p>${nav(path,true)}</footer></body></html>`;
   };
   const image = (id: string, caption?: string, expected: 'image' | 'video' | 'audio' | 'file' = 'image') => {
     const asset = media.get(id);
@@ -177,7 +192,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     warnings.push('Portable redirects are HTML link pages, not HTTP 301/308 responses.');
   }
   write('404.html', shell('Page not found', `<p><a href="${e(url('/'))}">Return Home</a></p>`, '/404/', {noindex:true}));
-  write('assets/theme.css', css+(site.theme.settings.font==='serif'?'body{font-family:Georgia,serif}':'')+(site.theme.settings.accentColor?`body.light,body.dark,body.system{--color-action:${site.theme.settings.accentColor};--color-focus:${site.theme.settings.accentColor}}`:''));
+  write('assets/theme.css', css+websiteDesignCss(site)+[...imagePositions.values()].join('')+(site.theme.settings.font==='serif'?'body{font-family:Georgia,serif}':'')+(site.theme.settings.accentColor?`body.light,body.dark,body.system{--color-action:${site.theme.settings.accentColor};--color-focus:${site.theme.settings.accentColor}}`:''));
   write('robots.txt', `User-agent: *\n${site.noindex ? 'Disallow: /' : 'Allow: /'}\n${site.publicBaseUrl ? `Sitemap: ${absolute('/sitemap.xml')}\n` : ''}`);
   write('redirects.json',JSON.stringify({apiVersion:'1',redirects:site.redirects.map(r=>({from:url(websitePath(r.from)),to:r.to.startsWith('/')?url(websitePath(r.to)):websiteExternalUrl(r.to),status:r.status}))},null,2)+'\n');
   const sitemapPaths = [...files.keys()].filter(name => name.endsWith('index.html')).map(name => name === 'index.html' ? '/' : '/' + name.slice(0,-10).split('/').map(encodeURIComponent).join('/')).filter(path => !pages.some(p => routes.get(p.id) === path && p.noindex) && !site.redirects.some(r => websitePath(r.from) === path));

@@ -2,7 +2,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { WebsiteError, type Website, type WebsiteDocument } from '@ubeeq/core';
-import type { WebsiteBuildRecord, WebsiteStore } from '@ubeeq/persistence';
+import type { WebsiteBuildRecord, WebsiteStore, WebsiteImageRecord } from '@ubeeq/persistence';
+import { createHash } from 'node:crypto';
 
 /** Local durable, workspace-partitioned private website records and immutable artifacts. */
 export class SqliteWebsiteStore implements WebsiteStore {
@@ -14,8 +15,18 @@ export class SqliteWebsiteStore implements WebsiteStore {
       CREATE TABLE IF NOT EXISTS website_records(workspace TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,revision INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(workspace,kind,id));
       CREATE TABLE IF NOT EXISTS website_artifacts(workspace TEXT NOT NULL,digest TEXT NOT NULL,zip BLOB NOT NULL,files TEXT NOT NULL,PRIMARY KEY(workspace,digest));`);
     this.db.exec('CREATE TABLE IF NOT EXISTS website_renditions(workspace TEXT NOT NULL,source TEXT NOT NULL,bytes BLOB NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,PRIMARY KEY(workspace,source))');
+    this.db.exec('CREATE TABLE IF NOT EXISTS website_images(workspace TEXT NOT NULL,id TEXT NOT NULL,metadata TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(workspace,id))');
   }
   close() { this.db.close(); }
+  async putWebsiteImage(image:WebsiteImageRecord,bytes:Uint8Array) {
+    if(image.id!==`website-image-${image.checksum}`||createHash('sha256').update(bytes).digest('hex')!==image.checksum||bytes.length!==image.sizeBytes)throw new WebsiteError('invalid_media','Image integrity check failed.');
+    this.db.prepare('INSERT OR IGNORE INTO website_images(workspace,id,metadata,bytes) VALUES(?,?,?,?)').run(image.workspaceId,image.id,JSON.stringify(image),bytes);
+  }
+  async listWebsiteImages(workspace:string):Promise<WebsiteImageRecord[]> { return (this.db.prepare('SELECT metadata FROM website_images WHERE workspace=? ORDER BY id').all(workspace) as {metadata:string}[]).map(row=>JSON.parse(row.metadata)); }
+  async getWebsiteImage(workspace:string,id:string) {
+    const row=this.db.prepare('SELECT metadata,bytes FROM website_images WHERE workspace=? AND id=?').get(workspace,id) as {metadata:string;bytes:Uint8Array}|undefined;
+    return row?{image:JSON.parse(row.metadata) as WebsiteImageRecord,bytes:new Uint8Array(row.bytes)}:undefined;
+  }
   private read<T>(workspace: string,kind: string,id: string): T | undefined {
     const row=this.db.prepare('SELECT payload FROM website_records WHERE workspace=? AND kind=? AND id=?').get(workspace,kind,id) as {payload:string}|undefined;
     return row?JSON.parse(row.payload):undefined;

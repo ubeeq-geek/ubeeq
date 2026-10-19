@@ -113,7 +113,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     return {...g,...resolveWebsiteGallery(site,g,snapshot.mappings)};
   });
   const needed=new Set<string>();
-  for(const id of [site.theme.settings.logoAssetId,site.theme.settings.faviconAssetId,...site.pages.filter(p=>p.state==='ready').map(p=>p.socialAssetId)]) if(id) needed.add(id);
+  for(const id of [site.theme.settings.logoAssetId,site.theme.settings.faviconAssetId,...site.pages.filter(p=>p.state==='ready').flatMap(p=>[p.socialAssetId,p.coverAssetId,p.backgroundAssetId])]) if(id) needed.add(id);
   const visit=(blocks: WebsiteDocument['blocks']) => { for (const b of blocks) { if (['image','video','audio','file','pdf_preview'].includes(b.type)) needed.add(b.fileId ?? b.assetId ?? ''); if (b.children) visit(b.children); } };
   for (const page of site.pages.filter(p=>p.state==='ready')) { const doc=documents.get(page.documentId); if(!doc) throw new WebsiteError('missing_document','A ready page has no resolved document.'); visit(doc.blocks); }
   for (const gallery of galleries) { if (gallery.href) gallery.previewAssetIds.forEach(id=>needed.add(id)); if(gallery.local) gallery.publicAssetIds.forEach(id=>needed.add(id)); }
