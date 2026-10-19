@@ -124,14 +124,14 @@ test('durable build/export lifecycle reauthorizes queued work and immutable cand
   const b=await service.requestBuild(actor,snapshot.website.id,1,'same-key'),same=await service.requestBuild(actor,snapshot.website.id,1,'same-key');assert.equal(b.id,same.id);
   await assert.rejects(service.requestBuild(actor,snapshot.website.id,2,'same-key'),{code:'idempotency_conflict'});
   const ready=await service.execute(actor.workspaceId,b.id);assert.equal(ready.state,'ready');assert.ok(ready.report.checks.includes('internal-links'));
-  const downloaded=await service.export(actor,b.id),again=await service.execute(actor.workspaceId,b.id);assert.equal(downloaded.digest,again.artifactDigest);
+  const downloaded=await service.export(actor,b.id);assert.deepEqual((await service.previewArchive(actor,b.id)).bytes,downloaded.bytes);const again=await service.execute(actor.workspaceId,b.id);assert.equal(downloaded.digest,again.artifactDigest);
   const changed={...snapshot.documents[0],revision:2,blocks:[block('paragraph',{text:'NEW DRAFT ONLY'})]};await service.saveDocument(actor,changed,1);
   assert.ok(!Buffer.from(await service.preview(actor,b.id,'index.html')).toString().includes('NEW DRAFT ONLY'));
   assert.deepEqual((await service.export(actor,b.id)).bytes,downloaded.bytes);
   await assert.rejects(service.saveDocument(actor,changed,1),{code:'revision_conflict'});
   h.setActive(false);await assert.rejects(service.export(actor,b.id),{code:'authorization_denied'});h.setActive(true);
   h.setAllowed(false);await assert.rejects(service.export(actor,b.id),{code:'release_restricted'});h.setAllowed(true);
-  h.setEligible(false);await assert.rejects(service.export(actor,b.id),{code:'dependency_restricted'});h.setEligible(true);
+  h.setEligible(false);await assert.rejects(service.previewArchive(actor,b.id),{code:'dependency_restricted'});await assert.rejects(service.export(actor,b.id),{code:'dependency_restricted'});h.setEligible(true);
   await service.invalidate(actor.workspaceId,{kind:'publication',id:'preview-private'});await assert.rejects(service.export(actor,b.id),{code:'artifact_unavailable'});
   assert.equal(await store.getWebsite('another-workspace',snapshot.website.id),undefined);
   assert.ok(h.events.some(e=>e.action==='website.export'));

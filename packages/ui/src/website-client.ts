@@ -21,6 +21,7 @@ export class WebsiteClient implements WebsiteWorkspaceClient {
   async requestBuild(expectedRevision:number,idempotencyKey:string) {return (await(await this.request('/'+encodeURIComponent(this.websiteId)+'/builds','POST',{expectedRevision,idempotencyKey})).json()).build;}
   async build(id:string) {return (await(await this.request('/builds/'+encodeURIComponent(id))).json()).build;}
   async builds() {return (await(await this.request('/'+encodeURIComponent(this.websiteId)+'/builds')).json()).builds;}
+  async previewSite(id:string) {return (await this.request('/builds/'+encodeURIComponent(id)+'/preview-site')).blob();}
   async previewPages(id:string) {return (await(await this.request('/builds/'+encodeURIComponent(id)+'/pages')).json()).pages;}
   async export(id:string) {return (await this.request('/builds/'+encodeURIComponent(id)+'/export')).blob();}
   async preview(id:string,file='index.html') {return (await this.request('/builds/'+encodeURIComponent(id)+'/preview?inline=1&file='+encodeURIComponent(file))).text();}

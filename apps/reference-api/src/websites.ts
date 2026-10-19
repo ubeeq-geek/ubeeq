@@ -18,6 +18,7 @@ export const handleWebsiteRequest = async (input: {
     if(method==='PUT') { const b=await input.body(),doc=b.document as WebsiteDocument; if(doc?.id!==parts[1]) throw new WebsiteError('invalid_document','Document ID must match the route.'); return {document:await service.saveDocument(actor,doc,Number(b.expectedRevision))}; }
   }
   if(parts[0]==='builds' && parts[1]) {
+    if(method==='GET' && parts[2]==='preview-site'){const archive=await service.previewArchive(actor,parts[1]);response.setHeader('content-type','application/zip');response.end(archive.bytes);return;}
     if(method==='GET' && parts[2]==='pages') return {pages:await service.previewPages(actor,parts[1])};
     if(method==='GET' && parts.length===2) return {build:await service.build(actor,parts[1])};
     if(method==='GET' && parts[2]==='export') {

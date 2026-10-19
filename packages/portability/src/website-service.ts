@@ -191,6 +191,10 @@ export class WebsiteService {
     await this.ports.audit({actor,action:'website.export',websiteId:build.websiteId,buildId,artifactDigest:build.artifactDigest,result:'exported'});
     return {digest:build.artifactDigest!,bytes:artifact.zip};
   }
+  async previewArchive(actor:WebsiteActor,buildId:string) {
+    const {build,artifact}=await this.artifact(actor,buildId,'preview');
+    return {digest:build.artifactDigest!,bytes:artifact.zip};
+  }
   async preview(actor: WebsiteActor, buildId: string, file: string) {
     const {artifact}=await this.artifact(actor,buildId,'preview');
     if(file.startsWith('/') || file.includes('\\') || file.split('/').some(p=>!p || p==='.' || p==='..')) throw new WebsiteError('invalid_path','Invalid preview path.');

@@ -1,3 +1,4 @@
+import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview} from './website-preview.js';
 import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
@@ -14,6 +15,7 @@ export interface WebsiteWorkspaceClient {
   saveDocument(document: WebsiteDocument, expectedRevision: number): Promise<WebsiteDocument>;
   requestBuild(revision: number, key: string): Promise<{ id: string; state: string }>;
   builds?(): Promise<readonly {id:string;state:string;websiteRevision:number}[]>;
+  previewSite?(id:string):Promise<Blob>;
   previewPages?(id:string): Promise<readonly string[]>;
   build(id: string): Promise<{ id: string; state: string; errorCode?: string; warnings: readonly string[]; stale?: boolean }>;
   export(id: string): Promise<Blob>;
@@ -22,11 +24,11 @@ export interface WebsiteWorkspaceClient {
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
-export interface WebsiteWorkspaceOptions { exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+export interface WebsiteWorkspaceOptions { previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
 /** Shared editor injection keeps the authoritative block format and existing editor. */
-export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}) => {
+export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void)) => {
   const d=root.ownerDocument;
-  let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
+  let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
   const documentDrafts=new Map<string,WebsiteDocument>();
   let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false;
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
@@ -73,26 +75,34 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
       let buildId:string|undefined;
       for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
-      if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Check its status in Preview.');buildId=build.id;}
+      if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Open Preview again once the build is ready.');buildId=build.id;}
       currentBuild=buildId;const route=websiteRoutes(saved).get(pageId);if(!route)throw new Error('This page is unavailable in the saved website.');
-      const html=await client.preview(buildId,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
+      if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
+      const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
+      const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
       if(popup.closed)return;
-      popup.document.title=page.title+' · Website preview';const frame=popup.document.createElement('iframe');frame.title=page.title+' preview';frame.setAttribute('sandbox','');frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';frame.srcdoc=html;popup.document.body.replaceChildren(frame);
+      if(options.previewPath){const target=new URL(options.previewPath,win!.location.href);if(target.origin!==win!.location.origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
       status.textContent='Preview opened in a new tab using saved changes.';
     }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}finally{previewPending=false;}
   };
   const show=async(tab:string)=>{
     const generation=++renderGeneration;
     for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.textContent===tab));
-    cleanupEditor?.();cleanupEditor=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
+    cleanupEditor?.();cleanupEditor=undefined;cleanupSettings?.();cleanupSettings=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
+    if(tab==='Settings'){
+      const settings=element('div');settings.className='website-site-settings';settings.append(element('p','Site-wide settings for this website.'));
+      const name=field(settings,'Site name',site.title,value=>site={...site,title:value});
+      settings.append(button('Save settings',async()=>{if(!site.title.trim())throw new Error('Enter a website name.');site={...site,title:site.title.trim()};await save();name.value=site.title;}));content.append(settings);
+      if(mountSettings){const host=element('div');host.className='website-creator-access';content.append(host);cleanupSettings=mountSettings(host);}
+    }
     if(tab==='Pages') {
       if(!selectedPage||!['new','redirects',...site.pages.map(p=>p.id)].includes(selectedPage))selectedPage=site.homePageId;
       const workspace=element('div'),selector=element('nav'),divider=element('div'),handle=element('div'),surface=element('div');
       workspace.className='website-page-workspace'+(pageSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-pages-'+site.id;selector.setAttribute('aria-label','Website pages');selector.tabIndex=0;selector.hidden=!pageSelectorExpanded;surface.className='website-page-surface';
       for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){
-        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));choice.append(element('small',page.id===site.homePageId?'Homepage':page.state==='ready'?'Ready':page.state));selector.append(choice);
+        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));if(page.id===site.homePageId){const icon=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');icon.setAttribute('viewBox','0 0 24 24');icon.setAttribute('aria-hidden','true');icon.classList.add('website-home-icon');path.setAttribute('d','M3 10 12 3l9 7v11h-6v-7H9v7H3Z');icon.append(path);choice.prepend(icon);choice.setAttribute('aria-label',page.title+' · Homepage');}selector.append(choice);
       }
-      selector.append(button('New page',async()=>{selectedPage='new';await show('Pages');}),button('Redirects',async()=>{selectedPage='redirects';await show('Pages');}));
+      const pageActions=element('div'),newPage=button('New page',async()=>{selectedPage='new';await show('Pages');}),redirect=button('Add a redirect',async()=>{selectedPage='redirects';await show('Pages');});pageActions.className='website-page-selector-actions';newPage.className='website-selector-action website-selector-action-primary';redirect.className='website-selector-action website-selector-action-secondary';for(const [action,symbol] of [[newPage,'+'],[redirect,'↪']] as const){const icon=element('span',symbol);icon.setAttribute('aria-hidden','true');action.prepend(icon);}pageActions.append(newPage,redirect);selector.append(pageActions);
       divider.className='website-page-divider';handle.className='website-page-handle-viewport';const toggle=button('',async()=>{pageSelectorExpanded=!pageSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!pageSelectorExpanded);selector.hidden=!pageSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
       const updateToggle=()=>{toggle.setAttribute('aria-label',pageSelectorExpanded?'Collapse page selector':'Expand page selector');toggle.setAttribute('aria-expanded',String(pageSelectorExpanded));const svg=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','2');svg.setAttribute('aria-hidden','true');path.setAttribute('d',pageSelectorExpanded?'m15 18-6-6 6-6':'m9 18 6-6-6-6');svg.append(path);toggle.replaceChildren(svg);};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);
       const active=site.pages.find(page=>page.id===selectedPage);
@@ -164,13 +174,13 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       if(client.media){surface.append(element('p','Images used here are included in your exported website. Centered wordmark headers hide the logo.'));await mediaField(surface,'Logo',site.theme.settings.logoAssetId,id=>setting('logoAssetId',id));}
       }
       if(selectedLayout==='Top navigation'||selectedLayout==='Footer')for(const key of (selectedLayout==='Footer'?['footerLinks']:['navigationLinks']) as ('footerLinks'|'navigationLinks')[]){const l=element('label',key==='navigationLinks'?'Extra header links · Label | https://… or mailto:… per line':'Extra footer links · Label | https://… or mailto:… per line'),textarea=element('textarea');textarea.value=(site[key]??[]).map(link=>link.label+' | '+link.url).join('\n');textarea.onchange=()=>{site={...site,[key]:textarea.value.split('\n').filter(line=>line.trim()).map(line=>{const at=line.indexOf('|');return {label:line.slice(0,at).trim(),url:line.slice(at+1).trim()};})};};l.append(textarea);surface.append(l);}
-      if(selectedLayout==='Header')field(surface,'Site title',site.title,v=>site={...site,title:v});if(selectedLayout==='Footer')field(surface,'Footer text',site.theme.settings.footer??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,footer:v}}});
+      if(selectedLayout==='Footer')field(surface,'Footer text',site.theme.settings.footer??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,footer:v}}});
       if(selectedLayout==='Footer'){const label=element('label','Show year-based copyright notice'),check=element('input');check.type='checkbox';check.checked=site.theme.settings.showCopyright!==false;check.onchange=()=>setting('showCopyright',check.checked);label.append(check);surface.append(label,element('p',`© ${new Date().getFullYear()} ${site.title} · The year updates when you rebuild the website.`));}
       if(selectedLayout==='Header'&&options.showAssetIds!==false)field(surface,'Logo public asset ID',site.theme.settings.logoAssetId??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,logoAssetId:v||undefined}}});
 
       if(selectedLayout==='Top navigation'||selectedLayout==='Footer'){
         const footer=selectedLayout==='Footer',key=footer?'footerNavigation':'navigation',orderKey=footer?'footerNavigationOrder':'navigationOrder',parentKey=footer?'footerNavigationParentId':'navigationParentId';
-        surface.append(element('h3',footer?'Footer navigation':'Navigation items'),element('p','Drag links between rows to reorder them, or into an indented area to create a dropdown. Use Move options for keyboard controls. Save the menu to keep your changes.'));
+        surface.append(element('h3',footer?'Footer navigation':'Navigation items'),element('p','Drag links between rows to reorder them, or into an indented area to create a dropdown. Use the arrows to move links without dragging. Save the menu to keep your changes.'));
         const menu=element('div');menu.className='website-navigation-editor';surface.append(menu);let draggedPageId:string|undefined;
         const included=(page:WebsitePage)=>!!page[key];
         const change=(updates:Map<string,Partial<WebsitePage>>)=>{site={...site,pages:site.pages.map(page=>updates.has(page.id)?{...page,...updates.get(page.id),revision:page.revision+1}:page)};};
@@ -198,15 +208,15 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
           };
           const row=(page:WebsitePage,siblings:WebsitePage[])=>{
             const item=element('li'),card=element('div'),title=element('strong',page.navigationLabel??page.title),actions=element('div');card.className='website-navigation-item';actions.className='website-navigation-actions';
-            const heading=element('div'),handle=element('button','⠿');heading.className='website-navigation-item-heading';handle.type='button';handle.className='website-navigation-drag-handle';handle.draggable=true;handle.setAttribute('aria-label',`Drag ${page.title} to reorder`);handle.dataset.menuFocus=page.id+'drag';handle.title='Drag to reorder; use Move options for keyboard controls';
+            const heading=element('div'),handle=element('button','⠿');heading.className='website-navigation-item-heading';handle.type='button';handle.className='website-navigation-drag-handle';handle.draggable=true;handle.setAttribute('aria-label',`Drag ${page.title} to reorder`);handle.dataset.menuFocus=page.id+'drag';handle.title='Drag to reorder; arrow buttons are also available';
             handle.ondragstart=event=>{draggedPageId=page.id;event.dataTransfer?.setData('application/x-website-menu-page',page.id);if(event.dataTransfer)event.dataTransfer.effectAllowed='move';menu.dataset.dragging='true';card.dataset.dragging='true';};
             handle.ondragend=()=>{draggedPageId=undefined;delete menu.dataset.dragging;delete card.dataset.dragging;for(const zone of menu.querySelectorAll<HTMLElement>('[data-active]'))delete zone.dataset.active;};heading.append(handle,title);card.append(heading);if(page.state!=='ready')card.append(element('small',`${page.state==='draft'?'Draft':'Archived'} · visible after the page is ready`));
             const at=siblings.findIndex(sibling=>sibling.id===page.id);
             for(const [direction,offset] of [['up',-1],['down',1]] as const){const move=control(direction==='up'?'↑':'↓',page.id+direction,()=>{const other=siblings[at+offset],ordered=[...members],a=ordered.findIndex(p=>p.id===page.id),b=ordered.findIndex(p=>p.id===other.id);[ordered[a],ordered[b]]=[ordered[b],ordered[a]];change(new Map(ordered.map((p,index)=>[p.id,{[orderKey]:index}])));});move.setAttribute('aria-label',`Move ${page.title} ${direction}`);move.disabled=at+offset<0||at+offset>=siblings.length;actions.append(move);}
-            const label=element('label','Menu level'),select=element('select');select.setAttribute('aria-label',`Menu parent for ${page.title}`);select.dataset.menuFocus=page.id+'parent';
-            for(const candidate of [{id:'',title:'Top level'},...roots.filter(root=>root.id!==page.id)]){const option=element('option',candidate.id?`Under ${candidate.title}`:candidate.title);option.value=candidate.id;select.append(option);}select.value=parent(page)??'';
-            select.onchange=()=>{const updates=new Map<string,Partial<WebsitePage>>([[page.id,{[parentKey]:select.value||null}]]);for(const child of members.filter(child=>parent(child)===page.id))updates.set(child.id,{[parentKey]:null});change(updates);status.textContent=`${page.title} moved ${select.value?'into a dropdown':'to the top level'}. Save this menu to keep the change.`;renderMenu(page.id+'parent');};label.append(select);actions.append(label);
-            const remove=control('Remove',page.id+'remove',()=>{const updates=new Map<string,Partial<WebsitePage>>([[page.id,{[key]:false}]]);for(const child of members.filter(child=>parent(child)===page.id))updates.set(child.id,{[parentKey]:null});change(updates);status.textContent=`${page.title} removed from this menu. The page is still available.`;});remove.setAttribute('aria-label',`Remove ${page.title} from navigation`);const tools=element('details'),summary=element('summary','Move options');tools.className='website-navigation-move-options';tools.append(summary,actions);card.append(tools);heading.append(remove);item.append(card);
+            const currentParent=parent(page),rootIndex=roots.findIndex(root=>root.id===page.id),previous=roots[rootIndex-1];
+            const level=control(currentParent?'←':'→',page.id+'level',()=>{if(currentParent){const parentIndex=roots.findIndex(root=>root.id===currentParent);movePage(page.id,undefined,roots[parentIndex+1]?.id);}else if(previous)movePage(page.id,previous.id);});
+            level.setAttribute('aria-label',currentParent?`Move ${page.title} to top level`:`Nest ${page.title} under the previous page`);level.disabled=!currentParent&&!previous;actions.append(level);
+            const remove=control('Remove',page.id+'remove',()=>{const updates=new Map<string,Partial<WebsitePage>>([[page.id,{[key]:false}]]);for(const child of members.filter(child=>parent(child)===page.id))updates.set(child.id,{[parentKey]:null});change(updates);status.textContent=`${page.title} removed from this menu. The page is still available.`;});remove.setAttribute('aria-label',`Remove ${page.title} from navigation`);heading.append(actions,remove);item.append(card);
             const children=members.filter(child=>parent(child)===page.id);if(!parent(page)){const nested=element('ol');nested.className='website-navigation-submenu';for(const child of children)nested.append(dropZone(page.id,child.id),row(child,children));nested.append(dropZone(page.id));item.append(nested);}return item;
           };
           for(const page of roots)list.append(dropZone(undefined,page.id),row(page,roots));list.append(dropZone());menu.append(list);if(!members.length)menu.append(element('p','No pages in this menu yet.'));
@@ -246,7 +256,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       content.append(button('Save publication overrides',save));
 
     }
-    if(tab==='Publishing'||tab==='Preview') {
+    if(tab==='Publishing') {
       content.append(element('p','Each build preserves a saved website version. Rebuild after changing pages or Works.'));
       if(client.builds) {
         const builds=await client.builds(),select=element('select');select.setAttribute('aria-label','Saved website build');select.append(element('option','Choose a build'));
@@ -255,15 +265,11 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       content.append(button('Build website',async()=>{const b=await client.requestBuild(site.revision,globalThis.crypto.randomUUID());currentBuild=b.id;status.textContent=b.state==='ready'?'Website build ready. Preview it or download the ZIP.':b.state==='failed'?'Website build failed. Refresh the status for details.':`Website build ${b.state}. Refresh the status to follow its progress.`;}));
       content.append(button('Refresh build status',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const b=await client.build(currentBuild);status.textContent=`Build ${b.state}${b.stale?' — newer or restricted sources exist':''}. ${b.errorCode??''} ${b.warnings.join(' ')}`;}));
       if(tab==='Publishing') content.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');if(client.download)await client.download(currentBuild);else{const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}status.textContent='Exported. Upload the files to your hosting provider to publish.';}));
-      if(tab==='Preview') {
-        const frame=element('iframe');frame.title='Private website candidate';frame.setAttribute('sandbox','');frame.style.width='100%';frame.style.height='600px';
-        const select=element('select');select.setAttribute('aria-label','Preview page');const option=element('option','Home');option.value='index.html';select.append(option);
-        content.append(button('Load candidate pages',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const paths=await client.previewPages?.(currentBuild)??['index.html'];select.replaceChildren();for(const path of paths){const option=element('option',path==='index.html'?'Home':path.replace(/\/index.html$/,''));option.value=path;select.append(option);}}),select,button('Show candidate',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');frame.srcdoc=await client.preview(currentBuild,select.value);}),button('Mobile width',async()=>{frame.style.width='375px';frame.style.maxWidth='100%';}),button('Desktop width',async()=>{frame.style.width='100%';}),frame);
-      }
+
     }
     if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
-  for(const tab of ['Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed)await show(tab);}));
+  for(const tab of ['Settings','Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
   const ready=client.get().then(async value=>{if(!disposed){site=value;await show('Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();root.replaceChildren();}};
+  return {ready,destroy(){disposed=true;win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
 };

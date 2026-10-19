@@ -1,12 +1,13 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { parseContentBlocks, toStoredPostBlocks, type WebsiteDocument } from '@ubeeq/core';
 import { BlockEditor, type BlockEditorMediaOption } from './react.js';
 import { createWebsiteWorkspace, type WebsiteWorkspaceClient, type WebsiteWorkspaceOptions } from './website-workspace.js';
 
 /** Website pages use the shared block editor, including its media insertion controls. */
-export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOptions}: {client:WebsiteWorkspaceClient;mediaOptions?:BlockEditorMediaOption[];options?:WebsiteWorkspaceOptions}) {
+export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOptions,settingsContent}: {settingsContent?:ReactNode;client:WebsiteWorkspaceClient;mediaOptions?:BlockEditorMediaOption[];options?:WebsiteWorkspaceOptions}) {
   const root=useRef<HTMLDivElement>(null),pendingUploads=useRef(0),failedPreviews=useRef(new Set<string>()),activeClient=useRef(client);activeClient.current=client;
+  const [settingsHost,setSettingsHost]=useState<HTMLElement|null>(null);
   const [editor,setEditor]=useState<{host:HTMLElement;document:WebsiteDocument;change:(document:WebsiteDocument)=>void}|null>(null);
   const [images,setImages]=useState<BlockEditorMediaOption[]>(mediaOptions),[libraryError,setLibraryError]=useState('');
   const [options,setOptions]=useState<{pages:{id:string;title:string}[];publications:{id:string;title:string}[];creators:{id:string;title:string}[]}>({pages:[],publications:[],creators:[]});
@@ -22,7 +23,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
       }).catch(error=>{if(!disposed&&current===generation)setLibraryError(error instanceof Error?error.message:'The image library could not be loaded.');});
       setEditor({host,document,change});
       return ()=>{generation++;setEditor(null);};
-    },workspaceOptions);
+    },workspaceOptions,host=>{setSettingsHost(host);return ()=>setSettingsHost(null);});
     return ()=>{disposed=true;generation++;workspace.destroy();};
   },[client,workspaceOptions]);
   useEffect(()=>{
@@ -40,7 +41,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
       if(activeClient.current===client)setImages(previous=>[...previous.filter(existing=>existing.mediaId!==option.mediaId),option]);return option;
     }finally{pendingUploads.current--;}
   }:undefined;
-  return <><div ref={root} />{editor&&createPortal(<>{libraryError&&<p role="alert">{libraryError}</p>}<BlockEditor value={toStoredPostBlocks(editor.document.blocks)} allowMedia allowStructured uploadMedia={upload} mediaOptions={images} websiteOptions={options} label="Page content" helpText="Add and arrange content blocks. Insert an existing Work image or upload an image directly here." onChange={value=>{
+  return <><div ref={root} />{settingsHost&&settingsContent&&createPortal(settingsContent,settingsHost)}{editor&&createPortal(<>{libraryError&&<p role="alert">{libraryError}</p>}<BlockEditor value={toStoredPostBlocks(editor.document.blocks)} allowMedia allowStructured uploadMedia={upload} mediaOptions={images} websiteOptions={options} label="Page content" helpText="Add and arrange content blocks. Insert an existing Work image or upload an image directly here." onChange={value=>{
     if(!root.current?.contains(editor.host))return;
     const next={...editor.document,blocks:parseContentBlocks(value,{unbounded:true})};editor.change(next);setEditor({...editor,document:next});
   }}/></>,editor.host)}</>;
