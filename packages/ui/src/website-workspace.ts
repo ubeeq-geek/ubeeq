@@ -24,7 +24,8 @@ export interface WebsiteWorkspaceOptions { destinationModes?: readonly ('local'|
 /** Shared editor injection keeps the authoritative block format and existing editor. */
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}) => {
   const d=root.ownerDocument;
-  let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, currentBuild:string|undefined;
+  let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,pageMode:'settings'|'content'='settings',renderGeneration=0;
+  const documentDrafts=new Map<string,WebsiteDocument>();
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
   const status=element('p'); status.setAttribute('role','status');
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
@@ -56,11 +57,25 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     parent.append(box);if(value&&client.mediaPreview)void client.mediaPreview(value).then(url=>preview.src=url).catch(error=>{status.textContent=String(error);});
   };
   const save=async()=>{if(uploads)throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
+  const win=d.defaultView;let measureFrame=0;
+  const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.offsetTop+first.offsetHeight/2}px`);};
+  const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
   const show=async(tab:string)=>{
+    const generation=++renderGeneration;
     cleanupEditor?.();cleanupEditor=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
     if(tab==='Pages') {
-      content.append(element('p','Hidden pages included in an export remain publicly reachable. Shared document edits affect every destination listed below.'));
-      for(const p of site.pages) {
+      if(!selectedPage||!['new','redirects',...site.pages.map(p=>p.id)].includes(selectedPage))selectedPage=site.homePageId;
+      const workspace=element('div'),selector=element('nav'),divider=element('div'),handle=element('div'),surface=element('div');
+      workspace.className='website-page-workspace'+(pageSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-pages-'+site.id;selector.setAttribute('aria-label','Website pages');selector.tabIndex=0;selector.hidden=!pageSelectorExpanded;surface.className='website-page-surface';
+      for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){
+        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));choice.append(element('small',page.id===site.homePageId?'Homepage':page.state==='ready'?'Ready':page.state));selector.append(choice);
+      }
+      selector.append(button('New page',async()=>{selectedPage='new';pageMode='settings';await show('Pages');}),button('Redirects',async()=>{selectedPage='redirects';pageMode='settings';await show('Pages');}));
+      divider.className='website-page-divider';handle.className='website-page-handle-viewport';const toggle=button('',async()=>{pageSelectorExpanded=!pageSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!pageSelectorExpanded);selector.hidden=!pageSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
+      const updateToggle=()=>{toggle.setAttribute('aria-label',pageSelectorExpanded?'Collapse page selector':'Expand page selector');toggle.setAttribute('aria-expanded',String(pageSelectorExpanded));const svg=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','2');svg.setAttribute('aria-hidden','true');path.setAttribute('d',pageSelectorExpanded?'m15 18-6-6 6-6':'m9 18 6-6-6-6');svg.append(path);toggle.replaceChildren(svg);};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);
+      const active=site.pages.find(page=>page.id===selectedPage);
+      if(active)surface.append(element('h2',active.title),element('p','Changes to a shared page document affect every page that uses it.'));
+      for(const p of site.pages.filter(page=>page.id===selectedPage)) {
         const row=element('div');
         const editPage=(patch:Partial<typeof p>)=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,...patch,revision:next.revision+1}:next)};};
         field(row,'Page title',p.title,v=>editPage({title:v}));
@@ -75,13 +90,13 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         if(p.kind==='update') field(row,'Update date',p.date??'',v=>editPage({date:v||undefined}));
         if(p.kind!=='home') {const state=element('select');state.setAttribute('aria-label','Page lifecycle');for(const value of ['draft','ready','archived']){const option=element('option',value);option.value=value;state.append(option);}state.value=p.state;state.onchange=()=>editPage({state:state.value as typeof p.state});row.append(state);}
         row.append(button('Duplicate document for this page',async()=>{const source=await client.document(p.documentId),id=globalThis.crypto.randomUUID();await client.saveDocument({...source.document,id,revision:1},0);editPage({documentId:id});await save();await show('Pages');}));
-        row.append(button(p.title,async()=>{
-          const result=await client.document(p.documentId),editor=element('div');let doc=result.document;
-          content.replaceChildren(element('h2',p.title),element('p',`Shared by: ${result.sharedBy.map(p=>p.title).join(', ')||'This page'}`),editor);
-          const mount=()=>{cleanupEditor?.();cleanupEditor=mountEditor(editor,doc,next=>{doc=next;});};mount();
-          if(client.media)await mediaField(content,'Add content image',undefined,id=>{if(id){doc={...doc,blocks:[...doc.blocks,{type:'image',id:globalThis.crypto.randomUUID() as EntityId,assetId:id as EntityId}]};mount();}});
-          content.append(button('Save content',async()=>{if(uploads)throw new Error('Wait for image uploads to finish before saving.');doc=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);status.textContent='Content saved. Reopen the editor to continue from the saved revision.';await show('Pages');}));
-        }));
+        const openContent=async()=>{
+          const result=await client.document(p.documentId);if(disposed||renderGeneration!==generation)return;const editor=element('div');let doc=documentDrafts.get(p.documentId)??result.document;pageMode='content';
+          surface.replaceChildren(element('h2',p.title),button('Page design and settings',async()=>{pageMode='settings';await show('Pages');}),element('p',`Shared by: ${result.sharedBy.map(p=>p.title).join(', ')||'This page'}`),editor);
+          const mount=()=>{cleanupEditor?.();cleanupEditor=mountEditor(editor,doc,next=>{doc=next;documentDrafts.set(doc.id,doc);});};mount();
+          if(client.media)await mediaField(surface,'Add content image',undefined,id=>{if(id){doc={...doc,blocks:[...doc.blocks,{type:'image',id:globalThis.crypto.randomUUID() as EntityId,assetId:id as EntityId}]};documentDrafts.set(doc.id,doc);mount();}});
+          surface.append(button('Save content',async()=>{if(uploads)throw new Error('Wait for image uploads to finish before saving.');doc=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);documentDrafts.delete(doc.id);status.textContent='Content saved.';await show('Pages');}));
+        };row.append(button('Edit content',openContent));
         if(p.kind!=='home') {
           field(row,'Path segment',p.slug,v=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,slug:v,revision:next.revision+1}:next)};});
           const label=element('label','Parent'),select=element('select');
@@ -90,17 +105,20 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         }
         const label=element('label','Show in navigation'),check=element('input');check.type='checkbox';check.checked=p.navigation;check.onchange=()=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,navigation:check.checked,revision:next.revision+1}:next)};};label.append(check);row.append(label);
         const footerLabel=element('label','Show in footer navigation'),footerCheck=element('input');footerCheck.type='checkbox';footerCheck.checked=p.footerNavigation??p.navigation;footerCheck.onchange=()=>editPage({footerNavigation:footerCheck.checked});footerLabel.append(footerCheck);row.append(footerLabel);
-        row.append(button('Move up',async()=>{const ordered=[...site.pages].sort((a,b)=>a.order-b.order);const i=ordered.findIndex(x=>x.id===p.id);if(i>0)[ordered[i],ordered[i-1]]=[ordered[i-1],ordered[i]];site={...site,pages:ordered.map((p,i)=>({...p,order:i,revision:p.revision+1}))};await save();await show('Pages');}));content.append(row);
+        row.append(button('Move up',async()=>{const ordered=[...site.pages].sort((a,b)=>a.order-b.order);const i=ordered.findIndex(x=>x.id===p.id);if(i>0)[ordered[i],ordered[i-1]]=[ordered[i-1],ordered[i]];site={...site,pages:ordered.map((p,i)=>({...p,order:i,revision:p.revision+1}))};await save();await show('Pages');}));surface.append(row);if(pageMode==='content')await openContent();
       }
-      content.append(button('Save page settings',save));
+      if(active&&pageMode==='settings')surface.append(button('Save page settings',save));
+      if(selectedPage==='redirects'){
       const redirects=element('label','Redirects: one previous path => current path or external URL per line'),text=element('textarea');
       text.value=site.redirects.map(r=>r.from+' => '+r.to).join('\n');
-      redirects.append(text);content.append(redirects,button('Save redirects',async()=>{site={...site,redirects:text.value.split('\n').filter(s=>s.trim()).map(line=>{const [from,to,...extra]=line.split('=>').map(s=>s.trim());if(!from||!to||extra.length)throw new Error('Redirects require previous path => destination.');return {from,to,status:301 as const};})};await save();}));
+      redirects.append(text);surface.append(redirects,button('Save redirects',async()=>{site={...site,redirects:text.value.split('\n').filter(s=>s.trim()).map(line=>{const [from,to,...extra]=line.split('=>').map(s=>s.trim());if(!from||!to||extra.length)throw new Error('Redirects require previous path => destination.');return {from,to,status:301 as const};})};await save();}));
 
+      }
+      if(selectedPage==='new'){surface.append(element('h2','New page'));
       const add=element('div');let title='',slug='',kind:'page'|'portfolio'|'update'='page',template:Website['pages'][number]['template']='standard';field(add,'New page title','',v=>title=v);field(add,'New page path','',v=>slug=v);
       const select=element('select');select.setAttribute('aria-label','Page kind');for(const k of ['page','portfolio','update'] as const){const o=element('option',k);o.value=k;select.append(o);}select.onchange=()=>kind=select.value as typeof kind;add.append(select);
       const templateSelect=element('select');templateSelect.setAttribute('aria-label','New page template');for(const t of WEBSITE_PAGE_TEMPLATES){const o=element('option',t.title);o.value=t.id;templateSelect.append(o);}templateSelect.onchange=()=>template=templateSelect.value as typeof template;add.append(templateSelect);
-      add.append(button('Add page',async()=>{if(!title.trim()||!slug.trim())throw new Error('Page title and path are required.');const id=globalThis.crypto.randomUUID(),documentId=globalThis.crypto.randomUUID();await client.saveDocument({id:documentId,workspaceId:site.workspaceId,revision:1,blocks:[]},0);site={...site,pages:[...site.pages,{id,documentId,websiteId:site.id,workspaceId:site.workspaceId,revision:1,kind,title,slug,template,order:site.pages.length,state:'ready',navigation:kind!=='update'}]};await save();await show('Pages');}));content.append(add);
+      add.append(button('Add page',async()=>{if(!title.trim()||!slug.trim())throw new Error('Page title and path are required.');const id=globalThis.crypto.randomUUID(),documentId=globalThis.crypto.randomUUID();await client.saveDocument({id:documentId,workspaceId:site.workspaceId,revision:1,blocks:template==='gallery'?[{type:'gallery_list',id:globalThis.crypto.randomUUID() as EntityId,data:{sort:'newest',pageSize:12}}]:[{type:'paragraph',id:globalThis.crypto.randomUUID() as EntityId,text:template==='profile'?'Introduce yourself and your work.':'Add your page content here.'}]},0);site={...site,pages:[...site.pages,{id,documentId,websiteId:site.id,workspaceId:site.workspaceId,revision:1,kind,title,slug,template,order:site.pages.length,state:'ready',navigation:kind!=='update'}]};selectedPage=id;pageMode='settings';await save();await show('Pages');}));surface.append(add);}
     }
     if(tab==='Appearance') {
       const themes=element('div');themes.className='website-theme-grid';
@@ -162,9 +180,9 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         content.append(button('Load candidate pages',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');const paths=await client.previewPages?.(currentBuild)??['index.html'];select.replaceChildren();for(const path of paths){const option=element('option',path==='index.html'?'Home':path.replace(/\/index.html$/,''));option.value=path;select.append(option);}}),select,button('Show candidate',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');frame.srcdoc=await client.preview(currentBuild,select.value);}),button('Mobile width',async()=>{frame.style.width='375px';frame.style.maxWidth='100%';}),button('Desktop width',async()=>{frame.style.width='100%';}),frame);
       }
     }
-    if(!disposed&&root.isConnected)root.scrollIntoView?.({block:'start'});
+    if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
   for(const tab of ['Pages','Appearance','Gallery destinations','Preview','Publishing'])tabs.append(button(tab,async()=>{if(!disposed)await show(tab);}));
   const ready=client.get().then(async value=>{if(!disposed){site=value;await show('Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();root.replaceChildren();}};
+  return {ready,destroy(){disposed=true;win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();root.replaceChildren();}};
 };
