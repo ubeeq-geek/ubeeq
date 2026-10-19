@@ -33,3 +33,19 @@ test('mixed galleries expose static creator filters and independently paginated 
 });
 
 test('connected creators remain filterable even when their gallery is empty',()=>{const input=fixture();input.website.creatorIdentityId='one';input.creatorIdentities=[{id:'one',title:'First artist'},{id:'two',title:'Second artist'}];input.documents.set('doc',{blocks:[{type:'gallery_list'}]});const files=renderStaticWebsite(input).files;assert.ok(![...files.keys()].some(path=>path.includes('/two/')));assert.match(Buffer.from(files.get('index.html')).toString(),/Second artist/);assert.match(Buffer.from(files.get('creator/1/second-artist/index.html')).toString(),/No entries yet/);});
+
+test('copyright uses the pinned build year, escapes the site title, and can be disabled',()=>{
+ const input=fixture();input.copyrightYear=2026;input.website.title='Artist & friends';
+ const html=()=>String(renderStaticWebsite(input).files.get('index.html'));
+ assert.match(html(),/© 2026 Artist &amp; friends/);
+ input.copyrightYear=2027;assert.match(html(),/© 2027 Artist &amp; friends/);
+ input.website.theme.settings.footer='Custom footer';input.website.theme.settings.showCopyright=false;
+ assert.doesNotMatch(html(),/site-copyright/);assert.match(html(),/Custom footer/);
+});
+test('pages default to top navigation only while explicit footer choices are preserved',()=>{
+ const input=fixture();const html=()=>String(renderStaticWebsite(input).files.get('index.html'));
+ assert.match(html().split('</header>')[0],/>Home<\/a>/);
+ assert.doesNotMatch(html().split('<footer')[1],/>Home<\/a>/);
+ input.website.pages[0].footerNavigation=true;
+ assert.match(html().split('<footer')[1],/>Home<\/a>/);
+});
