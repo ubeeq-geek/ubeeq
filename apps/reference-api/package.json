@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "package:lambda": "npm run build && node ../../scripts/package-reference-api-lambda.mjs",
+    "package:lambda": "npm run build && npm run build --workspace @ubeeq/web-reference && node ../../scripts/package-reference-api-lambda.mjs",
     "start": "node dist/server.js",
     "start:worker": "node dist/worker.js",
     "start:machine": "node dist/machine-server.js",
@@ -24,6 +24,8 @@
     "@ubeeq/federation": "^0.1.0",
     "@ubeeq/portability": "^0.1.0",
     "@ubeeq/processing": "^0.1.0",
-    "@ubeeq/persistence": "^0.1.0"
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/core": "^0.1.0",
+    "@ubeeq/media-sharp": "^0.1.0"
   }
 }

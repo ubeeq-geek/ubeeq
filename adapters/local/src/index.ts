@@ -1,4 +1,5 @@
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
+export { SqliteWebsiteStore } from './websites.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";

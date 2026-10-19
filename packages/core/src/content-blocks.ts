@@ -1,6 +1,6 @@
 import type { ContentBlock, ContentBlockType, EntityId } from "./index.js";
 
-const supported = new Set(["section", "heading", "paragraph", "image", "video", "audio", "quote", "divider", "embed", "file", "link", "credit", "grouping", "carousel", "pdf_preview", "html_fragment"]);
+const supported = new Set(["section", "heading", "paragraph", "image", "video", "audio", "quote", "divider", "embed", "file", "link", "credit", "grouping", "carousel", "pdf_preview", "html_fragment", "gallery_preview", "premium_promotion", "selected_portfolio", "gallery_list", "update_list", "page_link"]);
 
 export interface ContentBlockParseOptions {
   unbounded?: boolean;

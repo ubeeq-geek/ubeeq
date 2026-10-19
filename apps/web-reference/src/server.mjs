@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { createServer } from "node:http";
 import { EXTENSION_API_VERSION, EXTENSION_CONTRACTS } from "@ubeeq/extension-sdk";
 
@@ -41,6 +42,11 @@ export const createReferenceHandler = ({ referenceApiUrl = process.env.UBEEQ_REF
   const upstream = apiUrl(referenceApiUrl);
   return async (request, response) => {
     const url = new URL(request.url || "/", "http://reference.local");
+    if (url.pathname === '/website-editor.js') {
+      try { const js=await readFile(new URL('../dist/websites.js',import.meta.url));response.writeHead(200,{'content-type':'text/javascript; charset=utf-8','x-content-type-options':'nosniff'});response.end(js);return; }
+      catch { return sendJson(response,503,{error:'website_editor_build_required'}); }
+    }
+    if (url.pathname === '/websites') return sendHtml(response,`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Websites — Ubeeq</title><style>body{font:17px/1.6 system-ui,sans-serif;background:#fafaf9;color:#202321;max-width:76rem;margin:auto;padding:2rem}a{color:#225e47}button,input,select,textarea{font:inherit;padding:.5rem;margin:.35rem;max-width:100%}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #225e47;outline-offset:3px}label{display:block}section,fieldset{margin:1rem 0;padding:1rem;border:1px solid #a8b2aa}nav{display:flex;gap:.5rem;flex-wrap:wrap}.portable-block-editor-block{border:1px solid #a8b2aa;margin:1rem 0;padding:1rem}.portable-block-editor-content{min-height:3rem;padding:.5rem}iframe{border:1px solid #a8b2aa}textarea{width:100%;min-height:7rem}</style></head><body><a href="/workspace">Back to workspace</a><main id="websites"></main><script src="/website-editor.js" defer></script></body></html>`);
     if (url.pathname === "/health") return sendJson(response, 200, { status: "ok" });
     if (url.pathname === "/extension-contracts") return sendJson(response, 200, { apiVersion: EXTENSION_API_VERSION, contracts: EXTENSION_CONTRACTS });
     if (url.pathname === "/api-configuration") return sendJson(response, 200, { apiPath: "/api", referenceApiUrl: upstream.origin });
@@ -50,7 +56,9 @@ export const createReferenceHandler = ({ referenceApiUrl = process.env.UBEEQ_REF
         const target = new URL(url.pathname.slice(4) + url.search, upstream);
         const headers = { "content-type": request.headers["content-type"] || "application/json", ...(request.headers.authorization ? { authorization: request.headers.authorization } : {}), ...(request.headers["idempotency-key"] ? { "idempotency-key": request.headers["idempotency-key"] } : {}) };
         const upstreamResponse = await fetch(target, { method: request.method, headers, body: body.length ? body : undefined });
-        response.writeHead(upstreamResponse.status, { "content-type": upstreamResponse.headers.get("content-type") || "application/json" }); response.end(Buffer.from(await upstreamResponse.arrayBuffer())); return;
+        const forwarded = { "content-type": upstreamResponse.headers.get("content-type") || "application/json" };
+        for (const name of ['cache-control','content-security-policy','content-disposition','x-content-type-options','etag']) { const value=upstreamResponse.headers.get(name);if(value)forwarded[name]=value; }
+        response.writeHead(upstreamResponse.status, forwarded); response.end(Buffer.from(await upstreamResponse.arrayBuffer())); return;
       } catch { return sendJson(response, 502, { error: "reference_api_unavailable" }); }
     }
     if (url.pathname === "/" || url.pathname === "/workspace") return sendHtml(response, page);

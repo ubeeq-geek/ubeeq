@@ -2,8 +2,12 @@
   "name": "@ubeeq/portability",
   "version": "0.1.0",
   "private": false,
-  "publishConfig": { "access": "public" },
-  "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
   "main": "dist/index.js",
   "exports": {
     ".": {
@@ -13,6 +17,14 @@
     }
   },
   "types": "dist/index.d.ts",
-  "scripts": { "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/write-esm-package.mjs", "test": "npm run build && node --test test/*.test.mjs" },
-  "dependencies": { "@ubeeq/persistence": "^0.1.0" }
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.esm.json && node scripts/write-esm-package.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/core": "^0.1.0",
+    "@ubeeq/ui": "^0.1.0",
+    "parse5": "^7.3.0"
+  }
 }
