@@ -182,3 +182,8 @@ test("preview bindings prevent owner/actor/connection/revision substitution, sel
     }),
   );
 });
+
+test('newest-first providers can retain a bounded full-history cursor without repeated yearly scans',()=>{
+ validateAnnouncementImportScope({...scope,from:'2000-01-01',paginationOrder:'newest_first'});
+ assert.throws(()=>validateAnnouncementImportScope({...scope,from:'1800-01-01',paginationOrder:'newest_first'}));
+});

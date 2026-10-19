@@ -505,3 +505,25 @@ export function discordHistoryPermissions(input: {
   apply(input.overwrites.filter((o) => o.type === 1 && o.id === input.botId));
   return (bits & 1024n) !== 0n && (bits & 65536n) !== 0n;
 }
+
+/** Preserve DeviantArt journal/status bodies with the same bounded snapshot rules as other imports. */
+export function normalizeDeviantArtHistoricalPost(input: unknown, kind: "status" | "journal"): HistoricalRemotePost {
+  const post=row(input), author=row(post.author), b=builder();
+  const remoteId=remotePostId(kind === "status" ? post.statusid : post.deviationid);
+  if(!remoteId)throw Error("DeviantArt post has no lossless remote identity.");
+  b.snapshot.sourceData={format:"deviantart",...sanitizeHistoricalSourceData(post)};
+  if(b.snapshot.sourceData.truncated)b.reasons.push("source_data_limit");
+  if(kind === "journal")b.addText(plain(post.title),{subtype:"heading1"});
+  const body=post.body || post.html || row(post.text_content).html || row(row(post.text_content).body).html || post.description;
+  const formatted=legacyFormattedText(body);b.addText(formatted.text,formatted);
+  for(const match of text(body,100000).matchAll(/<img\b[^>]*src=["'](https?:\/\/[^"']+)["'][^>]*>/gi))b.media({url:match[1].replace(/&amp;/g,"&")},"source_attachment","image");
+  const shared=row(post.share || post.deviation);if(shared.url)b.addLink(shared.url,shared.title,"embed");
+  const postedAt=timestamp(post.ts)||date(post.ts)||timestamp(post.published_time)||date(post.published_time)||date(post.date);
+  const unavailable=post.is_deleted===true || post.is_blocked===true || ["locked","locked-subscribed"].includes(post.tier_access);
+  if(!postedAt)b.reasons.push("posted_time_unknown");
+  if(!formatted.text&&!unavailable)b.reasons.push("source_content_unavailable");
+  return {remoteId,sourceUrl:unsignedHistoricalUrl(post.url,true),
+    attribution:{authorId:remotePostId(author.userid)||"unknown_author",displayName:text(author.username,500)||"Unknown DeviantArt author",kind:post.parentid?"reply":"original"},
+    postedAt,remoteEditedAt:timestamp(post.updated_time)||date(post.updated_time),snapshot:b.snapshot,
+    visibility:unavailable?"restricted":"public",completeness:unavailable?"unavailable":!formatted.text?"partial":"full",reasons:b.reasons,retrieval:b.retrieval};
+}
