@@ -107,7 +107,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         const footerLabel=element('label','Show in footer navigation'),footerCheck=element('input');footerCheck.type='checkbox';footerCheck.checked=p.footerNavigation??p.navigation;footerCheck.onchange=()=>editPage({footerNavigation:footerCheck.checked});footerLabel.append(footerCheck);row.append(footerLabel);
         row.append(button('Move up',async()=>{const ordered=[...site.pages].sort((a,b)=>a.order-b.order);const i=ordered.findIndex(x=>x.id===p.id);if(i>0)[ordered[i],ordered[i-1]]=[ordered[i-1],ordered[i]];site={...site,pages:ordered.map((p,i)=>({...p,order:i,revision:p.revision+1}))};await save();await show('Pages');}));surface.append(row);if(pageMode==='content')await openContent();
       }
-      if(active&&pageMode==='settings')surface.append(button('Save page settings',save));
+      if(active&&pageMode==='settings')surface.append(button('Save page settings',async()=>{await save();await show('Pages');}));
       if(selectedPage==='redirects'){
       const redirects=element('label','Redirects: one previous path => current path or external URL per line'),text=element('textarea');
       text.value=site.redirects.map(r=>r.from+' => '+r.to).join('\n');
