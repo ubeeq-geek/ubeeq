@@ -18,7 +18,12 @@ export interface WebsitePage {
   seoTitle?: string; socialAssetId?: string; layout?: 'reading' | 'wide';
   template?: WebsitePageTemplate; coverAssetId?: string; backgroundAssetId?: string;
   coverPosition?: {x:number;y:number}; backgroundPosition?: {x:number;y:number}; footerNavigation?: boolean;
+  navigationOrder?:number; footerNavigationOrder?:number;
+  /** Menu hierarchy overrides page hierarchy without changing routes. Null means top level. */
+  navigationParentId?:string|null; footerNavigationParentId?:string|null;
 }
+export const websiteMenuParent = (page:WebsitePage,footer=false):string|undefined => {const value=footer?page.footerNavigationParentId:page.navigationParentId;return value===undefined?page.parentId:value??undefined;};
+export const websiteMenuOrder = (page:WebsitePage,footer=false):number => (footer?page.footerNavigationOrder:page.navigationOrder)??page.order;
 export type WebsiteDestination =
   | { mode: 'local' }
   | { mode: 'manual'; url: string }
@@ -148,6 +153,7 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   const pages = new Map(site.pages.map(page => [page.id, page]));
   if (pages.size !== site.pages.length || !site.pages.length || site.pages.filter(p => p.kind === 'home').length !== 1 || pages.get(site.homePageId)?.kind !== 'home') throw new WebsiteError('invalid_home', 'Exactly one Home page is required.');
   if (new Set(site.galleryPublicationIds).size !== site.galleryPublicationIds.length) throw new WebsiteError('duplicate_selection', 'Gallery publication selections must be unique.');
+  for(const footer of [false,true]){const included=site.pages.filter(page=>footer?page.footerNavigation:page.navigation);const members=new Set(included.map(page=>page.id));for(const page of included){const parentId=websiteMenuParent(page,footer);if(parentId&&members.has(parentId)){const parent=pages.get(parentId)!;const grandparent=websiteMenuParent(parent,footer);if(parentId===page.id||grandparent&&members.has(grandparent))throw new WebsiteError('invalid_navigation','Navigation supports top-level items and one dropdown level.');}}}
   const routes = new Map<string, string>(), occupied = new Set<string>();
   for (const page of site.pages) {
     if (page.websiteId !== site.id || page.workspaceId !== site.workspaceId || !page.id || !page.documentId || !page.title?.trim() || !Number.isSafeInteger(page.revision) || page.revision < 1 || !Number.isFinite(page.order) || !['home','page','portfolio','update'].includes(page.kind) || !['draft','ready','archived'].includes(page.state)) throw new WebsiteError('invalid_page', 'Pages and documents must belong to this website and workspace.');
@@ -155,6 +161,8 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     for(const position of [page.coverPosition,page.backgroundPosition])if(position&&(!Number.isFinite(position.x)||!Number.isFinite(position.y)||position.x<0||position.x>1||position.y<0||position.y>1))throw new WebsiteError('invalid_position','Image positions must be between zero and one.');
     for(const id of [page.coverAssetId,page.backgroundAssetId])if(id&&(typeof id!=='string'||!/^[-a-zA-Z0-9_:]{1,160}$/.test(id)))throw new WebsiteError('invalid_media','Choose an image from the library.');
     if(page.footerNavigation!==undefined&&typeof page.footerNavigation!=='boolean')throw new WebsiteError('invalid_navigation','Choose whether this page appears in the footer.');
+    for(const order of [page.navigationOrder,page.footerNavigationOrder])if(order!==undefined&&(!Number.isSafeInteger(order)||order<0))throw new WebsiteError('invalid_navigation','Menu order must be a non-negative integer.');
+    for(const footer of [false,true]){const id=footer?page.footerNavigationParentId:page.navigationParentId;if(id!==undefined&&id!==null&&(typeof id!=='string'||!pages.has(id)||id===page.id))throw new WebsiteError('invalid_navigation','Choose another page in this website as the menu parent.');}
     if (page.canonicalUrl) websiteExternalUrl(page.canonicalUrl);
     if (page.kind === 'home' && (page.parentId || page.slug || page.state !== 'ready')) throw new WebsiteError('invalid_home', 'Home must be ready, without a parent or slug.');
     const parent = page.parentId ? pages.get(page.parentId) : undefined;

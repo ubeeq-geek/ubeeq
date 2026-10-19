@@ -204,3 +204,21 @@ test('page designs bundle cover/background images and every theme supports light
  const html=Buffer.from(buildWebsiteArtifact(centered,limits).files.get('index.html')).toString();assert.match(html,/site-header centered/);assert.doesNotMatch(html,/class="site-logo"/);
  for(const patch of [{template:'unsafe'},{coverPosition:{x:2,y:.5}},{backgroundAssetId:'../secret'}]){const invalid=fixture();Object.assign(invalid.website.pages[0],patch);assert.throws(()=>websiteRoutes(invalid.website));}
 });
+
+test('menu order and dropdown levels are independent of routes and other menus',()=>{
+ const snapshot=fixture(),site=snapshot.website;
+ const home=site.pages[0],portfolio=site.pages[1],about=site.pages[2];
+ site.pages=site.pages.filter(page=>page.kind!=='update');
+ home.navigationOrder=2;portfolio.navigationOrder=1;about.navigationOrder=0;
+ about.navigationParentId=null;portfolio.navigationParentId='about';
+ for(const page of site.pages){page.footerNavigation=true;page.footerNavigationParentId=null;}
+ home.footerNavigationOrder=0;portfolio.footerNavigationOrder=1;about.footerNavigationOrder=2;
+ const routes=websiteRoutes(site);assert.equal(routes.get('about'),'/portfolio/about/');
+ const artifact=buildWebsiteArtifact(snapshot,limits),html=Buffer.from(artifact.files.get('index.html')).toString();
+ const top=html.split('</header>')[0],footer=html.split('<footer')[1];
+ assert.match(top,/<summary>about<\/summary>/);assert.ok(top.indexOf('<summary>about')<top.indexOf('>Home</a>'));
+ assert.doesNotMatch(footer,/nav-dropdown/);assert.ok(footer.indexOf('>Home</a>')<footer.indexOf('>portfolio</a>'));
+ home.navigationParentId='portfolio';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
+ home.navigationParentId=null;about.navigationParentId='portfolio';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
+ about.navigationParentId=null;portfolio.navigationParentId='missing';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
+});

@@ -1,4 +1,4 @@
-import { WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
+import { websiteMenuParent, websiteMenuOrder, WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
 import { websiteDesignCss } from './website-design-css.js';
 import { parseFragment, serialize } from 'parse5';
 import { sanitizeInlineHtml, textToInlineHtml } from './block-content.js';
@@ -82,10 +82,10 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     return serialize(root);
   };
   const nav = (current: string, footer=false) => {
-    const visible = pages.filter(p => (footer?(p.footerNavigation??false):p.navigation)).sort((a,b) => a.order-b.order || a.id.localeCompare(b.id, 'en'));
+    const visible = pages.filter(p => (footer?(p.footerNavigation??false):p.navigation)).sort((a,b) => websiteMenuOrder(a,footer)-websiteMenuOrder(b,footer) || a.id.localeCompare(b.id, 'en'));
     const item = (p: WebsitePage) => `<a href="${e(url(routes.get(p.id)!))}"${routes.get(p.id) === current ? ' aria-current="page"' : ''}>${e(p.navigationLabel ?? p.title)}</a>`;
-    const entries=visible.filter(p=>!p.parentId||!visible.some(parent=>parent.id===p.parentId)).map(p=>{
-      const children=visible.filter(child=>child.parentId===p.id);
+    const entries=visible.filter(p=>!websiteMenuParent(p,footer)||!visible.some(parent=>parent.id===websiteMenuParent(p,footer))).map(p=>{
+      const children=visible.filter(child=>websiteMenuParent(child,footer)===p.id);
       return `<li>${children.length?`<details class="nav-dropdown"><summary>${e(p.navigationLabel??p.title)}</summary><ul><li>${item(p)}</li>${children.map(child=>`<li>${item(child)}</li>`).join('')}</ul></details>`:item(p)}</li>`;
     }).join('');
     const extra=footer?site.footerLinks:site.navigationLinks;

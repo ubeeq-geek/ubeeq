@@ -1,4 +1,4 @@
-import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
 export interface WebsiteWorkspaceClient {
@@ -153,7 +153,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     if(tab==='Layout') {
       const workspace=element('div'),selector=element('nav'),divider=element('div'),surface=element('div');
       workspace.className='website-page-workspace'+(layoutSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-layout-'+site.id;selector.setAttribute('aria-label','Website layout');selector.hidden=!layoutSelectorExpanded;surface.className='website-page-surface';
-      for(const name of ['Header','Footer','Top navigation']){const choice=button(name,async()=>{selectedLayout=name;await show('Layout');});choice.className='website-page-choice';choice.setAttribute('aria-pressed',String(selectedLayout===name));selector.append(choice);}
+      for(const name of ['Header','Top navigation','Footer']){const choice=button(name,async()=>{selectedLayout=name;await show('Layout');});choice.className='website-page-choice';choice.setAttribute('aria-pressed',String(selectedLayout===name));selector.append(choice);}
       divider.className='website-page-divider';const handle=element('div');handle.className='website-page-handle-viewport';const toggle=button('',async()=>{layoutSelectorExpanded=!layoutSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!layoutSelectorExpanded);selector.hidden=!layoutSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
       const updateToggle=()=>{toggle.textContent=layoutSelectorExpanded?'‹':'›';toggle.setAttribute('aria-label',layoutSelectorExpanded?'Collapse layout selector':'Expand layout selector');toggle.setAttribute('aria-expanded',String(layoutSelectorExpanded));};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);surface.append(element('h2',selectedLayout));
       const setting=<K extends keyof Website['theme']['settings']>(key:K,value:Website['theme']['settings'][K])=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,[key]:value}}};
@@ -169,8 +169,33 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       if(selectedLayout==='Header'&&options.showAssetIds!==false)field(surface,'Logo public asset ID',site.theme.settings.logoAssetId??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,logoAssetId:v||undefined}}});
 
       if(selectedLayout==='Top navigation'||selectedLayout==='Footer'){
-        surface.append(element('h3',selectedLayout==='Footer'?'Footer navigation':'Top navigation'),element('p','Choose which pages appear in this menu. Child pages use dropdown navigation. Change page order and parents in Page settings.'));
-        for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){const row=element('fieldset');row.append(element('legend',page.title));for(const key of (selectedLayout==='Footer'?['footerNavigation']:['navigation']) as ('footerNavigation'|'navigation')[]){const label=element('label',key==='navigation'?'Top navigation':'Footer navigation'),check=element('input');check.type='checkbox';check.checked=key==='footerNavigation'?(page.footerNavigation??false):page.navigation;check.onchange=()=>{site={...site,pages:site.pages.map(p=>p.id===page.id?{...p,[key]:check.checked,revision:p.revision+1}:p)};};label.append(check);row.append(label);}surface.append(row);}
+        const footer=selectedLayout==='Footer',key=footer?'footerNavigation':'navigation',orderKey=footer?'footerNavigationOrder':'navigationOrder',parentKey=footer?'footerNavigationParentId':'navigationParentId';
+        surface.append(element('h3',footer?'Footer navigation':'Navigation items'),element('p','Order links, remove them from this menu, or place them inside a top-level dropdown. These changes do not move or delete pages.'));
+        const menu=element('div');menu.className='website-navigation-editor';surface.append(menu);
+        const included=(page:WebsitePage)=>!!page[key];
+        const change=(updates:Map<string,Partial<WebsitePage>>)=>{site={...site,pages:site.pages.map(page=>updates.has(page.id)?{...page,...updates.get(page.id),revision:page.revision+1}:page)};};
+        const renderMenu=(focus?:string)=>{
+          menu.replaceChildren();const members=site.pages.filter(included).sort((a,b)=>websiteMenuOrder(a,footer)-websiteMenuOrder(b,footer)||a.id.localeCompare(b.id,'en'));
+          const parent=(page:WebsitePage)=>{const id=websiteMenuParent(page,footer);return members.some(member=>member.id===id)?id:undefined;};
+          const roots=members.filter(page=>!parent(page));
+          const control=(label:string,focusId:string,action:()=>void)=>{const b=button(label,async()=>{action();renderMenu(focusId);});b.dataset.menuFocus=focusId;return b;};
+          const list=element('ol');list.className='website-navigation-list';list.setAttribute('aria-label',footer?'Footer navigation items':'Top navigation items');
+          const row=(page:WebsitePage,siblings:WebsitePage[])=>{
+            const item=element('li'),card=element('div'),title=element('strong',page.navigationLabel??page.title),actions=element('div');card.className='website-navigation-item';actions.className='website-navigation-actions';
+            card.append(title);if(page.state!=='ready')card.append(element('small',`${page.state==='draft'?'Draft':'Archived'} · visible after the page is ready`));
+            const at=siblings.findIndex(sibling=>sibling.id===page.id);
+            for(const [direction,offset] of [['up',-1],['down',1]] as const){const move=control(direction==='up'?'↑':'↓',page.id+direction,()=>{const other=siblings[at+offset],ordered=[...members],a=ordered.findIndex(p=>p.id===page.id),b=ordered.findIndex(p=>p.id===other.id);[ordered[a],ordered[b]]=[ordered[b],ordered[a]];change(new Map(ordered.map((p,index)=>[p.id,{[orderKey]:index}])));});move.setAttribute('aria-label',`Move ${page.title} ${direction}`);move.disabled=at+offset<0||at+offset>=siblings.length;actions.append(move);}
+            const label=element('label','Menu level'),select=element('select');select.setAttribute('aria-label',`Menu parent for ${page.title}`);select.dataset.menuFocus=page.id+'parent';
+            for(const candidate of [{id:'',title:'Top level'},...roots.filter(root=>root.id!==page.id)]){const option=element('option',candidate.id?`Under ${candidate.title}`:candidate.title);option.value=candidate.id;select.append(option);}select.value=parent(page)??'';
+            select.onchange=()=>{const updates=new Map<string,Partial<WebsitePage>>([[page.id,{[parentKey]:select.value||null}]]);for(const child of members.filter(child=>parent(child)===page.id))updates.set(child.id,{[parentKey]:null});change(updates);status.textContent=`${page.title} moved ${select.value?'into a dropdown':'to the top level'}. Save this menu to keep the change.`;renderMenu(page.id+'parent');};label.append(select);actions.append(label);
+            const remove=control('Remove',page.id+'remove',()=>{const updates=new Map<string,Partial<WebsitePage>>([[page.id,{[key]:false}]]);for(const child of members.filter(child=>parent(child)===page.id))updates.set(child.id,{[parentKey]:null});change(updates);status.textContent=`${page.title} removed from this menu. The page is still available.`;});remove.setAttribute('aria-label',`Remove ${page.title} from navigation`);actions.append(remove);card.append(actions);item.append(card);
+            const children=members.filter(child=>parent(child)===page.id);if(children.length){const nested=element('ol');for(const child of children)nested.append(row(child,children));item.append(nested);}return item;
+          };
+          for(const page of roots)list.append(row(page,roots));menu.append(list);if(!members.length)menu.append(element('p','No pages in this menu yet.'));
+          const available=site.pages.filter(page=>!included(page)&&page.state!=='archived'),addBox=element('div');addBox.className='website-navigation-add';
+          const label=element('label','Add a page to this menu'),select=element('select');select.setAttribute('aria-label','Page to add to navigation');const placeholder=element('option',available.length?'Choose a page…':'All available pages are in this menu');placeholder.value='';select.append(placeholder);for(const page of available){const option=element('option',page.title);option.value=page.id;select.append(option);}label.append(select);const add=control('Add to navigation','add',()=>{if(!select.value)return;const page=site.pages.find(p=>p.id===select.value)!;change(new Map([[page.id,{[key]:true,[parentKey]:null,[orderKey]:Math.max(-1,...members.map(p=>websiteMenuOrder(p,footer)))+1}]]));status.textContent=`${page.title} added to this menu. Save this menu to keep the change.`;});add.disabled=true;select.disabled=!available.length;select.onchange=()=>add.disabled=!select.value;addBox.append(label,add);menu.append(addBox);
+          if(focus){const target=[...menu.querySelectorAll<HTMLElement>('[data-menu-focus]')].find(control=>control.dataset.menuFocus===focus&&!control.hasAttribute('disabled'))??select;target.focus();}
+        };renderMenu();
       }
       surface.append(button('Save '+selectedLayout.toLowerCase(),save));
     }
