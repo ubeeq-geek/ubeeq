@@ -179,7 +179,8 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
           selected=selected.slice(0,max);
           const identities=input.creatorIdentities?new Map(input.creatorIdentities.filter(creator=>!Array.isArray(creators)||!creators.length||creators.includes(creator.id)).map(creator=>[creator.id,creator.title])):new Map(selected.map(g=>[g.creatorIdentityId??site.creatorIdentityId,g.creatorName??'Creator']));
           if(identities.size<2)return paginated(selected.map(g=>card(g)));
-          const filterPath=(id:string)=>`${path}creator/${index}/${encodeURIComponent(id)}/`;
+          const creatorPaths=new Map<string,string>(),usedNames=new Set<string>();for(const [id,name] of identities){const base=name.normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}_-]+/gu,'-').replace(/^-+|-+$/g,'').slice(0,70)||'creator';let slug=base,n=2;while(usedNames.has(slug))slug=base+'-'+n++;usedNames.add(slug);creatorPaths.set(id,`${path}creator/${index}/${encodeURIComponent(slug)}/`);}
+          const filterPath=(id:string)=>creatorPaths.get(id)!;
           const filter=(active?:string)=>`<nav class="gallery-creator-filter" aria-label="Filter gallery by creator"><a href="${e(url(path))}"${!active?' aria-current="page"':''}>All creators</a> ${[...identities].map(([id,name])=>`<a href="${e(url(filterPath(id)))}"${active===id?' aria-current="page"':''}>${e(name)}</a>`).join(' ')}</nav>`;
           for(const [id,name] of identities){if(++plannedPages>limits.maxPages)throw new WebsiteError('quota_exceeded','Creator filters exceed the page limit.');const body=paginated(selected.filter(g=>(g.creatorIdentityId??site.creatorIdentityId)===id).map(g=>card(g)),filterPath(id),filter(id));extraPages.push({path:filterPath(id),title:page.title+' — '+name,body:()=>body});}
           return paginated(selected.map(g => card(g)),path,filter());
@@ -188,7 +189,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
       }
     }).join('');
     add(path, shell(page.title, renderBlocks(doc.blocks), path, page));
-    for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body(), extra.path));
+    for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body(), extra.path,{...page,seoTitle:undefined,canonicalUrl:undefined}));
   }
   for (const g of galleries.filter(g => g.local)) {
     const path = websitePath(`/galleries/${g.slug}`);

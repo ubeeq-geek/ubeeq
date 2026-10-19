@@ -82,6 +82,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   };
   const show=async(tab:string)=>{
     const generation=++renderGeneration;
+    for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.textContent===tab));
     cleanupEditor?.();cleanupEditor=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
     if(tab==='Pages') {
       if(!selectedPage||!['new','redirects',...site.pages.map(p=>p.id)].includes(selectedPage))selectedPage=site.homePageId;
