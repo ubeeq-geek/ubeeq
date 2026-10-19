@@ -51,7 +51,7 @@ export interface HistoricalAttachment {
 }
 export interface HistoricalContentSnapshot {
   /** Provider structure is retained as inert, credential-free JSON, never executable HTML. */
-  sourceData?:{format:"tumblr"|"discord";json:string;truncated:boolean};
+  sourceData?:{format:"tumblr"|"discord"|"deviantart";json:string;truncated:boolean};
   blocks: readonly HistoricalContentBlock[];
   attachments: readonly HistoricalAttachment[];
   layout: readonly {
@@ -261,7 +261,7 @@ export function validateHistoricalSnapshot(
     throw new Error("Historical content exceeds snapshot bounds.");
   if(snapshot.sourceData){
     const data=snapshot.sourceData;
-    if(!only(data,["format","json","truncated"]) || !["tumblr","discord"].includes(data.format) || typeof data.json!=="string" || data.json.length>1048576 || typeof data.truncated!=="boolean")throw Error("Invalid retained source data.");
+    if(!only(data,["format","json","truncated"]) || !["tumblr","discord","deviantart"].includes(data.format) || typeof data.json!=="string" || data.json.length>1048576 || typeof data.truncated!=="boolean")throw Error("Invalid retained source data.");
     let parsed:unknown;try{parsed=JSON.parse(data.json);}catch{throw Error("Invalid retained source JSON.");}
     if(sanitizeHistoricalSourceData(parsed).json!==data.json)throw Error("Retained source data must be sanitized.");
   }
@@ -648,6 +648,7 @@ export async function historicalSourceContentHash(
     const raw=JSON.parse(sourceData.json);
     if(raw && typeof raw==='object' && !Array.isArray(raw)){
       for(const key of ['note_count','notes','liked','like_count','reblog_count','reply_count','reactions'])delete raw[key];
+      if(sourceData.format==='deviantart')for(const key of ['stats','is_favourited','is_liked'])delete raw[key];
       if(raw.poll && typeof raw.poll==='object')delete raw.poll.results;
       if(raw.thread && typeof raw.thread==='object')for(const key of ['message_count','member_count','total_message_sent'])delete raw.thread[key];
       contentData={...sourceData,json:JSON.stringify(canonical(raw))};

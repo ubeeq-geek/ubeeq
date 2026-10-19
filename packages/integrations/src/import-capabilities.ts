@@ -99,6 +99,8 @@ export function integrationImportReadiness(
 }
 
 export interface AnnouncementImportScope {
+  /** Providers without date filters traverse one bounded newest-first cursor across the selected history. */
+  paginationOrder?: "newest_first";
   from: string;
   to: string;
   sourceIds: readonly string[];
@@ -132,7 +134,8 @@ export function validateAnnouncementImportScope(
     !Number.isFinite(from) ||
     !Number.isFinite(to) ||
     from >= to ||
-    to - from > 366 * 86400000 ||
+    (scope.paginationOrder !== undefined && scope.paginationOrder !== "newest_first") ||
+    to - from > (scope.paginationOrder === "newest_first" ? 36600 : 366) * 86400000 ||
     !ids(scope.sourceIds, 25) ||
     !ids(scope.authorIds, 100) ||
     !bounded(scope.limits.pages, 100) ||
