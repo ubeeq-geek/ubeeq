@@ -13,6 +13,16 @@ export class WebsiteClient implements WebsiteWorkspaceClient {
     if(!response.ok){let message='Website operation failed.';try{message=(await response.json()).error?.message??message;}catch{}throw new Error(message);}
     return response;
   }
+  private hosting(path:string,method='GET',body?:unknown){return this.request('/'+encodeURIComponent(this.websiteId)+'/hosting/'+path,method,body);}
+  async hostingConnections(){return (await(await this.request('/hosting-connections')).json()).connections;}
+  async hostingConnectionAction(action:string,body:Record<string,unknown>){return (await this.request('/hosting-connections/'+encodeURIComponent(action),'POST',body)).json();}
+  async hostingChoices(){return (await(await this.hosting('choices')).json()).choices;}
+  async hostingHistory(){return (await this.hosting('history')).json();}
+  async createNativeTarget(adapterId:string,label:string){await this.hosting('native-target','POST',{adapterId,label,ownershipConfirmed:true});}
+  async reviewBinding(bindingId:string,bindingRevision:number,expectedRevision:number){return (await this.hosting('binding-review','POST',{bindingId,bindingRevision,expectedRevision})).json();}
+  async reviewPublication(expectedRevision:number,targetIds:readonly string[]){return (await this.hosting('review','POST',{expectedRevision,targetIds})).json();}
+  async publishWebsite(planId:string,fingerprint:string,idempotencyKey:string){await this.hosting('publish','POST',{planId,fingerprint,idempotencyKey});}
+  async hostingAction(action:string,id:string,body:unknown={}){await this.hosting(encodeURIComponent(action)+'/'+encodeURIComponent(id),'POST',body);}
   async get() {return (await(await this.request('/'+encodeURIComponent(this.websiteId))).json()).website as Website;}
   async catalogue() {return (await(await this.request('/catalogue')).json()).publications as {id:string;title:string}[];}
   async save(website:Website,expectedRevision:number) {return (await(await this.request('/'+encodeURIComponent(this.websiteId),'PUT',{website,expectedRevision})).json()).website as Website;}

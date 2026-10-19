@@ -1,0 +1,42 @@
+x-hosting: &hosting
+  UBEEQ_DATA_DIRECTORY: /var/lib/ubeeq/private
+  UBEEQ_DATABASE_PATH: /var/lib/ubeeq/private/ubeeq.sqlite
+  UBEEQ_WEBSITE_HOSTING_ROOT: /var/lib/ubeeq/public-releases
+  UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE: ${WEBSITE_URL_TEMPLATE:-http://static:4200/sites/{site}/}
+  UBEEQ_PUBLIC_BASE_URL: ${API_PUBLIC_URL:-http://localhost:4100}
+  UBEEQ_LISTEN_HOST: 0.0.0.0
+services:
+  initialize:
+    image: ubeeq-website-hosting:local
+    build:
+      context: ../..
+      dockerfile: examples/website-hosting/Dockerfile
+    user: root
+    command: ["node", "-e", "const fs=require('node:fs');for(const p of ['/var/lib/ubeeq/private','/var/lib/ubeeq/public-releases']){fs.mkdirSync(p,{recursive:true});fs.chownSync(p,1000,1000);}"]
+    volumes: ["website-private:/var/lib/ubeeq/private", "website-releases:/var/lib/ubeeq/public-releases"]
+  api:
+    image: ubeeq-website-hosting:local
+    command: ["node", "server.js"]
+    environment: *hosting
+    ports: ["127.0.0.1:4100:4100"]
+    volumes: ["website-private:/var/lib/ubeeq/private", "website-releases:/var/lib/ubeeq/public-releases"]
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+  publisher:
+    image: ubeeq-website-hosting:local
+    command: ["node", "worker.js"]
+    environment: *hosting
+    volumes: ["website-private:/var/lib/ubeeq/private", "website-releases:/var/lib/ubeeq/public-releases"]
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+  static:
+    image: ubeeq-website-hosting:local
+    environment: *hosting
+    ports: ["127.0.0.1:4200:4200"]
+    volumes: ["website-releases:/var/lib/ubeeq/public-releases:ro"]
+    read_only: true
+    depends_on:
+      initialize: {condition: service_completed_successfully}
+volumes:
+  website-private:
+  website-releases:

@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: website-hosting
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: website-hosting
+data:
+  UBEEQ_DATA_DIRECTORY: /data/private
+  UBEEQ_DATABASE_PATH: /data/private/ubeeq.sqlite
+  UBEEQ_WEBSITE_HOSTING_ROOT: /data/public-releases
+  UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE: http://127.0.0.1:4200/sites/{site}/
+  UBEEQ_PUBLIC_BASE_URL: http://127.0.0.1:4100
+  UBEEQ_LISTEN_HOST: 0.0.0.0
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: website-hosting
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: website-hosting}
+  template:
+    metadata:
+      labels: {app: website-hosting}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: initialize
+          image: ubeeq-website-hosting:local
+          imagePullPolicy: IfNotPresent
+          command: [node, -e, "const fs=require('node:fs');for(const p of ['/data/private','/data/public-releases'])fs.mkdirSync(p,{recursive:true});"]
+          volumeMounts: [{name: data, mountPath: /data}]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      containers:
+        - name: api
+          image: ubeeq-website-hosting:local
+          imagePullPolicy: IfNotPresent
+          command: [node, server.js]
+          envFrom: [{configMapRef: {name: website-hosting}}]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data, readOnly: false}
+          ports: [{containerPort: 4100}]
+          readinessProbe:
+            httpGet: {path: /ready, port: 4100}
+            initialDelaySeconds: 2
+        - name: publisher
+          image: ubeeq-website-hosting:local
+          imagePullPolicy: IfNotPresent
+          command: [node, worker.js]
+          envFrom: [{configMapRef: {name: website-hosting}}]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data, readOnly: false}
+        - name: static
+          image: ubeeq-website-hosting:local
+          imagePullPolicy: IfNotPresent
+          command: [node, website-server.js]
+          envFrom: [{configMapRef: {name: website-hosting}}]
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/public-releases, subPath: public-releases, readOnly: true}
+          ports: [{containerPort: 4200}]
+          readinessProbe:
+            httpGet: {path: /health, port: 4200}
+            initialDelaySeconds: 2
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: website-hosting}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: website-hosting
+spec:
+  selector: {app: website-hosting}
+  ports:
+    - {name: api, port: 4100, targetPort: 4100}
+    - {name: static, port: 4200, targetPort: 4200}

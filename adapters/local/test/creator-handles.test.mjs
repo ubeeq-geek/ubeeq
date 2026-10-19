@@ -88,7 +88,8 @@ test('history migration backfills aliases from existing canonical records', asyn
     assert.match(failed.stderr, /UNIQUE constraint failed/);
     assert.equal(local.database.prepare('SELECT id FROM ubeeq_schema_migrations WHERE id = ?').get('010-creator-handle-history'), undefined);
     assert.equal(local.database.prepare("SELECT COUNT(*) AS count FROM ubeeq_records WHERE repository = 'creators'").get().count, 2);
-    assert.equal(local.database.prepare('SELECT COUNT(*) AS count FROM ubeeq_creator_handle_aliases').get().count, 0);
+    // The migration and its receipt now roll back together, including newly created schema.
+    assert.equal(local.database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='ubeeq_creator_handle_aliases'").get(), undefined);
     // Resolve only this synthetic collision, then prove migration can be retried.
     local.database.prepare("DELETE FROM ubeeq_records WHERE repository = 'creators' AND id = ?").run('collision');
     const reopened = new LocalSqliteDatabase(config);
