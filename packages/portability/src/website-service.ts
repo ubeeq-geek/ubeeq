@@ -47,6 +47,7 @@ export class WebsiteService {
     const site=await this.get(actor,websiteId);
     if(site.revision!==expectedRevision)throw new WebsiteError('revision_conflict','Website changed before publication review.');
     await this.authorize(actor,'publish',[websiteId]);
+    for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
     const limits=await this.ports.capabilities(actor),raw=await this.ports.resolveSnapshot(actor,structuredClone(site));
     validateWebsiteSnapshotBudget(raw,limits);
     if(websiteFingerprint(raw.website)!==websiteFingerprint(site))throw new WebsiteError('snapshot_changed','Publication source changed during capture.');

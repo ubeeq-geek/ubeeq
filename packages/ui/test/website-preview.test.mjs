@@ -12,3 +12,12 @@ test('complete previews preserve pages and binary assets once in a bounded archi
  const unsafe=Buffer.from(createWebsiteZip(new Map([['index.html',new Uint8Array()],['safeimg.html',new Uint8Array()]])));unsafe.write('../evil.html',unsafe.indexOf('safeimg.html'));
  await assert.rejects(readWebsitePreviewArchive(new Blob([unsafe])));
 });
+
+test('queued previews wait automatically and report failed builds without fetching an archive',async()=>{
+ const {openWebsitePreview}=await import('../dist/website-workspace.js');
+ const site={id:'site',workspaceId:'workspace',creatorIdentityId:'creator',revision:1,title:'Website',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'local'}},mediaMode:'bundled',basePath:'/',pages:[{id:'home',websiteId:'site',workspaceId:'workspace',revision:1,documentId:'doc',kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]};
+ let polls=0,archiveCalls=0,output='';const popup={closed:false,document:{title:'',body:{textContent:''},open(){},write(value){output=value;},close(){}}};
+ const client={get:async()=>site,builds:async()=>[],requestBuild:async()=>({id:'queued',state:'queued'}),build:async()=>({state:++polls<2?'rendering':'ready',stale:false}),previewSite:async()=>{archiveCalls++;return new Blob([createWebsiteZip(new Map([['index.html',new TextEncoder().encode('<h1>Ready</h1>')]]))]);}};
+ assert.equal(await openWebsitePreview(client,popup,'https://example.com/'),'queued');assert.equal(archiveCalls,1);assert.match(output,/website-preview.navigate/);assert.ok(polls>=2);
+ archiveCalls=0;client.build=async()=>({state:'failed',errorCode:'storage_limit_reached'});await assert.rejects(openWebsitePreview(client,popup,'https://example.com/'),/storage_limit_reached/);assert.equal(archiveCalls,0);assert.match(popup.document.body.textContent,/could not be prepared/);
+});
