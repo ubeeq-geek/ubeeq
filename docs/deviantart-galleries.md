@@ -6,8 +6,9 @@ durable publication jobs and receipts. These functions make no network requests.
 
 Creation supports a regular folder name, optional description, and optional parent
 folder UUID for a sub-gallery. Hosts must verify that the selected parent belongs
-to the authenticated account and is a regular top-level gallery. DeviantArt checks
-Core membership and account limits. Invalid names are rejected rather than truncated.
+to the authenticated account and is top-level. Select a regular parent gallery;
+DeviantArt validates whether its type permits sub-galleries, Core membership and
+account limits. Invalid names are rejected rather than truncated.
 
 Premium and Watchers-Only creation are explicitly unsupported by this adapter:
 the documented OAuth creation endpoint exposes no visibility or price fields.
