@@ -73,7 +73,7 @@ function runWebsitePreview(files:Record<string,string>,initial:string,nonce:stri
     const message=document.createElement('p');message.setAttribute('role','status');message.setAttribute('aria-live','polite');
     const error=document.createElement('p');error.setAttribute('role','alert');
     const actions=document.createElement('div'),update=document.createElement('button'),dismiss=document.createElement('button'),editor=document.createElement('a');
-    update.type=dismiss.type='button';update.textContent='Update preview';dismiss.textContent='Dismiss';editor.textContent='Open Eversally Studio';editor.href=context.editorUrl;editor.target='_blank';editor.rel='noopener noreferrer';
+    update.type=dismiss.type='button';update.textContent='Update preview';dismiss.textContent='Dismiss';editor.textContent='Open the website editor';editor.href=context.editorUrl;editor.target='_blank';editor.rel='noopener noreferrer';
     const styles=document.createElement('style');styles.textContent='.website-preview-update{position:fixed;z-index:5;bottom:1rem;left:50%;transform:translateX(-50%);width:min(42rem,calc(100% - 2rem));box-sizing:border-box;padding:1rem 1.25rem;border:1px solid #b99ae8;border-radius:.8rem;background:#f8f6fc;color:#272135;box-shadow:0 .5rem 2rem #0004;font:14px/1.5 system-ui,sans-serif}.website-preview-update[hidden]{display:none}.website-preview-update p{margin:0 0 .75rem}.website-preview-update p:empty{display:none}.website-preview-update div{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem}.website-preview-update button,.website-preview-update a{font:inherit;border-radius:999px;padding:.45rem .9rem}.website-preview-update button{cursor:pointer;border:1px solid #7954b0;background:transparent;color:inherit}.website-preview-update button:first-child{background:#7954b0;color:white}.website-preview-update a{color:inherit}.website-preview-update button:focus-visible,.website-preview-update a:focus-visible{outline:3px solid #7954b0;outline-offset:3px}.website-preview-update button:disabled{cursor:wait;opacity:.65}@media(prefers-color-scheme:dark){.website-preview-update{background:#201a2c;color:#f4eefc}}';document.head.append(styles);
     actions.append(update,dismiss,editor);banner.append(message,error,actions);document.body.append(banner);
     let latest=context.revision,dismissed=context.revision,pending='',chosen='',timer:ReturnType<typeof setTimeout>|undefined;
@@ -86,15 +86,15 @@ function runWebsitePreview(files:Record<string,string>,initial:string,nonce:stri
       changes=new BroadcastChannel(context.websiteKey);changes.onmessage=event=>{if(event.data?.type==='saved')changed(event.data.revision);};
       control=new BroadcastChannel(context.refreshChannel);control.onmessage=event=>{const data=event.data;if(!pending||data?.requestId!==pending)return;
         if(data.type==='offer'&&!chosen&&typeof data.providerId==='string'&&/^[a-f0-9-]{36}$/.test(data.providerId)){chosen=data.providerId;const request=new BroadcastChannel(context.websiteKey+':requests');request.postMessage({type:'refresh-accept',requestId:pending,providerId:chosen});request.close();}
-        else if(data.type==='progress'){clearTimeout(timer);timer=setTimeout(()=>failed('The update is taking longer than expected. Try again or open Eversally Studio.'),25*60*1000);message.textContent=data.message||'Updating preview…';}
+        else if(data.type==='progress'){clearTimeout(timer);timer=setTimeout(()=>failed('The update is taking longer than expected. Try again or open the website editor.'),25*60*1000);message.textContent=data.message||'Updating preview…';}
         else if(data.type==='ready'&&typeof data.id==='string'&&/^[a-f0-9-]{36}$/.test(data.id)){clearTimeout(timer);const next=new URL(location.href);next.searchParams.set('id',data.id);next.hash='';location.replace(next.href);}
         else if(data.type==='error'&&typeof data.message==='string')failed(data.message);
       };
     }catch{}
-    update.onclick=()=>{if(pending)return;error.textContent='';if(!control){failed('Open Eversally Studio to update this preview.');return;}
+    update.onclick=()=>{if(pending)return;error.textContent='';if(!control){failed('Open the website editor to update this preview.');return;}
       pending=crypto.randomUUID();chosen='';update.disabled=true;update.textContent='Updating…';show();
       const path=new URLSearchParams(location.hash.slice(1)).get('page')??initial,pageId=Object.entries(context.pagePaths).find(([,value])=>value===path)?.[0];
-      const request=new BroadcastChannel(context.websiteKey+':requests');request.postMessage({type:'refresh-request',replyTo:context.refreshChannel,requestId:pending,pageId,path:path.endsWith('.html')?path:lastPage});request.close();timer=setTimeout(()=>failed('Keep Eversally Studio open to update this preview. Your older version is still available.'),15000);
+      const request=new BroadcastChannel(context.websiteKey+':requests');request.postMessage({type:'refresh-request',replyTo:context.refreshChannel,requestId:pending,pageId,path:path.endsWith('.html')?path:lastPage});request.close();timer=setTimeout(()=>failed('Keep the website editor open to update this preview. Your older version is still available.'),15000);
     };
     dismiss.onclick=()=>{dismissed=latest;banner.hidden=true;};
     addEventListener('storage',event=>{if(event.key===context.websiteKey)check();});addEventListener('focus',check);addEventListener('pageshow',check);check();
