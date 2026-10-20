@@ -105,6 +105,7 @@ export function BlockEditor({
   const [collapsedSections,setCollapsedSections]=useState<Set<string>>(()=>new Set());
   const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
   const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
+  const [imageSettings,setImageSettings]=useState<Record<string,boolean>>({});
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
   const [uploadTarget,setUploadTarget]=useState(''),[imageErrors,setImageErrors]=useState<Record<string,string>>({});
   const [splitError,setSplitError]=useState(''),[splitStatus,setSplitStatus]=useState('');
@@ -172,7 +173,7 @@ export function BlockEditor({
 
   const addImageBlock=()=>{
     const block:PostBlock={blockId:globalThis.crypto?.randomUUID?.()??`image-${Date.now()}`,type:'image',caption:''};
-    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);setActiveBlockId(block.blockId);
+    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);setActiveBlockId(block.blockId);setImageSettings(previous=>({...previous,[block.blockId]:true}));
   };
   const patchImage=(id:string,patch:Partial<PostBlock>)=>{const current=blocksRef.current;if(current.some(block=>block.blockId===id))onChange(current.map(block=>block.blockId===id?{...block,...patch}:block));};
   const uploadImage=async(id:string,input:HTMLInputElement)=>{
@@ -334,8 +335,14 @@ export function BlockEditor({
                 <small>File contents are not displayed here. Downloads require the application's authorized attachment route.</small>
               </div>}
               {block.type === 'image' && websiteOptions ? <div className="portable-block-editor-image">
-                <div className="portable-block-editor-media">
-                  {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-block-editor-media-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
+                <div className="portable-image-stage">
+                  <figure className={`portable-image-preview align-${String(block.payload?.alignment??'left')}`} style={{'--image-desktop-width':`${Number(block.payload?.desktopWidth??(block.payload?.textFlow==='wrap'?45:100))}%`,'--image-mobile-width':`${Number(block.payload?.mobileWidth??100)}%`} as React.CSSProperties}>
+                    {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-image-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
+                    {block.caption&&<figcaption>{block.caption}</figcaption>}
+                    <button type="button" className="portable-image-settings-toggle" aria-label="Image settings" aria-expanded={imageSettings[block.blockId]??!block.mediaId} aria-controls={`image-settings-${block.blockId}`} onClick={()=>setImageSettings(previous=>({...previous,[block.blockId]:!(previous[block.blockId]??!block.mediaId)}))}><span aria-hidden="true">•••</span></button>
+                  </figure>
+                </div>
+                <div id={`image-settings-${block.blockId}`} className="portable-image-controls" hidden={!(imageSettings[block.blockId]??!block.mediaId)}>
                   <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
                     <label>Choose existing image<select aria-label="Choose existing image" value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
                       <option value="">Choose from Works or uploads…</option>
@@ -345,14 +352,16 @@ export function BlockEditor({
                     {uploadMedia&&<label className="portable-block-editor-upload">{uploadTarget===block.blockId?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={readOnly||uploadBusy} onChange={event=>void uploadImage(block.blockId,event.currentTarget)}/></label>}
                     {imageErrors[block.blockId]&&<p role="alert">{imageErrors[block.blockId]}</p>}
                   </fieldset>
-                </div>
                 <fieldset disabled={readOnly} className="portable-image-settings">
                   <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
                   <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
-                  <label>Image alignment<select aria-label="Image alignment" value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+                  <label>Image alignment<select aria-label="Image alignment" value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{}),...(event.target.value==='full'?{desktopWidth:100}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
                   <label>Text flow<select aria-label="Text flow" value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
+                  {(['desktop','mobile'] as const).map(device=><label key={device}>{device==='desktop'?'Desktop width (%)':'Mobile width (%)'}<input type="number" min={1} max={100} step={1} value={Number(block.payload?.[device+'Width']??(device==='desktop'&&block.payload?.textFlow==='wrap'?45:100))} onChange={event=>{const width=event.currentTarget.valueAsNumber;if(Number.isInteger(width)&&width>=1&&width<=100)patchImage(block.blockId,{payload:{...block.payload,[device+'Width']:width,...(device==='desktop'&&width<100&&block.payload?.alignment==='full'?{alignment:'center'}:{})}});}}/></label>)}
+                  <p>Width is a percentage of the page’s content area. Mobile applies at 640px and below. Image proportions are preserved.</p>
                   <p>Wrap is available for left- and right-aligned images and applies to the following text blocks. Images stack above text on small screens.</p>
                 </fieldset>
+                </div>
               </div> : (block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
                 {media?.thumbnailUrl && block.type === 'image' ? <img src={media.thumbnailUrl} alt="" /> : <div className="portable-block-editor-media-placeholder">{media?.label || block.mediaId || 'Media'}</div>}
                 <label>

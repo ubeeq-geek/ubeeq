@@ -170,7 +170,11 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
           if(!block.assetId)throw new WebsiteError('missing_media','Choose an image for each image block before previewing.');
           const alignment=String(block.data?.alignment??'left'),flow=String(block.data?.textFlow??'separate'),alt=block.data?.alt;
           if(!['left','center','right','full'].includes(alignment)||!['separate','wrap'].includes(flow)||flow==='wrap'&&!['left','right'].includes(alignment)||alt!==undefined&&(typeof alt!=='string'||alt.length>2000))throw new WebsiteError('invalid_block','Choose a supported image alignment and text flow.');
-          return image(block.assetId,block.caption,'image',undefined,{className:`website-image align-${alignment} flow-${flow}`,alt:alt as string|undefined});
+          const desktop=block.data?.desktopWidth,mobile=block.data?.mobileWidth;
+          for(const width of [desktop,mobile])if(width!==undefined&&(typeof width!=='number'||!Number.isInteger(width)||width<1||width>100))throw new WebsiteError('invalid_block','Image widths must be whole percentages from 1 to 100.');
+          const sizeClass=desktop!==undefined||mobile!==undefined?` image-width-${desktop??(flow==='wrap'?45:100)}-${mobile??100}`:'';
+          if(sizeClass)imagePositions.set(sizeClass,`.page-content .website-image.${sizeClass.trim()}{width:${desktop??(flow==='wrap'?45:100)}%}.page-content .website-image.${sizeClass.trim()}>a,.page-content .website-image.${sizeClass.trim()} img{width:100%}@media(max-width:40rem){.page-content .website-image.${sizeClass.trim()}{width:${mobile??100}%}}`);
+          return image(block.assetId,block.caption,'image',undefined,{className:`website-image align-${alignment} flow-${flow}${sizeClass}`,alt:alt as string|undefined});
         }
         case 'video': case 'audio': return image(block.assetId ?? '', block.caption, block.type);
         case 'file': case 'pdf_preview': return image(block.fileId ?? block.assetId ?? '', block.label ?? block.caption, 'file');

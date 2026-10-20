@@ -84,3 +84,11 @@ test('image alignment and wrapping render approved media and keep flow inside th
  input.documents.get('doc').blocks[0].data={alignment:'center',textFlow:'wrap'};assert.throws(()=>renderStaticWebsite(input),/alignment and text flow/);
  input.documents.get('doc').blocks[0].assetId=undefined;assert.throws(()=>renderStaticWebsite(input),/Choose an image/);
 });
+
+
+test('image widths emit bounded responsive percentages and reject invalid values',()=>{
+ const input=fixture();const block={id:'sized',type:'image',assetId:'cover',data:{alignment:'right',textFlow:'wrap',desktopWidth:50,mobileWidth:80}};input.documents.set('doc',{blocks:[block]});
+ const output=renderStaticWebsite(input);assert.match(output.files.get('index.html'),/image-width-50-80/);const css=output.files.get('assets/theme.css');assert.match(css,/image-width-50-80\{width:50%\}/);assert.match(css,/@media\(max-width:40rem\)\{.page-content .website-image.image-width-50-80\{width:80%\}/);
+ for(const width of [0,101,25.5,'50',NaN]){block.data.desktopWidth=width;assert.throws(()=>renderStaticWebsite(input),/whole percentages/);}
+ block.data.desktopWidth=50;block.data.mobileWidth=-1;assert.throws(()=>renderStaticWebsite(input),/whole percentages/);
+});
