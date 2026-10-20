@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createReferenceApi } from '../dist/server.js';
@@ -61,7 +61,7 @@ test('personal website API persists pages, queues builds, isolates previews and 
 
 test('hosting HTTP API accepts a review once, worker publishes without export, and repeated Publish updates the same target',async t=>{
   const {createServer}=await import('node:http');const {createNativeWebsiteHandler}=await import('@ubeeq/adapter-local');
-  const dir=mkdtempSync(join(tmpdir(),'ubeeq-hosting-api-')),staticServer=createServer();await new Promise(r=>staticServer.listen(0,'127.0.0.1',r));
+  const dir=realpathSync(mkdtempSync(join(tmpdir(),'ubeeq-hosting-api-'))),staticServer=createServer();await new Promise(r=>staticServer.listen(0,'127.0.0.1',r));
   const profile={id:'local',root:join(dir,'hosting'),publicUrlTemplate:`http://127.0.0.1:${staticServer.address().port}/sites/{site}/`,persistent:true,writerMode:'single'};staticServer.on('request',createNativeWebsiteHandler([profile]));
   const api=createReferenceApi({databasePath:join(dir,'app.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',nativeWebsiteProfiles:[profile]});await new Promise(r=>api.server.listen(0,'127.0.0.1',r));const origin='http://127.0.0.1:'+api.server.address().port;
   t.after(async()=>{await api.close();await new Promise(r=>staticServer.close(r));rmSync(dir,{recursive:true,force:true});});let token;
