@@ -70,7 +70,8 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
   const documentDrafts=new Map<string,WebsiteDocument>();
-  let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false;
+  let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false,publishingTimer:ReturnType<typeof setTimeout>|undefined;
+  const stopPublishingPoll=()=>{if(publishingTimer)clearTimeout(publishingTimer);publishingTimer=undefined;};
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
   const status=element('p'); status.setAttribute('role','status');
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
@@ -118,7 +119,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     try{currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';}finally{previewPending=false;}
   };
   const show=async(tab:string)=>{
-    const generation=++renderGeneration;
+    const generation=++renderGeneration;stopPublishingPoll();
     for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.textContent===tab));
     cleanupEditor?.();cleanupEditor=undefined;cleanupSettings?.();cleanupSettings=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
     if(tab==='Settings'){
@@ -129,6 +130,21 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     }
     if(tab==='Publishing'&&client.hostingChoices&&client.hostingHistory){
       const choices=await client.hostingChoices(),history=await client.hostingHistory();if(disposed||renderGeneration!==generation)return;
+      const progress=element('div'),spinner=element('span'),message=element('div'),heading=element('strong'),detail=element('p');
+      progress.className='website-publish-progress';progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');progress.setAttribute('aria-atomic','true');spinner.className='website-publish-spinner';spinner.setAttribute('aria-hidden','true');message.append(heading,detail);progress.append(spinner,message);content.append(progress);
+      const pendingStates=['queued','generating','uploading','activating','verifying','unknown'];
+      const updateProgress=(latest:typeof history)=>{
+        const newest=new Map<string,typeof latest.attempts[number]>();for(const attempt of latest.attempts)if(!newest.has(attempt.targetId)||newest.get(attempt.targetId)!.generation<attempt.generation)newest.set(attempt.targetId,attempt);
+        const attempts=[...newest.values()],pending=attempts.filter(attempt=>pendingStates.includes(attempt.state)),failed=attempts.some(attempt=>['failed','reconnect_required'].includes(attempt.state));
+        progress.hidden=!attempts.length;spinner.hidden=!pending.length;progress.dataset.state=pending.length?'pending':failed?'attention':'complete';
+        if(pending.length){const queued=pending.every(attempt=>attempt.state==='queued'),checking=pending.every(attempt=>['verifying','unknown'].includes(attempt.state));heading.textContent=queued?'Website publish queued':checking?'Verifying website publication':'Publishing website';detail.textContent=queued?'Your approved release is waiting to publish. You can continue working; its status updates automatically.':checking?'Checking that your approved release is available at the destination. This may take a little time.':'Preparing and sending your approved release. Its status updates automatically; later edits stay out of this release.';}
+        else if(failed){heading.textContent='Website publication needs attention';detail.textContent='A destination could not finish publishing. Review the deployment details below to retry or reconnect.';}
+        else {const published=attempts.filter(attempt=>attempt.state==='published').length,unpublished=attempts.filter(attempt=>attempt.state==='unpublished').length;heading.textContent=published?'Website published':unpublished?'Website unpublished':'Website publication stopped';detail.textContent=published?'Your approved release is published. Destination details are shown below.':unpublished?'The website has been removed from public view.':'No publishing tasks are currently running. Review the deployment details below.';}
+        return pending.length>0;
+      };
+      let refreshAttempts:((latest:typeof history)=>void)|undefined;
+      const poll=()=>{publishingTimer=setTimeout(async()=>{publishingTimer=undefined;if(disposed||renderGeneration!==generation)return;if(d.hidden){poll();return;}try{const latest=await client.hostingHistory!();if(disposed||renderGeneration!==generation)return;refreshAttempts?.(latest);if(updateProgress(latest))poll();}catch{if(!disposed&&renderGeneration===generation){detail.textContent='Waiting for a status update. We’ll check again automatically; your accepted release remains queued or in progress.';poll();}}},5000);};
+      if(updateProgress(history))poll();
       content.append(element('p','Publish captures the approved saved content for the selected destinations. Later draft edits stay out of this release. Provider propagation and public verification may take time.'));
       if(!choices.length)content.append(element('p',options.emptyHostingMessage??'Hosting has not been enabled by the installation administrator. Exact candidate ZIP download remains available below.'));
       for(const choice of choices){
@@ -161,18 +177,21 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       const approve=async(plan:{planId:string;fingerprint:string;expiresAt:string},ids:readonly string[],label:string)=>{
         if(disposed||renderGeneration!==generation)return;
         const approvalKey=crypto.randomUUID();const destinations=history.targets.filter(t=>ids.includes(t.id)).map(t=>t.label+' — '+t.publicUrl).join('\n');
-        await confirmAction('Publish '+site.title+'?',`Saved revision ${site.revision}. Later draft edits are excluded.\n${label}\n${destinations}\nReview expires ${options.formatDate?.(plan.expiresAt)??new Date(plan.expiresAt).toLocaleString(undefined,{timeZoneName:'short'})}.\nStaged external deploy URLs can be public.`,'Publish approved release',async()=>{await client.publishWebsite!(plan.planId,plan.fingerprint,approvalKey);status.textContent='Publish accepted. The worker will generate and deploy the approved release.';await show('Publishing');});
+        await confirmAction('Publish '+site.title+'?',`Saved revision ${site.revision}. Later draft edits are excluded.\n${label}\n${destinations}\nReview expires ${options.formatDate?.(plan.expiresAt)??new Date(plan.expiresAt).toLocaleString(undefined,{timeZoneName:'short'})}.\nStaged external deploy URLs can be public.`,'Publish approved release',async()=>{await client.publishWebsite!(plan.planId,plan.fingerprint,approvalKey);status.textContent='';await show('Publishing');});
       };
       for(const binding of history.bindings??[])if(binding.enabled&&client.reviewBinding)content.append(button('Review Publish to '+binding.label,async()=>{const plan=await client.reviewBinding!(binding.id,binding.revision,site.revision);await approve(plan,binding.targetIds,binding.label);}));
       content.append(button('Review Publish',async()=>{if(!selected.size)throw new Error('Select a publishing destination.');const ids=[...selected],plan=await client.reviewPublication!(site.revision,ids);await approve(plan,ids,`${ids.length} destination(s)`);}));
       content.append(button('Refresh publishing status',async()=>show('Publishing')));
+      const attemptRows=element('div');content.append(attemptRows);let attemptVersion='';
+      refreshAttempts=(history)=>{const version=JSON.stringify(history.attempts);if(version===attemptVersion)return;attemptVersion=version;attemptRows.replaceChildren();
       for(const attempt of history.attempts){const row=element('div');row.append(element('p',`${history.targets.find(t=>t.id===attempt.targetId)?.label??'Website'}: generation ${attempt.generation}: ${attempt.state}${attempt.errorCode?' ('+attempt.errorCode+')':''}`));
         if(attempt.verification)row.append(element('p',attempt.verification.publicConfirmed?'Public release verified':`Verification pending: ${attempt.verification.reasons.join(', ')}`));
         if(['failed','reconnect_required'].includes(attempt.state))row.append(button('Retry deployment',async()=>{await client.hostingAction!('retry',attempt.id,{idempotencyKey:crypto.randomUUID()});await show('Publishing');}));
         if(['unknown','verifying'].includes(attempt.state))row.append(button('Reconcile serving status',async()=>{await client.hostingAction!('reconcile',attempt.id);await show('Publishing');}));
         if(['queued','generating','uploading'].includes(attempt.state))row.append(button('Cancel deployment',async()=>{await client.hostingAction!('cancel',attempt.id);await show('Publishing');}));
-        if(attempt.state==='published')row.append(button('Restore this retained release',async()=>{const key=crypto.randomUUID();await confirmAction('Restore '+(history.targets.find(t=>t.id===attempt.targetId)?.label??site.title)+'?', 'This replaces the currently hosted content with the selected release. Later saved edits remain in the editor.','Restore release',async()=>{await client.hostingAction!('rollback',attempt.targetId,{attemptId:attempt.id,idempotencyKey:key});await show('Publishing');});}));content.append(row);
+        if(attempt.state==='published')row.append(button('Restore this retained release',async()=>{const key=crypto.randomUUID();await confirmAction('Restore '+(history.targets.find(t=>t.id===attempt.targetId)?.label??site.title)+'?', 'This replaces the currently hosted content with the selected release. Later saved edits remain in the editor.','Restore release',async()=>{await client.hostingAction!('rollback',attempt.targetId,{attemptId:attempt.id,idempotencyKey:key});await show('Publishing');});}));attemptRows.append(row);
       }
+      };refreshAttempts(history);
     }
     if(tab==='Pages') {
       if(!selectedPage||!['new','redirects',...site.pages.map(p=>p.id)].includes(selectedPage))selectedPage=site.homePageId;
@@ -357,5 +376,5 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   };
   for(const tab of ['Settings','Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
   const ready=client.get().then(async value=>{if(!disposed){site=value;await show('Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
+  return {ready,destroy(){disposed=true;stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
 };
