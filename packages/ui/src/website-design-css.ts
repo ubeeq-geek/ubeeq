@@ -23,7 +23,7 @@ export function websiteDesignCss(site:Website):string {
  .theme-peril-poise .site-header:is(.centered,.stacked) .site-brand{gap:1rem}
  .theme-peril-poise .site-header:is(.centered,.stacked) .site-brand::before,.theme-peril-poise .site-header:is(.centered,.stacked) .site-brand::after{content:"";height:.4rem;flex:1;border-top:1px solid var(--color-border);border-bottom:3px solid var(--poise-burgundy)}
  .theme-peril-poise .site-wordmark{min-width:0;overflow-wrap:anywhere}.theme-peril-poise nav{font-size:.85rem;letter-spacing:.14em}
- .theme-peril-poise .page-heading h1{font-size:clamp(2.5rem,5vw,5rem);line-height:1.15}.theme-peril-poise .page-heading{text-align:center}
+ .theme-peril-poise .page-heading h1{font-size:clamp(1.25rem,2.5vw,2.5rem);line-height:1.15}.theme-peril-poise .page-heading{text-align:center}
  .theme-peril-poise .grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem}
  .theme-peril-poise .grid>.card{align-self:stretch;border:1px solid var(--color-border);border-radius:0;padding:1.25rem;background:color-mix(in srgb,var(--color-text) 6%,var(--color-canvas));align-content:center;text-align:center;min-height:clamp(12rem,17vw,20rem);gap:1rem}
  .theme-peril-poise .card h2{font-family:system-ui,sans-serif;font-weight:400;font-size:1rem;letter-spacing:.24em;text-transform:uppercase;line-height:1.5}.theme-peril-poise .card h2 a{text-decoration:none}
