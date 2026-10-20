@@ -68,6 +68,7 @@ function EditableBlockContent({
       if (element && document.activeElement !== element && element.innerHTML !== html) element.innerHTML = html;
     }}
     className={`portable-block-editor-content portable-block-editor-content-${block.type}`}
+    style={['left','center','right'].includes(String(block.payload?.textAlign))?{textAlign:block.payload!.textAlign as 'left'|'center'|'right'}:undefined}
     contentEditable={!readOnly}
     suppressContentEditableWarning
     role="textbox"
@@ -243,6 +244,7 @@ export function BlockEditor({
               <option value="2">H2</option>
               <option value="3">H3</option>
             </select>}
+            {websiteOptions&&canFormat&&<select aria-label="Block alignment" value={String(activeBlock?.payload?.textAlign??'')} onChange={event=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:event.target.value||undefined}});}}><option value="">Default alignment</option><option value="left">Align left</option><option value="center">Align center</option><option value="right">Align right</option></select>}
             <button type="button" disabled={activeBlockIndex <= 0} onClick={() => moveBlock(activeBlockIndex, -1)} aria-label="Move block up">↑</button>
             <button type="button" disabled={activeBlockIndex < 0 || activeBlockIndex === blocks.length - 1} onClick={() => moveBlock(activeBlockIndex, 1)} aria-label="Move block down">↓</button>
           </div>

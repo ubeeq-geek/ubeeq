@@ -92,3 +92,10 @@ test('image widths emit bounded responsive percentages and reject invalid values
  for(const width of [0,101,25.5,'50',NaN]){block.data.desktopWidth=width;assert.throws(()=>renderStaticWebsite(input),/whole percentages/);}
  block.data.desktopWidth=50;block.data.mobileWidth=-1;assert.throws(()=>renderStaticWebsite(input),/whole percentages/);
 });
+
+
+test('paragraphs, headings and quotes retain explicit alignment while defaults follow the theme',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[{id:'p',type:'paragraph',text:'Centered',data:{textAlign:'center'}},{id:'h',type:'heading',text:'Right',data:{textAlign:'right'}},{id:'q',type:'quote',text:'Left',data:{textAlign:'left'}},{id:'default',type:'paragraph',text:'Theme default'}]});
+ const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<p class="block-align-center">Centered/);assert.match(html,/<h2 id="heading-2" class="block-align-right">Right/);assert.match(html,/<blockquote class="block-align-left">Left/);assert.match(html,/<p>Theme default<\/p>/);
+ input.documents.get('doc').blocks[0].data.textAlign='center; color:red';assert.throws(()=>renderStaticWebsite(input),/text alignment/);
+});

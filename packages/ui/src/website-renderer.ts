@@ -159,10 +159,13 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         for (let n=2;n<=count;n++) extraPages.push({path:listPath(n),title:`${page.title} — Page ${n}`,body:()=>content(n)});
         return content(1);
       };
+      const textAlignment=block.data?.textAlign;
+      if(['paragraph','heading','quote'].includes(block.type)&&textAlignment!==undefined&&!['left','center','right'].includes(String(textAlignment)))throw new WebsiteError('invalid_block','Choose left, center, or right text alignment.');
+      const alignmentAttribute=textAlignment?` class="block-align-${e(String(textAlignment))}"`:'';
       switch (block.type) {
-        case 'paragraph': return `<p>${inline(block)}</p>`;
-        case 'heading': { const n = Math.max(2, Math.min(6, block.level ?? 2)); return `<h${n} id="heading-${index}">${inline(block)}</h${n}>`; }
-        case 'quote': return `<blockquote>${inline(block)}${block.author ? `<cite>${e(block.author)}</cite>` : ''}</blockquote>`;
+        case 'paragraph': return `<p${alignmentAttribute}>${inline(block)}</p>`;
+        case 'heading': { const n = Math.max(2, Math.min(6, block.level ?? 2)); return `<h${n} id="heading-${index}"${alignmentAttribute}>${inline(block)}</h${n}>`; }
+        case 'quote': return `<blockquote${alignmentAttribute}>${inline(block)}${block.author ? `<cite>${e(block.author)}</cite>` : ''}</blockquote>`;
         case 'divider': return '<hr>';
         case 'section': {const variant=String(block.data?.presentation??'standard');if(!['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].includes(variant))throw new WebsiteError('invalid_block','Unknown section layout.');return variant==='faq_item'?`<details class="website-faq"><summary>${e(block.title??'Question')}</summary>${children()}</details>`:`<section class="section-${variant}">${block.title?`<h2>${e(block.title)}</h2>`:''}${children()}${variant==='creators'?`<ul class="website-creator-list">${(input.creatorIdentities??[]).map(identity=>`<li><h3>${e(identity.title)}</h3></li>`).join('')}</ul>`:''}</section>`;}
         case 'grouping': case 'carousel': return `<div class="grid">${children()}</div>`;
