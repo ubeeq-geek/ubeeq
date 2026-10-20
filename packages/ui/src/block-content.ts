@@ -46,7 +46,7 @@ const inlineContent = (value: string, plainText: boolean): string => {
     const node = stack.pop()!;
     if (typeof node === 'string') { output.push(node); continue; }
     if (++visited > 50_000) throw new Error('Inline content exceeds its structure budget.');
-    if (node.nodeName === '#text' && 'value' in node) { output.push(plainText ? node.value : escapeHtml(node.value)); continue; }
+    if (node.nodeName === '#text' && 'value' in node) { output.push(plainText ? node.value : escapeHtml(node.value).replace(/\r\n?|\n/g, '<br>')); continue; }
     if (!('tagName' in node) || node.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
     const tag = node.tagName;
     if (['script', 'style', 'template', 'iframe', 'object', 'embed', 'noscript'].includes(tag)) continue;
@@ -77,7 +77,7 @@ const inlineContent = (value: string, plainText: boolean): string => {
 export const sanitizeInlineHtml = (value: string): string => inlineContent(value, false);
 export const inlineHtmlToText = (value: string): string => inlineContent(value, true);
 
-export const textToInlineHtml = (value: string): string => escapeHtml(value).replace(/\r?\n/g, '<br>');
+export const textToInlineHtml = (value: string): string => escapeHtml(value).replace(/\r\n?|\n/g, '<br>');
 
 export const createDescriptionBlock = (type: DescriptionBlockType = 'paragraph'): PostBlock => ({
   blockId: createBlockId(),
@@ -255,4 +255,30 @@ export function flattenWebsiteSections(blocks: PostBlock[]): PostBlock[] {
     } else sections.push(block);
   }
   return sections;
+}
+
+/** Split explicit line breaks while balancing formatting/link tags on every new paragraph. */
+export function splitParagraphBlock(block:PostBlock):PostBlock[] {
+  if(block.type!=='paragraph')return [block];
+  const root=parseFragment(sanitizeInlineHtml(block.html??textToInlineHtml(block.text??'')));
+  const pending:Array<DefaultTreeAdapterMap['node']|{end:true}>=[...root.childNodes].reverse();
+  const tags:Array<{open:string;close:string}>=[],lines:string[]=[];let current='',size=0;
+  const finish=()=>{
+    const html=current+tags.map(tag=>tag.close).reverse().join('');
+    if(inlineHtmlToText(html).trim()){size+=html.length;if(size>1_048_576||lines.length>=1000)throw new Error('Split fewer than 1,000 lines at a time.');lines.push(html);}
+    current=tags.map(tag=>tag.open).join('');
+  };
+  while(pending.length){
+    const node=pending.pop()!;
+    if('end' in node){current+=tags.pop()!.close;continue;}
+    if(node.nodeName==='#text'&&'value' in node){current+=escapeHtml(node.value);continue;}
+    if(!('tagName' in node))continue;
+    if(node.tagName==='br'){finish();continue;}
+    const serialized=serializeOuter(node),open=serialized.slice(0,serialized.indexOf('>')+1),close='</'+node.tagName+'>';
+    current+=open;tags.push({open,close});pending.push({end:true});
+    for(let index=node.childNodes.length-1;index>=0;index--)pending.push(node.childNodes[index]);
+  }
+  finish();
+  if(lines.length<2)return [block];
+  return lines.map((html,index)=>({...block,blockId:index?createBlockId():block.blockId,html,text:inlineHtmlToText(html)}));
 }

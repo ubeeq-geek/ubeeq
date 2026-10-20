@@ -71,3 +71,8 @@ test('page top headings default to visible, can differ from navigation titles, a
  page.showHeading=true;page.heading='';assert.match(renderStaticWebsite(input).files.get('index.html'),/<h1>Artist portfolio<\/h1>/);
  page.showHeading='false';assert.throws(()=>websiteRoutes(input.website),/whether it is shown/);
 });
+
+test('saved paragraphs retain pasted raw newlines and blank lines in static previews',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[{id:'pasted',type:'paragraph',html:'First line\n<strong>Second line</strong>\n\nFourth line'}]});
+ const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<p>First line<br><strong>Second line<\/strong><br><br>Fourth line<\/p>/);
+});

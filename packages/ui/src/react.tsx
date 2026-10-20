@@ -6,6 +6,7 @@ export { WebsiteWorkspace } from './website-workspace-react.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
   flattenWebsiteSections,
+  splitParagraphBlock,
   createDescriptionBlock,
   createStructuredBlock,
   changeTextBlockType,
@@ -96,6 +97,7 @@ export function BlockEditor({
   const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
   const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
+  const [splitError,setSplitError]=useState(''),[splitStatus,setSplitStatus]=useState('');
   const uploadPending=useRef(false),mounted=useRef(true);useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   const blocksRef=useRef(blocks);blocksRef.current=blocks;
   const editableRefs = useRef(new Map<string, HTMLDivElement>());
@@ -108,6 +110,11 @@ export function BlockEditor({
   const activeBlock = useMemo(() => blocks.find((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const activeBlockIndex = useMemo(() => blocks.findIndex((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const canFormat = Boolean(activeBlock && textBlockTypes.has(activeBlock.type));
+  const canSplit=activeBlock?.type==='paragraph'&&/(?:<br\b|<\/(?:p|div)>|[\r\n])/i.test(activeBlock.html??activeBlock.text??'');
+  const splitActiveParagraph=()=>{
+    setSplitError('');setSplitStatus('');const current=blocksRef.current,index=current.findIndex(block=>block.blockId===activeBlockRef.current);if(index<0)return;
+    try{const parts=splitParagraphBlock(current[index]);if(parts.length<2)return;editableRefs.current.get(current[index].blockId)?.blur();onChange([...current.slice(0,index),...parts,...current.slice(index+1)]);setActiveBlockId(parts[0].blockId);setSplitStatus(`Split into ${parts.length} paragraph blocks.`);window.setTimeout(()=>editableRefs.current.get(parts[0].blockId)?.focus(),0);}catch(error){setSplitError(error instanceof Error?error.message:'This paragraph could not be split.');}
+  };
 
   const replaceBlock = (blockId: string, next: PostBlock) => {
     onChange(blocksRef.current.map((block) => block.blockId === blockId ? next : block));
@@ -222,10 +229,12 @@ export function BlockEditor({
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('underline')} aria-label="Underline"><u>U</u></button>
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={addLink}>Link</button>
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('unlink')}>Unlink</button>
+            <button type="button" disabled={!canSplit} onMouseDown={event=>event.preventDefault()} onClick={splitActiveParagraph} title="Create a separate paragraph block for each non-empty line, preserving text formatting and links">Split into paragraphs</button>
           </div>
           <button type="button" className="portable-block-editor-remove" disabled={!activeBlock} onClick={() => activeBlock && removeBlock(activeBlock.blockId)}>Remove block</button>
         </div>}
 
+        {splitError&&<p role="alert">{splitError}</p>}{splitStatus&&<p role="status">{splitStatus}</p>}
         <div className="portable-block-editor-canvas" onClick={() => {
           if (!activeBlockId && blocks[0]) setActiveBlockId(blocks[0].blockId);
         }}>
