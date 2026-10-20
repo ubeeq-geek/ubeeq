@@ -7,9 +7,19 @@ import { createHash } from 'node:crypto';
 import type { WebsiteHostingStore, WebsitePublishPlan, WebsitePublishIntent, WebsiteDeploymentAttempt } from '@ubeeq/persistence';
 import type { HostingConnection, WebsiteHostingTarget, HostingDomain } from '@ubeeq/core';
 
+/** Structural connection port keeps Node's newer built-in sqlite declarations
+ * out of consuming applications that still compile against Node 20 types. */
+export interface WebsiteSqliteConnection {
+  exec(sql:string):void; close():void;
+  prepare(sql:string):{
+    run(...values:(string|number|bigint|Uint8Array|null)[]):{changes:number|bigint};
+    get(...values:(string|number|bigint|Uint8Array|null)[]):unknown;
+    all(...values:(string|number|bigint|Uint8Array|null)[]):unknown;
+  };
+}
 /** Local durable, workspace-partitioned private website records and immutable artifacts. */
 export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
-  protected readonly db: DatabaseSync;
+  protected readonly db: WebsiteSqliteConnection;
   constructor(path: string) {
     if(path!==':memory:') mkdirSync(dirname(path),{recursive:true});
     this.db=new DatabaseSync(path);
