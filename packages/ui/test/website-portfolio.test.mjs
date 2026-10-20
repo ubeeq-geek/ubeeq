@@ -51,7 +51,7 @@ test('configured platform mailing signup renders a native opt-in form with publi
 test('embedding validates exact origins and generates escaped subdirectory iframe code',async()=>{
  const {websiteEmbeddingOrigins,websiteEmbedCode,websiteFrameAncestors}=await import('@ubeeq/core');const input=fixture();input.website.embedding={mode:'selected',origins:['https://parent.example'],pageId:'home',presentation:'content',height:700};input.website.title='Art "and" <more>';
  assert.deepEqual(websiteEmbeddingOrigins(['https://parent.example/','https://parent.example']),['https://parent.example']);
- for(const value of ['https://*.example','https://parent.example/path','https://user@parent.example','https://parent.example?x=1',"https://parent.example; frame-src *",'javascript:alert(1)'])assert.throws(()=>websiteEmbeddingOrigins([value]));
+ for(const value of ['https://*.example','https://%2a.example','https://%27self%27.example','https://parent.example/path','https://user@parent.example','https://parent.example?x=1',"https://parent.example; frame-src *",'javascript:alert(1)'])assert.throws(()=>websiteEmbeddingOrigins([value]));
  const code=websiteEmbedCode(input.website,'https://site.example/portfolio/');assert.match(code,/src="https:\/\/site.example\/portfolio\/embed\/"/);assert.match(code,/height="700"/);assert.match(code,/&quot;and&quot; &lt;more&gt;/);assert.doesNotMatch(code,/srcdoc|<script/);
  assert.equal(websiteFrameAncestors({mode:'disabled',origins:[]}),"'none'");assert.equal(websiteFrameAncestors({mode:'any',origins:[]}),'*');assert.throws(()=>websiteFrameAncestors({mode:'selected',origins:[]}));
  input.website.embedding.height=199;assert.throws(()=>websiteEmbedCode(input.website,'https://site.example/'));
