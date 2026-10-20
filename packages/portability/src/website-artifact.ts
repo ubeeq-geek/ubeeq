@@ -79,7 +79,7 @@ export const validateWebsiteFiles = (site: Website, files: ReadonlyMap<string, U
         if(!/^https?:$/.test(new URL(attrs.action).protocol)||!/\/public\/mailing-list\/[^/]+\/subscribe-form$/.test(new URL(attrs.action).pathname))throw new WebsiteError('unsafe_output','Unexpected mailing-list submission URL.');
       }
       if ('attrs' in node) for (const attr of node.attrs as {name:string;value:string}[]) {
-        if (attr.name.startsWith('on') || attr.name === 'style') throw new WebsiteError('unsafe_output','Executable attributes are not allowed.');
+        if (attr.name.startsWith('on') || ['style','formaction','formmethod','formtarget','formenctype'].includes(attr.name)) throw new WebsiteError('unsafe_output','Executable attributes are not allowed.');
         if (attr.name === 'id') { if (found.has(attr.value)) throw new WebsiteError('duplicate_fragment','Duplicate generated fragment.'); found.add(attr.value); }
         if (['href','src','poster','action'].includes(attr.name)) references.push({file,value:attr.value});
       }

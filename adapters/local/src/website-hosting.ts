@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, lstat, readFile, realpath, rename, rm, open, readdir } from 'node:fs/promises';
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { WebsiteError, websiteExternalUrl, type HostingCapabilities, type HostingDeploymentContext, type HostingOutcome, type WebsiteHostingAdapter, type WebsiteHostingTarget } from '@ubeeq/core';
+import { WebsiteError, websiteFrameAncestors, websiteExternalUrl, type HostingCapabilities, type HostingDeploymentContext, type HostingOutcome, type WebsiteHostingAdapter, type WebsiteHostingTarget } from '@ubeeq/core';
 
 export interface NativeWebsiteHostingProfile {
   id:string; root:string; publicUrlTemplate:string; persistent:true;
@@ -68,8 +68,9 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
   }
 }
 
+const releaseFrameAncestors=async(root:string)=>{try{const path=join(root,'embedding.json');if(await realpath(path)!==resolve(path))return "'none'";const data=JSON.parse(await readFile(path,'utf8'));return websiteFrameAncestors(data);}catch{return "'none'";}};
 /** Read-only static data plane: target/serving state is checked before asset or release lookup. */
-export async function readNativeWebsite(profile:NativeWebsiteHostingProfile,url:URL,rawPath=url.pathname):Promise<{status:number;body?:Uint8Array;contentType?:string;immutable?:boolean}>{
+export async function readNativeWebsite(profile:NativeWebsiteHostingProfile,url:URL,rawPath=url.pathname):Promise<{status:number;body?:Uint8Array;contentType?:string;immutable?:boolean;frameAncestors?:string}>{
   const escaped=profile.publicUrlTemplate.replace(/[.*+?^${}()|[\]\\]/g,'\\$&').replace('\\{site\\}','([a-f0-9]{32})');
   const match=(url.origin+url.pathname).match(new RegExp('^'+escaped));if(!match)return {status:404};
   if(/%(?:2f|5c|25|2e)/i.test(rawPath)||rawPath.includes('\\')||rawPath.split('/').some(p=>p==='.'||p==='..'))return {status:400};
@@ -86,8 +87,8 @@ export async function readNativeWebsite(profile:NativeWebsiteHostingProfile,url:
     if(!/^[a-f0-9]{64}$/.test(pointer.releaseId))return {status:503};
     const immutable=/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(path),root=immutable?join(site,'assets'):join(site,'releases',pointer.releaseId),file=immutable?path.slice(7):path.endsWith('/')?path+'index.html':path;
     const destination=join(root,file),physical=await realpath(destination);if(physical!==resolve(destination)||!physical.startsWith(resolve(root)+'/'))return {status:403};
-    const st=await lstat(destination);if(!st.isFile())return {status:404};return {status:200,body:await readFile(destination),contentType:websiteContentType(file),immutable};
-  }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){try{const pointer=JSON.parse(await readFile(join(site,'current.json'),'utf8'));if(pointer.state==='active'&&/^[a-f0-9]{64}$/.test(pointer.releaseId)){const fallback=join(site,'releases',pointer.releaseId,'404.html');if(await realpath(fallback)!==resolve(fallback))return {status:503};const body=await readFile(fallback);return {status:404,body,contentType:'text/html; charset=utf-8'};}}catch{}return {status:404};}return {status:503};}
+    const st=await lstat(destination);if(!st.isFile())return {status:404};return {status:200,body:await readFile(destination),contentType:websiteContentType(file),immutable,frameAncestors:await releaseFrameAncestors(join(site,'releases',pointer.releaseId))};
+  }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){try{const pointer=JSON.parse(await readFile(join(site,'current.json'),'utf8'));if(pointer.state==='active'&&/^[a-f0-9]{64}$/.test(pointer.releaseId)){const fallback=join(site,'releases',pointer.releaseId,'404.html');if(await realpath(fallback)!==resolve(fallback))return {status:503};const body=await readFile(fallback);return {status:404,body,contentType:'text/html; charset=utf-8',frameAncestors:await releaseFrameAncestors(join(site,'releases',pointer.releaseId))};}}catch{}return {status:404};}return {status:503};}
 }
 /** Authorize only exact submission endpoints emitted by the validated static renderer. */
 export const nativeWebsiteFormActionPolicy=(body:Uint8Array|undefined):string=>{
@@ -101,6 +102,6 @@ export const createNativeWebsiteHandler=(profiles:readonly NativeWebsiteHostingP
   if(!['GET','HEAD'].includes(req.method??'GET')){res.writeHead(405).end();return;}
   const host=req.headers.host;if(!host){res.writeHead(400).end();return;}
   let url:URL;try{url=new URL(req.url??'/',`http://${host}`);}catch{res.writeHead(400).end();return;}
-  for(const profile of profiles){const template=new URL(profile.publicUrlTemplate.replace('{site}','a'.repeat(32)));url.protocol=template.protocol;const result=await readNativeWebsite(profile,url,(req.url??'/').split('?')[0]);if(result.status===404&&!result.body)continue;res.writeHead(result.status,{'content-type':result.contentType??'text/plain','cache-control':result.immutable?'public, max-age=31536000, immutable':'no-store','x-content-type-options':'nosniff','content-security-policy':`default-src 'none'; style-src 'self'; img-src 'self' https:; media-src 'self' https:; base-uri 'none'; form-action ${result.contentType?.startsWith('text/html')?nativeWebsiteFormActionPolicy(result.body):"'none'"}`});res.end(req.method==='HEAD'?undefined:result.body);return;}
+  for(const profile of profiles){const template=new URL(profile.publicUrlTemplate.replace('{site}','a'.repeat(32)));url.protocol=template.protocol;const result=await readNativeWebsite(profile,url,(req.url??'/').split('?')[0]);if(result.status===404&&!result.body)continue;res.writeHead(result.status,{'content-type':result.contentType??'text/plain','cache-control':result.immutable?'public, max-age=31536000, immutable':'no-store','x-content-type-options':'nosniff','content-security-policy':`default-src 'none'; style-src 'self'; img-src 'self' https:; media-src 'self' https:; base-uri 'none'; frame-ancestors ${result.frameAncestors??"'none'"}; form-action ${result.contentType?.startsWith('text/html')?nativeWebsiteFormActionPolicy(result.body):"'none'"}`});res.end(req.method==='HEAD'?undefined:result.body);return;}
   res.writeHead(404,{'cache-control':'no-store'}).end('Website not found');
 };

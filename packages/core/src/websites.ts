@@ -52,6 +52,7 @@ export interface WebsiteGallerySettings {
   description?: string; previewAssetId?: string;
   destination?: GalleryDestinationRule; generateLocal?: boolean; canonicalUrl?: string;
 }
+export interface WebsiteEmbedding {mode:'disabled'|'selected'|'any';origins:readonly string[];pageId:string;presentation:'full'|'content';height:number;}
 export interface Website {
   id: string; workspaceId: string; creatorIdentityId: string; revision: number;
   /** Identities explicitly authorized to contribute public Works; ownership remains in workspaceId. */
@@ -60,6 +61,7 @@ export interface Website {
   editingCreatorIds?: readonly string[];
   title: string; locale: string; homePageId: string;
   intent?: WebsiteIntentId;
+  embedding?:WebsiteEmbedding;
   theme: { id: WebsiteThemeId; version: '1'; settings: { colorMode?: 'light' | 'dark' | 'system'; width?: 'reading' | 'wide'; footer?: string; logoAssetId?: string; faviconAssetId?: string; font?: 'system' | 'serif'; accentColor?: string; headerLayout?:'split'|'centered'|'stacked'; footerLayout?:'split'|'centered'|'minimal'; showWordmark?:boolean; showCopyright?:boolean; membershipUrl?:string; memberAccountUrl?:string; mailingListUrl?:string; bookingUrl?:string; clientGalleryUrl?:string; trailerUrl?:string; podcastFeedUrl?:string; sponsorshipUrl?:string; inquiryUrl?:string; ticketsUrl?:string; courseUrl?:string; storeUrl?:string; audioUrl?:string; releaseUrl?:string; merchandiseUrl?:string } };
   galleryDefault: GalleryDestinationRule; mediaMode: 'bundled' | 'linked';
   basePath: string; publicBaseUrl?: string; noindex?: boolean;
@@ -113,10 +115,31 @@ export const websiteExternalUrl = (value: string, contact = false): string => {
   if (!(['https:', 'http:', ...(contact ? ['mailto:'] : [])].includes(url.protocol)) || url.username || url.password || [...url.searchParams.keys(), ...(url.hash.includes('=') ? [...new URLSearchParams(url.hash.slice(1)).keys()] : [])].some(key => /token|secret|signature|credential|authorization|password|api[-_]?key|^auth$|^key$|^sig$|^x-amz-/i.test(key))) throw new WebsiteError('invalid_url', 'URL scheme, credentials, or signed query parameters are not permitted.');
   return url.href;
 };
+/** Exact origins only: paths, credentials, wildcards and CSP syntax are never accepted. */
+export const websiteEmbeddingOrigins=(values:readonly string[]):readonly string[]=>{
+ if(!Array.isArray(values)||values.length>10)throw new WebsiteError('invalid_embedding','Choose up to 10 exact embedding origins.');
+ const origins=values.map(value=>{if(typeof value!=='string'||/[\s;,*'"<>]/.test(value))throw new WebsiteError('invalid_embedding','Use complete origins such as https://www.example.com.');let url:URL;try{url=new URL(value);}catch{throw new WebsiteError('invalid_embedding','Use complete origins such as https://www.example.com.');}if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||!url.hostname)throw new WebsiteError('invalid_embedding','Enter origins without paths, credentials, query strings or fragments.');return url.origin;});
+ const unique=[...new Set(origins)].sort();if(unique.join(' ').length>650)throw new WebsiteError('invalid_embedding','The combined allowed origins must be at most 650 characters.');return unique;
+};
+export const websiteFrameAncestors=(embedding?:Pick<WebsiteEmbedding,'mode'|'origins'>):string=>{
+ if(!embedding||embedding.mode==='disabled')return "'none'";
+ if(embedding.mode==='any')return '*';
+ if(embedding.mode!=='selected')throw new WebsiteError('invalid_embedding','Choose an embedding access option.');
+ const origins=websiteEmbeddingOrigins(embedding.origins);if(!origins.length)throw new WebsiteError('invalid_embedding','Add at least one allowed embedding origin.');return origins.join(' ');
+};
+export const websiteEmbedCode=(site:Website,publicUrl:string):string=>{
+ websiteRoutes(site);if(!site.embedding||site.embedding.mode==='disabled')throw new WebsiteError('embedding_disabled','Enable embedding and save settings first.');
+ const base=new URL(websiteExternalUrl(publicUrl));if(base.search||base.hash||!base.pathname.endsWith('/'))throw new WebsiteError('invalid_url','Use the published website URL ending in a slash.');
+ const route=websiteRoutes(site).get(site.embedding.pageId);if(!route)throw new WebsiteError('missing_page','Choose an available starting page.');
+ const escape=(text:string)=>text.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+ const src=new URL('embed'+route.replace(/^\//,'/'),base).href;
+ return `<iframe src="${escape(src)}" title="${escape(site.title)}" width="100%" height="${site.embedding.height}" style="border:0;max-width:100%" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"></iframe>`;
+};
 export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   if (!site.id || !site.workspaceId || !site.creatorIdentityId || !Number.isSafeInteger(site.revision) || site.revision < 1 || !site.title?.trim() || !/^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$/i.test(site.locale)) throw new WebsiteError('invalid_website', 'Website identity, revision, title and locale are required.');
   if(site.contributingCreatorIds!==undefined&&(!Array.isArray(site.contributingCreatorIds)||site.contributingCreatorIds.length>50||site.contributingCreatorIds.some(id=>typeof id!=='string'||! /^[a-zA-Z0-9_:-]{1,160}$/.test(id)||id===site.creatorIdentityId)||new Set(site.contributingCreatorIds).size!==site.contributingCreatorIds.length))throw new WebsiteError('invalid_contributors','Choose up to 50 distinct contributing creator identities.');
   if(site.editingCreatorIds!==undefined&&(!Array.isArray(site.editingCreatorIds)||site.editingCreatorIds.some(id=>!site.contributingCreatorIds?.includes(id))||new Set(site.editingCreatorIds).size!==site.editingCreatorIds.length))throw new WebsiteError('invalid_contributors','Website editors must be connected contributing identities.');
+  if(site.embedding){const config=site.embedding;if(!['disabled','selected','any'].includes(config.mode)||!['full','content'].includes(config.presentation)||!Number.isInteger(config.height)||config.height<200||config.height>2000||config.mode!=='disabled'&&!site.pages.some(page=>page.id===config.pageId&&page.state==='ready'))throw new WebsiteError('invalid_embedding','Choose a Ready starting page, presentation and height between 200 and 2000 pixels.');websiteEmbeddingOrigins(config.origins);websiteFrameAncestors(config);}
   websitePath(site.basePath);
   if (site.publicBaseUrl) { const url = new URL(websiteExternalUrl(site.publicBaseUrl)); if (url.pathname !== '/' || url.search || url.hash) throw new WebsiteError('invalid_url', 'Public base URL must be an origin; configure the base path separately.'); }
   if(site.intent!==undefined&&!WEBSITE_INTENTS.some(intent=>intent.id===site.intent))throw new WebsiteError('invalid_intent','Choose a supported website purpose.');
@@ -177,13 +200,13 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     if (page.kind !== 'home' && (!page.slug || page.slug.includes('/'))) throw new WebsiteError('invalid_path', 'Each editorial slug must be one path segment.');
     if (page.kind === 'update' && page.parentId) throw new WebsiteError('invalid_hierarchy', 'Update routes cannot have an editorial parent.');
     const route = page.kind === 'home' ? '/' : websitePath(page.kind === 'update' ? `/updates/${page.slug}` : `${parent ? '/' + parent.slug : ''}/${page.slug}`);
-    if (page.kind !== 'update' && route !== '/galleries/' && /^\/(galleries|updates|assets|page)\//.test(route)) throw new WebsiteError('reserved_route', 'This route namespace is reserved for generated content.');
+    if (page.kind !== 'update' && route !== '/galleries/' && /^\/(galleries|updates|assets|page|embed)\//.test(route)) throw new WebsiteError('reserved_route', 'This route namespace is reserved for generated content.');
     if (occupied.has(route)) throw new WebsiteError('route_collision', `Duplicate normalized route: ${route}`);
     occupied.add(route); routes.set(page.id, route);
   }
   for (const redirect of site.redirects) {
     const route = websitePath(redirect.from);
-    if (occupied.has(route) || route === '/' || /^\/(assets|galleries|updates|page)\//.test(route) || ![301,308].includes(redirect.status)) throw new WebsiteError('route_collision', 'Redirect collides with a page or reserved namespace.');
+    if (occupied.has(route) || route === '/' || /^\/(assets|galleries|updates|page|embed)\//.test(route) || ![301,308].includes(redirect.status)) throw new WebsiteError('route_collision', 'Redirect collides with a page or reserved namespace.');
     occupied.add(route);
     if (redirect.to.startsWith('/')) { const to = websitePath(redirect.to); if (![...routes.values()].includes(to) || to === route) throw new WebsiteError('invalid_redirect', 'Internal redirects must point directly to an existing page.'); }
     else websiteExternalUrl(redirect.to);

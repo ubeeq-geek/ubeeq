@@ -47,3 +47,18 @@ test('configured platform mailing signup renders a native opt-in form with publi
  const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<form class="website-mailing-form"/);assert.match(html,/method="post" action="https:\/\/api.example\/api\/public\/mailing-list\/creator\/subscribe-form"/);assert.match(html,/type="email" name="email"/);assert.match(html,/type="checkbox" name="consent" value="true" required/);assert.doesNotMatch(html,/name="consent"[^>]*checked/);assert.match(html,/Free &lt;print&gt;/);assert.match(html,/href="\/artist\//);
  input.website.theme.settings.mailingListUrl='https://other.example/signup';assert.doesNotMatch(renderStaticWebsite(input).files.get('index.html'),/<form/);
 });
+
+test('embedding validates exact origins and generates escaped subdirectory iframe code',async()=>{
+ const {websiteEmbeddingOrigins,websiteEmbedCode,websiteFrameAncestors}=await import('@ubeeq/core');const input=fixture();input.website.embedding={mode:'selected',origins:['https://parent.example'],pageId:'home',presentation:'content',height:700};input.website.title='Art "and" <more>';
+ assert.deepEqual(websiteEmbeddingOrigins(['https://parent.example/','https://parent.example']),['https://parent.example']);
+ for(const value of ['https://*.example','https://parent.example/path','https://user@parent.example','https://parent.example?x=1',"https://parent.example; frame-src *",'javascript:alert(1)'])assert.throws(()=>websiteEmbeddingOrigins([value]));
+ const code=websiteEmbedCode(input.website,'https://site.example/portfolio/');assert.match(code,/src="https:\/\/site.example\/portfolio\/embed\/"/);assert.match(code,/height="700"/);assert.match(code,/&quot;and&quot; &lt;more&gt;/);assert.doesNotMatch(code,/srcdoc|<script/);
+ assert.equal(websiteFrameAncestors({mode:'disabled',origins:[]}),"'none'");assert.equal(websiteFrameAncestors({mode:'any',origins:[]}),'*');assert.throws(()=>websiteFrameAncestors({mode:'selected',origins:[]}));
+ input.website.embedding.height=199;assert.throws(()=>websiteEmbedCode(input.website,'https://site.example/'));
+});
+test('embed views preserve subpath routing, omit selected chrome and open platform flows separately',()=>{
+ const input=fixture();input.website.basePath='/portfolio/';input.website.pages.push({id:'about',websiteId:'site',workspaceId:'creator',revision:1,slug:'about',documentId:'about-doc',kind:'page',title:'About',template:'standard',state:'ready',navigation:true,order:1});input.routes=new Map([['home','/'],['about','/about/']]);input.documents.set('about-doc',{blocks:[{id:'return',type:'page_link',data:{pageId:'home'}}]});input.website.embedding={mode:'selected',origins:['https://parent.example'],pageId:'about',presentation:'content',height:800};input.website.theme.settings.membershipUrl='https://platform.example/checkout';
+ const files=renderStaticWebsite(input).files,html=files.get('embed/index.html');assert.ok(html);assert.match(files.get('index.html'),/<header/);assert.doesNotMatch(html,/<header|<footer/);assert.match(html,/noindex,nofollow/);assert.match(html,/href="\/portfolio\/assets\/theme.css"/);assert.match(html,/href="https:\/\/platform.example\/checkout"[^>]*target="_blank"/);assert.match(files.get('embed/about/index.html'),/href="\/portfolio\/embed\/"/);assert.match(files.get('_headers'),/\/portfolio\/\*\n  Content-Security-Policy: frame-ancestors https:\/\/parent.example/);
+ input.website.embedding.presentation='full';assert.match(renderStaticWebsite(input).files.get('embed/index.html'),/<header/);
+ input.website.embedding.mode='disabled';assert.equal(renderStaticWebsite(input).files.has('embed/index.html'),false);
+});

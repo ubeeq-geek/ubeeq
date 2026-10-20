@@ -1,6 +1,6 @@
-import { websiteMenuParent, websiteMenuOrder, WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
+import { websiteFrameAncestors, websiteMenuParent, websiteMenuOrder, WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
 import { websiteDesignCss } from './website-design-css.js';
-import { parseFragment, serialize } from 'parse5';
+import { parse, parseFragment, serialize } from 'parse5';
 import { sanitizeInlineHtml, textToInlineHtml } from './block-content.js';
 
 export const STATIC_BLOCK_SUPPORT = Object.freeze({
@@ -211,6 +211,26 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
   write('redirects.json',JSON.stringify({apiVersion:'1',redirects:site.redirects.map(r=>({from:url(websitePath(r.from)),to:r.to.startsWith('/')?url(websitePath(r.to)):websiteExternalUrl(r.to),status:r.status}))},null,2)+'\n');
   const sitemapPaths = [...files.keys()].filter(name => name.endsWith('index.html')).map(name => name === 'index.html' ? '/' : '/' + name.slice(0,-10).split('/').map(encodeURIComponent).join('/')).filter(path => !pages.some(p => routes.get(p.id) === path && p.noindex) && !site.redirects.some(r => websitePath(r.from) === path));
   write('sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${!site.noindex && site.publicBaseUrl ? sitemapPaths.map(path => `<url><loc>${e(absolute(path)!)}</loc></url>`).join('') : ''}</urlset>`);
-  write('README.txt', `Static website\n\nServe this directory with a generic static HTTP server at ${websitePath(site.basePath)}.\nNo application runtime is required. Directory index files must be enabled.\nMedia mode: ${site.mediaMode}. ${site.mediaMode === 'linked' ? 'Public media depends on its configured delivery provider.' : 'Public media is bundled.'}\nExternal links and accepted embed links require their destinations to be available.\nRedirect pages provide links; configure HTTP redirects separately if required.\nDownloading this archive does not confirm a live deployment.\n`);
+  const ancestors=websiteFrameAncestors(site.embedding);
+  write('embedding.json',JSON.stringify({apiVersion:'1',mode:site.embedding?.mode??'disabled',origins:site.embedding?.origins??[],frameAncestors:ancestors})+'\n');
+  write('_headers',`${url('/*')}\n  Content-Security-Policy: frame-ancestors ${ancestors}\n`);
+  if(site.embedding&&site.embedding.mode!=='disabled'){
+    const pagesToEmbed=[...files].filter(([name])=>name.endsWith('.html'));if(pagesToEmbed.length*2>limits.maxPages)throw new WebsiteError('quota_exceeded','Embedding views exceed the generated page limit.');
+    const destinations=new Map(pagesToEmbed.map(([name])=>{const route=name==='index.html'?'/':name.endsWith('/index.html')?'/'+name.slice(0,-10):'/'+name;return [url(route),url('/embed'+route)];}));
+    for(const [name,html]of pagesToEmbed){
+      const doc=parse(html),pending:any[]=[doc];
+      const remove=(node:any)=>{if(node.parentNode)node.parentNode.childNodes=node.parentNode.childNodes.filter((child:any)=>child!==node);};
+      while(pending.length){const node=pending.pop();if(node.tagName==='header'&&node.attrs?.some((a:any)=>a.name==='class'&&a.value.includes('site-header'))||node.tagName==='footer'&&node.attrs?.some((a:any)=>a.name==='class'&&a.value.includes('site-footer'))){if(site.embedding.presentation==='content'){remove(node);continue;}}
+        if(node.attrs){for(const attr of node.attrs){if(attr.name==='href'&&destinations.has(attr.value))attr.value=destinations.get(attr.value);}
+          if(node.tagName==='a'){const href=node.attrs.find((a:any)=>a.name==='href')?.value??'';if(/^https?:|^mailto:/i.test(href)){node.attrs=node.attrs.filter((a:any)=>!['target','rel'].includes(a.name));node.attrs.push({name:'target',value:'_blank'},{name:'rel',value:'noopener noreferrer'});}}
+          if(node.tagName==='form'){node.attrs=node.attrs.filter((a:any)=>a.name!=='target');node.attrs.push({name:'target',value:'_blank'});}
+        }
+        if(node.tagName==='head'){node.childNodes.push({nodeName:'meta',tagName:'meta',attrs:[{name:'name',value:'robots'},{name:'content',value:'noindex,nofollow'}],namespaceURI:'http://www.w3.org/1999/xhtml',childNodes:[],parentNode:node});}
+        if(node.childNodes)pending.push(...node.childNodes);
+      }
+      write('embed/'+name,serialize(doc));
+    }
+  }
+  write('README.txt', `Static website\n\nServe this directory with a generic static HTTP server at ${websitePath(site.basePath)}.\nNo application runtime is required. Directory index files must be enabled.\nMedia mode: ${site.mediaMode}. ${site.mediaMode === 'linked' ? 'Public media depends on its configured delivery provider.' : 'Public media is bundled.'}\nExternal links and accepted embed links require their destinations to be available.\nRedirect pages provide links; configure HTTP redirects separately if required.\nDownloading this archive does not confirm a live deployment.\n\nEmbedding: ${site.embedding?.mode??'disabled'}. Set the HTTP response header Content-Security-Policy: frame-ancestors ${ancestors} on every HTML page. Netlify and Cloudflare Pages can use the included _headers file; SFTP/generic servers require host configuration. HTML meta tags do not enforce frame-ancestors. Do not add a conflicting X-Frame-Options header when allowing external embedding. Embedding requires a published URL; temporary previews are not shareable embed URLs.\n`);
   return { files, warnings };
 };
