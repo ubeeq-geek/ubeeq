@@ -89,10 +89,18 @@ export async function readNativeWebsite(profile:NativeWebsiteHostingProfile,url:
     const st=await lstat(destination);if(!st.isFile())return {status:404};return {status:200,body:await readFile(destination),contentType:websiteContentType(file),immutable};
   }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){try{const pointer=JSON.parse(await readFile(join(site,'current.json'),'utf8'));if(pointer.state==='active'&&/^[a-f0-9]{64}$/.test(pointer.releaseId)){const fallback=join(site,'releases',pointer.releaseId,'404.html');if(await realpath(fallback)!==resolve(fallback))return {status:503};const body=await readFile(fallback);return {status:404,body,contentType:'text/html; charset=utf-8'};}}catch{}return {status:404};}return {status:503};}
 }
+/** Authorize only exact submission endpoints emitted by the validated static renderer. */
+export const nativeWebsiteFormActionPolicy=(body:Uint8Array|undefined):string=>{
+  const actions=new Set<string>(),html=body?Buffer.from(body).toString('utf8'):'';
+  for(const match of html.matchAll(/<form class="website-mailing-form" data-website-mailing="true" method="post" action="([^"<>\s]+)"/g)){
+    try{const url=new URL(match[1]);if(!['https:','http:'].includes(url.protocol)||url.username||url.password||url.search||url.hash||!/\/public\/mailing-list\/[A-Za-z0-9_%~-]+\/subscribe-form$/.test(url.pathname)||!/^[A-Za-z0-9%/:._~\[\]-]+$/.test(url.href))continue;actions.add(url.href);}catch{}
+  }
+  return actions.size&&actions.size<=20?[...actions].sort().join(' '):"'none'";
+};
 export const createNativeWebsiteHandler=(profiles:readonly NativeWebsiteHostingProfile[])=>async(req:IncomingMessage,res:ServerResponse)=>{
   if(!['GET','HEAD'].includes(req.method??'GET')){res.writeHead(405).end();return;}
   const host=req.headers.host;if(!host){res.writeHead(400).end();return;}
   let url:URL;try{url=new URL(req.url??'/',`http://${host}`);}catch{res.writeHead(400).end();return;}
-  for(const profile of profiles){const template=new URL(profile.publicUrlTemplate.replace('{site}','a'.repeat(32)));url.protocol=template.protocol;const result=await readNativeWebsite(profile,url,(req.url??'/').split('?')[0]);if(result.status===404&&!result.body)continue;res.writeHead(result.status,{'content-type':result.contentType??'text/plain','cache-control':result.immutable?'public, max-age=31536000, immutable':'no-store','x-content-type-options':'nosniff','content-security-policy':"default-src 'none'; style-src 'self'; img-src 'self' https:; media-src 'self' https:; base-uri 'none'; form-action 'none'"});res.end(req.method==='HEAD'?undefined:result.body);return;}
+  for(const profile of profiles){const template=new URL(profile.publicUrlTemplate.replace('{site}','a'.repeat(32)));url.protocol=template.protocol;const result=await readNativeWebsite(profile,url,(req.url??'/').split('?')[0]);if(result.status===404&&!result.body)continue;res.writeHead(result.status,{'content-type':result.contentType??'text/plain','cache-control':result.immutable?'public, max-age=31536000, immutable':'no-store','x-content-type-options':'nosniff','content-security-policy':`default-src 'none'; style-src 'self'; img-src 'self' https:; media-src 'self' https:; base-uri 'none'; form-action ${result.contentType?.startsWith('text/html')?nativeWebsiteFormActionPolicy(result.body):"'none'"}`});res.end(req.method==='HEAD'?undefined:result.body);return;}
   res.writeHead(404,{'cache-control':'no-store'}).end('Website not found');
 };
