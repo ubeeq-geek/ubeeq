@@ -40,14 +40,15 @@ export function BlockPreview({ value, mediaOptions = [], label = 'Content previe
   };
   const render = (block: ContentBlock): ReactNode => {
     let content: ReactNode;
+    const textAlign=['left','center','right'].includes(String(block.data?.textAlign))?block.data!.textAlign as 'left'|'center'|'right':undefined;
     switch (block.type) {
       case 'section': content = <section>{block.title && <h2>{block.title}</h2>}{block.children?.map(render)}</section>; break;
-      case 'paragraph': content = <p>{inline(block)}</p>; break;
+      case 'paragraph': content = <p style={{textAlign}}>{inline(block)}</p>; break;
       case 'heading': {
         const Heading = `h${Math.max(2, Math.min(6, block.level || 2))}` as 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
-        content = <Heading>{inline(block)}</Heading>; break;
+        content = <Heading style={{textAlign}}>{inline(block)}</Heading>; break;
       }
-      case 'quote': content = <blockquote>{inline(block)}{block.author && <cite>{block.author}</cite>}</blockquote>; break;
+      case 'quote': content = <blockquote style={{textAlign}}>{inline(block)}{block.author && <cite>{block.author}</cite>}</blockquote>; break;
       case 'divider': content = <hr />; break;
       case 'link': content = <p>{link(block)}</p>; break;
       case 'credit': content = <p>{block.author && <strong>{block.author}: </strong>}{block.text}{block.url && <> — {link(block)}</>}</p>; break;

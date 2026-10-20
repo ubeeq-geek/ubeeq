@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import { EXTENSION_API_VERSION, EXTENSION_CONTRACTS } from "@ubeeq/extension-sdk";
 
 const sendJson = (response, status, body) => { response.writeHead(status, { "content-type": "application/json; charset=utf-8" }); response.end(JSON.stringify(body)); };
-const sendHtml = (response, html) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data: http: https:" }); response.end(html); };
+const sendHtml = (response, html) => { response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-security-policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: http: https:" }); response.end(html); };
 const apiUrl = (value) => { const url = new URL(value); if (!/^https?:$/.test(url.protocol)) throw new Error("Reference API URL must be HTTP(S)."); return url; };
 
 const page = `<!doctype html>

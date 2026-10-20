@@ -222,3 +222,20 @@ test('menu order and dropdown levels are independent of routes and other menus',
  home.navigationParentId=null;about.navigationParentId='portfolio';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
  about.navigationParentId=null;portfolio.navigationParentId='missing';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
 });
+
+test('public promotion overrides preserve exact links and never enable local premium originals',()=>{
+ const snapshot=fixture(),premium=snapshot.galleries.find(g=>g.premium),asset=snapshot.assets[0];
+ snapshot.website.gallerySettings=[{publicationId:premium.publicationId,description:'An approved public teaser',previewAssetId:asset.id,destination:{destination:{mode:'connected',destinationId:'tumblr',accountId:'blog-a'}}}];
+ snapshot.mappings=[{publicationId:premium.publicationId,workspaceId:snapshot.website.workspaceId,destinationId:'tumblr',accountId:'blog-a',publicUrl:'https://artist.tumblr.com/post/123'}];
+ const html=Buffer.from(buildWebsiteArtifact(snapshot,limits).files.get('index.html')).toString();assert.match(html,/An approved public teaser/);assert.match(html,/https:\/\/artist.tumblr.com\/post\/123/);
+ snapshot.website.gallerySettings[0].destination.destination.accountId='blog-b';assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='missing_destination');
+ snapshot.website.gallerySettings[0].destination={destination:{mode:'local'}};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='local_not_public');
+ snapshot.website.gallerySettings[0].description='a'.repeat(5001);assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='invalid_gallery');
+});
+
+test('only generated platform signup forms pass static validation, including subpath builds',async()=>{
+ const f=fixture('/artist/');f.website.theme.settings.mailingListUrl='https://platform.example/mailing/creator';f.documents[0].blocks.push(block('link',{id:'mailing-signup',label:'Subscribe',data:{action:'mailing'}}));f.mailingList={signupUrl:f.website.theme.settings.mailingListUrl,submitUrl:'https://api.example/public/mailing-list/creator/subscribe-form',consentText:'Receive letters. Unsubscribe any time.',offers:[]};
+ const built=buildWebsiteArtifact(f,limits);const html=Buffer.from(built.files.get('index.html')).toString();assert.match(html,/<form/);
+ const {validateWebsiteFiles}=await import('../dist/website-artifact.js');
+ for(const invalid of ['<form action="https://evil.example" method="post"></form>','<form data-website-mailing="true" method="post" action="https://evil.example/steal"></form>'])assert.throws(()=>validateWebsiteFiles(f.website,new Map([['index.html',new TextEncoder().encode(invalid)]])),/signup|submission/);
+});

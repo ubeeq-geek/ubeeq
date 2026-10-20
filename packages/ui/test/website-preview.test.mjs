@@ -12,3 +12,23 @@ test('complete previews preserve pages and binary assets once in a bounded archi
  const unsafe=Buffer.from(createWebsiteZip(new Map([['index.html',new Uint8Array()],['safeimg.html',new Uint8Array()]])));unsafe.write('../evil.html',unsafe.indexOf('safeimg.html'));
  await assert.rejects(readWebsitePreviewArchive(new Blob([unsafe])));
 });
+
+test('queued previews wait automatically and report failed builds without fetching an archive',async()=>{
+ const {openWebsitePreview}=await import('../dist/website-workspace.js');
+ const site={id:'site',workspaceId:'workspace',creatorIdentityId:'creator',revision:1,title:'Website',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'local'}},mediaMode:'bundled',basePath:'/',pages:[{id:'home',websiteId:'site',workspaceId:'workspace',revision:1,documentId:'doc',kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]};
+ let polls=0,archiveCalls=0,output='';const statuses=[],writes=[];const popup={closed:false,document:{title:'',body:{textContent:''},open(){},getElementById(){return {set textContent(value){statuses.push(value);}};},write(value){output=value;writes.push(value);},close(){}}};
+ const client={get:async()=>site,builds:async()=>[],requestBuild:async()=>({id:'queued',state:'queued'}),build:async()=>({state:++polls<2?'rendering':'ready',stale:false}),previewSite:async()=>{archiveCalls++;return new Blob([createWebsiteZip(new Map([['index.html',new TextEncoder().encode('<h1>Ready</h1>')]]))]);}};
+ assert.equal(await openWebsitePreview(client,popup,'https://example.com/'),'queued');assert.equal(archiveCalls,1);assert.match(output,/website-preview.navigate/);assert.ok(polls>=2);assert.match(writes[0],/website-preview-spinner/);assert.match(writes[0],/aria-busy="true"/);assert.ok(statuses.includes('Loading your preview…'));assert.match(output,/addEventListener\('load'/);
+ archiveCalls=0;client.build=async()=>({state:'failed',errorCode:'storage_limit_reached'});await assert.rejects(openWebsitePreview(client,popup,'https://example.com/'),/storage_limit_reached/);assert.equal(archiveCalls,0);assert.match(popup.document.body.textContent,/could not be prepared/);
+});
+
+test('preview update metadata remains outside the content sandbox and is escaped',()=>{
+ const context={websiteKey:'ubeeq.website-preview:creator:site',revision:7,refreshChannel:'ubeeq.website-preview.refresh:123',editorUrl:'https://example.com/?q=</script><script>bad</script>',pagePaths:{home:'index.html'}};
+ const html=websitePreviewHtml({'index.html':btoa('<h1>Old snapshot</h1>')},'index.html',context);
+ assert.match(html,/This preview is out of date/);assert.match(html,/Update preview/);assert.match(html,/Dismiss/);assert.match(html,/refresh-request/);assert.match(html,/refresh-accept/);assert.doesNotMatch(html,/<script>bad/);assert.match(html,/\\u003c\/script>/);assert.doesNotMatch(html,/allow-same-origin/);
+});
+test('saved revision announcements are monotonic and contain no website content',async()=>{
+ const {notifyWebsitePreviewSaved}=await import('../dist/website-preview.js'),originals={window:globalThis.window,localStorage:globalThis.localStorage,BroadcastChannel:globalThis.BroadcastChannel},stored=new Map(),sent=[];
+ globalThis.window={};globalThis.localStorage={getItem:key=>stored.get(key)??null,setItem:(key,value)=>stored.set(key,value)};globalThis.BroadcastChannel=class{constructor(key){this.key=key;}postMessage(data){sent.push([this.key,data]);}close(){}};
+ try{notifyWebsitePreviewSaved({workspaceId:'creator',id:'site',revision:2,title:'Private title'});notifyWebsitePreviewSaved({workspaceId:'creator',id:'site',revision:1});notifyWebsitePreviewSaved({workspaceId:'other',id:'site',revision:1});assert.deepEqual(sent,[['ubeeq.website-preview:creator:site',{type:'saved',revision:2}],['ubeeq.website-preview:other:site',{type:'saved',revision:1}]]);}finally{for(const[key,value]of Object.entries(originals)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}}
+});

@@ -66,3 +66,18 @@ test('browser Enter paragraphs retain separation while inline Shift-Enter stays 
   assert.equal(blocks[0].text, 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.');
   assert.equal(serializeDescriptionBlocks(blocks), `<p>${html}</p>`);
 });
+
+test('literal pasted newlines become explicit breaks and stay stable across sanitizing',()=>{
+ const html=sanitizeInlineHtml('First line\r\n<strong>Second\nline</strong>\n\nLast line');
+ assert.equal(html,'First line<br><strong>Second<br>line</strong><br><br>Last line');assert.equal(sanitizeInlineHtml(html),html);
+ assert.equal(textToInlineHtml('One\rTwo\r\nThree'),'One<br>Two<br>Three');
+});
+test('split paragraphs balance inline markup and preserve links, order and the original first identity',async()=>{
+ const {splitParagraphBlock}=await import('../dist/block-content.js');
+ const source={blockId:'original',type:'paragraph',html:'<strong>First<br><em>Second<br>Third</em></strong><br><br><a href="https://example.com/a?x=1&amp;y=2">Fourth\nFifth</a><script>bad</script>'},before=structuredClone(source);
+ const parts=splitParagraphBlock(source);assert.deepEqual(parts.map(block=>block.text),['First','Second','Third','Fourth','Fifth']);assert.equal(parts[0].blockId,'original');assert.equal(new Set(parts.map(block=>block.blockId)).size,5);assert.deepEqual(source,before);
+ assert.equal(parts[0].html,'<strong>First</strong>');assert.equal(parts[1].html,'<strong><em>Second</em></strong>');assert.equal(parts[2].html,'<strong><em>Third</em></strong>');assert.match(parts[3].html,/href="https:\/\/example.com\/a\?x=1&amp;y=2"/);assert.ok(parts.every(block=>sanitizeInlineHtml(block.html)===block.html));assert.ok(parts.every(block=>!block.html.includes('bad')));
+ assert.equal(splitParagraphBlock({blockId:'one',type:'paragraph',text:'One line'}).length,1);
+ assert.equal(splitParagraphBlock({blockId:'two',type:'paragraph',text:'One\n\nTwo'}).length,2);
+ assert.throws(()=>splitParagraphBlock({blockId:'huge',type:'paragraph',text:'Line\n'.repeat(1001)}),/1,000/);
+});

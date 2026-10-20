@@ -41,7 +41,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
       if(activeClient.current===client)setImages(previous=>[...previous.filter(existing=>existing.mediaId!==option.mediaId),option]);return option;
     }finally{pendingUploads.current--;}
   }:undefined;
-  return <><div ref={root} />{settingsHost&&settingsContent&&createPortal(settingsContent,settingsHost)}{editor&&createPortal(<>{libraryError&&<p role="alert">{libraryError}</p>}<BlockEditor value={toStoredPostBlocks(editor.document.blocks)} allowMedia allowStructured uploadMedia={upload} mediaOptions={images} websiteOptions={options} label="Page content" helpText="Add and arrange content blocks. Insert an existing Work image or upload an image directly here." onChange={value=>{
+  return <><div ref={root} />{settingsHost&&settingsContent&&createPortal(settingsContent,settingsHost)}{editor&&createPortal(<>{libraryError&&<p role="alert">{libraryError}</p>}<BlockEditor key={editor.document.id} value={toStoredPostBlocks(editor.document.blocks)} allowMedia allowStructured uploadMedia={upload} mediaOptions={images} websiteOptions={options} label="Page content" helpText="Add and arrange content blocks. Insert an existing Work image or upload an image directly here." onChange={value=>{
     if(!root.current?.contains(editor.host))return;
     const next={...editor.document,blocks:parseContentBlocks(value,{unbounded:true})};editor.change(next);setEditor({...editor,document:next});
   }}/></>,editor.host)}</>;

@@ -5,6 +5,8 @@ export { BlockPreview, type BlockPreviewMedia, type BlockMediaRenderer } from '.
 export { WebsiteWorkspace } from './website-workspace-react.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
+  flattenWebsiteSections,
+  splitParagraphBlock,
   createDescriptionBlock,
   createStructuredBlock,
   changeTextBlockType,
@@ -33,6 +35,8 @@ export type BlockEditorProps = {
   allowStructured?: boolean;
   websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
+  sectionDepth?: number;
+  stickyToolbarOffset?: number;
 };
 
 const textBlockTypes = new Set<PostBlock['type']>(['paragraph', 'heading', 'quote']);
@@ -64,6 +68,7 @@ function EditableBlockContent({
       if (element && document.activeElement !== element && element.innerHTML !== html) element.innerHTML = html;
     }}
     className={`portable-block-editor-content portable-block-editor-content-${block.type}`}
+    style={['left','center','right'].includes(String(block.payload?.textAlign))?{textAlign:block.payload!.textAlign as 'left'|'center'|'right'}:undefined}
     contentEditable={!readOnly}
     suppressContentEditableWarning
     role="textbox"
@@ -84,11 +89,27 @@ export function BlockEditor({
   uploadMedia,
   allowStructured = false,
   websiteOptions,
+  sectionDepth = 0,
+  stickyToolbarOffset = 0,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
-  const blocks = value.length ? value : [emptyBlock];
+  const toolbarRef=useRef<HTMLDivElement>(null);
+  const [toolbarHeight,setToolbarHeight]=useState(0);
+  useEffect(()=>{
+    const toolbar=toolbarRef.current;if(!websiteOptions||!toolbar)return;
+    const measure=()=>setToolbarHeight(toolbar.getBoundingClientRect().height);measure();
+    if(typeof ResizeObserver==='undefined')return;const observer=new ResizeObserver(measure);observer.observe(toolbar);return()=>observer.disconnect();
+  },[Boolean(websiteOptions),readOnly]);
+  const normalized = useMemo(() => websiteOptions && sectionDepth === 0 ? flattenWebsiteSections(value) : value, [value, Boolean(websiteOptions), sectionDepth]);
+  const blocks = normalized.length ? normalized : [emptyBlock];
+  const [collapsedSections,setCollapsedSections]=useState<Set<string>>(()=>new Set());
+  const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
+  const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
+  const [imageSettings,setImageSettings]=useState<Record<string,boolean>>({});
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
+  const [uploadTarget,setUploadTarget]=useState(''),[imageErrors,setImageErrors]=useState<Record<string,string>>({});
+  const [splitError,setSplitError]=useState(''),[splitStatus,setSplitStatus]=useState('');
   const uploadPending=useRef(false),mounted=useRef(true);useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   const blocksRef=useRef(blocks);blocksRef.current=blocks;
   const editableRefs = useRef(new Map<string, HTMLDivElement>());
@@ -101,6 +122,11 @@ export function BlockEditor({
   const activeBlock = useMemo(() => blocks.find((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const activeBlockIndex = useMemo(() => blocks.findIndex((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const canFormat = Boolean(activeBlock && textBlockTypes.has(activeBlock.type));
+  const canSplit=activeBlock?.type==='paragraph'&&/(?:<br\b|<\/(?:p|div)>|[\r\n])/i.test(activeBlock.html??activeBlock.text??'');
+  const splitActiveParagraph=()=>{
+    setSplitError('');setSplitStatus('');const current=blocksRef.current,index=current.findIndex(block=>block.blockId===activeBlockRef.current);if(index<0)return;
+    try{const parts=splitParagraphBlock(current[index]);if(parts.length<2)return;editableRefs.current.get(current[index].blockId)?.blur();onChange([...current.slice(0,index),...parts,...current.slice(index+1)]);setActiveBlockId(parts[0].blockId);setSplitStatus(`Split into ${parts.length} paragraph blocks.`);window.setTimeout(()=>editableRefs.current.get(parts[0].blockId)?.focus(),0);}catch(error){setSplitError(error instanceof Error?error.message:'This paragraph could not be split.');}
+  };
 
   const replaceBlock = (blockId: string, next: PostBlock) => {
     onChange(blocksRef.current.map((block) => block.blockId === blockId ? next : block));
@@ -119,6 +145,7 @@ export function BlockEditor({
 
   const addTextBlock = (type: 'paragraph' | 'heading' | 'quote' | 'divider' | 'section' | 'link' | 'credit') => {
     const block = type === 'section' || type === 'link' || type === 'credit' ? createStructuredBlock(type) : createDescriptionBlock(type);
+    if(type === 'section')setSectionProperties(previous=>new Set([...previous,block.blockId]));
     const activeIndex = blocks.findIndex((item) => item.blockId === activeBlockId);
     const insertAt = activeIndex >= 0 ? activeIndex + 1 : blocks.length;
     const next = [...blocks];
@@ -145,6 +172,18 @@ export function BlockEditor({
     setActiveBlockId(block.blockId);
   };
 
+  const addImageBlock=()=>{
+    const block:PostBlock={blockId:globalThis.crypto?.randomUUID?.()??`image-${Date.now()}`,type:'image',caption:''};
+    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);setActiveBlockId(block.blockId);setImageSettings(previous=>({...previous,[block.blockId]:true}));
+  };
+  const patchImage=(id:string,patch:Partial<PostBlock>)=>{const current=blocksRef.current;if(current.some(block=>block.blockId===id))onChange(current.map(block=>block.blockId===id?{...block,...patch}:block));};
+  const uploadImage=async(id:string,input:HTMLInputElement)=>{
+    const file=input.files?.[0];if(!file||!uploadMedia||uploadPending.current)return;
+    uploadPending.current=true;setUploadBusy(true);setUploadTarget(id);setImageErrors(previous=>({...previous,[id]:''}));
+    try{const image=await uploadMedia(file);if(mounted.current)patchImage(id,{mediaId:image.mediaId});}
+    catch(error){if(mounted.current)setImageErrors(previous=>({...previous,[id]:error instanceof Error?error.message:'The image could not be uploaded.'}));}
+    finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);setUploadTarget('');input.value='';}}
+  };
   const moveBlock = (index: number, direction: -1 | 1) => {
     if (!blocks[index]) return;
     onChange(movePostBlock(blocks, blocks[index].blockId, direction));
@@ -194,7 +233,7 @@ export function BlockEditor({
       </div>
 
       <div className="portable-block-editor-shell">
-        {!readOnly && <div className="portable-block-editor-toolbar" aria-label="Active block tools">
+        {!readOnly && <div ref={toolbarRef} className="portable-block-editor-toolbar" style={websiteOptions?{top:`calc(var(--website-tools-height, 0px) + ${stickyToolbarOffset}px + .5rem)`,zIndex:10+sectionDepth}:undefined} aria-label="Active block tools">
           <div className="portable-block-editor-block-tools">
             {activeBlock && textBlockTypes.has(activeBlock.type) ? <select value={activeBlock.type} onChange={(event) => updateActiveBlockType(event.target.value as 'paragraph' | 'heading' | 'quote')} aria-label="Active block type">
               <option value="paragraph">Paragraph</option>
@@ -205,6 +244,12 @@ export function BlockEditor({
               <option value="2">H2</option>
               <option value="3">H3</option>
             </select>}
+            {websiteOptions&&canFormat&&<div className="portable-block-alignment" role="group" aria-label="Block alignment">{(['','left','center','right'] as const).map(alignment=>{
+              const label=alignment?`Align ${alignment}`:'Use theme alignment';
+              return <button key={alignment} type="button" aria-label={label} title={label} aria-pressed={String(activeBlock?.payload?.textAlign??'')===alignment} onMouseDown={event=>event.preventDefault()} onClick={()=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:alignment||undefined}});}}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{alignment===''?<path d="M8 4 4 8l4 4M4 8h10a6 6 0 0 1 0 12h-3"/>:<path d={alignment==='left'?'M4 5h16M4 10h10M4 15h16M4 20h10':alignment==='center'?'M4 5h16M7 10h10M4 15h16M7 20h10':'M4 5h16M10 10h10M4 15h16M10 20h10'}/>}</svg>
+              </button>;
+            })}</div>}
             <button type="button" disabled={activeBlockIndex <= 0} onClick={() => moveBlock(activeBlockIndex, -1)} aria-label="Move block up">↑</button>
             <button type="button" disabled={activeBlockIndex < 0 || activeBlockIndex === blocks.length - 1} onClick={() => moveBlock(activeBlockIndex, 1)} aria-label="Move block down">↓</button>
           </div>
@@ -214,10 +259,12 @@ export function BlockEditor({
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('underline')} aria-label="Underline"><u>U</u></button>
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={addLink}>Link</button>
             <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('unlink')}>Unlink</button>
+            <button type="button" disabled={!canSplit} onMouseDown={event=>event.preventDefault()} onClick={splitActiveParagraph} title="Create a separate paragraph block for each non-empty line, preserving text formatting and links">Split into paragraphs</button>
           </div>
           <button type="button" className="portable-block-editor-remove" disabled={!activeBlock} onClick={() => activeBlock && removeBlock(activeBlock.blockId)}>Remove block</button>
         </div>}
 
+        {splitError&&<p role="alert">{splitError}</p>}{splitStatus&&<p role="status">{splitStatus}</p>}
         <div className="portable-block-editor-canvas" onClick={() => {
           if (!activeBlockId && blocks[0]) setActiveBlockId(blocks[0].blockId);
         }}>
@@ -243,13 +290,29 @@ export function BlockEditor({
               />}
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
+                {websiteOptions && <div className="portable-section-heading">
+                  <button type="button" className="portable-section-collapse" aria-expanded={!collapsedSections.has(block.blockId)} onClick={()=>toggleSection(block.blockId)}><span aria-hidden="true">{collapsedSections.has(block.blockId)?'▸':'▾'}</span> {block.title || 'Untitled section'}</button>
+                  {!readOnly && <button type="button" onClick={()=>removeBlock(block.blockId)} aria-label={`Remove section ${block.title || 'Untitled section'}`}>Remove section</button>}
+                </div>}
+                <div hidden={Boolean(websiteOptions)&&collapsedSections.has(block.blockId)}>
+                {websiteOptions ? <div className="portable-section-properties">
+                  <button type="button" className="portable-section-more" aria-expanded={sectionProperties.has(block.blockId)} onClick={()=>toggleSection(block.blockId,true)}>More Actions <span aria-hidden="true">{sectionProperties.has(block.blockId)?'▴':'▾'}</span></button>
+                  <div hidden={!sectionProperties.has(block.blockId)}>
+                {websiteOptions && <label>Section layout<select disabled={readOnly} value={String(block.payload?.presentation || 'standard')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,presentation:event.target.value}})}>{['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].map(value=><option key={value} value={value}>{({standard:'Standard',intro:'Hero introduction',callout:'Membership / offer callout',pricing:'Plan comparison',plan:'Plan card',faq:'Questions',faq_item:'Expandable answer',screening:'Featured film',excerpt:'Literary excerpt',bibliography:'Book / publication listing',release:'Audio release / track list',episode:'Featured episode / show notes',episodes:'Episode listing',creators:'Contributing creators'})[value]}</option>)}</select></label>}
+
                 <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
-                  label={block.title || 'Section'} onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
+                  </div>
+                </div> : <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>}
+                <div onClick={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}} onFocus={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}}>
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1} stickyToolbarOffset={stickyToolbarOffset+toolbarHeight}
+                  label="Section content" helpText="Add and arrange content in this section." onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
+                </div></div>
               </div>}
               {block.type === 'link' && <div>
+                {websiteOptions && <><label>Link destination<select disabled={readOnly} value={String(block.payload?.action || 'custom')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,action:event.target.value}})}>{[['custom','Custom URL'],['membership','Platform membership / checkout'],['account','Platform membership account'],['mailing','Platform mailing-list / offer'],['booking','Platform session booking'],['clients','Platform private client galleries'],['trailer','Featured trailer / playback'],['podcast_feed','Public podcast feed'],['sponsorship','Sponsorship information'],['inquiry','Commission / service inquiry'],['tickets','Tickets / attendance'],['course','Course / workshop enrollment'],['store','Store / checkout destination'],['audio','Featured audio / listening'],['release','Release purchase'],['merch','Merchandise store']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><label>Link style<select disabled={readOnly} value={String(block.payload?.appearance || 'text')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,appearance:event.target.value}})}>{['text','primary','secondary'].map(value=><option key={value} value={value}>{value}</option>)}</select></label></>}
+
                 <label>Link label<input value={block.label || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, label: event.target.value })} /></label>
-                <label>Link URL<input value={block.url || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, url: event.target.value })} /></label>
+                {websiteOptions && ['membership','account','mailing','booking','clients','trailer','audio','release','merch','podcast_feed','sponsorship','inquiry','tickets','course','store'].includes(String(block.payload?.action)) ? <p>This link follows the platform URL in Appearance and stays hidden until that URL is configured.</p> : <label>Link URL<input value={block.url || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, url: event.target.value })} /></label>}
               </div>}
               {block.type === 'credit' && <div>
                 <label>Credit author<input value={block.author || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, author: event.target.value })} /></label>
@@ -278,7 +341,35 @@ export function BlockEditor({
                 <label>Caption<input value={block.caption || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, caption: event.target.value })} /></label>
                 <small>File contents are not displayed here. Downloads require the application's authorized attachment route.</small>
               </div>}
-              {(block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
+              {block.type === 'image' && websiteOptions ? <div className="portable-block-editor-image">
+                <div className="portable-image-stage">
+                  <figure className={`portable-image-preview align-${String(block.payload?.alignment??'left')}`} style={{'--image-desktop-width':`${Number(block.payload?.desktopWidth??(block.payload?.textFlow==='wrap'?45:100))}%`,'--image-mobile-width':`${Number(block.payload?.mobileWidth??100)}%`} as React.CSSProperties}>
+                    {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-image-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
+                    {block.caption&&<figcaption>{block.caption}</figcaption>}
+                    <button type="button" className="portable-image-settings-toggle" aria-label="Image settings" aria-expanded={imageSettings[block.blockId]??!block.mediaId} aria-controls={`image-settings-${block.blockId}`} onClick={()=>setImageSettings(previous=>({...previous,[block.blockId]:!(previous[block.blockId]??!block.mediaId)}))}><span aria-hidden="true">•••</span></button>
+                  </figure>
+                </div>
+                <div id={`image-settings-${block.blockId}`} className="portable-image-controls" hidden={!(imageSettings[block.blockId]??!block.mediaId)}>
+                  <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
+                    <label>Choose existing image<select aria-label="Choose existing image" value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
+                      <option value="">Choose from Works or uploads…</option>
+                      {block.mediaId&&!mediaOptions.some(item=>item.mediaId===block.mediaId)&&<option value={block.mediaId}>Current image</option>}
+                      {mediaOptions.filter(item=>!item.assetType||item.assetType==='image').map(item=><option key={item.mediaId} value={item.mediaId}>{item.label}</option>)}
+                    </select></label>
+                    {uploadMedia&&<label className="portable-block-editor-upload">{uploadTarget===block.blockId?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={readOnly||uploadBusy} onChange={event=>void uploadImage(block.blockId,event.currentTarget)}/></label>}
+                    {imageErrors[block.blockId]&&<p role="alert">{imageErrors[block.blockId]}</p>}
+                  </fieldset>
+                <fieldset disabled={readOnly} className="portable-image-settings">
+                  <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
+                  <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
+                  <label>Image alignment<select aria-label="Image alignment" value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{}),...(event.target.value==='full'?{desktopWidth:100}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+                  <label>Text flow<select aria-label="Text flow" value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
+                  {(['desktop','mobile'] as const).map(device=><label key={device}>{device==='desktop'?'Desktop width (%)':'Mobile width (%)'}<input type="number" min={1} max={100} step={1} value={Number(block.payload?.[device+'Width']??(device==='desktop'&&block.payload?.textFlow==='wrap'?45:100))} onChange={event=>{const width=event.currentTarget.valueAsNumber;if(Number.isInteger(width)&&width>=1&&width<=100)patchImage(block.blockId,{payload:{...block.payload,[device+'Width']:width,...(device==='desktop'&&width<100&&block.payload?.alignment==='full'?{alignment:'center'}:{})}});}}/></label>)}
+                  <p>Width is a percentage of the page’s content area. Mobile applies at 640px and below. Image proportions are preserved.</p>
+                  <p>Wrap is available for left- and right-aligned images and applies to the following text blocks. Images stack above text on small screens.</p>
+                </fieldset>
+                </div>
+              </div> : (block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
                 {media?.thumbnailUrl && block.type === 'image' ? <img src={media.thumbnailUrl} alt="" /> : <div className="portable-block-editor-media-placeholder">{media?.label || block.mediaId || 'Media'}</div>}
                 <label>
                   <span>Caption</span>
@@ -294,11 +385,12 @@ export function BlockEditor({
           <span className="portable-block-editor-inserter-icon" aria-hidden="true">+</span>
           <span>Add block</span>
           <button type="button" onClick={() => addTextBlock('paragraph')}>Paragraph</button>
+          {websiteOptions&&allowMedia&&<button type="button" onClick={addImageBlock}>Image</button>}
           <button type="button" onClick={() => addTextBlock('heading')}>Heading</button>
           <button type="button" onClick={() => addTextBlock('quote')}>Quote</button>
           <button type="button" onClick={() => addTextBlock('divider')}>Divider</button>
           {allowStructured && <>
-            <button type="button" onClick={() => addTextBlock('section')}>Section</button>
+            {(!websiteOptions || sectionDepth === 0) && <button type="button" onClick={() => addTextBlock('section')}>Section</button>}
             <button type="button" onClick={() => addTextBlock('link')}>Link block</button>
             <button type="button" onClick={() => addTextBlock('credit')}>Credit</button>
           </>}
@@ -307,12 +399,12 @@ export function BlockEditor({
             const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12}: {})})}};
             onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
           }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
-          {allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
+          {!websiteOptions&&allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
             const input=event.currentTarget,file=input.files?.[0];if(!file||uploadPending.current)return;uploadPending.current=true;setUploadBusy(true);setUploadError('');
             try{const image=await uploadMedia(file);if(mounted.current)addMediaBlock(image.mediaId,image);}catch(error){if(mounted.current)setUploadError(error instanceof Error?error.message:'The image could not be uploaded.');}finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);input.value='';}}
           }}/></label>}
           {uploadError&&<p role="alert">{uploadError}</p>}
-          {allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
+          {!websiteOptions && allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
             addMediaBlock(event.target.value);
             event.target.value = '';
           }} aria-label={websiteOptions?"Add image from existing Works or uploads":"Add media block"}>

@@ -1,14 +1,26 @@
-import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview} from './website-preview.js';
-import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+import {removeWebsitePage} from './website-page-actions.js';
+import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
+import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteGallerySettings, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+export interface WebsiteCatalogueOption {id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
 export interface WebsiteWorkspaceClient {
   pendingUploads?():boolean;
+  mailingListStatus?():Promise<{enabled:boolean;emailAvailable:boolean;signupUrl:string;manageUrl:string}>;
   media?(query?:string):Promise<readonly WebsiteMediaOption[]>;
   uploadMedia?(file:File):Promise<WebsiteMediaOption>;
   mediaPreview?(id:string):Promise<string>;
   creators?():Promise<readonly {id:string;title:string}[]>;
-  catalogue?(): Promise<readonly {id:string;title:string}[]>;
+  hostingConnections?():Promise<readonly {id:string;family:string;accountId:string;state:string}[]>;
+  hostingConnectionAction?(action:string,body:Record<string,unknown>):Promise<any>;
+  hostingChoices?():Promise<readonly {id:string;family:string;capabilities:HostingCapabilities}[]>;
+  hostingHistory?():Promise<{targets:readonly WebsiteHostingTarget[];bindings?:readonly {id:string;revision:number;label:string;enabled:boolean;targetIds:readonly string[]}[];domains?:readonly {id:string;targetId:string;hostname:string;state:string;instructions:readonly string[]}[];attempts:readonly {id:string;targetId:string;state:string;generation:number;errorCode?:string;verification?:{publicConfirmed:boolean;reasons:readonly string[]}}[]}>;
+  createNativeTarget?(adapterId:string,label:string):Promise<void>;
+  reviewBinding?(id:string,bindingRevision:number,websiteRevision:number):Promise<{planId:string;fingerprint:string;expiresAt:string}>;
+  reviewPublication?(revision:number,targetIds:readonly string[]):Promise<{planId:string;fingerprint:string;expiresAt:string}>;
+  publishWebsite?(planId:string,fingerprint:string,key:string):Promise<void>;
+  hostingAction?(action:string,id:string,body?:unknown):Promise<void>;
+  catalogue?(): Promise<readonly WebsiteCatalogueOption[]>;
   get(): Promise<Website>;
   save(website: Website, expectedRevision: number): Promise<Website>;
   document(id: string): Promise<{ document: WebsiteDocument; sharedBy: readonly { title: string }[] }>;
@@ -24,19 +36,80 @@ export interface WebsiteWorkspaceClient {
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
-export interface WebsiteWorkspaceOptions { previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
-export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
-  popup.opener=null;popup.document.title='Opening website preview';popup.document.body.textContent='Preparing the saved website preview…';
-  try {
-    const saved=await client.get(),page=saved.pages.find(p=>p.id===(pageId??saved.homePageId));
+export interface WebsiteWorkspaceOptions { onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+type PreviewClient=Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>;
+const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(message:string)=>void=()=>{},closed:()=>boolean=()=>false,fallback=false)=>{
+    const saved=await client.get(),selected=saved.pages.find(p=>p.id===(pageId??saved.homePageId)),page=fallback&&selected?.state!=='ready'?saved.pages.find(p=>p.id===saved.homePageId):selected;
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
     let buildId:string|undefined;
-    for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
-    if(!buildId){const build=await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());if(build.state!=='ready')throw new Error('The website build is '+build.state+'. Open Preview again once the build is ready.');buildId=build.id;}
+    const candidates=await client.builds?.()??[];
+    for(const candidate of candidates)if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
+    if(!buildId){
+      const existing=candidates.find(b=>b.websiteRevision===saved.revision&&!['ready','failed','cancelled'].includes(b.state));
+      const requested=existing??await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());buildId=requested.id;
+      const deadline=Date.now()+20*60*1000;
+      for(;;){
+        if(closed())throw new Error('The preview tab was closed.');
+        const build=await client.build(buildId);
+        if(build.state==='ready'){if(build.stale)throw new Error('Website sources changed while preparing the preview. Open a new preview.');break;}
+        if(['failed','cancelled'].includes(build.state))throw new Error('Website preview could not be prepared'+(build.errorCode?' ('+build.errorCode+')':'')+'. Build a new candidate to retry.');
+        if(Date.now()>deadline)throw new Error('This build is taking longer than expected. Its progress is available in Publishing.');
+        progress(build.state==='queued'?'Your preview is queued. Preparing will begin shortly…':'Preparing your pages and images…');
+        await new Promise(resolve=>setTimeout(resolve,1000));
+      }
+    }
     const route=websiteRoutes(saved).get(page.id);if(!route)throw new Error('This page is unavailable in the saved website.');
     if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
+    progress('Loading your preview…');
     const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
-    const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
+
+    const initial=route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html';
+    return {saved,buildId,files,initial};
+};
+const previewProviders=new Map<string,{channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string}>();
+const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient)=>{
+  if(typeof window==='undefined'||typeof BroadcastChannel==='undefined')return;
+  const key=websitePreviewKey(saved),previous=previewProviders.get(key);
+  if(previous){previous.client=client;previous.sourceUrl=sourceUrl;return;}
+  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID()};
+  const offers=new Map<string,{replyTo:string;pageId?:string;path?:string;expires:number}>();
+  const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
+  provider.channel.onmessage=async event=>{
+    const data=event.data;if(typeof data?.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))return;
+    if(data.type==='refresh-request'){
+      if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.refresh:[a-f0-9-]{36}$/.test(data.replyTo)||data.pageId!==undefined&&(typeof data.pageId!=='string'||data.pageId.length>200)||data.path!==undefined&&(typeof data.path!=='string'||data.path.length>2000))return;
+      for(const [id,offer]of offers)if(offer.expires<Date.now())offers.delete(id);
+      if(offers.size>=50)return;offers.set(data.requestId,{replyTo:data.replyTo,pageId:data.pageId,path:data.path,expires:Date.now()+30000});
+      send(data.replyTo,data.requestId,'offer',{providerId:provider.id});return;
+    }
+    if(data.type!=='refresh-accept'||data.providerId!==provider.id)return;
+    const offer=offers.get(data.requestId);if(!offer||offer.expires<Date.now())return;offers.delete(data.requestId);
+    const reply=(type:string,extra:Record<string,unknown>={})=>send(offer.replyTo,data.requestId,type,extra);
+    try{
+      reply('progress',{message:'Preparing the latest saved preview…'});
+      const result=await prepareWebsitePreview(provider.client,offer.pageId,message=>reply('progress',{message}),undefined,true);
+      if(websitePreviewKey(result.saved)!==key)throw Error('This website is no longer available in the editor.');
+      const nextContext=makePreviewContext(result.saved,provider.sourceUrl,offer.replyTo);
+      const initial=!offer.pageId&&offer.path?.endsWith('.html')&&Object.hasOwn(result.files,offer.path)?offer.path:result.initial;
+      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext));notifyWebsitePreviewSaved(result.saved);reply('ready',{id});
+    }catch(error){reply('error',{message:error instanceof Error?error.message:'The latest preview could not be prepared. Try again.'});}
+  };
+  previewProviders.set(key,provider);
+  if(previewProviders.size>30){const oldest=previewProviders.keys().next().value!;previewProviders.get(oldest)?.channel.close();previewProviders.delete(oldest);}
+};
+const makePreviewContext=(saved:Website,sourceUrl:string,refreshChannel='ubeeq.website-preview.refresh:'+crypto.randomUUID()):WebsitePreviewContext=>{
+  const editor=new URL(sourceUrl);editor.searchParams.set('websiteId',saved.id);
+  return {websiteKey:websitePreviewKey(saved),revision:saved.revision,refreshChannel,editorUrl:editor.href,pagePaths:Object.fromEntries([...websiteRoutes(saved)].map(([id,route])=>[id,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html']))};
+};
+export {notifyWebsitePreviewSaved} from './website-preview.js';
+export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
+  popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
+  const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
+  try{
+    const {saved,buildId,files,initial}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed);
+    registerPreviewProvider(saved,sourceUrl,client);
+    const context=previewPath?makePreviewContext(saved,sourceUrl):undefined;
+    const html=websitePreviewHtml(files,initial,context);notifyWebsitePreviewSaved(saved);
     if(popup.closed)return buildId;
     if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
     return buildId;
@@ -46,14 +119,26 @@ export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void)) => {
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
-  const documentDrafts=new Map<string,WebsiteDocument>();
-  let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false;
+  const documentDrafts=new Map<string,WebsiteDocument>(),documentBaselines=new Map<string,string>();let savedSite='',reportedDirty=false,operations=0;
+  const dirty=()=>Boolean(site&&(JSON.stringify(site)!==savedSite||[...documentDrafts].some(([id,doc])=>JSON.stringify(doc)!==documentBaselines.get(id))||Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')).some(input=>input.value!==input.dataset.websiteDraftInitial)));
+  const reportDirty=()=>{const value=dirty();if(value!==reportedDirty){reportedDirty=value;options.onUnsavedChangesChange?.(value);}};
+  const scheduleDirty=()=>queueMicrotask(()=>{if(!disposed)reportDirty();});root.addEventListener('input',scheduleDirty);root.addEventListener('change',scheduleDirty);
+
+  let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false,publishingTimer:ReturnType<typeof setTimeout>|undefined;
+  const stopPublishingPoll=()=>{if(publishingTimer)clearTimeout(publishingTimer);publishingTimer=undefined;};
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
   const status=element('p'); status.setAttribute('role','status');
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
-  const act=(fn:()=>Promise<void>)=>async()=>{try{await fn();}catch(error){status.textContent=error instanceof Error?error.message:'Website operation failed.';}};
+  const act=(fn:()=>Promise<void>)=>async()=>{operations++;options.onBusyChange?.(true);try{await fn();}catch(error){status.textContent=error instanceof Error?error.message:'Website operation failed.';}finally{operations--;if(!disposed){reportDirty();options.onBusyChange?.(operations>0);}}};
   const button=(label:string,fn:()=>Promise<void>)=>{const b=element('button',label);b.type='button';b.onclick=act(fn);return b;};
-  const field=(parent:HTMLElement,label:string,value:string,change:(v:string)=>void)=>{const l=element('label',label),i=element('input');i.value=value;i.onchange=()=>change(i.value);l.append(i);parent.append(l);return i;};
+  const dialogs=new Map<HTMLDialogElement,()=>void>();
+  const confirmAction=(title:string,description:string,action:string,run:()=>Promise<void>,fields?:HTMLElement)=>new Promise<void>(resolve=>{
+    const dialog=element('dialog'),heading=element('h2',title),copy=element('p',description),error=element('p'),actions=element('div');heading.id='website-confirm-'+crypto.randomUUID();dialog.setAttribute('aria-labelledby',heading.id);dialog.className='website-confirm-dialog';error.setAttribute('role','alert');let pending=false,closed=false;const focused=d.activeElement as HTMLElement|null;
+    const close=()=>{if(closed)return;closed=true;dialog.close();dialog.remove();dialogs.delete(dialog);focused?.focus();resolve();};
+    const cancel=button('Cancel',async()=>close()),accept=button(action,async()=>{if(pending)return;pending=true;cancel.disabled=true;accept.disabled=true;error.textContent='';try{await run();close();}catch(e){error.textContent=e instanceof Error?e.message:'The operation could not be completed. Try again.';}finally{pending=false;cancel.disabled=false;accept.disabled=false;}});
+    dialog.oncancel=event=>{event.preventDefault();if(!pending)close();};actions.append(cancel,accept);dialog.append(heading,copy,...(fields?[fields]:[]),error,actions);d.body.append(dialog);dialogs.set(dialog,close);dialog.showModal();cancel.focus();
+  });
+  const field=(parent:HTMLElement,label:string,value:string,change:(v:string)=>void)=>{const l=element('label',label),i=element('input');i.value=value;i.dataset.websiteDraftInitial=value;i.onchange=()=>change(i.value);l.append(i);parent.append(l);return i;};
   let mediaCache:WebsiteMediaOption[]|undefined,uploads=0;const imageObservers:IntersectionObserver[]=[];
   const library=async()=>mediaCache??(mediaCache=[...await client.media?.()??[]]);
   const mediaField=async(parent:HTMLElement,label:string,value:string|undefined,change:(id:string|undefined)=>void,position?:{x:number;y:number},move?:(p:{x:number;y:number})=>void)=>{
@@ -78,7 +163,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     if(move){let framing=position??{x:.5,y:.5};preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;for(const axis of ['x','y'] as const){const l=element('label',label+(axis==='x'?' horizontal position':' vertical position')),range=element('input');range.type='range';range.min='0';range.max='1';range.step='.01';range.value=String(framing[axis]);range.oninput=()=>{framing={...framing,[axis]:Number(range.value)};move(framing);preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;};l.append(range);box.append(l);}}
     parent.append(box);if(value&&client.mediaPreview)void client.mediaPreview(value).then(url=>preview.src=url).catch(error=>{status.textContent=String(error);});
   };
-  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
+  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);savedSite=JSON.stringify(site);notifyWebsitePreviewSaved(site);for(const input of Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')))input.dataset.websiteDraftInitial=input.value;reportDirty();status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
   const win=d.defaultView;let measureFrame=0;
   const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.offsetTop+first.offsetHeight/2}px`);};
   const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
@@ -88,31 +173,140 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     try{currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';}finally{previewPending=false;}
   };
   const show=async(tab:string)=>{
-    const generation=++renderGeneration;
+    const generation=++renderGeneration;stopPublishingPoll();
     for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.textContent===tab));
     cleanupEditor?.();cleanupEditor=undefined;cleanupSettings?.();cleanupSettings=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
     if(tab==='Settings'){
       const settings=element('div');settings.className='website-site-settings';settings.append(element('p','Site-wide settings for this website.'));
       const name=field(settings,'Site name',site.title,value=>site={...site,title:value});
-      settings.append(button('Save settings',async()=>{if(!site.title.trim())throw new Error('Enter a website name.');site={...site,title:site.title.trim()};await save();name.value=site.title;}));content.append(settings);
+      const purposeLabel=element('label','Website purpose'),purpose=element('select');purpose.setAttribute('aria-label','Website purpose');for(const item of WEBSITE_INTENTS){const option=element('option',item.title);option.value=item.id;purpose.append(option);}purpose.value=site.intent??'portfolio';purpose.onchange=()=>{site={...site,intent:purpose.value as NonNullable<Website['intent']>};};purposeLabel.append(purpose);settings.append(purposeLabel,element('p','Purpose suggests starter content. Changing it here preserves existing pages and content; visual style is chosen separately in Appearance.'));
+      const saveSettings=button('Save settings',async()=>{if(!site.title.trim())throw new Error('Enter a website name.');site={...site,title:site.title.trim()};await save();name.value=site.title;refreshEmbedding();});content.append(settings);
+      const embeddingDetails=element('details'),embeddingSummary=element('summary','Embedding'),embedding=element('div');embeddingDetails.className='website-embedding-disclosure';embeddingDetails.append(embeddingSummary);embedding.className='website-embedding-settings';embedding.append(element('p','Allow other websites to display this published website in an iframe. Save settings and publish a new release to apply changes.'));
+      const defaults=()=>({mode:'disabled' as const,origins:[] as string[],pageId:site.homePageId,presentation:'full' as const,height:800});
+      const change=(patch:Partial<NonNullable<Website['embedding']>>)=>{site={...site,embedding:{...(site.embedding??defaults()),...patch}};refreshEmbedding();};
+      const optionField=(label:string,choices:readonly {value:string;label:string}[],value:string,onchange:(value:string)=>void)=>{const row=element('label',label),input=element('select');input.setAttribute('aria-label',label);for(const choice of choices){const option=element('option',choice.label);option.value=choice.value;input.append(option);}input.value=value;input.onchange=()=>onchange(input.value);row.append(input);embedding.append(row);return input;};
+      const access=optionField('Allow embedding',[{value:'disabled',label:'Off'},{value:'selected',label:'Selected domains'},{value:'any',label:'Any website'}],site.embedding?.mode??'disabled',value=>change({mode:value as NonNullable<Website['embedding']>['mode']}));
+      const originsRow=element('label','Allowed website origins (one per line)'),origins=element('textarea');origins.setAttribute('aria-label','Allowed website origins (one per line)');origins.placeholder='https://www.example.com';origins.value=site.embedding?.origins.join('\n')??'';origins.oninput=()=>change({origins:origins.value.split(/\n/).map(v=>v.trim()).filter(Boolean)});originsRow.append(origins);embedding.append(originsRow,element('p','Use exact origins including https:// and any port. Subdomains such as www.example.com are separate entries. Up to 10 origins; no wildcards or page paths.'));
+      const start=optionField('Embedding starting page',site.pages.filter(page=>page.state==='ready').map(page=>({value:page.id,label:page.title})),site.embedding?.pageId??site.homePageId,value=>change({pageId:value}));
+      const presentation=optionField('Embedding presentation',[{value:'full',label:'Full website'},{value:'content',label:'Content only — hide header and footer'}],site.embedding?.presentation??'full',value=>change({presentation:value as 'full'|'content'}));
+      const height=field(embedding,'Iframe height (pixels)',String(site.embedding?.height??800),value=>change({height:Number(value)}));height.type='number';height.min='200';height.max='2000';
+      const addressRow=element('label','Published website URL'),address=element('input');address.type='url';address.setAttribute('aria-label','Published website URL');address.placeholder='https://www.example.com/portfolio/';address.value=site.publicBaseUrl?new URL(site.basePath,site.publicBaseUrl).href:'';address.oninput=()=>refreshEmbedding();addressRow.append(address);embedding.append(addressRow);
+      const codeRow=element('label','Iframe embed code'),code=element('textarea');code.setAttribute('aria-label','Iframe embed code');code.readOnly=true;code.rows=5;codeRow.append(code);embedding.append(codeRow);
+      const instructions=element('p'),copy=button('Copy embed code',async()=>{if(dirty())throw new Error('Save your website settings before copying embed code.');if(!code.value)throw new Error('Enter the published website URL and valid embedding settings.');if(!win?.navigator.clipboard){code.focus();code.select();status.textContent='Embed code selected. Copy it using your browser.';return;}await win.navigator.clipboard.writeText(code.value);status.textContent='Embed code copied. Publish the saved website settings before using it.';});embedding.append(copy,instructions,element('p','Embedding uses a published URL, including its hosting subdirectory. Temporary preview URLs cannot be embedded. Platform account, signup and checkout links open separately. Fixed height uses normal iframe scrolling; automatic height adjustment is not included.'));
+      const refreshEmbedding=()=>{const enabled=(site.embedding?.mode??'disabled')!=='disabled';originsRow.hidden=site.embedding?.mode!=='selected';start.disabled=presentation.disabled=height.disabled=address.disabled=!enabled;code.value='';copy.disabled=!enabled;try{if(enabled&&address.value)code.value=websiteEmbedCode(site,address.value);instructions.textContent='HTTP response header: Content-Security-Policy: frame-ancestors '+websiteFrameAncestors(site.embedding)+'. Managed hosting applies this policy after deployment. Netlify/Cloudflare use the generated _headers file; other hosts need server configuration.';}catch(error){instructions.textContent=error instanceof Error?error.message:'Review embedding settings.';copy.disabled=true;}reportDirty();};
+      if(client.mailingListStatus){const mailing=element('section');mailing.className='website-mailing-setup';mailing.append(element('h3','Mailing-list signup'),element('p','Checking signup setup…'));settings.append(mailing);
+        void client.mailingListStatus().then(info=>{if(disposed||renderGeneration!==generation)return;mailing.replaceChildren(element('h3','Mailing-list signup'),element('p',info.enabled?'Visitors can enter their email and submit directly on the website. Confirmation and offer delivery are handled by the platform.':'Public signup is not enabled yet. Enable the mailing list to show the email input, opt-in and submit button directly on the website.'));if(!info.emailAvailable)mailing.append(element('p','Email delivery must also be configured before visitors can confirm a signup.'));
+          const manage=element('a','Manage mailing list and offers ↗');manage.href=info.manageUrl;manage.target='_blank';manage.rel='noopener noreferrer';mailing.append(manage);
+          if(site.theme.settings.mailingListUrl!==info.signupUrl){const explanation=element('p','The saved signup link differs from the current application address. Use the current address, then save settings.');mailing.append(explanation,button('Use current application address',async()=>{site={...site,theme:{...site.theme,settings:{...site.theme.settings,mailingListUrl:info.signupUrl}}};reportDirty();explanation.textContent='Current signup address selected. Save settings to apply it.';}));}
+        }).catch(()=>{if(!disposed&&renderGeneration===generation)mailing.replaceChildren(element('h3','Mailing-list signup'),element('p','Review mailing-list setup before publishing a signup form.'));});
+      }
+      embeddingDetails.append(embedding);settings.append(embeddingDetails,saveSettings);refreshEmbedding();
+      if(client.hostingHistory)void client.hostingHistory().then(history=>{if(disposed||renderGeneration!==generation)return;const targets=history.targets.filter(target=>target.serving==='active');if(targets.length){const choice=optionField('Published hosting destination',[{value:'',label:'Custom published URL'},...targets.map(target=>({value:target.publicUrl,label:target.label}))],targets[0].publicUrl,value=>{address.value=value;refreshEmbedding();});addressRow.before(choice.parentElement!);address.value=targets[0].publicUrl;refreshEmbedding();}}).catch(()=>{});
       if(mountSettings){const host=element('div');host.className='website-creator-access';content.append(host);cleanupSettings=mountSettings(host);}
+    }
+    if(tab==='Publishing'&&client.hostingChoices&&client.hostingHistory){
+      const choices=await client.hostingChoices(),history=await client.hostingHistory();if(disposed||renderGeneration!==generation)return;
+      const progress=element('div'),spinner=element('span'),message=element('div'),heading=element('strong'),detail=element('p');
+      progress.className='website-publish-progress';progress.setAttribute('role','status');progress.setAttribute('aria-live','polite');progress.setAttribute('aria-atomic','true');spinner.className='website-publish-spinner';spinner.setAttribute('aria-hidden','true');message.append(heading,detail);progress.append(spinner,message);content.append(progress);
+      const pendingStates=['queued','generating','uploading','activating','verifying','unknown'];
+      const updateProgress=(latest:typeof history)=>{
+        const newest=new Map<string,typeof latest.attempts[number]>();for(const attempt of latest.attempts)if(!newest.has(attempt.targetId)||newest.get(attempt.targetId)!.generation<attempt.generation)newest.set(attempt.targetId,attempt);
+        const attempts=[...newest.values()],pending=attempts.filter(attempt=>pendingStates.includes(attempt.state)),failed=attempts.some(attempt=>['failed','reconnect_required'].includes(attempt.state));
+        progress.hidden=!attempts.length;spinner.hidden=!pending.length;progress.dataset.state=pending.length?'pending':failed?'attention':'complete';
+        if(pending.length){const queued=pending.every(attempt=>attempt.state==='queued'),checking=pending.every(attempt=>['verifying','unknown'].includes(attempt.state));heading.textContent=queued?'Website publish queued':checking?'Verifying website publication':'Publishing website';detail.textContent=queued?'Your approved release is waiting to publish. You can continue working; its status updates automatically.':checking?'Checking that your approved release is available at the destination. This may take a little time.':'Preparing and sending your approved release. Its status updates automatically; later edits stay out of this release.';}
+        else if(failed){heading.textContent='Website publication needs attention';detail.textContent='A destination could not finish publishing. Review the deployment details below to retry or reconnect.';}
+        else {const published=attempts.filter(attempt=>attempt.state==='published').length,unpublished=attempts.filter(attempt=>attempt.state==='unpublished').length;heading.textContent=published?'Website published':unpublished?'Website unpublished':'Website publication stopped';detail.textContent=published?'Your approved release is published. Destination details are shown below.':unpublished?'The website has been removed from public view.':'No publishing tasks are currently running. Review the deployment details below.';}
+        return pending.length>0;
+      };
+      let refreshAttempts:((latest:typeof history)=>void)|undefined;
+      const poll=()=>{publishingTimer=setTimeout(async()=>{publishingTimer=undefined;if(disposed||renderGeneration!==generation)return;if(d.hidden){poll();return;}try{const latest=await client.hostingHistory!();if(disposed||renderGeneration!==generation)return;refreshAttempts?.(latest);if(updateProgress(latest))poll();}catch{if(!disposed&&renderGeneration===generation){detail.textContent='Waiting for a status update. We’ll check again automatically; your accepted release remains queued or in progress.';poll();}}},5000);};
+      if(updateProgress(history))poll();
+      content.append(element('p','Publish captures the approved saved content for the selected destinations. Later draft edits stay out of this release. Provider propagation and public verification may take time.'));
+      if(!choices.length)content.append(element('p',options.emptyHostingMessage??'Hosting has not been enabled by the installation administrator. Exact candidate ZIP download remains available below.'));
+      for(const choice of choices){
+        content.append(element('p',({aws:'Managed hosting',native:'Configured server hosting',netlify:'Netlify','cloudflare-pages':'Cloudflare Pages',sftp:'SFTP server'} as Record<string,string>)[choice.family]??choice.family));
+        if(['native','aws'].includes(choice.family)&&client.createNativeTarget)content.append(button(choice.family==='aws'?'Create managed destination':'Create native destination',async()=>{await client.createNativeTarget!(choice.id,site.title);await show('Publishing');}));
+      }
+      if(client.hostingConnections&&client.hostingConnectionAction&&choices.some(c=>['netlify','cloudflare-pages','sftp'].includes(c.family))){
+        const connections=await client.hostingConnections(),action=client.hostingConnectionAction.bind(client);
+        const connect=element('details');connect.append(element('summary','Connect a hosting account'));
+        if(choices.some(c=>c.family==='netlify')){let accountId='';field(connect,'Netlify team account ID','',v=>accountId=v);connect.append(button('Authorize Netlify',async()=>{const result=await action('netlify-authorize',{accountId});globalThis.location.assign(result.authorizationUrl);}));}
+        if(choices.some(c=>c.family==='cloudflare-pages')){let accountId='',token='';field(connect,'Cloudflare account ID','',v=>accountId=v);const secret=field(connect,'Restricted Pages API token','',v=>token=v);secret.type='password';secret.autocomplete='off';connect.append(button('Connect Cloudflare Pages',async()=>{await action('cloudflare-pages',{accountId,token});token='';secret.value='';await show('Publishing');}));}
+        if(choices.some(c=>c.family==='sftp')){let accountId='',username='',privateKey='',passphrase='';field(connect,'SFTP account label','',v=>accountId=v);field(connect,'SFTP username','',v=>username=v);const label=element('label','SSH private key'),key=element('textarea');key.autocomplete='off';key.dataset.websiteDraftInitial='';key.onchange=()=>privateKey=key.value;label.append(key);connect.append(label);const pass=field(connect,'Private key passphrase (optional)','',v=>passphrase=v);pass.type='password';pass.autocomplete='off';connect.append(button('Save SFTP key connection',async()=>{await action('sftp',{accountId,username,privateKey,passphrase:passphrase||undefined});privateKey='';passphrase='';key.value='';pass.value='';await show('Publishing');}));}
+        content.append(connect);
+        for(const connection of connections){const group=element('details');group.append(element('summary',`${connection.family}: ${connection.accountId} (${connection.state})`),button('Disconnect account',async()=>{await confirmAction('Disconnect '+connection.accountId+'?', 'Existing published copies remain online. Further updates need this account to be reconnected.','Disconnect account',async()=>{await action('disconnect',{connectionId:connection.id});await show('Publishing');});}));
+          if(['netlify','cloudflare-pages'].includes(connection.family)){let name='';field(group,'New provider site/project name','',v=>name=v);group.append(button('Create provider site/project',async()=>{await action('provision',{connectionId:connection.id,name});status.textContent='Provider site created. Reload the site catalogue to select it.';}),button('Load sites/projects',async()=>{const catalogue=await action('catalogue',{connectionId:connection.id});for(const remote of catalogue.sites){const row=element('div');row.append(element('p',remote.name),button('Use '+remote.name,async()=>{await confirmAction('Use '+remote.name+'?',(remote.gitConnected?'This site currently uses Git deployment. ':'')+'Future approved website releases will replace this site’s content. Confirm you manage this destination.','Use destination',async()=>{await action('target',{connectionId:connection.id,websiteId:site.id,remoteId:remote.id,label:remote.name,publicUrl:remote.publicUrl,ownershipConfirmed:true,config:connection.family==='cloudflare-pages'?{projectName:remote.name,productionBranch:remote.productionBranch}:{gitHandoff:'confirmed'}});await show('Publishing');});}));group.append(row);}}));}
+          if(connection.family==='sftp'){const config:Record<string,string>={port:'22'};for(const [key,label] of [['hostname','SFTP hostname'],['port','SFTP port'],['root','Dedicated absolute managed root'],['hostKeyFingerprint','Independently verified SHA256 host fingerprint']])field(group,label,config[key]??'',v=>config[key]=v);let publicUrl='';field(group,'Public HTTPS URL for this root','',v=>publicUrl=v);group.append(element('p','In-place copying can expose mixed files during interruptions. Pointer profiles require operator setup and a successful protocol probe.'),button('Validate and use in-place SFTP',async()=>{await confirmAction('Use '+config.hostname+':'+config.root+'?', 'Confirm that you manage this dedicated folder and authorize replacing its website files. In-place copying may show mixed files if interrupted.','Use SFTP destination',async()=>{await action('target',{connectionId:connection.id,adapterId:'sftp-in_place',websiteId:site.id,label:connection.accountId,publicUrl,config,ownershipConfirmed:true});await show('Publishing');});}));}
+          content.append(group);
+        }
+      }
+      const selected=new Set<string>();
+      for(const target of history.targets){const label=element('label',target.label),check=element('input');check.type='checkbox';check.onchange=()=>check.checked?selected.add(target.id):selected.delete(target.id);label.append(check);content.append(label,element('p',`Desired generation ${target.desiredGeneration}; active ${target.activeGeneration}; serving ${target.serving}.`));if(target.servingRemovalRequired)content.append(element('p','Policy requires serving removal. The provider/server operator must complete withdrawal; serving is not confirmed disabled.'));const link=element('a','Open public website');link.href=target.publicUrl;link.target='_blank';link.rel='noopener noreferrer';content.append(link);
+        if(['suspended','unpublished'].includes(target.serving)&&target.capabilities.emergencySuspension&&target.activeGeneration>0)content.append(button('Resume eligible serving',async()=>{await client.hostingAction!('resume',target.id);await show('Publishing');}));
+        if(target.capabilities.unpublish==='confirmed')content.append(button('Unpublish '+target.label,async()=>{const key=crypto.randomUUID();await confirmAction('Unpublish '+target.label+'?', 'This removes the hosted website from public view. A retained release can be published again.','Unpublish website',async()=>{await client.hostingAction!('unpublish',target.id,{idempotencyKey:key});await show('Publishing');});}));
+        else content.append(element('p','Serving removal requires the provider or server operator.'));
+        let hostname='';field(content,'Custom hostname for '+target.label,'',v=>hostname=v);content.append(button('Request domain',async()=>{await client.hostingAction!('domains',target.id,{hostname,mode:'alias'});await show('Publishing');}));
+        for(const domain of history.domains?.filter(d=>d.targetId===target.id)??[]){content.append(element('p',`${domain.hostname}: ${domain.state}. ${domain.instructions.join(' ')}`),button('Verify '+domain.hostname,async()=>{await client.hostingAction!('domain-verify',target.id,{domainId:domain.id});await show('Publishing');}),button('Remove '+domain.hostname,async()=>{await confirmAction('Remove '+domain.hostname+'?', 'Visitors will no longer be able to use this domain for the website once the provider completes removal.','Remove domain',async()=>{await client.hostingAction!('domain-remove',target.id,{domainId:domain.id});await show('Publishing');});}));}
+
+      }
+      let bindingLabel='';field(content,'Saved destination selection name','',v=>bindingLabel=v);content.append(button('Save destination binding',async()=>{await client.hostingAction!('binding','',{label:bindingLabel,targetIds:[...selected],expectedRevision:0,enabled:true});await show('Publishing');}));
+      const approve=async(plan:{planId:string;fingerprint:string;expiresAt:string},ids:readonly string[],label:string)=>{
+        if(disposed||renderGeneration!==generation)return;
+        const approvalKey=crypto.randomUUID();const destinations=history.targets.filter(t=>ids.includes(t.id)).map(t=>t.label+' — '+t.publicUrl).join('\n');
+        await confirmAction('Publish '+site.title+'?',`Saved revision ${site.revision}. Later draft edits are excluded.\n${label}\n${destinations}\nReview expires ${options.formatDate?.(plan.expiresAt)??new Date(plan.expiresAt).toLocaleString(undefined,{timeZoneName:'short'})}.\nStaged external deploy URLs can be public.`,'Publish approved release',async()=>{await client.publishWebsite!(plan.planId,plan.fingerprint,approvalKey);status.textContent='';await show('Publishing');});
+      };
+      for(const binding of history.bindings??[])if(binding.enabled&&client.reviewBinding)content.append(button('Review Publish to '+binding.label,async()=>{const plan=await client.reviewBinding!(binding.id,binding.revision,site.revision);await approve(plan,binding.targetIds,binding.label);}));
+      content.append(button('Review Publish',async()=>{if(!selected.size)throw new Error('Select a publishing destination.');const ids=[...selected],plan=await client.reviewPublication!(site.revision,ids);await approve(plan,ids,`${ids.length} destination(s)`);}));
+      content.append(button('Refresh publishing status',async()=>show('Publishing')));
+      const attemptRows=element('div');content.append(attemptRows);let attemptVersion='';
+      refreshAttempts=(history)=>{const version=JSON.stringify(history.attempts);if(version===attemptVersion)return;attemptVersion=version;attemptRows.replaceChildren();
+      for(const attempt of history.attempts){const row=element('div');row.append(element('p',`${history.targets.find(t=>t.id===attempt.targetId)?.label??'Website'}: generation ${attempt.generation}: ${attempt.state}${attempt.errorCode?' ('+attempt.errorCode+')':''}`));
+        if(attempt.verification)row.append(element('p',attempt.verification.publicConfirmed?'Public release verified':`Verification pending: ${attempt.verification.reasons.join(', ')}`));
+        if(['failed','reconnect_required'].includes(attempt.state))row.append(button('Retry deployment',async()=>{await client.hostingAction!('retry',attempt.id,{idempotencyKey:crypto.randomUUID()});await show('Publishing');}));
+        if(['unknown','verifying'].includes(attempt.state))row.append(button('Reconcile serving status',async()=>{await client.hostingAction!('reconcile',attempt.id);await show('Publishing');}));
+        if(['queued','generating','uploading'].includes(attempt.state))row.append(button('Cancel deployment',async()=>{await client.hostingAction!('cancel',attempt.id);await show('Publishing');}));
+        if(attempt.state==='published')row.append(button('Restore this retained release',async()=>{const key=crypto.randomUUID();await confirmAction('Restore '+(history.targets.find(t=>t.id===attempt.targetId)?.label??site.title)+'?', 'This replaces the currently hosted content with the selected release. Later saved edits remain in the editor.','Restore release',async()=>{await client.hostingAction!('rollback',attempt.targetId,{attemptId:attempt.id,idempotencyKey:key});await show('Publishing');});}));attemptRows.append(row);
+      }
+      };refreshAttempts(history);
     }
     if(tab==='Pages') {
       if(!selectedPage||!['new','redirects',...site.pages.map(p=>p.id)].includes(selectedPage))selectedPage=site.homePageId;
       const workspace=element('div'),selector=element('nav'),divider=element('div'),handle=element('div'),surface=element('div');
       workspace.className='website-page-workspace'+(pageSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-pages-'+site.id;selector.setAttribute('aria-label','Website pages');selector.tabIndex=0;selector.hidden=!pageSelectorExpanded;surface.className='website-page-surface';
       for(const page of [...site.pages].sort((a,b)=>a.order-b.order)){
-        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));if(page.id===site.homePageId){const icon=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');icon.setAttribute('viewBox','0 0 24 24');icon.setAttribute('aria-hidden','true');icon.classList.add('website-home-icon');path.setAttribute('d','M3 10 12 3l9 7v11h-6v-7H9v7H3Z');icon.append(path);choice.prepend(icon);choice.setAttribute('aria-label',page.title+' · Homepage');}selector.append(choice);
+        const choice=button(page.title,async()=>{selectedPage=page.id;await show('Pages');});choice.className='website-page-choice';choice.dataset.child=String(!!page.parentId);choice.setAttribute('aria-pressed',String(selectedPage===page.id));if(page.id===site.homePageId){const icon=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');icon.setAttribute('viewBox','0 0 24 24');icon.setAttribute('aria-hidden','true');icon.classList.add('website-home-icon');path.setAttribute('d','M3 10 12 3l9 7v11h-6v-7H9v7H3Z');icon.append(path);choice.prepend(icon);choice.setAttribute('aria-label',page.title+' · Homepage');}
+        const pageRow=element('div');pageRow.className='website-page-selector-row';
+        const remove=button('',async()=>{
+          const home=page.id===site.homePageId,fields=element('div');let replacement:string|undefined;
+          if(home){const label=element('label','Replacement homepage'),select=element('select');select.setAttribute('aria-label','Replacement homepage');const placeholder=element('option','Choose a Ready page');placeholder.value='';select.append(placeholder);for(const candidate of site.pages.filter(candidate=>candidate.id!==page.id&&candidate.state==='ready'&&candidate.kind!=='update')){const option=element('option',candidate.title);option.value=candidate.id;select.append(option);}select.onchange=()=>replacement=select.value;label.append(select);fields.append(label);}
+          await confirmAction('Delete page “'+page.title+'”?','This removes the page and its navigation entries from '+site.title+'. Child pages become top-level pages. Shared content and images are retained. Links in other page content may need updating. Unsaved content for this page will be discarded. The published website changes after you publish again. This action cannot be undone.','Delete page',async()=>{
+            if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before deleting a page.');
+            const draft=removeWebsitePage(site,page.id,replacement),baseline=JSON.parse(savedSite) as Website,expected=baseline.revision;
+            const saved=await client.save({...removeWebsitePage(baseline,page.id,replacement),revision:expected+1},expected);
+            site={...draft,revision:saved.revision};savedSite=JSON.stringify(saved);notifyWebsitePreviewSaved(saved);
+            if(!site.pages.some(candidate=>candidate.documentId===page.documentId)){documentDrafts.delete(page.documentId);documentBaselines.delete(page.documentId);}
+            if(selectedPage===page.id)selectedPage=site.homePageId;
+            status.textContent='Page “'+page.title+'” deleted. Publish again to update the live website.';reportDirty();await show('Pages');
+          },home?fields:undefined);
+        });remove.className='website-page-delete';remove.setAttribute('aria-label','Delete page '+page.title);remove.title=site.pages.length===1?'Add another page before deleting the only page.':'Delete page '+page.title;remove.disabled=site.pages.length===1;
+        const trash=d.createElementNS('http://www.w3.org/2000/svg','svg'),trashPath=d.createElementNS('http://www.w3.org/2000/svg','path');trash.setAttribute('viewBox','0 0 24 24');trash.setAttribute('fill','none');trash.setAttribute('stroke','currentColor');trash.setAttribute('stroke-width','1.8');trash.setAttribute('aria-hidden','true');trashPath.setAttribute('d','M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7');trash.append(trashPath);remove.append(trash);
+        const preview=button('',()=>previewPage(page.id));preview.className='website-page-preview website-page-delete';preview.setAttribute('aria-label','Preview page '+page.title);preview.title='Preview page '+page.title;
+        const eye=d.createElementNS('http://www.w3.org/2000/svg','svg');eye.setAttribute('viewBox','0 0 24 24');eye.setAttribute('fill','none');eye.setAttribute('stroke','currentColor');eye.setAttribute('stroke-width','1.8');eye.setAttribute('aria-hidden','true');const eyePath=d.createElementNS('http://www.w3.org/2000/svg','path');eyePath.setAttribute('d','M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z');const pupil=d.createElementNS('http://www.w3.org/2000/svg','circle');pupil.setAttribute('cx','12');pupil.setAttribute('cy','12');pupil.setAttribute('r','3');eye.append(eyePath,pupil);preview.append(eye);pageRow.append(choice,preview,remove);selector.append(pageRow);
       }
       const pageActions=element('div'),newPage=button('New page',async()=>{selectedPage='new';await show('Pages');}),redirect=button('Add a redirect',async()=>{selectedPage='redirects';await show('Pages');});pageActions.className='website-page-selector-actions';newPage.className='website-selector-action website-selector-action-primary';redirect.className='website-selector-action website-selector-action-secondary';for(const [action,symbol] of [[newPage,'+'],[redirect,'↪']] as const){const icon=element('span',symbol);icon.setAttribute('aria-hidden','true');action.prepend(icon);}pageActions.append(newPage,redirect);selector.append(pageActions);
       divider.className='website-page-divider';handle.className='website-page-handle-viewport';const toggle=button('',async()=>{pageSelectorExpanded=!pageSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!pageSelectorExpanded);selector.hidden=!pageSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
       const updateToggle=()=>{toggle.setAttribute('aria-label',pageSelectorExpanded?'Collapse page selector':'Expand page selector');toggle.setAttribute('aria-expanded',String(pageSelectorExpanded));const svg=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','2');svg.setAttribute('aria-hidden','true');path.setAttribute('d',pageSelectorExpanded?'m15 18-6-6 6-6':'m9 18 6-6-6-6');svg.append(path);toggle.replaceChildren(svg);};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);
-      const active=site.pages.find(page=>page.id===selectedPage);
-      if(active){const heading=element('div');heading.className='website-page-detail-heading';heading.append(element('h2',active.title),button('Preview in new tab',()=>previewPage(active.id)));surface.append(heading);}
       for(const p of site.pages.filter(page=>page.id===selectedPage)) {
         const row=element('div');row.className='website-page-settings-fields';
         const editPage=(patch:Partial<typeof p>)=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,...patch,revision:next.revision+1}:next)};};
-        field(row,'Page title',p.title,v=>editPage({title:v}));
+        const heading=element('div'),titleGroup=element('div'),pageTitle=element('h2',p.title),headingFields=element('div');heading.className='website-page-detail-heading';titleGroup.className='website-page-title-group';headingFields.className='website-page-heading-fields';headingFields.hidden=true;headingFields.id='website-page-heading-'+p.id;
+        const edit=button('',async()=>{headingFields.hidden=!headingFields.hidden;edit.setAttribute('aria-expanded',String(!headingFields.hidden));if(!headingFields.hidden)headingFields.querySelector('input')?.focus();});edit.className='website-page-title-edit';edit.setAttribute('aria-label','Edit page title and heading');edit.setAttribute('aria-controls',headingFields.id);edit.setAttribute('aria-expanded','false');edit.title='Edit page title and heading';
+        const pencil=d.createElementNS('http://www.w3.org/2000/svg','svg'),pencilPath=d.createElementNS('http://www.w3.org/2000/svg','path');pencil.setAttribute('viewBox','0 0 24 24');pencil.setAttribute('fill','none');pencil.setAttribute('stroke','currentColor');pencil.setAttribute('stroke-width','1.8');pencil.setAttribute('aria-hidden','true');pencilPath.setAttribute('d','m16 3 5 5M3 21l5-1L21 7a2.1 2.1 0 0 0-4-4L4 16l-1 5Z');pencil.append(pencilPath);edit.append(pencil);
+        titleGroup.append(pageTitle,edit);heading.append(titleGroup,button('Preview in new tab',()=>previewPage(p.id)));surface.append(heading,headingFields);
+        field(headingFields,'Page title',p.title,v=>{editPage({title:v});pageTitle.textContent=v||'Untitled page';topHeading.placeholder=v;});
+        const topHeading=field(headingFields,'Top heading',p.heading??'',v=>editPage({heading:v.trim()?v:undefined}));topHeading.placeholder=p.title;
+        headingFields.append(element('p','Leave the top heading blank to use the page title. Save page to keep these changes.'));
+        const headingLabel=element('label','Show heading at the top of the page'),showHeading=element('input');headingLabel.className='website-page-heading-toggle';showHeading.type='checkbox';showHeading.checked=p.showHeading!==false;showHeading.onchange=()=>{editPage({showHeading:showHeading.checked});topHeading.disabled=!showHeading.checked;};topHeading.disabled=p.showHeading===false;headingLabel.prepend(showHeading);headingFields.append(headingLabel);
         field(row,'Search title',p.seoTitle??'',v=>editPage({seoTitle:v||undefined}));
         field(row,'Search description',p.description??'',v=>editPage({description:v||undefined}));
         field(row,'Canonical URL (optional)',p.canonicalUrl??'',v=>editPage({canonicalUrl:v||undefined}));
@@ -125,9 +319,9 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         if(p.kind!=='home') {const state=element('select');state.setAttribute('aria-label','Page lifecycle');for(const value of ['draft','ready','archived']){const option=element('option',value);option.value=value;state.append(option);}state.value=p.state;state.onchange=()=>editPage({state:state.value as typeof p.state});row.append(state);}
         row.append(button('Duplicate document for this page',async()=>{const source=await client.document(p.documentId),id=globalThis.crypto.randomUUID();await client.saveDocument({...documentDrafts.get(p.documentId)??source.document,id,revision:1},0);editPage({documentId:id});await save();await show('Pages');}));
         const openContent=async()=>{
-          const result=await client.document(p.documentId);if(disposed||renderGeneration!==generation)return;const editor=element('div');editor.className='website-page-content-editor';let doc=documentDrafts.get(p.documentId)??result.document;
+          const result=await client.document(p.documentId);if(disposed||renderGeneration!==generation)return;const editor=element('div');editor.className='website-page-content-editor';documentBaselines.set(p.documentId,JSON.stringify(result.document));let doc=documentDrafts.get(p.documentId)??result.document;
           if(result.sharedBy.length>1)surface.append(element('p',`This content is shared by: ${result.sharedBy.map(page=>page.title).join(', ')}. Duplicate the document in Page settings to edit this page independently.`));surface.append(editor);
-          const mount=()=>{cleanupEditor?.();cleanupEditor=mountEditor(editor,doc,next=>{doc=next;documentDrafts.set(doc.id,doc);});};mount();
+          const mount=()=>{cleanupEditor?.();cleanupEditor=mountEditor(editor,doc,next=>{doc=next;documentDrafts.set(doc.id,doc);reportDirty();});};mount();
           let saving=false;const savePage=button('Save page',async()=>{if(saving)return;if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');saving=true;savePage.disabled=true;try{if(documentDrafts.has(doc.id)){doc=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);documentDrafts.delete(doc.id);mount();}await save();status.textContent='Page content and settings saved.';await show('Pages');}finally{saving=false;savePage.disabled=false;}});surface.append(savePage);
 
         };
@@ -154,9 +348,13 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       add.append(button('Add page',async()=>{if(!title.trim()||!slug.trim())throw new Error('Page title and path are required.');const id=globalThis.crypto.randomUUID(),documentId=globalThis.crypto.randomUUID();await client.saveDocument({id:documentId,workspaceId:site.workspaceId,revision:1,blocks:template==='gallery'?[{type:'gallery_list',id:globalThis.crypto.randomUUID() as EntityId,data:{sort:'newest',pageSize:12}}]:[{type:'paragraph',id:globalThis.crypto.randomUUID() as EntityId,text:template==='profile'?'Introduce yourself and your work.':'Add your page content here.'}]},0);site={...site,pages:[...site.pages,{id,documentId,websiteId:site.id,workspaceId:site.workspaceId,revision:1,kind,title,slug,template,order:site.pages.length,state:'ready',navigation:true,footerNavigation:false}]};selectedPage=id;await save();await show('Pages');}));surface.append(add);}
     }
     if(tab==='Appearance') {
+      content.append(element('p','Visual styles apply to every website purpose. Changing style preserves your pages and content.'));
+
       const themes=element('div');themes.className='website-theme-grid';
       for(const theme of WEBSITE_THEMES){const choice=button(theme.title,async()=>{site={...site,theme:{...site.theme,id:theme.id}};status.textContent='Theme selected. Save appearance to keep this theme.';for(const b of Array.from(themes.querySelectorAll('button')))b.setAttribute('aria-pressed',String(b===choice));});choice.setAttribute('aria-pressed',String(site.theme.id===theme.id));choice.className='website-theme-choice';for(const palette of [theme.light,theme.dark]){const swatch=element('span','Aa');swatch.className='website-theme-swatch';swatch.setAttribute('aria-hidden','true');swatch.style.background=palette.canvas;swatch.style.color=palette.text;swatch.style.borderColor=palette.action;choice.append(swatch);}themes.append(choice);}content.append(element('h3','Theme'),themes,element('p','Every theme supports light, dark, and system modes. Save appearance, then rebuild to preview the website.'));
       const setting=<K extends keyof Website['theme']['settings']>(key:K,value:Website['theme']['settings'][K])=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,[key]:value}}};
+      content.append(element('h3','Platform membership and offers'),element('p','Visitors continue to your platform-hosted checkout, membership account, or mailing-list offer. Leave unused links blank. Signup, consent, delivery and access are handled at the linked destination.'));
+      for(const [key,label] of [['membershipUrl','Membership / checkout URL'],['memberAccountUrl','Membership account URL'],['mailingListUrl','Mailing-list / offer signup URL'],['bookingUrl','Session booking URL'],['clientGalleryUrl','Private client gallery URL'],['trailerUrl','Featured trailer / playback URL'],['podcastFeedUrl','Public podcast feed URL (do not use a private member feed)'],['sponsorshipUrl','Sponsorship information URL'],['inquiryUrl','Commission / service inquiry URL'],['ticketsUrl','Event tickets / attendance URL'],['courseUrl','Workshop / course enrollment URL'],['storeUrl','Store / checkout destination URL'],['audioUrl','Featured audio / listening URL'],['releaseUrl','Release purchase URL'],['merchandiseUrl','Merchandise store URL']] as const)field(content,label,site.theme.settings[key]??'',value=>setting(key,value.trim()||undefined));
       if(client.media)await mediaField(content,'Favicon',site.theme.settings.faviconAssetId,id=>setting('faviconAssetId',id));
       field(content,'Accent color (six-digit hex; contrast checked on save)',site.theme.settings.accentColor??'',v=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,accentColor:v||undefined}}});
       const font=element('select');font.setAttribute('aria-label','Font preset');for(const value of ['system','serif']){const option=element('option',value);option.value=value;font.append(option);}font.value=site.theme.settings.font??'system';font.onchange=()=>{site={...site,theme:{...site.theme,settings:{...site.theme.settings,font:font.value as 'system'|'serif'}}};};content.append(font);
@@ -167,7 +365,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       workspace.className='website-page-workspace'+(layoutSelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector';selector.id='website-layout-'+site.id;selector.setAttribute('aria-label','Website layout');selector.hidden=!layoutSelectorExpanded;surface.className='website-page-surface';
       for(const name of ['Header','Top navigation','Footer']){const choice=button(name,async()=>{selectedLayout=name;await show('Layout');});choice.className='website-page-choice';choice.setAttribute('aria-pressed',String(selectedLayout===name));selector.append(choice);}
       divider.className='website-page-divider';const handle=element('div');handle.className='website-page-handle-viewport';const toggle=button('',async()=>{layoutSelectorExpanded=!layoutSelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!layoutSelectorExpanded);selector.hidden=!layoutSelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
-      const updateToggle=()=>{toggle.textContent=layoutSelectorExpanded?'‹':'›';toggle.setAttribute('aria-label',layoutSelectorExpanded?'Collapse layout selector':'Expand layout selector');toggle.setAttribute('aria-expanded',String(layoutSelectorExpanded));};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);surface.append(element('h2',selectedLayout));
+      const updateToggle=()=>{toggle.setAttribute('aria-label',layoutSelectorExpanded?'Collapse layout selector':'Expand layout selector');toggle.setAttribute('aria-expanded',String(layoutSelectorExpanded));const svg=d.createElementNS('http://www.w3.org/2000/svg','svg'),path=d.createElementNS('http://www.w3.org/2000/svg','path');svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('fill','none');svg.setAttribute('stroke','currentColor');svg.setAttribute('stroke-width','2');svg.setAttribute('aria-hidden','true');path.setAttribute('d',layoutSelectorExpanded?'m15 18-6-6 6-6':'m9 18 6-6-6-6');svg.append(path);toggle.replaceChildren(svg);};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);surface.append(element('h2',selectedLayout));
       const setting=<K extends keyof Website['theme']['settings']>(key:K,value:Website['theme']['settings'][K])=>site={...site,theme:{...site.theme,settings:{...site.theme.settings,[key]:value}}};
       const layout=(name:string,key:'headerLayout'|'footerLayout',values:string[])=>{const l=element('label',name),select=element('select');select.setAttribute('aria-label',name);for(const value of values){const o=element('option',value==='split'?'Brand left · navigation right':value==='centered'?(key==='headerLayout'?'Centered wordmark · no logo':'Centered navigation'):value==='stacked'?'Centered brand · navigation below':'Compact footer');o.value=value;select.append(o);}select.value=site.theme.settings[key]??'split';select.onchange=()=>setting(key,select.value as 'split'|'centered');l.append(select);surface.append(l);};
       if(selectedLayout==='Header')layout('Header layout','headerLayout',['split','centered','stacked']);
@@ -230,35 +428,42 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       surface.append(button('Save '+selectedLayout.toLowerCase(),save));
     }
     if(tab==='Gallery destinations') {
-      content.append(element('p',options.destinationModes&&!options.destinationModes.includes('connected')?'Select public Works to include in this website. Each Work can have its own title and link destination.':'Gallery blocks select exact publication IDs. A missing connected mapping blocks the build unless an explicit fallback or omission rule is configured.'));
-      const select=element('select');select.setAttribute('aria-label','Default gallery destination');for(const mode of options.destinationModes ?? ['local','manual','connected']){const o=element('option',mode);o.value=mode;select.append(o);}select.value=site.galleryDefault.destination.mode;
-      let external=site.galleryDefault.destination.mode==='manual'?site.galleryDefault.destination.url:'';
-      let destination=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.destinationId:'',account=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.accountId:'',space=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.spaceId??'':'';
-      content.append(select);const manualInput=field(content,'External public URL',external,v=>external=v);
-      const connectedInputs=options.destinationModes&&!options.destinationModes.includes('connected')?[]:[field(content,'Connected destination ID',destination,v=>destination=v),field(content,'Account ID',account,v=>account=v),field(content,'Space ID (optional)',space,v=>space=v)];
-      const toggleFields=()=>{manualInput.parentElement!.hidden=select.value!=='manual';for(const input of connectedInputs)input.parentElement!.hidden=select.value!=='connected';};select.onchange=toggleFields;toggleFields();
-      content.append(button('Save gallery default',async()=>{site={...site,galleryDefault:{destination:select.value==='manual'?{mode:'manual',url:external}:select.value==='connected'?{mode:'connected',destinationId:destination,accountId:account,spaceId:space||undefined}:{mode:'local'},missing:'error'}};await save();}));
-      const catalogue=client.catalogue?await client.catalogue():undefined;
-      if(catalogue) for(const publication of catalogue) {
-        const label=element('label',publication.title),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
-        check.onchange=()=>{site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:check.checked?site.gallerySettings:site.gallerySettings?.filter(s=>s.publicationId!==publication.id)};};label.append(check);content.append(label);
-      } else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
+      content.append(element('p','Choose the publications to show in your galleries and where each card opens. Connected links use that exact publication and account. Member content stays at its source; choose a public summary and preview for its card.'));
+      const catalogue=client.catalogue?await client.catalogue():undefined;if(disposed||renderGeneration!==generation)return;
+      const availableModes=options.destinationModes??['local','manual','connected'];
+      const destinationPicker=(parent:HTMLElement,label:string,value:WebsiteDestination|undefined,choices:readonly WebsiteCatalogueOption[],change:(v:WebsiteDestination|undefined)=>void,inherit=false)=>{
+        const box=element('fieldset');box.className='website-gallery-destination';box.append(element('legend',label));const mode=element('select');mode.setAttribute('aria-label',label);
+        for(const id of [...(inherit?['inherit']:[]),...availableModes]){const option=element('option',({inherit:'Use gallery default',local:'Website gallery',manual:'Custom public link',connected:'Connected publication'} as Record<string,string>)[id]);option.value=id;mode.append(option);}mode.value=value?.mode??'inherit';box.append(mode);
+        let manual=value?.mode==='manual'?value.url:'';
+        const url=field(box,'Public URL',manual,v=>{manual=v;update();});
+        const connection=element('select');connection.setAttribute('aria-label',label+' connection');const empty=element('option','Choose a connected destination');empty.value='';connection.append(empty);
+        const destinations=new Map<string,Extract<WebsiteDestination,{mode:'connected'}>>();
+        for(const row of choices)if(row.destination){const key=JSON.stringify(row.destination);if(destinations.has(key))continue;destinations.set(key,row.destination);const option=element('option',row.destinationLabel??row.title);option.value=key;connection.append(option);}
+        if(value?.mode==='connected'){const key=JSON.stringify(value);if(!destinations.has(key)){destinations.set(key,value);const option=element('option','Saved connection (not currently available)');option.value=key;connection.append(option);}connection.value=key;}
+        box.append(connection);parent.append(box);
+        const visible=()=>{url.parentElement!.hidden=mode.value!=='manual';connection.hidden=mode.value!=='connected';};
+        const update=()=>{visible();change(mode.value==='inherit'?undefined:mode.value==='local'?{mode:'local'}:mode.value==='manual'?{mode:'manual',url:manual}:destinations.get(connection.value)??{mode:'connected',destinationId:'',accountId:''});};mode.onchange=update;connection.onchange=update;visible();
+      };
+      destinationPicker(content,'Default gallery destination',site.galleryDefault.destination,catalogue??[],destination=>{if(destination)site={...site,galleryDefault:{destination,missing:'error'}};});
+      content.append(button('Save gallery default',save));
+      if(catalogue)for(const publication of catalogue){
+        const label=element('label',publication.title+' · '+(publication.destinationLabel??'Public Work')+(publication.premium?' · Member content':'')),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
+        check.onchange=()=>{const settings=site.gallerySettings?.filter(s=>s.publicationId!==publication.id)??[];if(check.checked&&publication.destination&&(publication.premium||publication.preferLocal!==true))settings.push({publicationId:publication.id,destination:{destination:publication.destination,missing:'error'}});site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:settings};};label.append(check);content.append(label);
+      }else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
       content.append(button('Save selection',async()=>{await save();await show('Gallery destinations');}));
-      for(const publicationId of site.galleryPublicationIds) {
-        const row=element('fieldset');row.append(element('legend',catalogue?.find(p=>p.id===publicationId)?.title??'Selected publication'));
-        let setting=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
+      for(const publicationId of site.galleryPublicationIds){
+        const publication=catalogue?.find(p=>p.id===publicationId),row=element('fieldset');row.className='website-gallery-card';row.append(element('legend',publication?.title??'Selected publication'));
+        let setting:WebsiteGallerySettings=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
         const change=()=>{site={...site,gallerySettings:[...(site.gallerySettings??[]).filter(s=>s.publicationId!==publicationId),setting]};};
         field(row,'Website title',setting.title??'',v=>{setting={...setting,title:v||undefined};change();});
         field(row,'Website slug',setting.slug??'',v=>{setting={...setting,slug:v||undefined};change();});
-        const mode=element('select');mode.setAttribute('aria-label','Publication destination');for(const m of ['inherit',...(options.destinationModes ?? ['local','manual']).filter(m=>m!=='connected')]){const o=element('option',m);o.value=m;mode.append(o);}mode.value=setting.destination?.destination.mode??'inherit';
-        let manual=setting.destination?.destination.mode==='manual'?setting.destination.destination.url:'';
-        const update=()=>{setting={...setting,destination:mode.value==='inherit'?undefined:{destination:mode.value==='local'?{mode:'local'}:{mode:'manual',url:manual},missing:'error'}};change();};
-        mode.onchange=update;row.append(mode);field(row,'Publication external URL',manual,v=>{manual=v;update();});content.append(row);
+        destinationPicker(row,'Publication destination',setting.destination?.destination,publication?[publication]:[],destination=>{setting={...setting,destination:destination?{destination,missing:'error'}:undefined};change();},true);
+        const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value};change();};summaryLabel.append(summary);row.append(summaryLabel);
+        await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});if(disposed||renderGeneration!==generation)return;content.append(row);
       }
       content.append(button('Save publication overrides',save));
-
     }
-    if(tab==='Publishing') {
+    if(tab==='Publishing'&&options.exportEnabled!==false) {
       content.append(element('p','Each build preserves a saved website version. Rebuild after changing pages or Works.'));
       if(client.builds) {
         const builds=await client.builds(),select=element('select');select.setAttribute('aria-label','Saved website build');select.append(element('option','Choose a build'));
@@ -271,7 +476,9 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     }
     if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
-  for(const tab of ['Settings','Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
-  const ready=client.get().then(async value=>{if(!disposed){site=value;await show('Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
+  for(const tab of ['Settings','Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
+  const measureTools=()=>{if(win){const height=win.getComputedStyle(tabs).position==='sticky'?tabs.getBoundingClientRect().height:0;root.style.setProperty('--website-tools-height',`${height}px`);scheduleMeasure();}};
+  const toolsObserver=typeof ResizeObserver==='undefined'?undefined:new ResizeObserver(measureTools);toolsObserver?.observe(tabs);measureTools();
+  const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);notifyWebsitePreviewSaved(value);if(win)registerPreviewProvider(value,win.location.href,client);await show('Pages');}}).catch(error=>{status.textContent=String(error);});
+  return {ready,destroy(){disposed=true;toolsObserver?.disconnect();root.style.removeProperty('--website-tools-height');root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
 };

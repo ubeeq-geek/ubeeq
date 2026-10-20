@@ -11,12 +11,13 @@ export interface WebsiteServicePorts {
   creatorIdentityAllowed(actor: WebsiteActor, creatorIdentityId: string): Promise<boolean>;
   capabilities(actor: WebsiteActor): Promise<WebsiteCapabilities>;
   resolveSnapshot(actor: WebsiteActor, website: Website): Promise<WebsiteSnapshot>;
-  evaluateRelease(input: { actor: WebsiteActor; action: 'build' | 'preview' | 'export'; dependencies: readonly WebsiteDependency[]; websiteId: string }): Promise<WebsiteReleaseDecision>;
+  evaluateRelease(input: { actor: WebsiteActor; action: 'build' | 'preview' | 'export' | 'publish'; dependencies: readonly WebsiteDependency[]; websiteId: string }): Promise<WebsiteReleaseDecision>;
   /** Recheck pinned source eligibility, actor offboarding and holds; ordinary newer drafts may stay eligible. */
   dependenciesEligible(actor: WebsiteActor, dependencies: readonly WebsiteDependency[]): Promise<boolean>;
   dependenciesCurrent?(actor: WebsiteActor, dependencies: readonly WebsiteDependency[]): Promise<boolean>;
   enqueue(input: { buildId: string; workspaceId: string; actorId: string; idempotencyKey: string }): Promise<void>;
   audit(input: { actor: WebsiteActor; action: string; websiteId: string; buildId?: string; artifactDigest?: string; result: string }): Promise<void>;
+  retryableBuildError?(error:unknown):boolean;
   now?: () => Date; retentionSeconds?: number;
 }
 export class WebsiteService {
@@ -24,13 +25,13 @@ export class WebsiteService {
     if (!Number.isSafeInteger(ports.retentionSeconds ?? 604800) || (ports.retentionSeconds ?? 604800) < 1) throw new WebsiteError('invalid_retention','Retention must be positive seconds.');
   }
   private now() { return this.ports.now?.() ?? new Date(); }
-  private async authorize(actor: WebsiteActor, operation: 'view' | 'edit' | 'export', resources: readonly string[]) {
+  private async authorize(actor: WebsiteActor, operation: 'view' | 'edit' | 'export' | 'publish', resources: readonly string[]) {
     const member=await this.ports.membership(actor);
     if (!actor.actorId || !actor.workspaceId || member?.userId !== actor.actorId || member.workspaceId !== actor.workspaceId || !resources.every(id=>membershipAllows(member,operation,id))) throw new WebsiteError('authorization_denied','Current workspace authority is required.');
     // Public website export is a release operation; manager/personal owner authority is required.
     if(operation==='export' && !['owner','administrator'].includes(member.role)) throw new WebsiteError('authorization_denied','Public website downloads require owner or manager export authority.');
   }
-  private async decision(actor: WebsiteActor, action: 'build' | 'preview' | 'export', websiteId: string, deps: readonly WebsiteDependency[]) {
+  private async decision(actor: WebsiteActor, action: 'build' | 'preview' | 'export' | 'publish', websiteId: string, deps: readonly WebsiteDependency[]) {
     const decision=await this.ports.evaluateRelease({actor,action,websiteId,dependencies:deps});
     if(decision.decision!=='allow' || !decision.revision || (decision.expiresAt && (!Number.isFinite(Date.parse(decision.expiresAt)) || Date.parse(decision.expiresAt)<=this.now().getTime()))) throw new WebsiteError('release_restricted','Current release policy does not allow this operation.');
     return decision;
@@ -42,6 +43,26 @@ export class WebsiteService {
   }
   private resources(websiteId:string,deps:readonly WebsiteDependency[]) { return [websiteId,...deps.filter(d=>!['policy','catalogue'].includes(d.kind)).map(d=>d.id)]; }
   async capabilities(actor: WebsiteActor) { await this.viewingMember(actor); return this.ports.capabilities(actor); }
+  async capturePublication(actor:WebsiteActor,websiteId:string,expectedRevision:number) {
+    const site=await this.get(actor,websiteId);
+    if(site.revision!==expectedRevision)throw new WebsiteError('revision_conflict','Website changed before publication review.');
+    await this.authorize(actor,'publish',[websiteId]);
+    for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
+    const limits=await this.ports.capabilities(actor),raw=await this.ports.resolveSnapshot(actor,structuredClone(site));
+    validateWebsiteSnapshotBudget(raw,limits);
+    if(websiteFingerprint(raw.website)!==websiteFingerprint(site))throw new WebsiteError('snapshot_changed','Publication source changed during capture.');
+    const snapshot=structuredClone(raw);
+    const dependencies:WebsiteDependency[]=[{kind:'website',id:site.id,revision:String(site.revision)},...snapshot.dependencies,...snapshot.documents.map(d=>({kind:'document' as const,id:d.id,revision:String(d.revision)})),...snapshot.galleries.map(g=>({kind:'publication' as const,id:g.publicationId,revision:String(g.revision)})),...snapshot.assets.map(a=>({kind:'asset' as const,id:a.id,revision:`${a.revision}:${a.checksum}`}))];
+    const decision=await this.authorizePublication(actor,websiteId,site.creatorIdentityId,dependencies);
+    return {snapshot,dependencies,limits,policyRevision:decision.revision};
+  }
+  async authorizePublication(actor:WebsiteActor,websiteId:string,creatorIdentityId:string,dependencies:readonly WebsiteDependency[]) {
+    await this.authorize(actor,'publish',this.resources(websiteId,dependencies));
+    if(!await this.ports.creatorIdentityAllowed(actor,creatorIdentityId))throw new WebsiteError('foreign_reference','Publishing identity is unavailable.');
+    const decision=await this.decision(actor,'publish',websiteId,dependencies);
+    if(!await this.ports.dependenciesEligible(actor,dependencies))throw new WebsiteError('dependency_restricted','Pinned publication sources are no longer eligible.');
+    return decision;
+  }
   async list(actor: WebsiteActor) { const member=await this.viewingMember(actor); return (await this.ports.store.listWebsites(actor.workspaceId)).filter(site=>membershipAllows(member,'view',site.id)); }
   async get(actor: WebsiteActor, id: string) {
     await this.authorize(actor,'view',[id]);
@@ -143,7 +164,7 @@ export class WebsiteService {
       await transition({state:'ready',artifactDigest:artifact.digest,snapshotDigest:artifact.snapshotDigest,dependencies:artifact.dependencies,warnings:artifact.warnings,report:artifact.report});
       await this.ports.audit({actor,action:'website.build',websiteId:site.id,buildId,artifactDigest:artifact.digest,result:'ready'});
     } catch(error) {
-      if(build.state==='ready') throw error;
+      if(build.state==='ready'||this.ports.retryableBuildError?.(error)) throw error;
       await transition({state:'failed',errorCode:error instanceof WebsiteError?error.code:'build_failed'});
       await this.ports.audit({actor,action:'website.build',websiteId:build.websiteId,buildId,result:build.errorCode!});
     }
@@ -160,7 +181,7 @@ export class WebsiteService {
       if(String((await this.ports.store.getDocument(actor.workspaceId,dep.id))?.revision)!==dep.revision) stale=true;
     }
     if(this.ports.dependenciesCurrent && !await this.ports.dependenciesCurrent(actor,build.dependencies)) stale=true;
-    return {...build,stale:stale || !await this.ports.dependenciesEligible(actor,build.dependencies)};
+    return {...build,stale:Boolean(build.invalidated) || stale || !await this.ports.dependenciesEligible(actor,build.dependencies)};
   }
   async builds(actor:WebsiteActor,websiteId:string) {
     await this.get(actor,websiteId);

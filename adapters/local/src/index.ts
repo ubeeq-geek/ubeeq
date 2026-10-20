@@ -1,5 +1,6 @@
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
 export { SqliteWebsiteStore } from './websites.js';
+export * from './website-hosting.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
@@ -62,13 +63,22 @@ export class LocalSqliteDatabase {
     // The compact profile has one API process and one worker process. WAL mode
     // keeps readers independent while a bounded busy timeout lets short writes
     // serialize instead of failing immediately under that expected contention.
-    this.database.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+    this.database.exec("PRAGMA busy_timeout = 5000;");
+    // Changing journal mode can return SQLITE_BUSY immediately during simultaneous
+    // first opens, even with busy_timeout. Retry only initialization contention.
+    const startupDeadline=Date.now()+5000;
+    for(;;){try{this.database.exec("PRAGMA journal_mode = WAL;");break;}catch(error){
+      if(!/database is locked|database is busy/i.test((error as Error).message)||Date.now()>=startupDeadline)throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25);
+    }}
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
+    this.transactionSync(()=>{
     for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
+    });
   }
 
   /** Atomic synchronous work must not yield while holding SQLite's write lock. */
