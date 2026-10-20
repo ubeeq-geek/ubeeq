@@ -34,7 +34,7 @@ export interface WebsiteWorkspaceClient {
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
-export interface WebsiteWorkspaceOptions { onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+export interface WebsiteWorkspaceOptions { onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
 export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
   popup.opener=null;popup.document.title='Opening website preview';popup.document.body.textContent='Preparing the saved website preview…';
   try {
@@ -69,7 +69,7 @@ export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void)) => {
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
-  const documentDrafts=new Map<string,WebsiteDocument>(),documentBaselines=new Map<string,string>();let savedSite='',reportedDirty=false;
+  const documentDrafts=new Map<string,WebsiteDocument>(),documentBaselines=new Map<string,string>();let savedSite='',reportedDirty=false,operations=0;
   const dirty=()=>Boolean(site&&(JSON.stringify(site)!==savedSite||[...documentDrafts].some(([id,doc])=>JSON.stringify(doc)!==documentBaselines.get(id))||Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')).some(input=>input.value!==input.dataset.websiteDraftInitial)));
   const reportDirty=()=>{const value=dirty();if(value!==reportedDirty){reportedDirty=value;options.onUnsavedChangesChange?.(value);}};
   const scheduleDirty=()=>queueMicrotask(()=>{if(!disposed)reportDirty();});root.addEventListener('input',scheduleDirty);root.addEventListener('change',scheduleDirty);
@@ -79,7 +79,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
   const status=element('p'); status.setAttribute('role','status');
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
-  const act=(fn:()=>Promise<void>)=>async()=>{try{await fn();}catch(error){status.textContent=error instanceof Error?error.message:'Website operation failed.';}finally{if(!disposed)reportDirty();}};
+  const act=(fn:()=>Promise<void>)=>async()=>{operations++;options.onBusyChange?.(true);try{await fn();}catch(error){status.textContent=error instanceof Error?error.message:'Website operation failed.';}finally{operations--;if(!disposed){reportDirty();options.onBusyChange?.(operations>0);}}};
   const button=(label:string,fn:()=>Promise<void>)=>{const b=element('button',label);b.type='button';b.onclick=act(fn);return b;};
   const dialogs=new Map<HTMLDialogElement,()=>void>();
   const confirmAction=(title:string,description:string,action:string,run:()=>Promise<void>)=>new Promise<void>(resolve=>{
