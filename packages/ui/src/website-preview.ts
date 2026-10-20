@@ -14,6 +14,12 @@ export const readWebsitePreviewArchive = async (archive:Blob):Promise<Record<str
   return files;
 };
 
+/** A script-free loading surface, also used before the build and archive are ready. */
+export const websitePreviewLoadingMarkup = `<style>
+:root{color-scheme:light dark}body{margin:0;background:#f8f6fc;color:#272135;font:16px/1.6 system-ui,sans-serif}.website-preview-loading{position:fixed;inset:0;z-index:2;display:grid;place-content:center;justify-items:center;text-align:center;padding:2rem;background:inherit}.website-preview-loading h1{font-size:1.4rem;margin:1.25rem 0 .5rem}.website-preview-loading p{max-width:34rem;margin:.25rem 0;color:#635a72}.website-preview-spinner{width:2.5rem;height:2.5rem;border:.25rem solid #d9cfe9;border-top-color:#7954b0;border-radius:50%;animation:website-preview-spin .8s linear infinite}@keyframes website-preview-spin{to{transform:rotate(360deg)}}@media(prefers-color-scheme:dark){body{background:#201a2c;color:#f4eefc}.website-preview-loading p{color:#c3b8d5}.website-preview-spinner{border-color:#504060;border-top-color:#b99ae8}}@media(prefers-reduced-motion:reduce){.website-preview-spinner{animation:none;border-style:dotted}}
+</style><main id="website-preview-loading" class="website-preview-loading" aria-busy="true"><span class="website-preview-spinner" aria-hidden="true"></span><h1>Opening website preview</h1><p id="website-preview-status" role="status" aria-live="polite">Preparing your saved pages and images…</p><p>This tab will show your website when it is ready.</p></main>`;
+export const websitePreviewLoadingHtml = () => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Opening website preview</title></head><body>${websitePreviewLoadingMarkup}</body></html>`;
+
 /** Trusted shell only: page content stays in a opaque-origin sandbox with only a nonce-authorized navigation bridge. */
 function runWebsitePreview(files:Record<string,string>,initial:string,nonce:string) {
   const decoder=new TextDecoder(),bytes=(name:string)=>Uint8Array.from(atob(files[name]),c=>c.charCodeAt(0)),text=(name:string)=>decoder.decode(bytes(name));
@@ -28,24 +34,26 @@ function runWebsitePreview(files:Record<string,string>,initial:string,nonce:stri
   };
   const mime:Record<string,string>={css:'text/css',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',webp:'image/webp',avif:'image/avif',gif:'image/gif',mp4:'video/mp4',webm:'video/webm',mp3:'audio/mpeg',ogg:'audio/ogg',wav:'audio/wav',pdf:'application/pdf',txt:'text/plain'};
   const asset=(path:string)=>`data:${mime[path.split('.').pop()??'']??'application/octet-stream'};base64,${files[path]}`;
-  let frame=document.createElement('iframe');frame.title='Website preview';frame.setAttribute('sandbox','allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads');frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';document.body.replaceChildren(frame);
+  let frame=document.createElement('iframe');frame.title='Website preview';frame.setAttribute('sandbox','allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads');frame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0';document.body.append(frame);
   let lastPage=initial;
   const render=()=>{
     const params=new URLSearchParams(location.hash.slice(1)),path=params.get('page')??initial,anchor=params.get('anchor')??'';
     if(!Object.hasOwn(files,path))return;
     const isPage=path.endsWith('.html'),doc=isPage?new DOMParser().parseFromString(text(path),'text/html'):document.implementation.createHTMLDocument('Image preview');
     if(isPage)lastPage=path;else{const image=doc.createElement('img');image.src=asset(path);image.alt='Image preview';image.style.cssText='display:block;max-width:100%;height:auto;margin:1rem auto';doc.body.append(image);}
-    doc.querySelectorAll('script,base,iframe,object,embed,form,meta[http-equiv]').forEach(node=>node.remove());
+    doc.querySelectorAll('script,base,iframe,object,embed,meta[http-equiv]').forEach(node=>node.remove());
+    const formOrigins=new Set<string>();
+    for(const form of doc.querySelectorAll('form')){try{const target=new URL(form.action);if(form.dataset.websiteMailing!=='true'||form.method!=='post'||!['https:','http:'].includes(target.protocol)||!/\/public\/mailing-list\/[^/]+\/subscribe-form$/.test(target.pathname))throw Error();form.target='_blank';formOrigins.add(target.origin);}catch{form.remove();}}
     for(const node of doc.querySelectorAll('*'))for(const attr of [...node.attributes])if(attr.name.startsWith('on'))node.removeAttribute(attr.name);
     for(const link of doc.querySelectorAll<HTMLLinkElement>('link[rel="stylesheet"]')){const target=local(link.getAttribute('href')??'',path);if(target){const style=doc.createElement('style');style.textContent=text(target.path);link.replaceWith(style);}else link.remove();}
     for(const node of doc.querySelectorAll('[src],[poster]'))for(const attr of ['src','poster']){const value=node.getAttribute(attr);if(value){const target=local(value,path);if(target)node.setAttribute(attr,asset(target.path));else if(!value.startsWith('data:'))node.removeAttribute(attr);}}
     for(const link of doc.querySelectorAll<HTMLAnchorElement>('a[href]')){const href=link.getAttribute('href')!,target=local(href,path);if(target&&(target.path.endsWith('.html')||/^image\//.test(mime[target.path.split('.').pop()??'']??''))){const params=new URLSearchParams({page:target.path});if(target.anchor)params.set('anchor',target.anchor);link.href='#'+params.toString();link.dataset.previewPage=target.path;link.dataset.previewAnchor=target.anchor;link.removeAttribute('target');}else if(target){link.href=asset(target.path);link.download=target.path.split('/').pop()??'download';link.removeAttribute('target');}else{link.target='_blank';link.rel='noopener noreferrer';}}
     doc.querySelectorAll('link[rel="icon"]').forEach(node=>node.remove());
     if(!isPage){const back=doc.createElement('a');back.textContent='Back to page';back.href='#';back.dataset.previewPage=lastPage;back.dataset.previewAnchor='';doc.body.prepend(back);}
-    const policy=doc.createElement('meta');policy.httpEquiv='Content-Security-Policy';policy.content=`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src blob: data:; media-src blob: data:; connect-src 'none'; base-uri 'none'; form-action 'none'`;doc.head.prepend(policy);
+    const policy=doc.createElement('meta');policy.httpEquiv='Content-Security-Policy';policy.content=`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src blob: data:; media-src blob: data:; connect-src 'none'; base-uri 'none'; form-action ${[...formOrigins].join(' ')||"'none'"}`;doc.head.prepend(policy);
     function bridge(anchor:string){if(anchor){let id=anchor;try{id=decodeURIComponent(anchor);}catch{}document.getElementById(id)?.scrollIntoView();}document.addEventListener('click',event=>{const link=event.target instanceof Element?event.target.closest<HTMLAnchorElement>('a[data-preview-page]'):null;if(!link)return;event.preventDefault();parent.postMessage({type:'website-preview.navigate',path:link.dataset.previewPage,anchor:link.dataset.previewAnchor},'*');});}
     const script=doc.createElement('script');script.setAttribute('nonce',nonce);script.textContent=`(${bridge.toString()})(${JSON.stringify(anchor).replace(/</g,'\\u003c')});`;doc.body.append(script);
-    document.title=doc.title+' · Preview';const next=frame.cloneNode(false) as HTMLIFrameElement;next.srcdoc='<!doctype html>'+doc.documentElement.outerHTML;frame.replaceWith(next);frame=next;
+    document.title=doc.title+' · Preview';const next=frame.cloneNode(false) as HTMLIFrameElement;next.srcdoc='<!doctype html>'+doc.documentElement.outerHTML;next.style.visibility='hidden';next.addEventListener('load',()=>{next.style.visibility='visible';document.getElementById('website-preview-loading')?.remove();},{once:true});frame.replaceWith(next);frame=next;
   };
   addEventListener('message',event=>{const data=event.data;if(event.source!==frame.contentWindow||!data||data.type!=='website-preview.navigate'||typeof data.path!=='string'||!Object.hasOwn(files,data.path)||!data.path.endsWith('.html')&&!/^image\//.test(mime[data.path.split('.').pop()??'']??'')||typeof data.anchor!=='string'||data.anchor.length>2000)return;const params=new URLSearchParams({page:data.path});if(data.anchor)params.set('anchor',data.anchor);const hash='#'+params.toString();if(location.hash===hash)render();else location.hash=hash;});
   addEventListener('hashchange',render);render();
@@ -54,7 +62,7 @@ export const websitePreviewHtml = (files:Record<string,string>,initial='index.ht
   if(!files[initial]||!initial.endsWith('.html'))throw new Error('The selected preview page is unavailable.');
   const nonce=crypto.randomUUID().replace(/-/g,'');
   const data=JSON.stringify(files).replace(/</g,'\\u003c');
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src blob: data:; media-src blob: data:; frame-src blob:; connect-src 'none'; base-uri 'none'; form-action 'none'"><link rel="icon" href="data:,"><title>Website preview</title></head><body><script nonce="${nonce}">(${runWebsitePreview.toString()})(${data},${JSON.stringify(initial).replace(/</g,'\\u003c')},${JSON.stringify(nonce)});</script></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src blob: data:; media-src blob: data:; frame-src blob:; connect-src 'none'; base-uri 'none'; form-action https: http:"><link rel="icon" href="data:,"><title>Website preview</title></head><body>${websitePreviewLoadingMarkup}<script nonce="${nonce}">(${runWebsitePreview.toString()})(${data},${JSON.stringify(initial).replace(/</g,'\\u003c')},${JSON.stringify(nonce)});</script></body></html>`;
 };
 
 /** Temporary local preview cache, shared with the standalone preview document. */

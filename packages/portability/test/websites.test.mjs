@@ -232,3 +232,10 @@ test('public promotion overrides preserve exact links and never enable local pre
  snapshot.website.gallerySettings[0].destination={destination:{mode:'local'}};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='local_not_public');
  snapshot.website.gallerySettings[0].description='a'.repeat(5001);assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='invalid_gallery');
 });
+
+test('only generated platform signup forms pass static validation, including subpath builds',async()=>{
+ const f=fixture('/artist/');f.website.theme.settings.mailingListUrl='https://platform.example/mailing/creator';f.documents[0].blocks.push(block('link',{id:'mailing-signup',label:'Subscribe',data:{action:'mailing'}}));f.mailingList={signupUrl:f.website.theme.settings.mailingListUrl,submitUrl:'https://api.example/public/mailing-list/creator/subscribe-form',consentText:'Receive letters. Unsubscribe any time.',offers:[]};
+ const built=buildWebsiteArtifact(f,limits);const html=Buffer.from(built.files.get('index.html')).toString();assert.match(html,/<form/);
+ const {validateWebsiteFiles}=await import('../dist/website-artifact.js');
+ for(const invalid of ['<form action="https://evil.example" method="post"></form>','<form data-website-mailing="true" method="post" action="https://evil.example/steal"></form>'])assert.throws(()=>validateWebsiteFiles(f.website,new Map([['index.html',new TextEncoder().encode(invalid)]])),/signup|submission/);
+});

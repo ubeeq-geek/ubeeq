@@ -1,4 +1,4 @@
-import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview} from './website-preview.js';
+import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml} from './website-preview.js';
 import { WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteGallerySettings, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteCatalogueOption {id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
@@ -36,7 +36,8 @@ export interface WebsiteWorkspaceClient {
 }
 export interface WebsiteWorkspaceOptions { onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
 export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
-  popup.opener=null;popup.document.title='Opening website preview';popup.document.body.textContent='Preparing the saved website preview…';
+  popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
+  const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
   try {
     const saved=await client.get(),page=saved.pages.find(p=>p.id===(pageId??saved.homePageId));
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
@@ -52,12 +53,13 @@ export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get
         if(build.state==='ready'){if(build.stale)throw new Error('Website sources changed while preparing the preview. Open a new preview.');break;}
         if(['failed','cancelled'].includes(build.state))throw new Error('Website preview could not be prepared'+(build.errorCode?' ('+build.errorCode+')':'')+'. Build a new candidate to retry.');
         if(Date.now()>deadline)throw new Error('This build is taking longer than expected. Its progress is available in Publishing.');
-        popup.document.body.textContent='Preparing website preview: '+build.state+'. This tab will open the website automatically when it is ready.';
+        progress(build.state==='queued'?'Your preview is queued. Preparing will begin shortly…':'Preparing your pages and images…');
         await new Promise(resolve=>setTimeout(resolve,1000));
       }
     }
     const route=websiteRoutes(saved).get(page.id);if(!route)throw new Error('This page is unavailable in the saved website.');
     if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
+    progress('Loading your preview…');
     const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
     const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
     if(popup.closed)return buildId;

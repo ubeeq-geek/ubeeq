@@ -14,6 +14,7 @@ export interface WebsitePublicAsset {
 export interface WebsiteSnapshot {
   copyrightYear?:number;
   creatorIdentities?:readonly {id:string;title:string}[];
+  mailingList?: {signupUrl:string;submitUrl:string;consentText:string;offers:readonly {id:string;title:string}[]};
   apiVersion: '1'; website: Website; documents: readonly WebsiteDocument[];
   galleries: readonly WebsiteGallery[]; mappings: readonly WebsitePublicationMapping[];
   assets: readonly WebsitePublicAsset[]; dependencies: readonly WebsiteDependency[];
@@ -70,11 +71,17 @@ export const validateWebsiteFiles = (site: Website, files: ReadonlyMap<string, U
     const root=parse(Buffer.from(bytes).toString('utf8')), pending: DefaultTreeAdapterMap['node'][]=[root], found=new Set<string>(); ids.set(file,found);
     while(pending.length) {
       const node=pending.pop()!;
-      if ('tagName' in node && ['script','iframe','object','embed','form'].includes(String(node.tagName))) throw new WebsiteError('unsafe_output','Active authored output is not allowed.');
+      if ('tagName' in node && ['script','iframe','object','embed'].includes(String(node.tagName))) throw new WebsiteError('unsafe_output','Active authored output is not allowed.');
+      if ('tagName' in node && node.tagName==='form') {
+        const attrs=Object.fromEntries(node.attrs.map(a=>[a.name,a.value]));
+        if(attrs['data-website-mailing']!=='true'||attrs.method!=='post'||!attrs.action)throw new WebsiteError('unsafe_output','Only generated mailing-list signup forms are allowed.');
+        websiteExternalUrl(attrs.action);
+        if(!/^https?:$/.test(new URL(attrs.action).protocol)||!/\/public\/mailing-list\/[^/]+\/subscribe-form$/.test(new URL(attrs.action).pathname))throw new WebsiteError('unsafe_output','Unexpected mailing-list submission URL.');
+      }
       if ('attrs' in node) for (const attr of node.attrs as {name:string;value:string}[]) {
         if (attr.name.startsWith('on') || attr.name === 'style') throw new WebsiteError('unsafe_output','Executable attributes are not allowed.');
         if (attr.name === 'id') { if (found.has(attr.value)) throw new WebsiteError('duplicate_fragment','Duplicate generated fragment.'); found.add(attr.value); }
-        if (['href','src','poster'].includes(attr.name)) references.push({file,value:attr.value});
+        if (['href','src','poster','action'].includes(attr.name)) references.push({file,value:attr.value});
       }
       if ('childNodes' in node) pending.push(...node.childNodes);
     }
@@ -94,6 +101,7 @@ export const validateWebsiteSnapshotBudget = (raw: WebsiteSnapshot, limits: {max
   if(raw.copyrightYear!==undefined&&(!Number.isInteger(raw.copyrightYear)||raw.copyrightYear<1||raw.copyrightYear>9999))throw new WebsiteError('invalid_year','Copyright year must be a calendar year.');
   if (raw.apiVersion !== '1') throw new WebsiteError('unsupported_schema','Unsupported website snapshot version.');
   for (const limit of [limits.maxPages, limits.maxAssets, limits.maxBytes]) if (!Number.isSafeInteger(limit) || limit < 1) throw new WebsiteError('invalid_limits','Build limits must be positive integers.');
+  if(raw.mailingList){websiteExternalUrl(raw.mailingList.signupUrl);websiteExternalUrl(raw.mailingList.submitUrl);if(raw.mailingList.consentText.length>2000||raw.mailingList.offers.length>20||raw.mailingList.offers.some(o=>!o.id||o.id.length>200||o.title.length>200))throw new WebsiteError('invalid_mailing_list','Invalid public signup projection.');}
   if(raw.creatorIdentities&&(raw.creatorIdentities.length>51||new Set(raw.creatorIdentities.map(creator=>creator.id)).size!==raw.creatorIdentities.length||raw.creatorIdentities.some(creator=>![raw.website.creatorIdentityId,...raw.website.contributingCreatorIds??[]].includes(creator.id)||typeof creator.title!=='string'||!creator.title.trim()||creator.title.length>500)))throw new WebsiteError('invalid_contributors','Resolve only the connected public creator identities.');
   if (raw.website.pages.length > limits.maxPages || raw.assets.length > limits.maxAssets || raw.galleries.length > 1000) throw new WebsiteError('quota_exceeded','Website page, gallery or media quota exceeded.');
   // Bound the source projection before cloning it or allocating rendered output.
@@ -137,7 +145,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,creatorIdentities:snapshot.creatorIdentities});
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');
