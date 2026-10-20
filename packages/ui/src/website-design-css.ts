@@ -15,9 +15,10 @@ export function websiteDesignCss(site:Website):string {
  .template-portfolio.has-cover .page-surface{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:2rem;align-items:center}.template-portfolio.has-cover .page-heading{grid-column:1;grid-row:1;align-self:end}.template-portfolio .page-heading h1{font-size:clamp(2.5rem,6vw,5rem);line-height:1.05;letter-spacing:-.045em}.template-portfolio.has-cover .page-cover{grid-column:2;grid-row:1 / span 2}.template-portfolio .page-cover img{aspect-ratio:4/5;max-height:42rem}.template-portfolio .page-content{display:contents}.template-portfolio .page-content>*{grid-column:1/-1}.template-portfolio.has-cover .page-content>.section-intro{grid-column:1;grid-row:2;align-self:start}
  .theme-peril-poise{--width:100rem;--poise-burgundy:#913b52;--poise-focus:#ed6b35;background-image:radial-gradient(ellipse at center,color-mix(in srgb,var(--color-text) 3%,transparent),transparent 75%)}
  .theme-peril-poise :where(h1,h2,h3,.site-wordmark){font-family:Didot,"Bodoni MT",Georgia,serif;font-weight:400;letter-spacing:-.025em}
- .theme-peril-poise .site-wordmark{font-size:clamp(2.5rem,6vw,6rem);line-height:1.1;color:var(--color-text)}
+ .theme-peril-poise .site-wordmark{font-size:clamp(1.25rem,3vw,3rem);line-height:1.1;color:var(--color-text)}
  .theme-peril-poise :where(.site-header,.site-footer){border:0;position:relative;padding-block:1.5rem}
  .theme-peril-poise :where(.site-header,.site-footer)::after{content:"";position:absolute;inset-inline:clamp(1rem,4vw,3rem);height:.4rem;border-top:1px solid var(--color-border);border-bottom:3px solid var(--poise-burgundy);pointer-events:none}
+ .theme-peril-poise .site-header{padding-block:.75rem;gap:1rem}.theme-peril-poise .site-header nav>ul{margin-block:.5rem;row-gap:.5rem}.theme-peril-poise .site-header .website-action{padding-block:.4rem}.theme-peril-poise .site-header .site-logo{max-width:6rem;max-height:2.5rem}
  .theme-peril-poise .site-header::after{bottom:0}.theme-peril-poise .site-footer::after{top:0}
  .theme-peril-poise .site-header:is(.centered,.stacked) .site-brand{gap:1rem}
  .theme-peril-poise .site-header:is(.centered,.stacked) .site-brand::before,.theme-peril-poise .site-header:is(.centered,.stacked) .site-brand::after{content:"";height:.4rem;flex:1;border-top:1px solid var(--color-border);border-bottom:3px solid var(--poise-burgundy)}
