@@ -44,7 +44,7 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
   private list<T>(workspace:string,kind:string): T[] {
     return (this.db.prepare('SELECT payload FROM website_records WHERE workspace=? AND kind=? ORDER BY id').all(workspace,kind) as {payload:string}[]).map(r=>JSON.parse(r.payload));
   }
-  private save<T extends {id:string;revision:number}>(workspace:string,kind:string,value:T,expected:number) {
+  protected save<T extends {id:string;revision:number}>(workspace:string,kind:string,value:T,expected:number) {
     if(!workspace || !value.id || !Number.isSafeInteger(expected) || expected<0 || value.revision!==expected+1) throw new WebsiteError('revision_conflict','Invalid record revision.');
     if(expected===0) {
       const result=this.db.prepare('INSERT OR IGNORE INTO website_records(workspace,kind,id,revision,payload) VALUES(?,?,?,?,?)').run(workspace,kind,value.id,value.revision,JSON.stringify(value));
