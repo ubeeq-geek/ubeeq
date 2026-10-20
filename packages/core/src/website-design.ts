@@ -7,10 +7,11 @@ export const WEBSITE_PAGE_TEMPLATES = [
   {id:'gallery',title:'Gallery',description:'A wide canvas for portfolios and gallery blocks.'}
 ] as const;
 export type WebsitePageTemplate = typeof WEBSITE_PAGE_TEMPLATES[number]['id'];
-export type WebsiteThemeId = 'neutral'|'ink'|'ocean'|'plum'|'modernist'|'nocturne'|'organic'|'cinema'|'literary'|'broadsheet'|'minimal'|'editorial'|'poster';
+export type WebsiteThemeId = 'neutral'|'ink'|'ocean'|'plum'|'modernist'|'nocturne'|'organic'|'cinema'|'literary'|'broadsheet'|'minimal'|'editorial'|'poster'|'peril-poise';
 export interface WebsitePalette { canvas:string;text:string;muted:string;action:string;border:string; }
 export const WEBSITE_THEMES: readonly {id:WebsiteThemeId;title:string;light:WebsitePalette;dark:WebsitePalette}[] = [
   {id:'neutral',title:'Evergreen',light:{canvas:'#fafaf9',text:'#202321',muted:'#525b55',action:'#225e47',border:'#a8b2aa'},dark:{canvas:'#181e1a',text:'#edf2ee',muted:'#b7c2b9',action:'#a3dfba',border:'#819687'}},
+  {id:'peril-poise',title:'Peril & Poise',light:{canvas:'#f7f1e7',text:'#262123',muted:'#665550',action:'#79551e',border:'#947038'},dark:{canvas:'#151517',text:'#f3ebdf',muted:'#c9b9a8',action:'#d3ac64',border:'#b59559'}},
   {id:'ink',title:'Ink',light:{canvas:'#ffffff',text:'#202124',muted:'#555b65',action:'#344b74',border:'#abb4c0'},dark:{canvas:'#17191f',text:'#eff0f6',muted:'#bcc2d0',action:'#b6c9ff',border:'#707b92'}},
   {id:'ocean',title:'Ocean',light:{canvas:'#f2f8fc',text:'#122c3c',muted:'#415c70',action:'#075582',border:'#8aa7bb'},dark:{canvas:'#102531',text:'#edf7fc',muted:'#b0ccd9',action:'#86d2ff',border:'#7599ad'}},
   {id:'modernist',title:'Modernist',light:{canvas:'#f3f2ef',text:'#201e1d',muted:'#625d59',action:'#ae1800',border:'#aaa29b'},dark:{canvas:'#1b1918',text:'#f6f2ef',muted:'#c7bdb7',action:'#ff9e8c',border:'#8c7d73'}},

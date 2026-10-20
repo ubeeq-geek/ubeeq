@@ -30,7 +30,7 @@ test('photography, cinema and literary starters stay editable and use configured
 
 test('every purpose renders with every visual style without rewriting its content',async()=>{
  const{WEBSITE_INTENTS,WEBSITE_THEMES,websiteIntentBlocks}=await import('@ubeeq/core');
- assert.equal(WEBSITE_INTENTS.length,12);assert.equal(WEBSITE_THEMES.length,13);
+ assert.equal(WEBSITE_INTENTS.length,12);assert.equal(WEBSITE_THEMES.length,14);
  for(const intent of WEBSITE_INTENTS){const blocks=websiteIntentBlocks(intent.id,'home',()=>crypto.randomUUID()),before=JSON.stringify(blocks);for(const style of WEBSITE_THEMES){const input=fixture(style.id);input.website.intent=intent.id;input.documents.set('doc',{blocks});websiteRoutes(input.website);const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,new RegExp('theme-'+style.id));assert.doesNotMatch(html,/<script|<form|482913/);assert.equal(JSON.stringify(blocks),before);}}
 });
 test('purpose controls booking or release actions independently of visual style',()=>{
