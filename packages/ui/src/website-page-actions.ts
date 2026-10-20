@@ -20,7 +20,7 @@ export function removeWebsitePage(site:Website,pageId:string,replacementHomeId?:
   let next:Website={...site,pages,homePageId:home.id,redirects:[],...(site.embedding?.pageId===pageId?{embedding:{...site.embedding,pageId:home.id}}:{})};
   const routes=websiteRoutes(next),moved=new Map([...oldRoutes].filter(([id])=>id!==pageId).map(([id,path])=>[path,routes.get(id)!]));
   const removedPath=oldRoutes.get(pageId);
-  next={...next,redirects:site.redirects.filter(redirect=>redirect.to!==removedPath&&!new Set(routes.values()).has(redirect.from)).map(redirect=>({...redirect,to:moved.get(redirect.to)??redirect.to}))};
+  next={...next,redirects:site.redirects.filter(redirect=>(redirect.to!==removedPath||replacingHome)&&!new Set(routes.values()).has(redirect.from)).map(redirect=>({...redirect,to:moved.get(redirect.to)??redirect.to}))};
   websiteRoutes(next);
   return next;
 }

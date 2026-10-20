@@ -8,7 +8,7 @@ test('page deletion promotes child pages, cleans menus/redirects and resets embe
  assert.deepEqual(site,before);assert.equal(next.pages.length,2);assert.equal(next.pages[1].parentId,undefined);assert.equal(next.pages[1].navigationParentId,null);assert.equal(next.pages[1].footerNavigationParentId,null);assert.equal(next.pages[1].documentId,'shared-document');assert.equal(next.embedding.pageId,'home');assert.deepEqual(next.redirects,[{from:'/old-team/',to:'/team/',status:301}]);websiteRoutes(next);
 });
 test('homepage deletion requires a Ready replacement and preserves valid page hierarchy',()=>{
- const site=fixture();assert.throws(()=>removeWebsitePage(site,'home'),/Choose a Ready page/);const next=removeWebsitePage(site,'home','about');assert.equal(next.homePageId,'about');assert.equal(next.pages[0].kind,'home');assert.equal(next.pages[0].slug,'');assert.equal(next.pages[1].parentId,undefined);websiteRoutes(next);
+ const site=fixture();assert.throws(()=>removeWebsitePage(site,'home'),/Choose a Ready page/);site.redirects.push({from:'/start/',to:'/',status:301});const next=removeWebsitePage(site,'home','about');assert.ok(next.redirects.some(redirect=>redirect.from==='/start/'&&redirect.to==='/'));assert.equal(next.homePageId,'about');assert.equal(next.pages[0].kind,'home');assert.equal(next.pages[0].slug,'');assert.equal(next.pages[1].parentId,undefined);websiteRoutes(next);
  assert.throws(()=>removeWebsitePage({...site,pages:[site.pages[0]]},'home'),/only page/);
  assert.throws(()=>removeWebsitePage({...site,pages:site.pages.map(page=>page.id==='about'?{...page,state:'draft'}:page)},'home','about'),/Ready page/);
 });
