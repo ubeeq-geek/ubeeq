@@ -296,7 +296,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     }
     if(tab==='Gallery destinations') {
       content.append(element('p','Choose the publications to show in your galleries and where each card opens. Connected links use that exact publication and account. Member content stays at its source; choose a public summary and preview for its card.'));
-      const catalogue=client.catalogue?await client.catalogue():undefined;
+      const catalogue=client.catalogue?await client.catalogue():undefined;if(disposed||renderGeneration!==generation)return;
       const availableModes=options.destinationModes??['local','manual','connected'];
       const destinationPicker=(parent:HTMLElement,label:string,value:WebsiteDestination|undefined,choices:readonly WebsiteCatalogueOption[],change:(v:WebsiteDestination|undefined)=>void,inherit=false)=>{
         const box=element('fieldset');box.className='website-gallery-destination';box.append(element('legend',label));const mode=element('select');mode.setAttribute('aria-label',label);
@@ -326,7 +326,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         field(row,'Website slug',setting.slug??'',v=>{setting={...setting,slug:v||undefined};change();});
         destinationPicker(row,'Publication destination',setting.destination?.destination,publication?[publication]:[],destination=>{setting={...setting,destination:destination?{destination,missing:'error'}:undefined};change();},true);
         const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value};change();};summaryLabel.append(summary);row.append(summaryLabel);
-        await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});content.append(row);
+        await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});if(disposed||renderGeneration!==generation)return;content.append(row);
       }
       content.append(button('Save publication overrides',save));
     }
