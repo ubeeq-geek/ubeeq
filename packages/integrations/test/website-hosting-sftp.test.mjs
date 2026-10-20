@@ -30,4 +30,5 @@ test('real SSH transport refuses a changed host key before authentication and re
  const target={config:{hostname:'127.0.0.1',port:String(server.address().port),hostKeyFingerprint:'SHA256:'+'A'.repeat(43)}};let authorized=0;
  await assert.rejects(connectWebsiteSftp({target,credential:{username:'test',privateKey:key.private},authorizeHost:async()=>authorized++}),{code:'host_key_changed'});assert.equal(authorized,1);
  await assert.rejects(connectWebsiteSftp({target,credential:{username:'test',privateKey:key.private},authorizeHost:async()=>{throw new Error('outbound denied');}}),/outbound denied/);
+ await assert.rejects(connectWebsiteSftp({target:{...target,config:{...target.config,hostname:'must-not-resolve.invalid'}},credential:{username:'test',privateKey:key.private},authorizeHost:async()=> '127.0.0.1'}),{code:'host_key_changed'});
 });

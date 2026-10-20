@@ -163,7 +163,7 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
     const t=this.owned(a.workspaceId,a.targetId,a.id,e);
     this.save(a.workspaceId,'hosting_attempt',a,expected);
     const keepLock=a.state==='unknown';
-    const active=outcome&&a.generation>=t.activeGeneration?{servingRemovalRequired:false,activeGeneration:a.generation,activeAttemptId:a.id,activeReleaseId:outcome.releaseId,activeArtifactDigest:a.artifactDigest,serving:outcome.disabled?'unpublished' as const:'active' as const}:{};
+    const active=outcome&&a.generation>=t.activeGeneration?{servingRemovalRequired:outcome.disabled?false:!!t.servingRemovalRequired,activeGeneration:a.generation,activeAttemptId:a.id,activeReleaseId:outcome.releaseId,activeArtifactDigest:a.artifactDigest,serving:outcome.disabled?'unpublished' as const:t.serving==='suspended'?'suspended' as const:'active' as const}:{};
     this.replace(a.workspaceId,'hosting_target',{...t,...active,lock:keepLock?t.lock:undefined});
     this.db.prepare('DELETE FROM website_hosting_outbox WHERE workspace=? AND attempt=?').run(a.workspaceId,a.id);
   });}

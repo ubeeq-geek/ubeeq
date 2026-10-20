@@ -55,11 +55,11 @@ export class SftpWebsiteHostingAdapter implements WebsiteHostingAdapter {
 }
 
 /** DNS/outbound authorization is mandatory and supplied by the installation. */
-export const connectWebsiteSftp=async(input:{target:WebsiteHostingTarget;credential:{username:string;privateKey:string;passphrase?:string};authorizeHost:(host:string,port:number)=>Promise<void>}):Promise<WebsiteSftpSession>=>{
+export const connectWebsiteSftp=async(input:{target:WebsiteHostingTarget;credential:{username:string;privateKey:string;passphrase?:string};authorizeHost:(host:string,port:number)=>Promise<string|void>}):Promise<WebsiteSftpSession>=>{
   const {target}=input,host=target.config.hostname,port=Number(target.config.port??22),fingerprint=target.config.hostKeyFingerprint;
   if(!host||!Number.isSafeInteger(port)||port<1||port>65535||!/^SHA256:[A-Za-z0-9+/]{43}$/.test(fingerprint??''))throw new WebsiteError('invalid_sftp_connection','Host, port and an independently verified SHA256 host-key fingerprint are required.');
-  await input.authorizeHost(host,port);const client=new Client();let hostMismatch=false;
-  const config:ConnectConfig={host,port,username:input.credential.username,privateKey:input.credential.privateKey,passphrase:input.credential.passphrase,readyTimeout:15000,keepaliveInterval:10000,keepaliveCountMax:2,hostVerifier:(key:Buffer)=>{const actual='SHA256:'+createHash('sha256').update(key).digest('base64').replace(/=+$/,'');hostMismatch=actual.length!==fingerprint.length||!timingSafeEqual(Buffer.from(actual),Buffer.from(fingerprint));return !hostMismatch;}};
+  const approvedAddress=await input.authorizeHost(host,port);const client=new Client();let hostMismatch=false;
+  const config:ConnectConfig={host:typeof approvedAddress==='string'?approvedAddress:host,port,username:input.credential.username,privateKey:input.credential.privateKey,passphrase:input.credential.passphrase,readyTimeout:15000,keepaliveInterval:10000,keepaliveCountMax:2,hostVerifier:(key:Buffer)=>{const actual='SHA256:'+createHash('sha256').update(key).digest('base64').replace(/=+$/,'');hostMismatch=actual.length!==fingerprint.length||!timingSafeEqual(Buffer.from(actual),Buffer.from(fingerprint));return !hostMismatch;}};
   await new Promise<void>((resolve,reject)=>{client.once('ready',resolve);client.once('error',()=>reject(new WebsiteError(hostMismatch?'host_key_changed':'sftp_connection_failed','SFTP connection failed or the approved host key changed.')));client.connect(config);});
   const sftp=await new Promise<SFTPWrapper>((resolve,reject)=>client.sftp((error,value)=>error?reject(new WebsiteError('sftp_unavailable','Server does not provide SFTP.')):resolve(value)));
   const call=<T>(fn:(cb:(error:Error|undefined|null,value?:T)=>void)=>void)=>new Promise<T>((resolve,reject)=>{const timeout=setTimeout(()=>reject(new WebsiteError('sftp_timeout','SFTP operation timed out.')),30000);fn((error,value)=>{clearTimeout(timeout);error?reject(error):resolve(value!);});});

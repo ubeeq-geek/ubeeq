@@ -120,3 +120,10 @@ test('invalidated candidates remain stale after eligibility is restored',async t
  const f=await fixture(t);await f.store.saveBuild({id:'old-build',workspaceId:'workspace',websiteId:'site',websiteRevision:1,actorId:'actor',creatorIdentityId:'creator',revision:1,idempotencyKey:'old',state:'ready',invalidated:true,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),dependencies:[],warnings:[]},0);
  assert.equal((await f.website.build(actor,'old-build')).stale,true);
 });
+
+test('verification cannot clear a serving suspension or operator withdrawal flag',async t=>{
+ const f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...a)=>n.validateTarget(...a),prepare:c=>n.prepare(c),activate:c=>n.activate(c),reconcile:c=>n.reconcile(c),verify:async(...args)=>({...await n.verify(...args),publicConfirmed:false})})});
+ const intent=await f.accept('pending-public-verification');assert.equal((await f.service.execute('workspace',intent.attemptIds[0])).state,'verifying');
+ await f.native.suspend(f.target);await f.store.setServingState('workspace','target','suspended',true);
+ await f.service.reconcile('workspace',intent.attemptIds[0]);const target=await f.store.getTarget('workspace','target');assert.equal(target.serving,'suspended');assert.equal(target.servingRemovalRequired,true);assert.equal((await fetch(f.target.publicUrl)).status,410);
+});
