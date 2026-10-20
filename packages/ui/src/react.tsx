@@ -36,6 +36,7 @@ export type BlockEditorProps = {
   websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
   sectionDepth?: number;
+  stickyToolbarOffset?: number;
 };
 
 const textBlockTypes = new Set<PostBlock['type']>(['paragraph', 'heading', 'quote']);
@@ -88,9 +89,17 @@ export function BlockEditor({
   allowStructured = false,
   websiteOptions,
   sectionDepth = 0,
+  stickyToolbarOffset = 0,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
+  const toolbarRef=useRef<HTMLDivElement>(null);
+  const [toolbarHeight,setToolbarHeight]=useState(0);
+  useEffect(()=>{
+    const toolbar=toolbarRef.current;if(!websiteOptions||!toolbar)return;
+    const measure=()=>setToolbarHeight(toolbar.getBoundingClientRect().height);measure();
+    if(typeof ResizeObserver==='undefined')return;const observer=new ResizeObserver(measure);observer.observe(toolbar);return()=>observer.disconnect();
+  },[Boolean(websiteOptions),readOnly]);
   const normalized = useMemo(() => websiteOptions && sectionDepth === 0 ? flattenWebsiteSections(value) : value, [value, Boolean(websiteOptions), sectionDepth]);
   const blocks = normalized.length ? normalized : [emptyBlock];
   const [collapsedSections,setCollapsedSections]=useState<Set<string>>(()=>new Set());
@@ -209,7 +218,7 @@ export function BlockEditor({
       </div>
 
       <div className="portable-block-editor-shell">
-        {!readOnly && <div className="portable-block-editor-toolbar" aria-label="Active block tools">
+        {!readOnly && <div ref={toolbarRef} className="portable-block-editor-toolbar" style={websiteOptions?{top:stickyToolbarOffset,zIndex:10+sectionDepth}:undefined} aria-label="Active block tools">
           <div className="portable-block-editor-block-tools">
             {activeBlock && textBlockTypes.has(activeBlock.type) ? <select value={activeBlock.type} onChange={(event) => updateActiveBlockType(event.target.value as 'paragraph' | 'heading' | 'quote')} aria-label="Active block type">
               <option value="paragraph">Paragraph</option>
@@ -274,7 +283,7 @@ export function BlockEditor({
                   </div>
                 </div> : <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>}
                 <div onClick={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}} onFocus={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}}>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1}
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1} stickyToolbarOffset={stickyToolbarOffset+toolbarHeight}
                   label="Section content" helpText="Add and arrange content in this section." onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
                 </div></div>
               </div>}
