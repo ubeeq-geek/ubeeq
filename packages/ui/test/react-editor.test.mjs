@@ -80,3 +80,13 @@ test('website sections are flat, individually removable and have closed properti
   assert.equal((html.match(/>Section<\/button>/g)||[]).length,1);
   assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,3);
 });
+
+test('existing top-level galleries become sections with their filters and heading preserved',async()=>{
+ const {flattenWebsiteSections}=await import('../dist/block-content.js');
+ const gallery={blockId:'gallery',type:'gallery_list',payload:{publicationIds:['one','two'],creatorIdentityIds:['artist'],tags:['prints'],pageSize:6}};
+ const value=[{blockId:'heading',type:'heading',level:2,text:'Selected galleries'},gallery],before=structuredClone(value),flat=flattenWebsiteSections(value);
+ assert.equal(flat.length,1);assert.equal(flat[0].title,'Selected galleries');assert.deepEqual(flat[0].blocks,[gallery]);assert.deepEqual(value,before);assert.deepEqual(flattenWebsiteSections(flat),flat);
+ const bare=flattenWebsiteSections([gallery]);assert.equal(bare[0].title,'Galleries');assert.deepEqual(bare[0].blocks,[gallery]);
+ const html=renderToStaticMarkup(createElement(BlockEditor,{value,websiteOptions:{pages:[],publications:[]},allowStructured:true,onChange:()=>assert.fail('Rendering must not save')}));
+ assert.match(html,/Remove section Selected galleries/);assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,1);
+});

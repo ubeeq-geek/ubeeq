@@ -240,5 +240,19 @@ export function flattenWebsiteSections(blocks: PostBlock[]): PostBlock[] {
     }
   };
   for (const block of blocks) visit(block);
-  return result;
+  const sections: PostBlock[] = [];
+  const isGallery = (block: PostBlock | undefined) => block && ['gallery_list','selected_portfolio'].includes(block.type);
+  for (let index=0;index<result.length;index++) {
+    const block=result[index],next=result[index+1];
+    if (block.type==='heading' && (block.level??2)===2 && isGallery(next)) {
+      sections.push({blockId:block.blockId,type:'section',title:block.text || inlineHtmlToText(block.html || '') || 'Galleries',blocks:[next],payload:{presentation:'standard'}});
+      index++;
+    } else if (isGallery(block)) {
+      let id=block.blockId+'-section';
+      while(used.has(id))id+='-section';
+      used.add(id);
+      sections.push({blockId:id,type:'section',title:'Galleries',blocks:[block],payload:{presentation:'standard'}});
+    } else sections.push(block);
+  }
+  return sections;
 }
