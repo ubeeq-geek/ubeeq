@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,rm,readFile } from 'node:fs/promises';
+import { mkdtemp,rm,readFile,realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -10,7 +10,7 @@ import { SqliteWebsiteStore,NativeWebsiteHostingAdapter,createNativeWebsiteHandl
 import { createHostingPublicProbe } from '@ubeeq/integrations';
 const actor={workspaceId:'workspace',actorId:'actor'};
 async function fixture(t,{fake,enqueueFails=false,confirmQuiescent}={}){
-  const dir=await mkdtemp(join(tmpdir(),'ubeeq-hosting-'));t.after(()=>rm(dir,{recursive:true,force:true}));
+  const dir=await realpath(await mkdtemp(join(tmpdir(),'ubeeq-hosting-')));t.after(()=>rm(dir,{recursive:true,force:true}));
   const store=new SqliteWebsiteStore(join(dir,'website.sqlite'));t.after(()=>store.close());
   const site={id:'site',workspaceId:'workspace',creatorIdentityId:'creator',revision:1,title:'Approved website',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'manual',url:'https://example.com/'},missing:'error'},mediaMode:'bundled',basePath:'/',publicBaseUrl:'https://example.com',pages:[{id:'home',websiteId:'site',workspaceId:'workspace',revision:1,documentId:'home-doc',kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true},{id:'about',websiteId:'site',workspaceId:'workspace',revision:1,documentId:'about-doc',kind:'page',title:'About',slug:'about',order:1,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]};
   let text='Approved content',allowed=true,member=true,asset;let queues=[];
