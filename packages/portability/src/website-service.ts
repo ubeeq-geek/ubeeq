@@ -181,7 +181,7 @@ export class WebsiteService {
       if(String((await this.ports.store.getDocument(actor.workspaceId,dep.id))?.revision)!==dep.revision) stale=true;
     }
     if(this.ports.dependenciesCurrent && !await this.ports.dependenciesCurrent(actor,build.dependencies)) stale=true;
-    return {...build,stale:stale || !await this.ports.dependenciesEligible(actor,build.dependencies)};
+    return {...build,stale:Boolean(build.invalidated) || stale || !await this.ports.dependenciesEligible(actor,build.dependencies)};
   }
   async builds(actor:WebsiteActor,websiteId:string) {
     await this.get(actor,websiteId);

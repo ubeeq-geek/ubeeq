@@ -116,3 +116,7 @@ test('frozen publication plans preserve current design, shared identities and co
  await f.website.save(actor,site,1);const review=await f.service.review(actor,'site',2,['target']),plan=await f.store.getPlan('workspace',review.planId),snapshot=await f.store.getSnapshot('workspace',plan.snapshotReference);
  assert.equal(snapshot.copyrightYear,2026);assert.equal(snapshot.creatorIdentities[1].id,'guest');assert.deepEqual(snapshot.website.theme,site.theme);assert.deepEqual(snapshot.website.pages[0],site.pages[0]);assert.deepEqual(snapshot.website.editingCreatorIds,['guest']);
 });
+test('invalidated candidates remain stale after eligibility is restored',async t=>{
+ const f=await fixture(t);await f.store.saveBuild({id:'old-build',workspaceId:'workspace',websiteId:'site',websiteRevision:1,actorId:'actor',creatorIdentityId:'creator',revision:1,idempotencyKey:'old',state:'ready',invalidated:true,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),dependencies:[],warnings:[]},0);
+ assert.equal((await f.website.build(actor,'old-build')).stale,true);
+});
