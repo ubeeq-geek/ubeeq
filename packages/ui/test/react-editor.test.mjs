@@ -65,3 +65,18 @@ test('structured insertion is opt-in and link/credit values remain inert metadat
   assert.match(body, /Credit author/); assert.match(body, /Link URL/);
   assert.doesNotMatch(body, /href=|<script>/);
 });
+
+test('website sections are flat, individually removable and have closed properties initially', async () => {
+  const {flattenWebsiteSections}=await import('../dist/block-content.js');
+  const p=(id,text)=>({blockId:id,type:'paragraph',text});
+  const value=[{blockId:'main',type:'section',title:'Main',payload:{presentation:'standard'},blocks:[p('before','Before'),{blockId:'mail',type:'section',title:'Mailing list',payload:{presentation:'callout'},blocks:[p('signup','Sign up')]},p('after','After')]}];
+  const before=structuredClone(value),flat=flattenWebsiteSections(value);
+  assert.deepEqual(flat.flatMap(section=>section.blocks.map(block=>block.text)),['Before','Sign up','After']);
+  assert.equal(flat.length,3);assert.equal(flat[1].blockId,'mail');assert.equal(flat[1].payload.presentation,'callout');
+  assert.ok(flat.every(section=>section.blocks.every(block=>block.type!=='section')));
+  assert.deepEqual(flattenWebsiteSections(flat),flat);assert.deepEqual(value,before);
+  const html=renderToStaticMarkup(createElement(BlockEditor,{value,websiteOptions:{pages:[],publications:[]},allowStructured:true,onChange:()=>assert.fail('Rendering must not save changes')}));
+  assert.match(html,/Remove section Mailing list/);assert.match(html,/aria-expanded="false">More Actions/);
+  assert.equal((html.match(/>Section<\/button>/g)||[]).length,1);
+  assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,3);
+});

@@ -5,6 +5,7 @@ export { BlockPreview, type BlockPreviewMedia, type BlockMediaRenderer } from '.
 export { WebsiteWorkspace } from './website-workspace-react.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
+  flattenWebsiteSections,
   createDescriptionBlock,
   createStructuredBlock,
   changeTextBlockType,
@@ -33,6 +34,7 @@ export type BlockEditorProps = {
   allowStructured?: boolean;
   websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
+  sectionDepth?: number;
 };
 
 const textBlockTypes = new Set<PostBlock['type']>(['paragraph', 'heading', 'quote']);
@@ -84,10 +86,15 @@ export function BlockEditor({
   uploadMedia,
   allowStructured = false,
   websiteOptions,
+  sectionDepth = 0,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
-  const blocks = value.length ? value : [emptyBlock];
+  const normalized = useMemo(() => websiteOptions && sectionDepth === 0 ? flattenWebsiteSections(value) : value, [value, Boolean(websiteOptions), sectionDepth]);
+  const blocks = normalized.length ? normalized : [emptyBlock];
+  const [collapsedSections,setCollapsedSections]=useState<Set<string>>(()=>new Set());
+  const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
+  const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
   const uploadPending=useRef(false),mounted=useRef(true);useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   const blocksRef=useRef(blocks);blocksRef.current=blocks;
@@ -119,6 +126,7 @@ export function BlockEditor({
 
   const addTextBlock = (type: 'paragraph' | 'heading' | 'quote' | 'divider' | 'section' | 'link' | 'credit') => {
     const block = type === 'section' || type === 'link' || type === 'credit' ? createStructuredBlock(type) : createDescriptionBlock(type);
+    if(type === 'section')setSectionProperties(previous=>new Set([...previous,block.blockId]));
     const activeIndex = blocks.findIndex((item) => item.blockId === activeBlockId);
     const insertAt = activeIndex >= 0 ? activeIndex + 1 : blocks.length;
     const next = [...blocks];
@@ -243,11 +251,23 @@ export function BlockEditor({
               />}
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
+                {websiteOptions && <div className="portable-section-heading">
+                  <button type="button" className="portable-section-collapse" aria-expanded={!collapsedSections.has(block.blockId)} onClick={()=>toggleSection(block.blockId)}><span aria-hidden="true">{collapsedSections.has(block.blockId)?'▸':'▾'}</span> {block.title || 'Untitled section'}</button>
+                  {!readOnly && <button type="button" onClick={()=>removeBlock(block.blockId)} aria-label={`Remove section ${block.title || 'Untitled section'}`}>Remove section</button>}
+                </div>}
+                <div hidden={Boolean(websiteOptions)&&collapsedSections.has(block.blockId)}>
+                {websiteOptions ? <div className="portable-section-properties">
+                  <button type="button" className="portable-section-more" aria-expanded={sectionProperties.has(block.blockId)} onClick={()=>toggleSection(block.blockId,true)}>More Actions <span aria-hidden="true">{sectionProperties.has(block.blockId)?'▴':'▾'}</span></button>
+                  <div hidden={!sectionProperties.has(block.blockId)}>
                 {websiteOptions && <label>Section layout<select disabled={readOnly} value={String(block.payload?.presentation || 'standard')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,presentation:event.target.value}})}>{['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].map(value=><option key={value} value={value}>{({standard:'Standard',intro:'Hero introduction',callout:'Membership / offer callout',pricing:'Plan comparison',plan:'Plan card',faq:'Questions',faq_item:'Expandable answer',screening:'Featured film',excerpt:'Literary excerpt',bibliography:'Book / publication listing',release:'Audio release / track list',episode:'Featured episode / show notes',episodes:'Episode listing',creators:'Contributing creators'})[value]}</option>)}</select></label>}
 
                 <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
-                  label={block.title || 'Section'} onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
+                  </div>
+                </div> : <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>}
+                <div onClick={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}} onFocus={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}}>
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1}
+                  label="Section content" helpText="Add and arrange content in this section." onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
+                </div></div>
               </div>}
               {block.type === 'link' && <div>
                 {websiteOptions && <><label>Link destination<select disabled={readOnly} value={String(block.payload?.action || 'custom')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,action:event.target.value}})}>{[['custom','Custom URL'],['membership','Platform membership / checkout'],['account','Platform membership account'],['mailing','Platform mailing-list / offer'],['booking','Platform session booking'],['clients','Platform private client galleries'],['trailer','Featured trailer / playback'],['podcast_feed','Public podcast feed'],['sponsorship','Sponsorship information'],['inquiry','Commission / service inquiry'],['tickets','Tickets / attendance'],['course','Course / workshop enrollment'],['store','Store / checkout destination'],['audio','Featured audio / listening'],['release','Release purchase'],['merch','Merchandise store']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><label>Link style<select disabled={readOnly} value={String(block.payload?.appearance || 'text')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,appearance:event.target.value}})}>{['text','primary','secondary'].map(value=><option key={value} value={value}>{value}</option>)}</select></label></>}
@@ -302,7 +322,7 @@ export function BlockEditor({
           <button type="button" onClick={() => addTextBlock('quote')}>Quote</button>
           <button type="button" onClick={() => addTextBlock('divider')}>Divider</button>
           {allowStructured && <>
-            <button type="button" onClick={() => addTextBlock('section')}>Section</button>
+            {(!websiteOptions || sectionDepth === 0) && <button type="button" onClick={() => addTextBlock('section')}>Section</button>}
             <button type="button" onClick={() => addTextBlock('link')}>Link block</button>
             <button type="button" onClick={() => addTextBlock('credit')}>Credit</button>
           </>}

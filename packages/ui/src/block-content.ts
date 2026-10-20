@@ -213,3 +213,32 @@ export const movePostBlock = (blocks: PostBlock[], blockId: string, direction: -
   if (target >= 0 && target < next.length) [next[index], next[target]] = [next[target], next[index]];
   return next;
 };
+
+/** Promote website subsections without dropping content or changing its reading order. */
+export function flattenWebsiteSections(blocks: PostBlock[]): PostBlock[] {
+  const used = new Set<string>();
+  const collect = (items: PostBlock[]) => { for (const item of items) { used.add(item.blockId); if (item.blocks) collect(item.blocks); } };
+  collect(blocks);
+  const result: PostBlock[] = [];
+  const visit = (block: PostBlock) => {
+    if (block.type !== 'section') { result.push(block); return; }
+    let current: PostBlock | undefined = { ...block, blocks: [] };
+    result.push(current);
+    let part = 0;
+    for (const child of block.blocks ?? []) {
+      if (child.type === 'section') { visit(child); current = undefined; }
+      else {
+        if (!current) {
+          let id: string;
+          do { id = `${block.blockId}-continued-${++part}`; } while (used.has(id));
+          used.add(id);
+          current = { ...block, blockId: id, title: block.title ? `${block.title} (continued)` : '', blocks: [] };
+          result.push(current);
+        }
+        current.blocks!.push(child);
+      }
+    }
+  };
+  for (const block of blocks) visit(block);
+  return result;
+}
