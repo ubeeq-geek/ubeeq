@@ -15,6 +15,8 @@ export interface WebsitePage {
   title: string; slug: string; parentId?: string; order: number;
   state: 'draft' | 'ready' | 'archived'; navigation: boolean; navigationLabel?: string;
   description?: string; date?: string; excerpt?: string; noindex?: boolean; canonicalUrl?: string;
+  /** Top heading follows the page title unless customized; shown by default. */
+  heading?: string; showHeading?: boolean;
   seoTitle?: string; socialAssetId?: string; layout?: 'reading' | 'wide';
   template?: WebsitePageTemplate; coverAssetId?: string; backgroundAssetId?: string;
   coverPosition?: {x:number;y:number}; backgroundPosition?: {x:number;y:number}; footerNavigation?: boolean;
@@ -187,6 +189,7 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   const routes = new Map<string, string>(), occupied = new Set<string>();
   for (const page of site.pages) {
     if (page.websiteId !== site.id || page.workspaceId !== site.workspaceId || !page.id || !page.documentId || !page.title?.trim() || !Number.isSafeInteger(page.revision) || page.revision < 1 || !Number.isFinite(page.order) || !['home','page','portfolio','update'].includes(page.kind) || !['draft','ready','archived'].includes(page.state)) throw new WebsiteError('invalid_page', 'Pages and documents must belong to this website and workspace.');
+    if(page.heading!==undefined&&typeof page.heading!=='string'||page.showHeading!==undefined&&typeof page.showHeading!=='boolean')throw new WebsiteError('invalid_page','Choose a text heading and whether it is shown.');
     if(page.template&&!WEBSITE_PAGE_TEMPLATES.some(t=>t.id===page.template))throw new WebsiteError('invalid_template','Choose a supported page template.');
     for(const position of [page.coverPosition,page.backgroundPosition])if(position&&(!Number.isFinite(position.x)||!Number.isFinite(position.y)||position.x<0||position.x>1||position.y<0||position.y>1))throw new WebsiteError('invalid_position','Image positions must be between zero and one.');
     for(const id of [page.coverAssetId,page.backgroundAssetId])if(id&&(typeof id!=='string'||!/^[-a-zA-Z0-9_:]{1,160}$/.test(id)))throw new WebsiteError('invalid_media','Choose an image from the library.');

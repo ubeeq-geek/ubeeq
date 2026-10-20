@@ -62,3 +62,12 @@ test('embed views preserve subpath routing, omit selected chrome and open platfo
  input.website.embedding.presentation='full';assert.match(renderStaticWebsite(input).files.get('embed/index.html'),/<header/);
  input.website.embedding.mode='disabled';assert.equal(renderStaticWebsite(input).files.has('embed/index.html'),false);
 });
+
+test('page top headings default to visible, can differ from navigation titles, and can be hidden',()=>{
+ const input=fixture('peril-poise'),page=input.website.pages[0];let html=renderStaticWebsite(input).files.get('index.html');
+ assert.match(html,/<div class="page-heading"><h1>Artist portfolio<\/h1>/);
+ page.heading='Selected <galleries>';html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<h1>Selected &lt;galleries&gt;<\/h1>/);assert.match(html,/<title>Artist portfolio — My work<\/title>/);assert.match(html,/>Artist portfolio<\/a>/);
+ page.showHeading=false;html=renderStaticWebsite(input).files.get('index.html');assert.doesNotMatch(html,/<div class="page-heading">|<h1>/);assert.match(html,/no-page-heading/);assert.match(html,/<title>Artist portfolio — My work<\/title>/);assert.match(html,/section-intro/);
+ page.showHeading=true;page.heading='';assert.match(renderStaticWebsite(input).files.get('index.html'),/<h1>Artist portfolio<\/h1>/);
+ page.showHeading='false';assert.throws(()=>websiteRoutes(input.website),/whether it is shown/);
+});
