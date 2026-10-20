@@ -244,7 +244,12 @@ export function BlockEditor({
               <option value="2">H2</option>
               <option value="3">H3</option>
             </select>}
-            {websiteOptions&&canFormat&&<select aria-label="Block alignment" value={String(activeBlock?.payload?.textAlign??'')} onChange={event=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:event.target.value||undefined}});}}><option value="">Default alignment</option><option value="left">Align left</option><option value="center">Align center</option><option value="right">Align right</option></select>}
+            {websiteOptions&&canFormat&&<div className="portable-block-alignment" role="group" aria-label="Block alignment">{(['','left','center','right'] as const).map(alignment=>{
+              const label=alignment?`Align ${alignment}`:'Use theme alignment';
+              return <button key={alignment} type="button" aria-label={label} title={label} aria-pressed={String(activeBlock?.payload?.textAlign??'')===alignment} onMouseDown={event=>event.preventDefault()} onClick={()=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:alignment||undefined}});}}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{alignment===''?<path d="M8 4 4 8l4 4M4 8h10a6 6 0 0 1 0 12h-3"/>:<path d={alignment==='left'?'M4 5h16M4 10h10M4 15h16M4 20h10':alignment==='center'?'M4 5h16M7 10h10M4 15h16M7 20h10':'M4 5h16M10 10h10M4 15h16M10 20h10'}/>}</svg>
+              </button>;
+            })}</div>}
             <button type="button" disabled={activeBlockIndex <= 0} onClick={() => moveBlock(activeBlockIndex, -1)} aria-label="Move block up">↑</button>
             <button type="button" disabled={activeBlockIndex < 0 || activeBlockIndex === blocks.length - 1} onClick={() => moveBlock(activeBlockIndex, 1)} aria-label="Move block down">↓</button>
           </div>
