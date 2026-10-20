@@ -1,5 +1,5 @@
 import {removeWebsitePage} from './website-page-actions.js';
-import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml} from './website-preview.js';
+import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
 import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteGallerySettings, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteCatalogueOption {id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
@@ -37,20 +37,19 @@ export interface WebsiteWorkspaceClient {
   preview(id: string,file?:string): Promise<string>;
 }
 export interface WebsiteWorkspaceOptions { onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
-export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
-  popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
-  const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
-  try {
-    const saved=await client.get(),page=saved.pages.find(p=>p.id===(pageId??saved.homePageId));
+type PreviewClient=Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>;
+const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(message:string)=>void=()=>{},closed:()=>boolean=()=>false,fallback=false)=>{
+    const saved=await client.get(),selected=saved.pages.find(p=>p.id===(pageId??saved.homePageId)),page=fallback&&selected?.state!=='ready'?saved.pages.find(p=>p.id===saved.homePageId):selected;
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
     let buildId:string|undefined;
-    for(const candidate of await client.builds?.()??[])if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
+    const candidates=await client.builds?.()??[];
+    for(const candidate of candidates)if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
     if(!buildId){
-      const existing=(await client.builds?.()??[]).find(b=>b.websiteRevision===saved.revision&&!['ready','failed','cancelled'].includes(b.state));
+      const existing=candidates.find(b=>b.websiteRevision===saved.revision&&!['ready','failed','cancelled'].includes(b.state));
       const requested=existing??await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());buildId=requested.id;
       const deadline=Date.now()+20*60*1000;
       for(;;){
-        if(popup.closed)return buildId;
+        if(closed())throw new Error('The preview tab was closed.');
         const build=await client.build(buildId);
         if(build.state==='ready'){if(build.stale)throw new Error('Website sources changed while preparing the preview. Open a new preview.');break;}
         if(['failed','cancelled'].includes(build.state))throw new Error('Website preview could not be prepared'+(build.errorCode?' ('+build.errorCode+')':'')+'. Build a new candidate to retry.');
@@ -63,7 +62,54 @@ export const openWebsitePreview = async (client:Pick<WebsiteWorkspaceClient,'get
     if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
     progress('Loading your preview…');
     const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
-    const html=websitePreviewHtml(files,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html');
+
+    const initial=route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html';
+    return {saved,buildId,files,initial};
+};
+const previewProviders=new Map<string,{channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string}>();
+const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient)=>{
+  if(typeof window==='undefined'||typeof BroadcastChannel==='undefined')return;
+  const key=websitePreviewKey(saved),previous=previewProviders.get(key);
+  if(previous){previous.client=client;previous.sourceUrl=sourceUrl;return;}
+  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID()};
+  const offers=new Map<string,{replyTo:string;pageId?:string;path?:string;expires:number}>();
+  const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
+  provider.channel.onmessage=async event=>{
+    const data=event.data;if(typeof data?.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))return;
+    if(data.type==='refresh-request'){
+      if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.refresh:[a-f0-9-]{36}$/.test(data.replyTo)||data.pageId!==undefined&&(typeof data.pageId!=='string'||data.pageId.length>200)||data.path!==undefined&&(typeof data.path!=='string'||data.path.length>2000))return;
+      for(const [id,offer]of offers)if(offer.expires<Date.now())offers.delete(id);
+      if(offers.size>=50)return;offers.set(data.requestId,{replyTo:data.replyTo,pageId:data.pageId,path:data.path,expires:Date.now()+30000});
+      send(data.replyTo,data.requestId,'offer',{providerId:provider.id});return;
+    }
+    if(data.type!=='refresh-accept'||data.providerId!==provider.id)return;
+    const offer=offers.get(data.requestId);if(!offer||offer.expires<Date.now())return;offers.delete(data.requestId);
+    const reply=(type:string,extra:Record<string,unknown>={})=>send(offer.replyTo,data.requestId,type,extra);
+    try{
+      reply('progress',{message:'Preparing the latest saved preview…'});
+      const result=await prepareWebsitePreview(provider.client,offer.pageId,message=>reply('progress',{message}),undefined,true);
+      if(websitePreviewKey(result.saved)!==key)throw Error('This website is no longer available in the editor.');
+      const nextContext=makePreviewContext(result.saved,provider.sourceUrl,offer.replyTo);
+      const initial=!offer.pageId&&offer.path?.endsWith('.html')&&Object.hasOwn(result.files,offer.path)?offer.path:result.initial;
+      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext));notifyWebsitePreviewSaved(result.saved);reply('ready',{id});
+    }catch(error){reply('error',{message:error instanceof Error?error.message:'The latest preview could not be prepared. Try again.'});}
+  };
+  previewProviders.set(key,provider);
+  if(previewProviders.size>30){const oldest=previewProviders.keys().next().value!;previewProviders.get(oldest)?.channel.close();previewProviders.delete(oldest);}
+};
+const makePreviewContext=(saved:Website,sourceUrl:string,refreshChannel='ubeeq.website-preview.refresh:'+crypto.randomUUID()):WebsitePreviewContext=>{
+  const editor=new URL(sourceUrl);editor.searchParams.set('websiteId',saved.id);
+  return {websiteKey:websitePreviewKey(saved),revision:saved.revision,refreshChannel,editorUrl:editor.href,pagePaths:Object.fromEntries([...websiteRoutes(saved)].map(([id,route])=>[id,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html']))};
+};
+export {notifyWebsitePreviewSaved} from './website-preview.js';
+export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
+  popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
+  const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
+  try{
+    const {saved,buildId,files,initial}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed);
+    registerPreviewProvider(saved,sourceUrl,client);
+    const context=previewPath?makePreviewContext(saved,sourceUrl):undefined;
+    const html=websitePreviewHtml(files,initial,context);notifyWebsitePreviewSaved(saved);
     if(popup.closed)return buildId;
     if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
     return buildId;
@@ -117,7 +163,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     if(move){let framing=position??{x:.5,y:.5};preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;for(const axis of ['x','y'] as const){const l=element('label',label+(axis==='x'?' horizontal position':' vertical position')),range=element('input');range.type='range';range.min='0';range.max='1';range.step='.01';range.value=String(framing[axis]);range.oninput=()=>{framing={...framing,[axis]:Number(range.value)};move(framing);preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;};l.append(range);box.append(l);}}
     parent.append(box);if(value&&client.mediaPreview)void client.mediaPreview(value).then(url=>preview.src=url).catch(error=>{status.textContent=String(error);});
   };
-  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);savedSite=JSON.stringify(site);for(const input of Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')))input.dataset.websiteDraftInitial=input.value;reportDirty();status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
+  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);savedSite=JSON.stringify(site);notifyWebsitePreviewSaved(site);for(const input of Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')))input.dataset.websiteDraftInitial=input.value;reportDirty();status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
   const win=d.defaultView;let measureFrame=0;
   const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.offsetTop+first.offsetHeight/2}px`);};
   const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
@@ -237,7 +283,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
             if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before deleting a page.');
             const draft=removeWebsitePage(site,page.id,replacement),baseline=JSON.parse(savedSite) as Website,expected=baseline.revision;
             const saved=await client.save({...removeWebsitePage(baseline,page.id,replacement),revision:expected+1},expected);
-            site={...draft,revision:saved.revision};savedSite=JSON.stringify(saved);
+            site={...draft,revision:saved.revision};savedSite=JSON.stringify(saved);notifyWebsitePreviewSaved(saved);
             if(!site.pages.some(candidate=>candidate.documentId===page.documentId)){documentDrafts.delete(page.documentId);documentBaselines.delete(page.documentId);}
             if(selectedPage===page.id)selectedPage=site.homePageId;
             status.textContent='Page “'+page.title+'” deleted. Publish again to update the live website.';reportDirty();await show('Pages');
@@ -429,6 +475,6 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
   for(const tab of ['Settings','Pages','Layout','Appearance','Gallery destinations','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
-  const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);await show('Pages');}}).catch(error=>{status.textContent=String(error);});
+  const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);notifyWebsitePreviewSaved(value);if(win)registerPreviewProvider(value,win.location.href,client);await show('Pages');}}).catch(error=>{status.textContent=String(error);});
   return {ready,destroy(){disposed=true;root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
 };
