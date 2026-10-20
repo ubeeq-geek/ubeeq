@@ -243,11 +243,15 @@ export function BlockEditor({
               />}
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
+                {websiteOptions && <label>Section layout<select disabled={readOnly} value={String(block.payload?.presentation || 'standard')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,presentation:event.target.value}})}>{['standard','intro','callout','pricing','plan','faq','faq_item'].map(value=><option key={value} value={value}>{({standard:'Standard',intro:'Hero introduction',callout:'Membership / offer callout',pricing:'Plan comparison',plan:'Plan card',faq:'Questions',faq_item:'Expandable answer'})[value]}</option>)}</select></label>}
+
                 <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
                 <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions}
                   label={block.title || 'Section'} onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
               </div>}
               {block.type === 'link' && <div>
+                {websiteOptions && <><label>Link destination<select disabled={readOnly} value={String(block.payload?.action || 'custom')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,action:event.target.value}})}>{[['custom','Custom URL'],['membership','Platform membership / checkout'],['account','Platform membership account'],['mailing','Platform mailing-list / offer']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><label>Link style<select disabled={readOnly} value={String(block.payload?.appearance || 'text')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,appearance:event.target.value}})}>{['text','primary','secondary'].map(value=><option key={value} value={value}>{value}</option>)}</select></label></>}
+
                 <label>Link label<input value={block.label || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, label: event.target.value })} /></label>
                 <label>Link URL<input value={block.url || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, url: event.target.value })} /></label>
               </div>}
