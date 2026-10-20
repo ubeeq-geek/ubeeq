@@ -27,3 +27,17 @@ test('premium cards link approved previews to the access destination',()=>{
 test('photography, cinema and literary starters stay editable and use configured action URLs',()=>{
  for(const [preset,variant]of[['organic','intro'],['cinema','screening'],['literary','excerpt'],['broadsheet','release']]){const input=fixture(preset);input.documents.set('doc',{blocks:websitePresetBlocks(preset,'home',()=>crypto.randomUUID())});input.website.theme.settings={bookingUrl:'https://platform.example/photography/artist',clientGalleryUrl:'https://platform.example/photography/artist/clients',trailerUrl:'https://video.example/trailer'};websiteRoutes(input.website);const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,new RegExp('section-'+variant));assert.doesNotMatch(html,/<script|<form|482913|Pay \$|unlocked/);if(preset==='cinema')assert.match(html,/https:\/\/video.example\/trailer/);if(preset==='organic')assert.match(html,/https:\/\/platform.example\/photography\/artist/);}
 });
+
+test('every purpose renders with every visual style without rewriting its content',async()=>{
+ const{WEBSITE_INTENTS,WEBSITE_THEMES,websiteIntentBlocks}=await import('@ubeeq/core');
+ assert.equal(WEBSITE_INTENTS.length,12);assert.equal(WEBSITE_THEMES.length,13);
+ for(const intent of WEBSITE_INTENTS){const blocks=websiteIntentBlocks(intent.id,'home',()=>crypto.randomUUID()),before=JSON.stringify(blocks);for(const style of WEBSITE_THEMES){const input=fixture(style.id);input.website.intent=intent.id;input.documents.set('doc',{blocks});websiteRoutes(input.website);const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,new RegExp('theme-'+style.id));assert.doesNotMatch(html,/<script|<form|482913/);assert.equal(JSON.stringify(blocks),before);}}
+});
+test('purpose controls booking or release actions independently of visual style',()=>{
+ const input=fixture('nocturne');input.website.intent='photography';input.website.theme.settings.bookingUrl='https://platform.example/photography/artist';assert.match(renderStaticWebsite(input).files.get('index.html').split('</header>')[0],/>Book a session<\/a>/);
+ input.website.theme.id='organic';input.website.intent='music';input.website.theme.settings.releaseUrl='https://platform.example/releases/latest';assert.match(renderStaticWebsite(input).files.get('index.html').split('</header>')[0],/>Buy the release<\/a>/);
+});
+test('podcast feeds and collective creator sections use explicitly approved data',async()=>{
+ const{websiteIntentBlocks}=await import('@ubeeq/core'),input=fixture('minimal');input.website.intent='podcast';input.website.theme.settings.podcastFeedUrl='https://podcast.example/feed.xml';input.documents.set('doc',{blocks:websiteIntentBlocks('podcast','home',()=>crypto.randomUUID())});let html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/rel="alternate" type="application\/rss\+xml"/);assert.match(html,/section-episodes/);assert.doesNotMatch(html,/private feed|Ads are gone/);
+ input.website.intent='collective';input.creatorIdentities=[{id:'one',title:'First artist'},{id:'two',title:'Second & artist'}];input.documents.set('doc',{blocks:websiteIntentBlocks('collective','team',()=>crypto.randomUUID())});html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/First artist/);assert.match(html,/Second &amp; artist/);
+});
