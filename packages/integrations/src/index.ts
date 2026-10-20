@@ -12,6 +12,7 @@ export * from './soundcloud-transport.js';
 export * from './multipart-stream.js';
 export * from './bounded-response-text.js';
 export * from './deviantart-labels.js';
+export * from './deviantart-galleries.js';
 export * from "./account-health.js";
 export * from "./publication-preflight.js";
 export * from "./announcement-publication.js";
