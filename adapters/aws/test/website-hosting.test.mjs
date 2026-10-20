@@ -40,3 +40,10 @@ test('viewer-response embedding policy is per-host, cache-independent, and fails
  data.set('host:one.example',JSON.stringify({state:'active',frameAncestors:"https://allowed.example; script-src *"}));assert.match((await response('one.example')).headers['content-security-policy'].value,/frame-ancestors 'none'$/);assert.equal((await response('two.example')).headers['x-frame-options'],undefined);
  assert.match(awsWebsiteEmbeddingResponseSource('arn:test'),/event.request,event.response/);
 });
+
+test('embedding response function runs without browser URL globals at the edge',async()=>{
+ const {runInNewContext}=await import('node:vm'),{awsWebsiteEmbeddingResponse}=await import('../dist/index.js');
+ const apply=runInNewContext('('+awsWebsiteEmbeddingResponse.toString()+')',{URL:undefined});
+ const response=await apply({headers:{host:{value:'site.example'}}},{headers:{}},async()=>JSON.stringify({state:'active',frameAncestors:'https://parent.example'}));
+ assert.equal(response.headers['content-security-policy'].value,'frame-ancestors https://parent.example');
+});

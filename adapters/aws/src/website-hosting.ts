@@ -47,7 +47,7 @@ export function awsWebsiteRouterSource(kvsArn:string){return `import cf from 'cl
 export async function awsWebsiteEmbeddingResponse(request:any,response:any,get:(key:string)=>Promise<string|undefined>){
  let policy="'none'";
  try{const host=request.headers.host?.value?.toLowerCase();if(host&&/^[a-z0-9.-]+$/.test(host)){const raw=await get('host:'+host),mapping=raw?JSON.parse(raw):undefined,value=mapping?.frameAncestors;
- if(mapping?.state==='active'&&typeof value==='string'&&value.length<=650){if(value==='*'||value==="'none'")policy=value;else{const origins=value.split(' ');if(origins.length<=10&&origins.every((origin:string)=>{const url=new URL(origin);return ['https:','http:'].includes(url.protocol)&&!url.username&&!url.password&&url.origin===origin&&!/[;,*'"<>\s]/.test(origin);}))policy=value;}}}}
+ if(mapping?.state==='active'&&typeof value==='string'&&value.length<=650){if(value==='*'||value==="'none'")policy=value;else{const origins=value.split(' ');if(origins.length<=10&&origins.every((origin:string)=>/^https?:\/\/(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?|\[[a-f0-9:]+\])(?::[0-9]{1,5})?$/.test(origin)))policy=value;}}}}
  catch{}
  response.headers??={};const existing=response.headers['content-security-policy']?.value??'';
  response.headers['content-security-policy']={value:existing.split(';').map((part:string)=>part.trim()).filter((part:string)=>part&&!/^frame-ancestors(?:\s|$)/i.test(part)).concat('frame-ancestors '+policy).join('; ')};
