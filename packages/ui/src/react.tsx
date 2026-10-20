@@ -337,7 +337,7 @@ export function BlockEditor({
                 <div className="portable-block-editor-media">
                   {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-block-editor-media-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
                   <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
-                    <label>Choose existing image<select value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
+                    <label>Choose existing image<select aria-label="Choose existing image" value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
                       <option value="">Choose from Works or uploads…</option>
                       {block.mediaId&&!mediaOptions.some(item=>item.mediaId===block.mediaId)&&<option value={block.mediaId}>Current image</option>}
                       {mediaOptions.filter(item=>!item.assetType||item.assetType==='image').map(item=><option key={item.mediaId} value={item.mediaId}>{item.label}</option>)}
@@ -349,8 +349,8 @@ export function BlockEditor({
                 <fieldset disabled={readOnly} className="portable-image-settings">
                   <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
                   <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
-                  <label>Image alignment<select value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-                  <label>Text flow<select value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
+                  <label>Image alignment<select aria-label="Image alignment" value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+                  <label>Text flow<select aria-label="Text flow" value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
                   <p>Wrap is available for left- and right-aligned images and applies to the following text blocks. Images stack above text on small screens.</p>
                 </fieldset>
               </div> : (block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
