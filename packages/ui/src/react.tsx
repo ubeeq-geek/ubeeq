@@ -218,7 +218,7 @@ export function BlockEditor({
       </div>
 
       <div className="portable-block-editor-shell">
-        {!readOnly && <div ref={toolbarRef} className="portable-block-editor-toolbar" style={websiteOptions?{top:stickyToolbarOffset,zIndex:10+sectionDepth}:undefined} aria-label="Active block tools">
+        {!readOnly && <div ref={toolbarRef} className="portable-block-editor-toolbar" style={websiteOptions?{top:`calc(var(--website-tools-height, 0px) + ${stickyToolbarOffset}px + .5rem)`,zIndex:10+sectionDepth}:undefined} aria-label="Active block tools">
           <div className="portable-block-editor-block-tools">
             {activeBlock && textBlockTypes.has(activeBlock.type) ? <select value={activeBlock.type} onChange={(event) => updateActiveBlockType(event.target.value as 'paragraph' | 'heading' | 'quote')} aria-label="Active block type">
               <option value="paragraph">Paragraph</option>
