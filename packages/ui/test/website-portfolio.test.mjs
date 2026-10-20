@@ -76,3 +76,11 @@ test('saved paragraphs retain pasted raw newlines and blank lines in static prev
  const input=fixture();input.documents.set('doc',{blocks:[{id:'pasted',type:'paragraph',html:'First line\n<strong>Second line</strong>\n\nFourth line'}]});
  const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<p>First line<br><strong>Second line<\/strong><br><br>Fourth line<\/p>/);
 });
+
+test('image alignment and wrapping render approved media and keep flow inside the text group',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[{id:'image',type:'image',assetId:'cover',caption:'Caption <safe>',data:{alignment:'right',textFlow:'wrap',alt:'Alt <safe>'}},{id:'text',type:'paragraph',text:'Text flows beside the image.'},{id:'boundary',type:'section',title:'Next section',children:[{id:'after',type:'paragraph',text:'Separate section.'}]}]});
+ let html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<div class="website-image-text-flow"><figure class="website-image align-right flow-wrap">/);assert.match(html,/alt="Alt &lt;safe&gt;"/);assert.match(html,/Caption &lt;safe&gt;/);assert.match(html,/Text flows beside the image\.<\/p><\/div><section/);
+ for(const alignment of ['left','center','right','full']){input.documents.get('doc').blocks[0].data={alignment,textFlow:'separate'};html=renderStaticWebsite(input).files.get('index.html');assert.match(html,new RegExp('website-image align-'+alignment+' flow-separate'));assert.doesNotMatch(html,/<div class="website-image-text-flow">/);}
+ input.documents.get('doc').blocks[0].data={alignment:'center',textFlow:'wrap'};assert.throws(()=>renderStaticWebsite(input),/alignment and text flow/);
+ input.documents.get('doc').blocks[0].assetId=undefined;assert.throws(()=>renderStaticWebsite(input),/Choose an image/);
+});

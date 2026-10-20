@@ -90,3 +90,8 @@ test('existing top-level galleries become sections with their filters and headin
  const html=renderToStaticMarkup(createElement(BlockEditor,{value,websiteOptions:{pages:[],publications:[]},allowStructured:true,onChange:()=>assert.fail('Rendering must not save')}));
  assert.match(html,/Remove section Selected galleries/);assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,1);
 });
+
+test('website images are normal insertable blocks with their own source and layout controls',()=>{
+ const html=renderToStaticMarkup(createElement(BlockEditor,{value:[{blockId:'image',type:'image',mediaId:'one',caption:'A caption',payload:{alignment:'right',textFlow:'wrap'}}],allowMedia:true,uploadMedia:async()=>({mediaId:'new',label:'Uploaded'}),mediaOptions:[{mediaId:'one',label:'An existing Work',assetType:'image'},{mediaId:'video',label:'Not an image',assetType:'video'}],websiteOptions:{pages:[],publications:[]},onChange:()=>assert.fail('Rendering must not edit')}));
+ assert.match(html,/>Image<\/button>/);assert.match(html,/Choose existing image/);assert.match(html,/Upload image/);assert.match(html,/Image alignment/);assert.match(html,/Text flow/);assert.match(html,/Image description \(alt text\)/);assert.match(html,/An existing Work/);assert.doesNotMatch(html,/Not an image|Add image from existing Works or uploads/);
+});

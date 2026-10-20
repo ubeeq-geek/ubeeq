@@ -110,15 +110,15 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     const socialUrl=social?(site.publicBaseUrl?new URL(social.src,site.publicBaseUrl).href:social.src):undefined;
     return `<!doctype html><html lang="${e(site.locale)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(meta.seoTitle??title)} — ${e(site.title)}</title>${site.theme.settings.podcastFeedUrl?`<link rel="alternate" type="application/rss+xml" title="Public podcast feed" href="${e(websiteExternalUrl(site.theme.settings.podcastFeedUrl))}">`:''}${favicon?`<link rel="icon" href="${e(favicon.src)}">`:""}${socialUrl?`<meta property="og:image" content="${e(socialUrl)}">`:""}<meta property="og:title" content="${e(meta.seoTitle??title)}">${meta.description ? `<meta name="description" content="${e(meta.description)}">` : ''}${site.noindex || meta.noindex ? '<meta name="robots" content="noindex,nofollow">' : ''}${canonical ? `<link rel="canonical" href="${e(canonical)}">` : ''}<link rel="stylesheet" href="${e(url('/assets/theme.css'))}"></head><body class="theme-${e(site.theme.id)} ${e(site.theme.settings.colorMode ?? 'light')} ${site.theme.settings.width === 'reading' ? 'reading' : ''}"><a class="skip" href="#main">Skip to content</a><header class="site-header ${header}"><a class="site-brand" href="${e(url('/'))}">${brand}</a>${nav(path)}${site.intent==='photography'&&site.theme.settings.bookingUrl?`<a class="website-action primary" href="${e(websiteExternalUrl(site.theme.settings.bookingUrl))}">Book a session</a>`:site.intent==='music'&&site.theme.settings.releaseUrl?`<a class="website-action primary" href="${e(websiteExternalUrl(site.theme.settings.releaseUrl))}">Buy the release</a>`:site.theme.settings.membershipUrl?`<a class="website-action primary" href="${e(websiteExternalUrl(site.theme.settings.membershipUrl))}">Membership</a>`:''}${site.theme.settings.memberAccountUrl?`<a href="${e(websiteExternalUrl(site.theme.settings.memberAccountUrl))}">Member account</a>`:''}</header><main id="main" class="template-${e(meta.template??'standard')} ${meta.layout==='reading'?'reading':''} ${background?'has-background':''} ${cover?'has-cover':''} ${meta.showHeading===false?'no-page-heading':''}">${background?`<div class="page-background" aria-hidden="true">${background}</div>`:''}<div class="page-surface">${cover?`<figure class="page-cover">${cover}</figure>`:''}${meta.showHeading===false?'':`<div class="page-heading"><h1>${e(meta.heading?.trim()||title)}</h1></div>`}<div class="page-content">${body}</div></div></main><footer class="site-footer ${footer}"><div class="site-footer-text">${site.theme.settings.footer?`<p>${e(site.theme.settings.footer)}</p>`:''}${site.theme.settings.showCopyright!==false?`<p class="site-copyright">© ${input.copyrightYear===undefined?'':`${e(String(input.copyrightYear))} `}${e(site.title)}</p>`:''}</div>${nav(path,true)}</footer></body></html>`;
   };
-  const image = (id: string, caption?: string, expected: 'image' | 'video' | 'audio' | 'file' = 'image', href?:string) => {
+  const image = (id: string, caption?: string, expected: 'image' | 'video' | 'audio' | 'file' = 'image', href?:string, options?:{className:string;alt?:string}) => {
     const asset = media.get(id);
     if (!asset) throw new WebsiteError('missing_media', 'An approved public rendition is missing.');
     const source = e(asset.src);
     if (expected !== 'file' && !asset.mimeType.startsWith(expected + '/')) throw new WebsiteError('invalid_media', 'Rendition type does not match the block.');
-    const content = expected === 'image' ? `<a href="${e(href??asset.src)}"><img src="${source}" alt="${e(asset.alt)}" loading="lazy"${asset.width ? ` width="${asset.width}"` : ''}${asset.height ? ` height="${asset.height}"` : ''}></a>`
+    const content = expected === 'image' ? `<a href="${e(href??asset.src)}"><img src="${source}" alt="${e(options?.alt??asset.alt)}" loading="lazy"${asset.width ? ` width="${asset.width}"` : ''}${asset.height ? ` height="${asset.height}"` : ''}></a>`
       : expected === 'file' ? `<a href="${source}">${e(caption || 'Download public file')}</a>`
       : `<${expected} controls preload="metadata" src="${source}"><a href="${source}">Open ${expected}</a></${expected}>`;
-    return `<figure>${content}${caption ? `<figcaption>${e(caption)}</figcaption>` : ''}</figure>`;
+    return `<figure${options?` class="${e(options.className)}"`: ''}>${content}${caption ? `<figcaption>${e(caption)}</figcaption>` : ''}</figure>`;
   };
   const card = (g: StaticWebsiteGallery, promotion = false) => !g.href ? '' : `<article class="card">${g.previewAssetIds[0] ? image(g.previewAssetIds[0],undefined,'image',g.href.startsWith('/')?url(g.href):websiteExternalUrl(g.href)) : ''}<h2><a href="${e(g.href.startsWith('/') ? url(g.href) : g.href)}">${e(g.title)}</a></h2>${g.creatorName?`<p class="work-creator">${e(g.creatorName)}</p>`:''}${g.description ? `<p>${e(g.description)}</p>` : ''}${g.premium?'<p class="gallery-access">Public preview · membership access</p>':''}${promotion ? '<p>View access options at the linked destination.</p>' : ''}</article>`;
   for (const page of pages) {
@@ -126,7 +126,19 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     if (!doc) throw new WebsiteError('missing_document', 'Page document was not resolved.');
     let blockNumber = 0;
     const extraPages: { path: string; title: string; body: () => string }[] = [];
-    const renderBlocks = (blocks: readonly ContentBlock[]): string => blocks.map(block => {
+    const renderBlocks = (blocks: readonly ContentBlock[]): string => {
+      const output:string[]=[];
+      for(let at=0;at<blocks.length;at++){
+        const block=blocks[at];
+        if(block.type==='image'&&block.data?.textFlow==='wrap'){
+          const group=[renderBlock(block)];
+          while(at+1<blocks.length&&['paragraph','heading','quote'].includes(blocks[at+1].type))group.push(renderBlock(blocks[++at]));
+          output.push(`<div class="website-image-text-flow">${group.join('')}</div>`);
+        }else output.push(renderBlock(block));
+      }
+      return output.join('');
+    };
+    const renderBlock = (block:ContentBlock):string => {
       const index = ++blockNumber;
       if (!(block.type in STATIC_BLOCK_SUPPORT)) throw new WebsiteError('unsupported_block', `Unsupported static block: ${block.type}`);
       const children = () => renderBlocks(block.children ?? []);
@@ -154,7 +166,13 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         case 'divider': return '<hr>';
         case 'section': {const variant=String(block.data?.presentation??'standard');if(!['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].includes(variant))throw new WebsiteError('invalid_block','Unknown section layout.');return variant==='faq_item'?`<details class="website-faq"><summary>${e(block.title??'Question')}</summary>${children()}</details>`:`<section class="section-${variant}">${block.title?`<h2>${e(block.title)}</h2>`:''}${children()}${variant==='creators'?`<ul class="website-creator-list">${(input.creatorIdentities??[]).map(identity=>`<li><h3>${e(identity.title)}</h3></li>`).join('')}</ul>`:''}</section>`;}
         case 'grouping': case 'carousel': return `<div class="grid">${children()}</div>`;
-        case 'image': case 'video': case 'audio': return image(block.assetId ?? '', block.caption, block.type);
+        case 'image': {
+          if(!block.assetId)throw new WebsiteError('missing_media','Choose an image for each image block before previewing.');
+          const alignment=String(block.data?.alignment??'left'),flow=String(block.data?.textFlow??'separate'),alt=block.data?.alt;
+          if(!['left','center','right','full'].includes(alignment)||!['separate','wrap'].includes(flow)||flow==='wrap'&&!['left','right'].includes(alignment)||alt!==undefined&&(typeof alt!=='string'||alt.length>2000))throw new WebsiteError('invalid_block','Choose a supported image alignment and text flow.');
+          return image(block.assetId,block.caption,'image',undefined,{className:`website-image align-${alignment} flow-${flow}`,alt:alt as string|undefined});
+        }
+        case 'video': case 'audio': return image(block.assetId ?? '', block.caption, block.type);
         case 'file': case 'pdf_preview': return image(block.fileId ?? block.assetId ?? '', block.label ?? block.caption, 'file');
         case 'link': {const action=block.data?.action,setting=action==='membership'?'membershipUrl':action==='account'?'memberAccountUrl':action==='mailing'?'mailingListUrl':action==='booking'?'bookingUrl':action==='clients'?'clientGalleryUrl':action==='trailer'?'trailerUrl':action==='inquiry'?'inquiryUrl':action==='tickets'?'ticketsUrl':action==='course'?'courseUrl':action==='store'?'storeUrl':action==='podcast_feed'?'podcastFeedUrl':action==='sponsorship'?'sponsorshipUrl':action==='audio'?'audioUrl':action==='release'?'releaseUrl':action==='merch'?'merchandiseUrl':undefined;const target=setting?site.theme.settings[setting]:block.url;if(!target&&setting)return '';
           if(action==='mailing'&&input.mailingList&&String(target)===input.mailingList.signupUrl){const mailing=input.mailingList;return `<form class="website-mailing-form" data-website-mailing="true" method="post" action="${e(link(mailing.submitUrl))}" accept-charset="UTF-8"><label>Email address<input type="email" name="email" autocomplete="email" maxlength="254" required></label>${mailing.offers.length?`<label>Free offer (optional)<select name="offerId"><option value="">Updates only</option>${mailing.offers.map(offer=>`<option value="${e(offer.id)}">${e(offer.title)}</option>`).join('')}</select></label>`:''}<input type="hidden" name="consentText" value="${e(mailing.consentText)}"><label class="website-mailing-consent"><input type="checkbox" name="consent" value="true" required><span>${e(mailing.consentText)}</span></label><button type="submit" class="website-action primary">${e(block.label??'Subscribe')}</button><p class="website-mailing-help">Check your inbox to confirm your email. Your subscription starts after confirmation.</p></form>`;}
@@ -192,7 +210,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         }
         case 'update_list': return paginated(pages.filter(p => p.kind === 'update').sort((a,b) => (b.date ?? '').localeCompare(a.date ?? '') || a.id.localeCompare(b.id,'en')).map(p => `<article><h2><a href="${e(url(routes.get(p.id)!))}">${e(p.title)}</a></h2>${p.date ? `<time datetime="${e(p.date)}">${e(p.date)}</time>` : ''}<p>${e(p.excerpt ?? '')}</p></article>`));
       }
-    }).join('');
+    };
     add(path, shell(page.title, renderBlocks(doc.blocks), path, page));
     for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body(), extra.path,{...page,seoTitle:undefined,canonicalUrl:undefined}));
   }

@@ -106,6 +106,7 @@ export function BlockEditor({
   const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
   const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
+  const [uploadTarget,setUploadTarget]=useState(''),[imageErrors,setImageErrors]=useState<Record<string,string>>({});
   const [splitError,setSplitError]=useState(''),[splitStatus,setSplitStatus]=useState('');
   const uploadPending=useRef(false),mounted=useRef(true);useEffect(()=>{mounted.current=true;return()=>{mounted.current=false;};},[]);
   const blocksRef=useRef(blocks);blocksRef.current=blocks;
@@ -169,6 +170,18 @@ export function BlockEditor({
     setActiveBlockId(block.blockId);
   };
 
+  const addImageBlock=()=>{
+    const block:PostBlock={blockId:globalThis.crypto?.randomUUID?.()??`image-${Date.now()}`,type:'image',caption:''};
+    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);setActiveBlockId(block.blockId);
+  };
+  const patchImage=(id:string,patch:Partial<PostBlock>)=>{const current=blocksRef.current;if(current.some(block=>block.blockId===id))onChange(current.map(block=>block.blockId===id?{...block,...patch}:block));};
+  const uploadImage=async(id:string,input:HTMLInputElement)=>{
+    const file=input.files?.[0];if(!file||!uploadMedia||uploadPending.current)return;
+    uploadPending.current=true;setUploadBusy(true);setUploadTarget(id);setImageErrors(previous=>({...previous,[id]:''}));
+    try{const image=await uploadMedia(file);if(mounted.current)patchImage(id,{mediaId:image.mediaId});}
+    catch(error){if(mounted.current)setImageErrors(previous=>({...previous,[id]:error instanceof Error?error.message:'The image could not be uploaded.'}));}
+    finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);setUploadTarget('');input.value='';}}
+  };
   const moveBlock = (index: number, direction: -1 | 1) => {
     if (!blocks[index]) return;
     onChange(movePostBlock(blocks, blocks[index].blockId, direction));
@@ -320,7 +333,27 @@ export function BlockEditor({
                 <label>Caption<input value={block.caption || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, caption: event.target.value })} /></label>
                 <small>File contents are not displayed here. Downloads require the application's authorized attachment route.</small>
               </div>}
-              {(block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
+              {block.type === 'image' && websiteOptions ? <div className="portable-block-editor-image">
+                <div className="portable-block-editor-media">
+                  {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-block-editor-media-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
+                  <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
+                    <label>Choose existing image<select value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
+                      <option value="">Choose from Works or uploads…</option>
+                      {block.mediaId&&!mediaOptions.some(item=>item.mediaId===block.mediaId)&&<option value={block.mediaId}>Current image</option>}
+                      {mediaOptions.filter(item=>!item.assetType||item.assetType==='image').map(item=><option key={item.mediaId} value={item.mediaId}>{item.label}</option>)}
+                    </select></label>
+                    {uploadMedia&&<label className="portable-block-editor-upload">{uploadTarget===block.blockId?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={readOnly||uploadBusy} onChange={event=>void uploadImage(block.blockId,event.currentTarget)}/></label>}
+                    {imageErrors[block.blockId]&&<p role="alert">{imageErrors[block.blockId]}</p>}
+                  </fieldset>
+                </div>
+                <fieldset disabled={readOnly} className="portable-image-settings">
+                  <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
+                  <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
+                  <label>Image alignment<select value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+                  <label>Text flow<select value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
+                  <p>Wrap is available for left- and right-aligned images and applies to the following text blocks. Images stack above text on small screens.</p>
+                </fieldset>
+              </div> : (block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
                 {media?.thumbnailUrl && block.type === 'image' ? <img src={media.thumbnailUrl} alt="" /> : <div className="portable-block-editor-media-placeholder">{media?.label || block.mediaId || 'Media'}</div>}
                 <label>
                   <span>Caption</span>
@@ -336,6 +369,7 @@ export function BlockEditor({
           <span className="portable-block-editor-inserter-icon" aria-hidden="true">+</span>
           <span>Add block</span>
           <button type="button" onClick={() => addTextBlock('paragraph')}>Paragraph</button>
+          {websiteOptions&&allowMedia&&<button type="button" onClick={addImageBlock}>Image</button>}
           <button type="button" onClick={() => addTextBlock('heading')}>Heading</button>
           <button type="button" onClick={() => addTextBlock('quote')}>Quote</button>
           <button type="button" onClick={() => addTextBlock('divider')}>Divider</button>
@@ -349,12 +383,12 @@ export function BlockEditor({
             const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12}: {})})}};
             onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
           }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
-          {allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
+          {!websiteOptions&&allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
             const input=event.currentTarget,file=input.files?.[0];if(!file||uploadPending.current)return;uploadPending.current=true;setUploadBusy(true);setUploadError('');
             try{const image=await uploadMedia(file);if(mounted.current)addMediaBlock(image.mediaId,image);}catch(error){if(mounted.current)setUploadError(error instanceof Error?error.message:'The image could not be uploaded.');}finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);input.value='';}}
           }}/></label>}
           {uploadError&&<p role="alert">{uploadError}</p>}
-          {allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
+          {!websiteOptions && allowMedia && mediaOptions.length > 0 && <select defaultValue="" onChange={(event) => {
             addMediaBlock(event.target.value);
             event.target.value = '';
           }} aria-label={websiteOptions?"Add image from existing Works or uploads":"Add media block"}>
