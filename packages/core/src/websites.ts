@@ -48,6 +48,8 @@ export interface WebsitePublicationMapping {
 export interface WebsiteRedirect { from: string; to: string; status: 301 | 308; }
 export interface WebsiteGallerySettings {
   publicationId: string; title?: string; slug?: string;
+  /** Explicit public card copy and an independently approved public rendition. */
+  description?: string; previewAssetId?: string;
   destination?: GalleryDestinationRule; generateLocal?: boolean; canonicalUrl?: string;
 }
 export interface Website {
@@ -146,6 +148,8 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   if (new Set(site.gallerySettings?.map(g=>g.publicationId)).size !== (site.gallerySettings?.length ?? 0)) throw new WebsiteError('duplicate_selection','Gallery settings must select unique publications.');
   for (const setting of site.gallerySettings ?? []) {
     if (!site.galleryPublicationIds.includes(setting.publicationId)) throw new WebsiteError('foreign_reference','Gallery settings must reference a selected publication.');
+    if (setting.description!==undefined&&(typeof setting.description!=='string'||setting.description.length>5000)) throw new WebsiteError('invalid_gallery','Public gallery summaries must be 5,000 characters or fewer.');
+    if (setting.previewAssetId!==undefined&&(typeof setting.previewAssetId!=='string'||! /^[a-zA-Z0-9_:-]{1,160}$/.test(setting.previewAssetId))) throw new WebsiteError('invalid_gallery','Choose a valid public preview image.');
     if (setting.destination) validateRule(setting.destination);
     if (setting.slug) { if(setting.slug.includes('/')) throw new WebsiteError('invalid_path','Gallery slug must be a single segment.'); websitePath(setting.slug); }
     if (setting.canonicalUrl) websiteExternalUrl(setting.canonicalUrl);

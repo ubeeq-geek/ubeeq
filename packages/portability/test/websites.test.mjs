@@ -222,3 +222,13 @@ test('menu order and dropdown levels are independent of routes and other menus',
  home.navigationParentId=null;about.navigationParentId='portfolio';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
  about.navigationParentId=null;portfolio.navigationParentId='missing';assert.throws(()=>websiteRoutes(site),{code:'invalid_navigation'});
 });
+
+test('public promotion overrides preserve exact links and never enable local premium originals',()=>{
+ const snapshot=fixture(),premium=snapshot.galleries.find(g=>g.premium),asset=snapshot.assets[0];
+ snapshot.website.gallerySettings=[{publicationId:premium.publicationId,description:'An approved public teaser',previewAssetId:asset.id,destination:{destination:{mode:'connected',destinationId:'tumblr',accountId:'blog-a'}}}];
+ snapshot.mappings=[{publicationId:premium.publicationId,workspaceId:snapshot.website.workspaceId,destinationId:'tumblr',accountId:'blog-a',publicUrl:'https://artist.tumblr.com/post/123'}];
+ const html=Buffer.from(buildWebsiteArtifact(snapshot,limits).files.get('index.html')).toString();assert.match(html,/An approved public teaser/);assert.match(html,/https:\/\/artist.tumblr.com\/post\/123/);
+ snapshot.website.gallerySettings[0].destination.destination.accountId='blog-b';assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='missing_destination');
+ snapshot.website.gallerySettings[0].destination={destination:{mode:'local'}};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='local_not_public');
+ snapshot.website.gallerySettings[0].description='a'.repeat(5001);assert.throws(()=>buildWebsiteArtifact(snapshot,limits),e=>e.code==='invalid_gallery');
+});

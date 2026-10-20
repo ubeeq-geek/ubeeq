@@ -111,7 +111,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
   if (snapshot.galleries.some(g => g.workspaceId !== site.workspaceId) || new Set(snapshot.galleries.map(g=>g.publicationId)).size !== snapshot.galleries.length || site.galleryPublicationIds.some(id => !snapshot.galleries.some(g=>g.publicationId===id)) || snapshot.galleries.some(g=>!site.galleryPublicationIds.includes(g.publicationId))) throw new WebsiteError('foreign_reference','Resolve exactly the explicitly selected publication pool.');
   const galleries=snapshot.galleries.map(source => {
     const setting=site.gallerySettings?.find(s=>s.publicationId===source.publicationId);
-    const g={...source,...(setting ? {title:setting.title??source.title,slug:setting.slug??source.slug,destination:setting.destination??source.destination,generateLocal:setting.generateLocal??source.generateLocal,canonicalUrl:setting.canonicalUrl??source.canonicalUrl} : {})};
+    const g={...source,...(setting ? {title:setting.title??source.title,description:setting.description??source.description,previewAssetIds:setting.previewAssetId?[setting.previewAssetId]:source.previewAssetIds,slug:setting.slug??source.slug,destination:setting.destination??source.destination,generateLocal:setting.generateLocal??source.generateLocal,canonicalUrl:setting.canonicalUrl??source.canonicalUrl} : {})};
     if(!g.slug || g.slug.includes('/')) throw new WebsiteError('invalid_path','Gallery slug must be a safe single segment.');
     if(g.canonicalUrl) websiteExternalUrl(g.canonicalUrl);
     return {...g,...resolveWebsiteGallery(site,g,snapshot.mappings)};

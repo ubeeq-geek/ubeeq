@@ -1,5 +1,6 @@
 import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview} from './website-preview.js';
-import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+import { WEBSITE_THEMES, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteGallerySettings, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+export interface WebsiteCatalogueOption {id:string;title:string;premium?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
 export interface WebsiteWorkspaceClient {
@@ -17,7 +18,7 @@ export interface WebsiteWorkspaceClient {
   reviewPublication?(revision:number,targetIds:readonly string[]):Promise<{planId:string;fingerprint:string;expiresAt:string}>;
   publishWebsite?(planId:string,fingerprint:string,key:string):Promise<void>;
   hostingAction?(action:string,id:string,body?:unknown):Promise<void>;
-  catalogue?(): Promise<readonly {id:string;title:string}[]>;
+  catalogue?(): Promise<readonly WebsiteCatalogueOption[]>;
   get(): Promise<Website>;
   save(website: Website, expectedRevision: number): Promise<Website>;
   document(id: string): Promise<{ document: WebsiteDocument; sharedBy: readonly { title: string }[] }>;
@@ -294,33 +295,40 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       surface.append(button('Save '+selectedLayout.toLowerCase(),save));
     }
     if(tab==='Gallery destinations') {
-      content.append(element('p',options.destinationModes&&!options.destinationModes.includes('connected')?'Select public Works to include in this website. Each Work can have its own title and link destination.':'Gallery blocks select exact publication IDs. A missing connected mapping blocks the build unless an explicit fallback or omission rule is configured.'));
-      const select=element('select');select.setAttribute('aria-label','Default gallery destination');for(const mode of options.destinationModes ?? ['local','manual','connected']){const o=element('option',mode);o.value=mode;select.append(o);}select.value=site.galleryDefault.destination.mode;
-      let external=site.galleryDefault.destination.mode==='manual'?site.galleryDefault.destination.url:'';
-      let destination=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.destinationId:'',account=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.accountId:'',space=site.galleryDefault.destination.mode==='connected'?site.galleryDefault.destination.spaceId??'':'';
-      content.append(select);const manualInput=field(content,'External public URL',external,v=>external=v);
-      const connectedInputs=options.destinationModes&&!options.destinationModes.includes('connected')?[]:[field(content,'Connected destination ID',destination,v=>destination=v),field(content,'Account ID',account,v=>account=v),field(content,'Space ID (optional)',space,v=>space=v)];
-      const toggleFields=()=>{manualInput.parentElement!.hidden=select.value!=='manual';for(const input of connectedInputs)input.parentElement!.hidden=select.value!=='connected';};select.onchange=toggleFields;toggleFields();
-      content.append(button('Save gallery default',async()=>{site={...site,galleryDefault:{destination:select.value==='manual'?{mode:'manual',url:external}:select.value==='connected'?{mode:'connected',destinationId:destination,accountId:account,spaceId:space||undefined}:{mode:'local'},missing:'error'}};await save();}));
+      content.append(element('p','Choose the publications to show in your galleries and where each card opens. Connected links use that exact publication and account. Member content stays at its source; choose a public summary and preview for its card.'));
       const catalogue=client.catalogue?await client.catalogue():undefined;
-      if(catalogue) for(const publication of catalogue) {
-        const label=element('label',publication.title),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
-        check.onchange=()=>{site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:check.checked?site.gallerySettings:site.gallerySettings?.filter(s=>s.publicationId!==publication.id)};};label.append(check);content.append(label);
-      } else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
+      const availableModes=options.destinationModes??['local','manual','connected'];
+      const destinationPicker=(parent:HTMLElement,label:string,value:WebsiteDestination|undefined,choices:readonly WebsiteCatalogueOption[],change:(v:WebsiteDestination|undefined)=>void,inherit=false)=>{
+        const box=element('fieldset');box.append(element('legend',label));const mode=element('select');mode.setAttribute('aria-label',label);
+        for(const id of [...(inherit?['inherit']:[]),...availableModes]){const option=element('option',({inherit:'Use gallery default',local:'Website gallery',manual:'Custom public link',connected:'Connected publication'} as Record<string,string>)[id]);option.value=id;mode.append(option);}mode.value=value?.mode??'inherit';box.append(mode);
+        let manual=value?.mode==='manual'?value.url:'';
+        const url=field(box,'Public URL',manual,v=>{manual=v;update();});
+        const connection=element('select');connection.setAttribute('aria-label',label+' connection');const empty=element('option','Choose a connected destination');empty.value='';connection.append(empty);
+        const destinations=new Map<string,Extract<WebsiteDestination,{mode:'connected'}>>();
+        for(const row of choices)if(row.destination){const key=JSON.stringify(row.destination);if(destinations.has(key))continue;destinations.set(key,row.destination);const option=element('option',row.destinationLabel??row.title);option.value=key;connection.append(option);}
+        if(value?.mode==='connected'){const key=JSON.stringify(value);if(!destinations.has(key)){destinations.set(key,value);const option=element('option','Saved connection (not currently available)');option.value=key;connection.append(option);}connection.value=key;}
+        box.append(connection);parent.append(box);
+        const visible=()=>{url.parentElement!.hidden=mode.value!=='manual';connection.hidden=mode.value!=='connected';};
+        const update=()=>{visible();change(mode.value==='inherit'?undefined:mode.value==='local'?{mode:'local'}:mode.value==='manual'?{mode:'manual',url:manual}:destinations.get(connection.value)??{mode:'connected',destinationId:'',accountId:''});};mode.onchange=update;connection.onchange=update;visible();
+      };
+      destinationPicker(content,'Default gallery destination',site.galleryDefault.destination,catalogue??[],destination=>{if(destination)site={...site,galleryDefault:{destination,missing:'error'}};});
+      content.append(button('Save gallery default',save));
+      if(catalogue)for(const publication of catalogue){
+        const label=element('label',publication.title+' · '+(publication.destinationLabel??'Public Work')+(publication.premium?' · Member content':'')),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
+        check.onchange=()=>{const settings=site.gallerySettings?.filter(s=>s.publicationId!==publication.id)??[];if(check.checked&&publication.destination&&(publication.premium||publication.destination.destinationId!=='eversally'))settings.push({publicationId:publication.id,destination:{destination:publication.destination,missing:'error'}});site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:settings};};label.prepend(check);content.append(label);
+      }else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
       content.append(button('Save selection',async()=>{await save();await show('Gallery destinations');}));
-      for(const publicationId of site.galleryPublicationIds) {
-        const row=element('fieldset');row.append(element('legend',catalogue?.find(p=>p.id===publicationId)?.title??'Selected publication'));
-        let setting=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
+      for(const publicationId of site.galleryPublicationIds){
+        const publication=catalogue?.find(p=>p.id===publicationId),row=element('fieldset');row.append(element('legend',publication?.title??'Selected publication'));
+        let setting:WebsiteGallerySettings=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
         const change=()=>{site={...site,gallerySettings:[...(site.gallerySettings??[]).filter(s=>s.publicationId!==publicationId),setting]};};
         field(row,'Website title',setting.title??'',v=>{setting={...setting,title:v||undefined};change();});
         field(row,'Website slug',setting.slug??'',v=>{setting={...setting,slug:v||undefined};change();});
-        const mode=element('select');mode.setAttribute('aria-label','Publication destination');for(const m of ['inherit',...(options.destinationModes ?? ['local','manual']).filter(m=>m!=='connected')]){const o=element('option',m);o.value=m;mode.append(o);}mode.value=setting.destination?.destination.mode??'inherit';
-        let manual=setting.destination?.destination.mode==='manual'?setting.destination.destination.url:'';
-        const update=()=>{setting={...setting,destination:mode.value==='inherit'?undefined:{destination:mode.value==='local'?{mode:'local'}:{mode:'manual',url:manual},missing:'error'}};change();};
-        mode.onchange=update;row.append(mode);field(row,'Publication external URL',manual,v=>{manual=v;update();});content.append(row);
+        destinationPicker(row,'Publication destination',setting.destination?.destination,publication?[publication]:[],destination=>{setting={...setting,destination:destination?{destination,missing:'error'}:undefined};change();},true);
+        const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value||undefined};change();};summaryLabel.append(summary);row.append(summaryLabel);
+        await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});content.append(row);
       }
       content.append(button('Save publication overrides',save));
-
     }
     if(tab==='Publishing'&&options.exportEnabled!==false) {
       content.append(element('p','Each build preserves a saved website version. Rebuild after changing pages or Works.'));
