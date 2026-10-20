@@ -299,7 +299,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       const catalogue=client.catalogue?await client.catalogue():undefined;
       const availableModes=options.destinationModes??['local','manual','connected'];
       const destinationPicker=(parent:HTMLElement,label:string,value:WebsiteDestination|undefined,choices:readonly WebsiteCatalogueOption[],change:(v:WebsiteDestination|undefined)=>void,inherit=false)=>{
-        const box=element('fieldset');box.append(element('legend',label));const mode=element('select');mode.setAttribute('aria-label',label);
+        const box=element('fieldset');box.className='website-gallery-destination';box.append(element('legend',label));const mode=element('select');mode.setAttribute('aria-label',label);
         for(const id of [...(inherit?['inherit']:[]),...availableModes]){const option=element('option',({inherit:'Use gallery default',local:'Website gallery',manual:'Custom public link',connected:'Connected publication'} as Record<string,string>)[id]);option.value=id;mode.append(option);}mode.value=value?.mode??'inherit';box.append(mode);
         let manual=value?.mode==='manual'?value.url:'';
         const url=field(box,'Public URL',manual,v=>{manual=v;update();});
@@ -315,17 +315,17 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       content.append(button('Save gallery default',save));
       if(catalogue)for(const publication of catalogue){
         const label=element('label',publication.title+' · '+(publication.destinationLabel??'Public Work')+(publication.premium?' · Member content':'')),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
-        check.onchange=()=>{const settings=site.gallerySettings?.filter(s=>s.publicationId!==publication.id)??[];if(check.checked&&publication.destination&&(publication.premium||publication.destination.destinationId!=='eversally'))settings.push({publicationId:publication.id,destination:{destination:publication.destination,missing:'error'}});site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:settings};};label.prepend(check);content.append(label);
+        check.onchange=()=>{const settings=site.gallerySettings?.filter(s=>s.publicationId!==publication.id)??[];if(check.checked&&publication.destination&&(publication.premium||publication.destination.destinationId!=='eversally'))settings.push({publicationId:publication.id,destination:{destination:publication.destination,missing:'error'}});site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:settings};};label.append(check);content.append(label);
       }else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
       content.append(button('Save selection',async()=>{await save();await show('Gallery destinations');}));
       for(const publicationId of site.galleryPublicationIds){
-        const publication=catalogue?.find(p=>p.id===publicationId),row=element('fieldset');row.append(element('legend',publication?.title??'Selected publication'));
+        const publication=catalogue?.find(p=>p.id===publicationId),row=element('fieldset');row.className='website-gallery-card';row.append(element('legend',publication?.title??'Selected publication'));
         let setting:WebsiteGallerySettings=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
         const change=()=>{site={...site,gallerySettings:[...(site.gallerySettings??[]).filter(s=>s.publicationId!==publicationId),setting]};};
         field(row,'Website title',setting.title??'',v=>{setting={...setting,title:v||undefined};change();});
         field(row,'Website slug',setting.slug??'',v=>{setting={...setting,slug:v||undefined};change();});
         destinationPicker(row,'Publication destination',setting.destination?.destination,publication?[publication]:[],destination=>{setting={...setting,destination:destination?{destination,missing:'error'}:undefined};change();},true);
-        const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value||undefined};change();};summaryLabel.append(summary);row.append(summaryLabel);
+        const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value};change();};summaryLabel.append(summary);row.append(summaryLabel);
         await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});content.append(row);
       }
       content.append(button('Save publication overrides',save));
