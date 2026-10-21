@@ -1,3 +1,4 @@
+import { WebsiteError } from '@ubeeq/core';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp,rm,readFile } from 'node:fs/promises';
@@ -126,4 +127,27 @@ test('verification cannot clear a serving suspension or operator withdrawal flag
  const intent=await f.accept('pending-public-verification');assert.equal((await f.service.execute('workspace',intent.attemptIds[0])).state,'verifying');
  await f.native.suspend(f.target);await f.store.setServingState('workspace','target','suspended',true);
  await f.service.reconcile('workspace',intent.attemptIds[0]);const target=await f.store.getTarget('workspace','target');assert.equal(target.serving,'suspended');assert.equal(target.servingRemovalRequired,true);assert.equal((await fetch(f.target.publicUrl)).status,410);
+});
+
+test('resumable upload interruptions retain their checkpoint and do not enter activation',async t=>{
+ let first=true,activations=0;
+ const f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...args)=>n.validateTarget(...args),prepare:async c=>{await c.beforeUpload();if(first){first=false;await c.saveCheckpoint({data:{archive:'reserved.zip',offset:'3'}});throw new WebsiteError('upload_interrupted','Retry the saved upload.');}assert.equal(c.checkpoint.data.offset,'3');return n.prepare(c);},activate:async c=>{activations++;return n.activate(c);},reconcile:c=>n.reconcile(c),verify:(...args)=>n.verify(...args)})});
+ const intent=await f.accept('upload-resume'),id=intent.attemptIds[0];
+ assert.equal((await f.service.execute('workspace',id)).state,'uploading');assert.equal(activations,0);
+ assert.equal((await f.store.getAttempt('workspace',id)).activationStarted,false);
+ assert.equal((await f.service.execute('workspace',id)).state,'published');assert.equal(activations,1);
+});
+test('a pending candidate does not replace the last verified live release',async t=>{
+ let confirmed=true;
+ const f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...args)=>n.validateTarget(...args),prepare:c=>n.prepare(c),activate:c=>n.activate(c),reconcile:c=>n.reconcile(c),verify:async(...args)=>({...await n.verify(...args),publicConfirmed:confirmed})})});
+ const first=await f.accept('first-live');assert.equal((await f.service.execute('workspace',first.attemptIds[0])).state,'published');
+ const live=(await f.store.getTarget('workspace','target')).activeAttemptId;
+ confirmed=false;const next=await f.accept('pending');assert.equal((await f.service.execute('workspace',next.attemptIds[0])).state,'verifying');assert.equal((await f.store.getTarget('workspace','target')).activeAttemptId,live);
+ confirmed=true;const reconciled=await f.service.reconcile('workspace',next.attemptIds[0]);assert.equal(reconciled.state,'published');assert.equal(reconciled.errorCode,undefined);assert.equal((await f.store.getTarget('workspace','target')).activeAttemptId,next.attemptIds[0]);
+});
+
+test('transient Hostinger preparation failures retry the same immutable attempt before activation',async t=>{
+ let fail=true,activations=0;
+ const f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...args)=>n.validateTarget(...args),prepare:async c=>{if(fail){fail=false;await c.saveCheckpoint({data:{hostingerPreparingAt:new Date().toISOString()}});throw new WebsiteError('provider_outcome_unknown','Provider temporarily unavailable.');}return n.prepare(c);},activate:async c=>{activations++;return n.activate(c);},reconcile:c=>n.reconcile(c),verify:(...args)=>n.verify(...args)})});
+ const intent=await f.accept('preparation-retry'),id=intent.attemptIds[0];assert.equal((await f.service.execute('workspace',id)).state,'uploading');assert.equal(activations,0);assert.equal((await f.service.execute('workspace',id)).state,'published');assert.equal(activations,1);
 });
