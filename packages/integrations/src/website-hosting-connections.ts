@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { WebsiteError, type HostingConnection } from '@ubeeq/core';
 import type { CredentialVault, OAuthStateStore, OAuthAuthorizationState } from './index.js';
+import { HostingerWebsiteHostingAdapter } from './website-hosting-hostinger.js';
 import { HostingHttp, type HostingFetch } from './website-hosting-http.js';
 export interface HostingConnectionActor {workspaceId:string;actorId:string;}
 export interface WebsiteHostingConnectionPorts {
@@ -44,6 +45,20 @@ export class WebsiteHostingConnections {
     return this.save(a,{id:state.connectionId,family:'netlify',authorization:'oauth',accountId:state.accountId,secret:accessToken});
   }
   async connectPages(a:HostingConnectionActor,input:{accountId:string;token:string;id?:string}){await this.ports.authorize(a);if(!/^[a-f0-9]{32}$/i.test(input.accountId)||!input.token||input.token.length>8192)throw new WebsiteError('invalid_connection','Provide the Cloudflare account and restricted Pages token.');const response=await new HostingHttp('https://api.cloudflare.com',this.ports.fetch).request('/client/v4/accounts/'+input.accountId+'/pages/projects',input.token);if(response.success!==true)throw new WebsiteError('reconnect_required','Token cannot access Pages in this account.');return this.save(a,{id:input.id,family:'cloudflare-pages',authorization:'api_token',accountId:input.accountId,secret:input.token});}
+  async connectHostinger(a:HostingConnectionActor,input:{token:string;accountId:string;id?:string}) {
+    await this.ports.authorize(a);
+    if(!input.token||input.token.length>8192||!/^\d+$/.test(input.accountId))throw new WebsiteError('invalid_connection','Provide the Hostinger API token and discovered customer ID.');
+    const adapter=new HostingerWebsiteHostingAdapter({credential:async()=>input.token,probe:async()=>{throw Error('Discovery only');},fetch:this.ports.fetch,uploadHosts:[]});
+    const sites=await adapter.discover(input.token);
+    if(!sites.some(site=>String(site.client_id)===input.accountId))throw new WebsiteError('account_changed','Token cannot access the selected Hostinger customer.');
+    return this.save(a,{id:input.id,family:'hostinger',accountId:input.accountId,authorization:'api_token',secret:input.token});
+  }
+  async discoverHostinger(a:HostingConnectionActor,token:string) {
+    await this.ports.authorize(a);
+    if(!token||token.length>8192)throw new WebsiteError('invalid_connection','Provide a Hostinger API token.');
+    const adapter=new HostingerWebsiteHostingAdapter({credential:async()=>token,probe:async()=>{throw Error('Discovery only');},fetch:this.ports.fetch,uploadHosts:[]});
+    return [...new Set((await adapter.discover(token)).map(site=>site.client_id).filter(id=>Number.isSafeInteger(id)))].map(id=>({id:String(id)}));
+  }
   async connectSftp(a:HostingConnectionActor,input:{id?:string;accountId:string;username:string;privateKey:string;passphrase?:string}){await this.ports.authorize(a);if(!input.accountId||!input.username||!input.privateKey||input.privateKey.length>65536)throw new WebsiteError('invalid_connection','SFTP account, username and private key are required.');return this.save(a,{id:input.id,family:'sftp',authorization:'ssh_key',accountId:input.accountId,secret:JSON.stringify({username:input.username,privateKey:input.privateKey,passphrase:input.passphrase})});}
   async disconnect(a:HostingConnectionActor,id:string){await this.ports.authorize(a);const c=await this.ports.get(a.workspaceId,id);if(!c)throw new WebsiteError('connection_not_found','Connection was not found.');await this.ports.save({...c,state:'disconnected',credentialReference:undefined,revision:c.revision+1},c.revision);if(c.credentialReference)await this.ports.vault.revoke({cellId:this.ports.cellId,reference:c.credentialReference});}
 }

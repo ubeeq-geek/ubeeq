@@ -1,7 +1,7 @@
 import { WebsiteError } from './websites.js';
 import type { WebsiteDependency } from './websites.js';
 
-export type HostingFamily = 'native' | 'aws' | 'netlify' | 'cloudflare-pages' | 'sftp';
+export type HostingFamily = 'native' | 'aws' | 'netlify' | 'cloudflare-pages' | 'sftp' | 'hostinger';
 export interface HostingCapabilities {
   emergencySuspension?:boolean; provision: boolean; select: boolean;
   staging: 'private' | 'public' | 'none';
@@ -54,6 +54,8 @@ export interface HostingDeploymentContext {
   saveCheckpoint(checkpoint: HostingCheckpoint): Promise<void>;
   /** Must be awaited immediately before a serving-changing operation, including combined deploy APIs. */
   beforeActivation(): Promise<void>;
+  /** Revalidate writer ownership and authorization before resumable upload chunks. */
+  beforeUpload?(): Promise<void>;
 }
 /** Explicit v2 extension. The original StaticDeploymentAdapter v1 remains unchanged. */
 export interface WebsiteHostingAdapter {

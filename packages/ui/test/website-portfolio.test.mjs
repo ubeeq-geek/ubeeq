@@ -99,3 +99,11 @@ test('paragraphs, headings and quotes retain explicit alignment while defaults f
  const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<p class="block-align-center">Centered/);assert.match(html,/<h2 id="heading-2" class="block-align-right">Right/);assert.match(html,/<blockquote class="block-align-left">Left/);assert.match(html,/<p>Theme default<\/p>/);
  input.documents.get('doc').blocks[0].data.textAlign='center; color:red';assert.throws(()=>renderStaticWebsite(input),/text alignment/);
 });
+
+test('Builder embed associations preserve the stable source and offer a responsive full-site fallback',async()=>{
+ const {websiteRoutes,websiteEmbedCode}=await import('@ubeeq/core');const {website}=fixture();
+ website.embedding={mode:'selected',origins:['https://parent.example'],parentUrl:'https://parent.example/portfolio',sourceUrl:'https://source.example/site/',responsive:true,pageId:'home',presentation:'full',height:800};
+ websiteRoutes(website);const code=websiteEmbedCode(website,website.embedding.sourceUrl);
+ assert.match(code,/height:80vh/);assert.match(code,/Open full site/);assert.match(code,/href="https:\/\/source.example\/site\/"/);
+ website.embedding.parentUrl='https://wrong.example/';assert.throws(()=>websiteRoutes(website),{code:'invalid_embedding'});
+});
