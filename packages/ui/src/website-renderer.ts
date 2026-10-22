@@ -1,3 +1,4 @@
+import {websiteNamedGalleryPath} from '@ubeeq/core';
 import { websiteFrameAncestors, websiteMenuParent, websiteMenuOrder, WebsiteError, websiteExternalUrl, websitePath, type ContentBlock, type Website, type WebsiteDocument, type WebsiteGallery, type WebsitePage } from '@ubeeq/core';
 import { websiteDesignCss } from './website-design-css.js';
 import { parse, parseFragment, serialize } from 'parse5';
@@ -45,7 +46,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
   const pages = site.pages.filter(p => p.state === 'ready');
   const limits = input.limits ?? { maxPages: 200, maxBytes: 50 * 1024 * 1024 };
   if (![limits.maxPages, limits.maxBytes].every(n => Number.isSafeInteger(n) && n > 0)) throw new WebsiteError('invalid_limits', 'Render limits must be positive integers.');
-  let plannedPages = pages.length + galleries.filter(g => g.local).length + site.redirects.length + 1;
+  let plannedPages = (site.namedGalleries?.length??0) + pages.length + galleries.filter(g => g.local).length + site.redirects.length + 1;
   if (plannedPages > limits.maxPages) throw new WebsiteError('quota_exceeded', 'Generated page limit exceeded.');
   let outputBytes = 0;
   const write = (name: string, content: string) => {
@@ -121,6 +122,12 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     return `<figure${options?` class="${e(options.className)}"`: ''}>${content}${caption ? `<figcaption>${e(caption)}</figcaption>` : ''}</figure>`;
   };
   const card = (g: StaticWebsiteGallery, promotion = false) => !g.href ? '' : `<article class="card">${g.previewAssetIds[0] ? image(g.previewAssetIds[0],undefined,'image',g.href.startsWith('/')?url(g.href):websiteExternalUrl(g.href)) : ''}<h2><a href="${e(g.href.startsWith('/') ? url(g.href) : g.href)}">${e(g.title)}</a></h2>${g.creatorName?`<p class="work-creator">${e(g.creatorName)}</p>`:''}${g.description ? `<p>${e(g.description)}</p>` : ''}${g.premium?'<p class="gallery-access">Public preview · membership access</p>':''}${promotion ? '<p>View access options at the linked destination.</p>' : ''}</article>`;
+  const namedContent=(id:string):string=>{
+    const gallery=site.namedGalleries?.find(row=>row.id===id);if(!gallery)throw new WebsiteError('missing_gallery','This gallery block references a removed website gallery.');
+    if(gallery.kind==='galleries')return `<div class="grid">${site.namedGalleries!.filter(row=>row.parentId===id).map(child=>`<article class="card"><h2><a href="${e(url(websiteNamedGalleryPath(site,child)))}">${e(child.title)}</a></h2><p>${child.access==='preview'?'Previews':'Free gallery'}</p></article>`).join('')}</div>`;
+    if(gallery.access==='free'&&galleries.some(row=>gallery.publicationIds.includes(row.publicationId)&&row.premium))throw new WebsiteError('restricted_gallery','Member content can only appear as an approved preview.');
+    return `<div class="grid">${galleries.filter(row=>gallery.publicationIds.includes(row.publicationId)).map(row=>card(row,gallery.access==='preview')).join('')}</div>`;
+  };
   for (const page of pages) {
     const path = routes.get(page.id)!, doc = documents.get(page.documentId);
     if (!doc) throw new WebsiteError('missing_document', 'Page document was not resolved.');
@@ -194,6 +201,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         case 'gallery_preview': case 'premium_promotion': { const selected = refs(); if (selected.length !== 1) throw new WebsiteError('invalid_block', 'Preview blocks select exactly one publication.'); return card(selected[0], block.type === 'premium_promotion'); }
         case 'selected_portfolio': return `<div class="grid">${refs().map(g => card(g)).join('')}</div>`;
         case 'gallery_list': {
+          if(block.data?.websiteGalleryId)return namedContent(String(block.data.websiteGalleryId));
           let selected = galleries.filter(g => g.href);
           const tags = block.data?.tags, collections = block.data?.collectionIds, publications = block.data?.publicationIds,creators=block.data?.creatorIdentityIds;
           for (const filter of [tags, collections, publications,creators]) if (filter !== undefined && (!Array.isArray(filter) || filter.some(v => typeof v !== 'string'))) throw new WebsiteError('invalid_query', 'Query filters must be string arrays.');
@@ -221,6 +229,7 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
     add(path, shell(page.title, renderBlocks(doc.blocks), path, page));
     for (const extra of extraPages) add(extra.path, shell(extra.title, extra.body(), extra.path,{...page,seoTitle:undefined,canonicalUrl:undefined}));
   }
+  for(const gallery of site.namedGalleries??[]){const path=websiteNamedGalleryPath(site,gallery);add(path,shell(gallery.title,namedContent(gallery.id),path));}
   for (const g of galleries.filter(g => g.local)) {
     const path = websitePath(`/galleries/${g.slug}`);
     add(path, shell(g.title, `${g.creatorName?`<p class="work-creator">${e(g.creatorName)}</p>`:''}<p>${e(g.description ?? '')}</p><div class="grid">${g.publicAssetIds.map(id => image(id)).join('')}</div>`, path, { canonicalUrl: g.canonicalUrl }));
