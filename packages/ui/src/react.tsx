@@ -416,3 +416,5 @@ export function BlockEditor({
     </div>
   );
 }
+
+export { AiAction, AiBadge, AiAssistanceProvider, TitlePolishControl, AI_ASSISTANCE_CSS, titleDiff, type AiVisibility, type TitlePolishControlProps } from './ai-assistance.js';
