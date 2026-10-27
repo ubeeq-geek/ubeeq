@@ -10,7 +10,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
   const [settingsHost,setSettingsHost]=useState<HTMLElement|null>(null);
   const [editor,setEditor]=useState<{host:HTMLElement;document:WebsiteDocument;change:(document:WebsiteDocument)=>void}|null>(null);
   const [images,setImages]=useState<BlockEditorMediaOption[]>(mediaOptions),[libraryError,setLibraryError]=useState('');
-  const [options,setOptions]=useState<{pages:{id:string;title:string}[];publications:{id:string;title:string}[];creators:{id:string;title:string}[]}>({pages:[],publications:[],creators:[]});
+  const [options,setOptions]=useState<{galleries?:{id:string;title:string}[];pages:{id:string;title:string}[];publications:{id:string;title:string}[];creators:{id:string;title:string}[]}>({pages:[],publications:[],creators:[]});
   useEffect(()=>{
     if(!root.current)return;
     setImages(mediaOptions);setOptions({pages:[],publications:[],creators:[]});failedPreviews.current.clear();let generation=0,disposed=false;
@@ -19,7 +19,7 @@ export function WebsiteWorkspace({client,mediaOptions=[],options:workspaceOption
       void Promise.all([client.get(),client.catalogue?.()??Promise.resolve([]),client.media?.()??Promise.resolve([]),client.creators?.()??Promise.resolve([])]).then(([site,catalogue,library,creators])=>{
         if(disposed||current!==generation)return;
         setImages(previous=>{const result=new Map(previous.map(image=>[image.mediaId,image]));for(const image of library){const old=result.get(image.id);result.set(image.id,{...old,mediaId:image.id,label:image.title,assetType:'image'});}return [...result.values()];});
-        setOptions({creators:[...creators],pages:site.pages.map(p=>({id:p.id,title:p.title})),publications:site.galleryPublicationIds.map(id=>({id,title:site.gallerySettings?.find(s=>s.publicationId===id)?.title??catalogue.find(p=>p.id===id)?.title??id}))});
+        setOptions({galleries:site.namedGalleries?.map(gallery=>({id:gallery.id,title:(gallery.parentId?'↳ ':'')+gallery.title})),creators:[...creators],pages:site.pages.map(p=>({id:p.id,title:p.title})),publications:site.galleryPublicationIds.map(id=>({id,title:site.gallerySettings?.find(s=>s.publicationId===id)?.title??catalogue.find(p=>p.id===id)?.title??id}))});
       }).catch(error=>{if(!disposed&&current===generation)setLibraryError(error instanceof Error?error.message:'The image library could not be loaded.');});
       setEditor({host,document,change});
       return ()=>{generation++;setEditor(null);};

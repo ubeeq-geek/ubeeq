@@ -107,3 +107,20 @@ test('Builder embed associations preserve the stable source and offer a responsi
  assert.match(code,/height:80vh/);assert.match(code,/Open full site/);assert.match(code,/href="https:\/\/source.example\/site\/"/);
  website.embedding.parentUrl='https://wrong.example/';assert.throws(()=>websiteRoutes(website),{code:'invalid_embedding'});
 });
+
+test('named gallery blocks render two-level child galleries and reuse Work pages across destinations',()=>{
+ const input=fixture();input.website.basePath='/portfolio/';input.website.namedGalleries=[
+  {id:'index',title:'Galleries',slug:'all',kind:'galleries',access:'free',publicationIds:[]},
+  {id:'free',title:'Free images',slug:'free',parentId:'index',kind:'works',access:'free',publicationIds:['work']},
+  {id:'preview',title:'Previews',slug:'previews',parentId:'index',kind:'works',access:'preview',publicationIds:['work']}
+ ];input.website.galleryPublicationIds=['work'];input.media.set('image',{src:'/portfolio/assets/work.jpg',mimeType:'image/jpeg',alt:'Work'});
+ input.galleries=[{publicationId:'work',workId:'work',title:'A Work',slug:'work',href:'/galleries/work/',local:true,premium:false,previewAssetIds:['image'],publicAssetIds:['image'],tags:[],collectionIds:[],date:'2026-10-21'}];
+ input.documents.set('doc',{blocks:[{id:'gallery-block',type:'gallery_list',data:{websiteGalleryId:'index'}}]});
+ const files=renderStaticWebsite(input).files;
+ assert.match(files.get('index.html'),/\/portfolio\/galleries\/collections\/all\/free\//);
+ assert.match(files.get('galleries/collections/all/free/index.html'),/A Work/);
+ assert.match(files.get('galleries/collections/all/previews/index.html'),/A Work/);
+ assert.ok(files.has('galleries/work/index.html'));
+ const invalid=structuredClone(input.website);invalid.namedGalleries[0].parentId='free';assert.throws(()=>websiteRoutes(invalid),/two levels/);
+ input.website.namedGalleries[1].access='premium';assert.throws(()=>websiteRoutes(input.website),/Name each gallery/);
+});

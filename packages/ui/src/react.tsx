@@ -33,7 +33,7 @@ export type BlockEditorProps = {
   allowMedia?: boolean;
   uploadMedia?: (file:File)=>Promise<BlockEditorMediaOption>;
   allowStructured?: boolean;
-  websiteOptions?: { creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
+  websiteOptions?: { galleries?: readonly {id:string;title:string}[]; creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
   readOnly?: boolean;
   sectionDepth?: number;
   stickyToolbarOffset?: number;
@@ -324,15 +324,16 @@ export function BlockEditor({
                 {block.type === 'premium_promotion' && <p>Only approved public previews are exported. Access remains at the external destination.</p>}
                 {block.type === 'page_link' ? <label>Page<select value={String(block.payload?.pageId ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageId:event.target.value}})}>
                   <option value="">Choose a page</option>{websiteOptions.pages.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
-                </select></label> : block.type !== 'update_list' && <label>Publications<select multiple={['selected_portfolio','gallery_list'].includes(block.type)} value={['selected_portfolio','gallery_list'].includes(block.type)?(block.payload?.publicationIds as string[] ?? []):String((block.payload?.publicationIds as string[] ?? [])[0] ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,publicationIds:Array.from(event.target.selectedOptions).map(o=>o.value).filter(Boolean)}})}>
+                </select></label> : block.type !== 'update_list' && !(block.type==='gallery_list'&&block.payload?.websiteGalleryId) && <label>Publications<select multiple={['selected_portfolio','gallery_list'].includes(block.type)} value={['selected_portfolio','gallery_list'].includes(block.type)?(block.payload?.publicationIds as string[] ?? []):String((block.payload?.publicationIds as string[] ?? [])[0] ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,publicationIds:Array.from(event.target.selectedOptions).map(o=>o.value).filter(Boolean)}})}>
                   {!['selected_portfolio','gallery_list'].includes(block.type)&&<option value="">Choose the intended publication</option>}{websiteOptions.publications.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
                 </select></label>}
-                {['gallery_list','update_list'].includes(block.type)&&<>
+                {['gallery_list','update_list'].includes(block.type)&&!(block.type==='gallery_list'&&block.payload?.websiteGalleryId)&&<>
                   <label>Page size<input type="number" min={1} max={100} value={Number(block.payload?.pageSize ?? 12)} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageSize:Number(event.target.value)}})}/></label>
                   <label>Empty message<input value={String(block.payload?.emptyMessage ?? 'No entries yet.')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,emptyMessage:event.target.value}})}/></label>
                 </>}
-                {block.type==='gallery_list'&&websiteOptions.creators&&<label>Creator identities · leave unselected for all<select multiple value={(block.payload?.creatorIdentityIds as string[])??[]} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,creatorIdentityIds:Array.from(event.target.selectedOptions).map(option=>option.value)}})}>{[...websiteOptions.creators,...((block.payload?.creatorIdentityIds as string[])??[]).filter(id=>!websiteOptions.creators!.some(creator=>creator.id===id)).map(id=>({id,title:'Disconnected identity · '+id}))].map(creator=><option key={creator.id} value={creator.id}>{creator.title}</option>)}</select></label>}
-                {block.type==='gallery_list'&&<label>Tags (comma separated)<input value={((block.payload?.tags as string[])??[]).join(', ')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,tags:event.target.value.split(',').map(t=>t.trim()).filter(Boolean)}})}/></label>}
+                {block.type==='gallery_list'&&<label>Website gallery<select value={String(block.payload?.websiteGalleryId??'')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,websiteGalleryId:event.target.value||undefined}})}><option value="">All selected publications / filters</option>{websiteOptions.galleries?.map(gallery=><option key={gallery.id} value={gallery.id}>{gallery.title}</option>)}</select></label>}
+                {block.type==='gallery_list'&&!block.payload?.websiteGalleryId&&websiteOptions.creators&&<label>Creator identities · leave unselected for all<select multiple value={(block.payload?.creatorIdentityIds as string[])??[]} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,creatorIdentityIds:Array.from(event.target.selectedOptions).map(option=>option.value)}})}>{[...websiteOptions.creators,...((block.payload?.creatorIdentityIds as string[])??[]).filter(id=>!websiteOptions.creators!.some(creator=>creator.id===id)).map(id=>({id,title:'Disconnected identity · '+id}))].map(creator=><option key={creator.id} value={creator.id}>{creator.title}</option>)}</select></label>}
+                {block.type==='gallery_list'&&!block.payload?.websiteGalleryId&&<label>Tags (comma separated)<input value={((block.payload?.tags as string[])??[]).join(', ')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,tags:event.target.value.split(',').map(t=>t.trim()).filter(Boolean)}})}/></label>}
               </fieldset>}
               {!isTextBlock && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit', ...(websiteOptions?['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link']:[])].includes(block.type) && <p>Preserved {block.type} block — static export requires an explicit renderer or accepted fallback.</p>}
               {block.type === 'file' && <div className="portable-block-editor-file">
@@ -396,7 +397,7 @@ export function BlockEditor({
           </>}
           {websiteOptions && <select defaultValue="" aria-label="Add website block" onChange={event=>{
             const type=event.target.value as PostBlock['type'];if(!type)return;
-            const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12}: {})})}};
+            const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12,websiteGalleryId:websiteOptions.galleries?.[0]?.id}: {})})}};
             onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
           }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
           {!websiteOptions&&allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
@@ -416,3 +417,5 @@ export function BlockEditor({
     </div>
   );
 }
+
+export { AiAction, AiBadge, AiAssistanceProvider, TitlePolishControl, AI_ASSISTANCE_CSS, titleDiff, type AiVisibility, type TitlePolishControlProps } from './ai-assistance.js';

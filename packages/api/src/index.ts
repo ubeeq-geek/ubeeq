@@ -98,3 +98,5 @@ export const composeReferenceApplication = (
   }
   return { configuration, extensions: loadProductExtensions(configuration.extensions, configuration.requiredExtensions), dependencies };
 };
+
+export * from './ai-assistance.js';
