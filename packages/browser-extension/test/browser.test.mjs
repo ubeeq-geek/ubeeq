@@ -36,3 +36,30 @@ test('target manifests have no cookie, arbitrary execution, default host or exte
     assert.match(manifest.content_security_policy.extension_pages, /script-src 'self'/);
   }
 });
+
+test('API base validation preserves selected routing prefixes and rejects unsafe URLs', async () => {
+  const code = await readFile(new URL('../browser/client.js', import.meta.url), 'utf8');
+  const { apiBase } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+  assert.equal(apiBase('https://api.example/tenant/api/'), 'https://api.example/tenant/api');
+  assert.equal(apiBase('http://127.0.0.1:5175/local-api'), 'http://127.0.0.1:5175/local-api');
+  for (const url of ['http://api.example/api', 'https://user:secret@api.example/api', 'https://api.example/api?token=x', 'https://api.example/api#x', 'https://api.example/api%2Fother', 'https://api.example//api'])
+    assert.throws(() => apiBase(url));
+});
+
+test('obsolete background errors send the observed revision and cannot overwrite replacement progress', async () => {
+  let connection = { token: 'token', jobId: 'job', tabId: 1, profileId: 'profile', containerId: 'default', source: {provider:'deviantart',accountId:'artist'}, progress: {revision:1} };
+  let rejectStep, entered;
+  const started = new Promise(resolve => { entered=resolve; }), calls=[];
+  const sandbox = {
+    state:async()=>structuredClone(connection), inspect:async()=>connection.source,
+    request:async(_connection,path,body)=>{calls.push({path,body});if(path.endsWith('/step')){entered();return new Promise((_resolve,reject)=>{rejectStep=reject;});}return {};},
+    browserApi:{storage:{local:{set:async value=>{connection=value.connection;}}},tabs:{get:async()=>({id:1})},alarms:{create:async()=>{},onAlarm:{addListener(){}}},runtime:{onStartup:{addListener(){}},onMessage:{addListener(){}}}}
+  };
+  const code = (await readFile(new URL('../browser/background.js', import.meta.url), 'utf8')).replace(/^import[^\n]*\n/, '');
+  vm.runInNewContext(code+'\nglobalThis.advance=advance;',sandbox);
+  const old=sandbox.advance();await started;
+  connection.progress={revision:2,state:'importing'};
+  rejectStep(new Error('obsolete request'));await old;
+  assert.equal(calls[1].body.revision,1);
+  assert.equal(connection.progress.revision,2);assert.equal(connection.error,undefined);
+});

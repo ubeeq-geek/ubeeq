@@ -1,5 +1,5 @@
 import { preparePremiumGalleryForm } from './premium-gallery-form.mjs';
-import { browserApi, appOrigin, state, request, visibleItems, inspect } from './client.js';
+import { browserApi, appOrigin, apiBase, state, request, visibleItems, inspect } from './client.js';
 const $ = id => document.getElementById(id);
 let connection = await state(), detected, preview, selected = new Set(), busy = false;
 function displayGallerySetup() {
@@ -42,21 +42,21 @@ $('useApproval').onclick = () => run(async () => {
   if (!tab?.id) throw new Error('Open the application’s approved browser connection page.');
   const [result] = await browserApi.scripting.executeScript({ target: { tabId: tab.id }, func: () => {
     const approval = document.querySelector('[data-ubeeq-browser-approval]');
-    return approval ? { code: approval.getAttribute('data-ubeeq-browser-approval'), origin: approval.getAttribute('data-ubeeq-api-origin') } : null;
+    return approval ? { code: approval.getAttribute('data-ubeeq-browser-approval'), apiBase: approval.getAttribute('data-ubeeq-api-base') || approval.getAttribute('data-ubeeq-api-origin') } : null;
   } });
   if (!result?.result) throw new Error('Approve a browser connection on this application’s Integrations page first.');
-  $('origin').value = appOrigin(result.result.origin); $('code').value = result.result.code; $('connect').focus();
+  $('origin').value = apiBase(result.result.apiBase); $('code').value = result.result.code; $('connect').focus();
 });
 $('connect').onclick = async () => {
   // Permission request stays directly in the user gesture, before any asynchronous work.
   let origin;
-  try { origin = appOrigin($('origin').value); } catch (error) { $('error').textContent = error.message; return; }
-  if (!await browserApi.permissions.request({ origins: [`${origin}/*`] })) { $('error').textContent = 'Application access was declined. Your selections are preserved.'; return; }
+  try { origin = apiBase($('origin').value); } catch (error) { $('error').textContent = error.message; return; }
+  if (!await browserApi.permissions.request({ origins: [`${new URL(origin).origin}/*`] })) { $('error').textContent = 'Application access was declined. Your selections are preserved.'; return; }
   await run(async () => {
     const profileId = (await browserApi.storage.local.get('profileId')).profileId || crypto.randomUUID();
     await browserApi.storage.local.set({ profileId });
-    const result = await request({ origin }, '/exchange', { code: $('code').value, profileId });
-    connection = { ...result, origin, profileId, webOrigin: appOrigin(result.webOrigin), studioName: result.studioName };
+    const result = await request({ apiBase: origin }, '/exchange', { code: $('code').value, profileId });
+    connection = { ...result, apiBase: origin, profileId, webOrigin: appOrigin(result.webOrigin), studioName: result.studioName };
     $('code').value = ''; await save(); display(); $('detect').focus();
   });
 };
@@ -124,7 +124,9 @@ $('resume').onclick = () => run(async () => {
   await save(); display(); await browserApi.runtime.sendMessage({ type: 'resume' });
 });
 $('cancel').onclick = () => run(async () => {
-  connection.progress = await request(connection, `/jobs/${connection.jobId}/cancel`, {}); await save(); display();
+  connection.progress = await request(connection, `/jobs/${connection.jobId}/cancel`, {});
+  if (preview) delete preview.requestId;
+  delete connection.pendingStart; await save(); display();
 });
 $('galleryAccounts').onclick = () => run(async () => {
   const result = await request(connection, '/gallery-accounts');

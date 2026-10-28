@@ -11,14 +11,14 @@ async function advance() {
       throw new Error('The source changed. Return to your confirmed source and choose Resume.');
     const result = await request(connection, `/jobs/${connection.jobId}/step`, { source: observed, profileId: connection.profileId });
     const latest = await state();
-    if (latest?.jobId !== connection.jobId || latest?.token !== connection.token) return;
+    if (latest?.jobId !== connection.jobId || latest?.token !== connection.token || latest?.progress?.revision !== connection.progress?.revision) return;
     await browserApi.storage.local.set({ connection: { ...latest, progress: result, error: null } });
     if (result.remaining && !['cancelled', 'waiting_for_authorization', 'waiting_for_browser'].includes(result.state))
       await browserApi.alarms.create('import', { when: Date.now() + 1500 });
   } catch (error) {
-    try { await request(connection, `/jobs/${connection.jobId}/pause`, { state: 'waiting_for_browser' }); } catch {}
+    try { await request(connection, `/jobs/${connection.jobId}/pause`, { state: 'waiting_for_browser', revision: connection.progress?.revision }); } catch {}
     const latest = await state();
-    if (latest?.jobId === connection.jobId && latest?.token === connection.token)
+    if (latest?.jobId === connection.jobId && latest?.token === connection.token && latest?.progress?.revision === connection.progress?.revision)
       await browserApi.storage.local.set({ connection: { ...latest, error: error.message } });
   }
 }

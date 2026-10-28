@@ -36,7 +36,7 @@ export class BrowserExtensionService {
   confirmGallery(token: string, id: string, remoteId: string): Promise<BrowserGallerySetup>;
   preview(token: string, input: any): Promise<any>;
   start(token: string, input: any): Promise<BrowserJob>;
-  pause(token: string, id: string, state?: string): BrowserJob;
+  pause(token: string, id: string, state?: string, expectedRevision?: number): BrowserJob;
   get(token: string, id: string): Promise<BrowserJob>;
   control(token: string, id: string, action: string): Promise<BrowserJob>;
   step(token: string, id: string, observedSource: any, profileId: string): Promise<BrowserJob>;

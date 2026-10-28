@@ -6,9 +6,17 @@ export function appOrigin(input) {
     throw new Error('Enter an HTTPS application origin, or a local development origin.');
   return url.origin;
 }
+// Keep the routing prefix while rejecting credentials, queries and ambiguous paths.
+export function apiBase(input) {
+  const url = new URL(input);
+  appOrigin(url.origin);
+  if (url.username || url.password || url.search || url.hash || /[%\\]/.test(url.pathname) || /\/{2}/.test(url.pathname))
+    throw new Error('Enter an HTTPS API base URL without credentials, query or fragment.');
+  return url.origin + url.pathname.replace(/\/+$/, '');
+}
 export async function state() { return (await browserApi.storage.local.get('connection')).connection; }
 export async function request(connection, path, data) {
-  const response = await fetch(`${appOrigin(connection.origin)}/browser-extension${path}`, {
+  const response = await fetch(`${apiBase(connection.apiBase || connection.origin)}/browser-extension${path}`, {
     method: data === undefined ? 'GET' : 'POST', credentials: 'omit', redirect: 'error', cache: 'no-store',
     headers: { ...(connection.token ? { Authorization: `Bearer ${connection.token}` } : {}), 'Content-Type': 'application/json' },
     ...(data === undefined ? {} : { body: JSON.stringify(data) }), signal: AbortSignal.timeout(20000)

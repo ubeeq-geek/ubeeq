@@ -21,6 +21,7 @@ try {
       if (!String(url).startsWith('https://api.example/')) return nativeFetch(url, options);
       const input = options.body ? JSON.parse(options.body) : {};
       if (String(url).endsWith('/preview')) return Response.json({ previewId: 'preview', source, items: source.items });
+      if (String(url).endsWith('/cancel')) return Response.json({ id: 'job', state: 'cancelled', imported: 0, alreadyPresent: 0, failed: 0, remaining: 1, total: 1, items: [] });
       if (String(url).endsWith('/jobs')) { window.lastImport = input; return Response.json({ id: 'job', state: 'importing', imported: 0, alreadyPresent: 0, failed: 0, remaining: input.selected.length, total: input.selected.length, items: [] }); }
       return Response.json({ disconnected: true });
     };
@@ -39,6 +40,11 @@ try {
   await page.locator('#name').fill('First'); assert.match(await page.locator('#count').textContent(), /1 selected/);
   await page.locator('#name').fill(''); assert.match(await page.locator('#count').textContent(), /1 selected/);
   await page.locator('#import').click(); await page.locator('#progress').filter({ hasText: '1 selected' }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.lastImport.selected), ['100']);
+  const originalRequest = await page.evaluate(() => window.lastImport.requestId);
+  await page.locator('#cancel').click(); await page.locator('#progress').filter({ hasText: 'cancelled' }).waitFor();
+  await page.locator('#import').click(); await page.locator('#progress').filter({ hasText: 'importing' }).waitFor();
+  assert.notEqual(await page.evaluate(() => window.lastImport.requestId), originalRequest);
   assert.deepEqual(await page.evaluate(() => window.lastImport.selected), ['100']);
   await page.locator('#disconnect').click(); assert.equal(await page.locator('#keep').evaluate(node => document.activeElement === node), true);
   await page.keyboard.press('Escape'); assert.equal(await page.locator('#disconnectDialog').isVisible(), false);

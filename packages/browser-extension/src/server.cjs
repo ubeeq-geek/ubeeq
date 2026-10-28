@@ -199,13 +199,13 @@ class BrowserExtensionService {
       remaining: count('pending'), total: job.items.length,
       items: job.items.map(({ remoteId, state, workId }) => ({ remoteId, state, ...(workId ? { workId } : {}) })) };
   }
-  pause(token, id, state = 'waiting_for_browser') {
+  pause(token, id, state = 'waiting_for_browser', expectedRevision) {
     const pairing = typeof token === 'string' && this.store.get(`pair:${hash(token)}`);
     if (!pairing) fail('pairing_required', 401);
     return this.store.transaction(() => {
       const key = `job:${text(id, 100)}`, job = this.store.get(key);
       if (!job || job.pairingId !== pairing.pairingId) fail('job_not_found', 404);
-      if (['completed', 'cancelled'].includes(job.state)) return this.view(job);
+      if (['completed', 'cancelled'].includes(job.state) || job.revision !== expectedRevision || job.lease?.until > this.now()) return this.view(job);
       job.state = state === 'waiting_for_authorization' ? state : 'waiting_for_browser';
       job.revision++; delete job.lease; this.store.put(key, job); return this.view(job);
     });
@@ -221,15 +221,17 @@ class BrowserExtensionService {
       if (!job || job.pairingId !== pairing.pairingId) fail('job_not_found', 404);
       if (!['cancel', 'retry'].includes(action)) fail('invalid_action', 400);
       if (action === 'retry' && job.state === 'cancelled') fail('job_cancelled');
+      if (action === 'retry' && job.lease?.until > this.now()) fail('lease_busy');
       job.state = action === 'cancel' ? 'cancelled' : 'importing'; job.revision++; delete job.lease;
       if (action === 'retry') job.items.forEach(row => { if (row.state === 'failed') row.state = 'pending'; });
       this.store.put(`job:${id}`, job); return this.view(job);
     });
   }
   async step(token, id, observedSource, profileId) {
+    const expectedRevision = this.store.get(`job:${text(id, 100)}`)?.revision;
     let pairing;
     try { pairing = await this.pairing(token); }
-    catch (error) { try { this.pause(token, id, 'waiting_for_authorization'); } catch {} throw error; }
+    catch (error) { try { this.pause(token, id, 'waiting_for_authorization', expectedRevision); } catch {} throw error; }
     const scope = source(observedSource), key = `job:${text(id, 100)}`;
     const claim = this.store.transaction(() => {
       const job = this.store.get(key);

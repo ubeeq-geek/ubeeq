@@ -141,3 +141,32 @@ test('premium setup fails closed for unsupported types, parent galleries, ambigu
     await assert.rejects(f.service.prepareGallery(f.pair.token, { ...input, ...changed }), { code: 'invalid_gallery_setup' });
   const other = await fixture(t); await assert.rejects(other.service.prepareGallery(other.pair.token, input), { code: 'gallery_setup_unavailable' });
 });
+
+test('live leases reject Resume and stale pause cannot stop a replacement after expiry', async t => {
+  const releases = [], started = [];
+  const f = await fixture(t, { importItem: async (_p, _s, item, _key, fence) => {
+    await new Promise(resolve => { releases.push(resolve); started.shift()?.(); });
+    await fence(); return { workId: item.remoteId, alreadyPresent: false };
+  } });
+  const waitStarted = () => new Promise(resolve => started.push(resolve));
+  const job = await f.job();
+  let ready = waitStarted(); const old = f.step(job.id); await ready;
+  await assert.rejects(f.service.control(f.pair.token, job.id, 'retry'), { code: 'lease_busy' });
+  assert.equal(f.service.pause(f.pair.token, job.id, 'waiting_for_browser', job.revision).state, 'importing');
+  f.tick(30001);
+  const replacement = await f.service.control(f.pair.token, job.id, 'retry');
+  ready = waitStarted(); const pending = f.step(job.id); await ready;
+  releases[0](); await assert.rejects(old, { code: 'lease_expired' });
+  const paused = f.service.pause(f.pair.token, job.id, 'waiting_for_browser', job.revision);
+  assert.equal(paused.revision, replacement.revision); assert.equal(paused.state, 'importing');
+  releases[1](); assert.equal((await pending).imported, 1);
+});
+test('browser pause requires the current revision and cannot replace terminal state', async t => {
+  const f = await fixture(t), job = await f.job();
+  assert.equal(f.service.pause(f.pair.token, job.id).state, 'importing');
+  assert.equal(f.service.pause(f.pair.token, job.id, 'waiting_for_browser', job.revision).state, 'waiting_for_browser');
+  const resumed = await f.service.control(f.pair.token, job.id, 'retry');
+  assert.equal(f.service.pause(f.pair.token, job.id, 'waiting_for_browser', job.revision).state, 'importing');
+  await f.step(job.id);
+  assert.equal(f.service.pause(f.pair.token, job.id, 'waiting_for_browser', resumed.revision).state, 'completed');
+});
