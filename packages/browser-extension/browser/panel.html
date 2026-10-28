@@ -11,5 +11,16 @@
 <section id="previewSection" hidden><h2>Choose Works</h2><p>First visible page · up to 50 references. Visit another gallery page to preview more. Descriptions, tags, dates and originals are unavailable in this experimental adapter.</p>
 <label>Filter by title<input id="name" type="search"></label><p id="count" role="status"></p><div id="items"></div><button id="import">Import selected references</button></section>
 <section id="progressSection" hidden><h2>Import progress</h2><p id="progress" role="status"></p><button id="resume">Resume / retry incomplete items</button><button id="cancel">Cancel remaining import</button><div id="results"></div></section>
+<section id="premiumGallery"><h2>Premium gallery on DeviantArt</h2>
+<p>Use an existing authorized DA connection. Core membership and native approval are required. This assists the form; it does not create a gallery automatically or add artwork.</p>
+<button id="galleryAccounts">Load authorized DA accounts</button><label>Account<select id="galleryAccount"><option value="">Choose an account</option></select></label>
+<label>Gallery title<input id="galleryName" maxlength="50"></label><label>Proposed one-time price (USD)<input id="galleryPrice" inputmode="decimal" placeholder="5.00"></label>
+<button id="galleryPrepare">Prepare premium gallery setup</button>
+<div id="gallerySteps" hidden><p id="gallerySummary"></p><a id="galleryManager" target="_blank" rel="noreferrer">Open the confirmed DA gallery manager</a>
+<p>On DeviantArt, open Edit → New Gallery → Premium Gallery. Verify the signed-in account. Then reopen this extension on that tab.</p>
+<button id="galleryFill">Fill the open premium form</button><p id="galleryStatus" role="status"></p>
+<p>Review the actual title, gallery type and price, then click Create on DeviantArt yourself. Afterwards, refresh and select the resulting gallery below.</p>
+<button id="galleryRefresh">Refresh premium galleries</button><label>Gallery to verify<select id="galleryCandidate"><option value="">Choose the gallery you created</option></select></label>
+<button id="galleryVerify">Verify selected premium gallery</button><p id="galleryVerified" role="status"></p></div></section>
 <button id="disconnect">Disconnect browser</button><dialog id="disconnectDialog" aria-labelledby="disconnectTitle"><h2 id="disconnectTitle">Disconnect this browser?</h2><p id="dialogError" role="alert"></p><p>Imported Works and independent platform authorizations are preserved. This browser will need a new pairing to continue imports.</p><button id="keep">Cancel</button><button id="revoke">Disconnect browser</button></dialog></section>
 </main><script type="module" src="panel.js"></script></body></html>

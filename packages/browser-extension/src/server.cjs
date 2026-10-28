@@ -63,9 +63,10 @@ class SqliteBrowserStore {
 }
 /** Every product supplies live policy, current Creator authority and an atomic, idempotent canonical importer. */
 class BrowserExtensionService {
-  constructor({ store, deploymentId, policy, authorize, importItem, existing, budget, now = Date.now }) {
+  constructor({ store, deploymentId, policy, authorize, importItem, existing, budget, galleryAccounts, galleryAccount, galleryCandidates, verifyGallery, now = Date.now }) {
     const namespace = hash(text(deploymentId, 500));
     this.store = { get: key => store.get(`${namespace}:${key}`), put: (key, value) => store.put(`${namespace}:${key}`, value), transaction: fn => store.transaction(fn) }; this.policy = policy; this.authorize = authorize; this.importItem = importItem;
+    this.galleryAccounts = galleryAccounts; this.galleryAccount = galleryAccount; this.galleryCandidates = galleryCandidates; this.verifyGallery = verifyGallery;
     this.existing = existing; this.budget = budget; this.now = now;
   }
   enabled() { const f = features(this.policy()); if (!f.browserExtensionAvailable) fail('extension_unavailable', 403); return f.applicationCode; }
@@ -112,6 +113,57 @@ class BrowserExtensionService {
     const reference = this.store.get(`pairing:${text(pairingId, 100)}`);
     if (!reference || reference.userId !== userId || !await this.authorize(userId, reference.creatorId)) fail('pairing_not_found', 404);
     this.store.transaction(() => { const key = `pair:${reference.tokenHash}`; this.store.put(key, { ...this.store.get(key), revoked: true }); });
+  }
+  async listGalleryAccounts(token) {
+    const pairing = await this.pairing(token);
+    if (!this.galleryAccounts) fail('gallery_setup_unavailable', 422);
+    return { items: await this.galleryAccounts(pairing), nativeConfirmationRequired: true, automaticCreationReady: false };
+  }
+  async prepareGallery(token, input) {
+    const pairing = await this.pairing(token);
+    if (!this.galleryAccount) fail('gallery_setup_unavailable', 422);
+    const externalAccountId = text(input.externalAccountId, 200), name = text(input.name, 50);
+    if (/[\u0000-\u001f\u007f]/.test(name) || input.kind !== 'premium' || input.parentFolderId !== undefined || input.currency !== 'USD'
+      || !Number.isSafeInteger(input.priceCents) || input.priceCents < 1 || input.priceCents > 100000000) fail('invalid_gallery_setup', 400);
+    const account = await this.galleryAccount(pairing, externalAccountId);
+    if (!account || !/^[a-z0-9][a-z0-9-]{0,49}$/i.test(account.username) || !account.remoteId) fail('account_unverified', 409);
+    const setup = { id: secret(), pairingId: pairing.pairingId, externalAccountId, account: { username: account.username, remoteId: account.remoteId },
+      creatorId: pairing.creatorId, name, kind: 'premium', priceCents: input.priceCents, currency: 'USD',
+      state: 'awaiting_native_creation', expiresAt: this.now() + 3600000, automaticCreationReady: false };
+    await this.pairing(token);
+    this.store.put(`gallery:${setup.id}`, setup);
+    return this.galleryView(setup);
+  }
+  galleryView(setup) {
+    const { pairingId, ...view } = setup;
+    return { ...view, galleryUrl: `https://www.deviantart.com/${encodeURIComponent(setup.account.username)}/gallery`,
+      nativeConfirmationRequired: true, priceVerified: false };
+  }
+  async gallerySetup(token, id) {
+    const pairing = await this.pairing(token), setup = this.store.get(`gallery:${text(id, 100)}`);
+    if (!setup || setup.pairingId !== pairing.pairingId || setup.expiresAt <= this.now()) fail('gallery_setup_expired', 409);
+    return this.galleryView(setup);
+  }
+  async listGalleryCandidates(token, id) {
+    const pairing = await this.pairing(token), setup = await this.gallerySetup(token, id);
+    if (!this.galleryCandidates) fail('gallery_setup_unavailable', 422);
+    const items = await this.galleryCandidates(pairing, setup);
+    await this.pairing(token);
+    return { items, automaticCreationReady: false };
+  }
+  async confirmGallery(token, id, remoteId) {
+    const pairing = await this.pairing(token), setup = await this.gallerySetup(token, id);
+    if (!this.verifyGallery) fail('gallery_setup_unavailable', 422);
+    remoteId = text(remoteId, 200);
+    const result = await this.verifyGallery(pairing, setup, remoteId, async () => {
+      await this.pairing(token); await this.gallerySetup(token, id);
+    });
+    if (result.remoteId !== remoteId || result.name !== setup.name) fail('premium_gallery_unverified', 409);
+    await this.pairing(token);
+    const current = this.store.get(`gallery:${id}`);
+    current.state = 'access_verified'; current.gallery = { remoteId: result.remoteId, name: result.name, accessType: 'premium' };
+    this.store.put(`gallery:${id}`, current);
+    return this.galleryView(current);
   }
   async preview(token, input) {
     const pairing = await this.pairing(token), scope = source(input.source);

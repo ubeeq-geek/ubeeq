@@ -115,3 +115,29 @@ test('a shared database cannot exchange another deployment approval or accept it
   await assert.rejects(other.exchange(approval.code, 'profile'), { code: 'approval_expired' });
   await assert.rejects(other.pairing(f.pair.token), { code: 'pairing_required' });
 });
+
+test('premium gallery setup is scoped and durable, requires exact verified IDs, and never claims automated creation or price verification', async t => {
+  let verifications = 0;
+  const f = await fixture(t, {
+    galleryAccounts: async () => [{ id: 'account', remoteId: 'principal', username: 'artist' }],
+    galleryAccount: async (_pairing, id) => { assert.equal(id, 'account'); return { remoteId: 'principal', username: 'artist' }; },
+    galleryCandidates: async (_pairing, setup) => [{ remoteId: 'folder-id', name: setup.name, accessType: 'premium' }],
+    verifyGallery: async (_pairing, setup, id, fence) => { if (id !== 'folder-id') throw new Error('not verified'); await fence(); verifications++; return { remoteId: id, name: setup.name }; }
+  });
+  const setup = await f.service.prepareGallery(f.pair.token, { externalAccountId: 'account', name: 'Paid collection', kind: 'premium', priceCents: 550, currency: 'USD' });
+  assert.equal(setup.state, 'awaiting_native_creation'); assert.equal(setup.automaticCreationReady, false); assert.equal(setup.priceVerified, false);
+  assert.equal(setup.account.remoteId, 'principal'); assert.equal(setup.galleryUrl, 'https://www.deviantart.com/artist/gallery');
+  f.restart(); assert.equal((await f.service.gallerySetup(f.pair.token, setup.id)).name, 'Paid collection');
+  assert.equal((await f.service.listGalleryCandidates(f.pair.token, setup.id)).items.length, 1);
+  await assert.rejects(f.service.confirmGallery(f.pair.token, setup.id, 'wrong-id'));
+  assert.equal((await f.service.confirmGallery(f.pair.token, setup.id, 'folder-id')).state, 'access_verified'); assert.equal(verifications, 1);
+  f.config.browserExtensionAvailable = false;
+  await assert.rejects(f.service.confirmGallery(f.pair.token, setup.id, 'folder-id'), { code: 'extension_unavailable' });
+});
+test('premium setup fails closed for unsupported types, parent galleries, ambiguous prices and missing authorization adapters', async t => {
+  const f = await fixture(t, { galleryAccount: async () => ({ username: 'artist', remoteId: 'principal' }) });
+  const input = { externalAccountId: 'account', name: 'Paid collection', kind: 'premium', priceCents: 500, currency: 'USD' };
+  for (const changed of [{ kind: 'regular' }, { kind: 'watchers_only' }, { parentFolderId: 'parent' }, { priceCents: 5.5 }, { priceCents: 0 }, { currency: 'EUR' }])
+    await assert.rejects(f.service.prepareGallery(f.pair.token, { ...input, ...changed }), { code: 'invalid_gallery_setup' });
+  const other = await fixture(t); await assert.rejects(other.service.prepareGallery(other.pair.token, input), { code: 'gallery_setup_unavailable' });
+});

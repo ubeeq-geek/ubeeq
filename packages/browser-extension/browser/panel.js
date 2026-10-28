@@ -1,7 +1,17 @@
+import { preparePremiumGalleryForm } from './premium-gallery-form.mjs';
 import { browserApi, appOrigin, state, request, visibleItems, inspect } from './client.js';
 const $ = id => document.getElementById(id);
 let connection = await state(), detected, preview, selected = new Set(), busy = false;
+function displayGallerySetup() {
+  const setup = connection?.gallerySetup;
+  $('gallerySteps').hidden = !setup;
+  if (!setup) return;
+  $('gallerySummary').textContent = `${setup.account.username} · ${setup.name} · proposed USD ${(setup.priceCents / 100).toFixed(2)} · Creator ${connection.creatorName || connection.creatorId}`;
+  $('galleryManager').href = setup.galleryUrl;
+  if (setup.state === 'access_verified') $('galleryVerified').textContent = 'Premium access type and account verified through the API. The price has not been verified by the API; confirm it on DeviantArt. No publishing destination has been selected.';
+}
 function display() {
+  displayGallerySetup();
   $('pair').hidden = Boolean(connection); $('connected').hidden = !connection;
   $('heading').textContent = connection ? `Connect to ${connection.studioName}` : 'Connect account';
   $('destination').textContent = connection ? `${connection.studioName} · Creator Identity ${connection.creatorName || connection.creatorId} · ${connection.applicationCode}` : '';
@@ -115,6 +125,39 @@ $('resume').onclick = () => run(async () => {
 });
 $('cancel').onclick = () => run(async () => {
   connection.progress = await request(connection, `/jobs/${connection.jobId}/cancel`, {}); await save(); display();
+});
+$('galleryAccounts').onclick = () => run(async () => {
+  const result = await request(connection, '/gallery-accounts');
+  $('galleryAccount').replaceChildren(new Option('Choose an account', ''));
+  for (const account of result.items) $('galleryAccount').append(new Option(account.username, account.id));
+  if (!result.items.length) throw new Error('Connect a DeviantArt account in your application first. Shared accounts require administrator access to every linked Creator Identity.');
+});
+$('galleryPrepare').onclick = () => run(async () => {
+  const price = $('galleryPrice').value.trim();
+  if (!/^\d{1,7}(?:\.\d{1,2})?$/.test(price)) throw new Error('Enter a positive USD price with at most two decimal places.');
+  const [whole, cents = ''] = price.split('.'), priceCents = Number(whole) * 100 + Number(cents.padEnd(2, '0'));
+  connection.gallerySetup = await request(connection, '/gallery-setups', { externalAccountId: $('galleryAccount').value, name: $('galleryName').value,
+    kind: 'premium', currency: 'USD', priceCents });
+  await save(); displayGallerySetup(); $('galleryManager').focus();
+});
+$('galleryFill').onclick = () => run(async () => {
+  const setup = await request(connection, `/gallery-setups/${connection.gallerySetup.id}`);
+  const [tab] = await browserApi.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error('Open the premium gallery form in the confirmed DA account.');
+  const [result] = await browserApi.scripting.executeScript({ target: { tabId: tab.id }, func: preparePremiumGalleryForm, args: [setup] });
+  if (!result?.result?.prepared) throw new Error(result?.result?.message || 'The native form could not be identified. Fill it manually on DeviantArt.');
+  $('galleryStatus').textContent = result.result.message;
+});
+$('galleryRefresh').onclick = () => run(async () => {
+  const result = await request(connection, `/gallery-setups/${connection.gallerySetup.id}/candidates`);
+  $('galleryCandidate').replaceChildren(new Option('Choose the gallery you created', ''));
+  for (const gallery of result.items) $('galleryCandidate').append(new Option(`${gallery.name} · Premium`, gallery.remoteId));
+  if (!result.items.length) throw new Error('No premium gallery with this title was verified through the API. Complete creation on DeviantArt, then refresh; a regular gallery will not be substituted.');
+});
+$('galleryVerify').onclick = () => run(async () => {
+  if (!$('galleryCandidate').value) throw new Error('Choose the exact premium gallery to verify.');
+  connection.gallerySetup = await request(connection, `/gallery-setups/${connection.gallerySetup.id}/verify`, { remoteId: $('galleryCandidate').value });
+  await save(); displayGallerySetup();
 });
 $('disconnect').onclick = () => { $('dialogError').textContent = ''; $('disconnectDialog').showModal(); $('keep').focus(); };
 $('keep').onclick = () => $('disconnectDialog').close();

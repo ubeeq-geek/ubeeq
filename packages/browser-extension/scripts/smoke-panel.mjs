@@ -27,9 +27,9 @@ try {
   });
   await page.route('https://panel.test/**', async route => {
     const name = new URL(route.request().url()).pathname.slice(1) || 'panel.html';
-    const allowed = ['panel.html', 'panel.js', 'panel.css', 'client.js'];
+    const allowed = ['panel.html', 'panel.js', 'panel.css', 'client.js', 'premium-gallery-form.mjs'];
     if (!allowed.includes(name)) return route.abort();
-    await route.fulfill({ body: await readFile(new URL(`../browser/${name}`, import.meta.url)), contentType: name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
+    await route.fulfill({ body: await readFile(new URL(`../browser/${name}`, import.meta.url)), contentType: (/\.m?js$/.test(name)) ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html',
       headers: { 'Content-Security-Policy': "script-src 'self'; object-src 'none'; base-uri 'none'" } });
   });
   await page.goto('https://panel.test/panel.html'); await page.locator('#detect').click();
