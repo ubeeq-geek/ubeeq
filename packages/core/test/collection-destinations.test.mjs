@@ -221,6 +221,7 @@ test("executor records receipts, resumes without repeating writes, and verifies 
     remote = [];
   const port = {
     exclusive: async (m, fn) => fn(),
+    assertLease: async () => {},
     current: async () => ({
       mapping: mapping(),
       inputs,
@@ -235,7 +236,8 @@ test("executor records receipts, resumes without repeating writes, and verifies 
     validateEffects: async () => {},
     reconcileOperation: async (m, op) =>
       remote.includes(op.publicationId) ? "confirmed" : "not_applied",
-    writeMembership: async (m, op) => {
+    writeMembership: async (m, op, assertCurrent) => {
+      await assertCurrent();
       writes++;
       remote.push(op.publicationId);
       return { receipt: "remote-receipt" };
@@ -270,6 +272,7 @@ test("an ambiguous remote success is reconciled before a retry and never blindly
     remote = false;
   const port = {
     exclusive: async (m, fn) => fn(),
+    assertLease: async () => {},
     current: async () => ({
       mapping: mapping(),
       inputs,
@@ -283,7 +286,8 @@ test("an ambiguous remote success is reconciled before a retry and never blindly
     },
     validateEffects: async () => {},
     reconcileOperation: async () => (remote ? "confirmed" : "not_applied"),
-    writeMembership: async () => {
+    writeMembership: async (_m, _op, assertCurrent) => {
+      await assertCurrent();
       writes++;
       remote = true;
       throw new Error("timeout after remote acceptance");
@@ -323,6 +327,7 @@ test("executor fences a changed generation before further writes", async () => {
     generation = 1;
   const port = {
     exclusive: async (m, fn) => fn(),
+    assertLease: async () => {},
     current: async () => ({
       mapping: mapping({ scope: "released", generation }),
       inputs: { ...inputs, generation },
@@ -336,7 +341,8 @@ test("executor fences a changed generation before further writes", async () => {
     },
     validateEffects: async () => {},
     reconcileOperation: async () => "not_applied",
-    writeMembership: async () => {
+    writeMembership: async (_m, _op, assertCurrent) => {
+      await assertCurrent();
       writes++;
       generation++;
       return {};
@@ -354,3 +360,32 @@ test("executor fences a changed generation before further writes", async () => {
   assert.equal(writes, 1);
   assert.equal(run.operations[0].state, "confirmed");
 });
+
+for (const phase of ['reconcile', 'receipt', 'adapter']) {
+  for (const change of ['membership', 'metadata', 'release', 'access', 'mapping', 'generation', 'capability', 'disconnected', 'archived', 'lease', 'effects', 'expired']) {
+    test(`executor blocks writes when ${change} changes during ${phase}`, async () => {
+      const {executeCollectionDestinationPlan,CollectionDestinationError}=await import('../dist/index.js');
+      const p=plan({observation:observation({publicationIds:[]})});
+      let changed=false,writes=0,saves=0;
+      const port={
+        exclusive:async (_m,fn)=>fn(),
+        assertLease:async()=>{if(changed&&change==='lease')throw new CollectionDestinationError('stale_plan','Lease lost');},
+        current:async()=>{
+          const values={...inputs};if(changed&&Object.hasOwn(values,change))values[change]++;
+          return {mapping:mapping({revision:values.mapping,generation:values.generation}),inputs:values,archived:changed&&change==='archived',connected:!(changed&&change==='disconnected'),capabilities:{...caps,revision:values.capability}};
+        },
+        getExecution:async()=>undefined,
+        saveExecution:async()=>{if(++saves===2&&phase==='receipt')changed=true;},
+        validateEffects:async()=>{if(changed&&change==='effects')throw new CollectionDestinationError('stale_plan','Access effects changed');},
+        reconcileOperation:async()=>{if(phase==='reconcile')changed=true;return 'not_applied';},
+        writeMembership:async(_m,_op,assertCurrent)=>{
+          if(phase==='adapter')changed=true;
+          await assertCurrent();writes++;return {};
+        },
+        observe:async()=>observation(),
+      };
+      const result=await executeCollectionDestinationPlan({plan:p,mapping:mapping(),reviewed:true,port,now:()=>changed&&change==='expired'?'2026-10-28T12:06:00.000Z':now});
+      assert.equal(writes,0);assert.equal(result.state,'paused');
+    });
+  }
+}

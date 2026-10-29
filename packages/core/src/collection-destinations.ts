@@ -452,6 +452,8 @@ export interface CollectionSyncExecutionPort {
     mapping: CollectionDestinationMapping,
     operation: () => Promise<T>,
   ): Promise<T>;
+  /** Throw stale_plan if either the mapping or account/gallery lease was lost. */
+  assertLease(mapping: CollectionDestinationMapping): Promise<void>;
   current(mappingId: string): Promise<{
     mapping: CollectionDestinationMapping;
     inputs: CollectionSyncInputs;
@@ -474,6 +476,10 @@ export interface CollectionSyncExecutionPort {
   writeMembership(
     mapping: CollectionDestinationMapping,
     operation: CollectionSyncOperationReceipt,
+    /** Invoke after adapter preparation, immediately before issuing the provider request.
+     * Adapters must also fence their durable writes with the owned lease token.
+     */
+    assertCurrent: () => Promise<void>,
   ): Promise<{ receipt?: string }>;
   observe(
     mapping: CollectionDestinationMapping,
@@ -514,6 +520,7 @@ export async function executeCollectionDestinationPlan(input: {
         );
       authorizeCollectionPlan(plan, current.mapping, input.reviewed);
       await port.validateEffects(plan, input.reviewed);
+      await port.assertLease(current.mapping);
       return current.mapping;
     };
     let mapping = await check();
@@ -566,10 +573,14 @@ export async function executeCollectionDestinationPlan(input: {
         }
         operation.state = "prepared";
         await port.saveExecution(structuredClone(run));
+        // Reconciliation and durable receipt writes may outlive the reviewed
+        // inputs or lease. Never carry their earlier authorization into a write.
+        mapping = await check();
         // A timeout or a local receipt failure must be reconciled, never blindly repeated.
         const receipt = await port.writeMembership(
           mapping,
           structuredClone(operation),
+          async () => { await check(); },
         );
         operation.remoteReceipt = receipt.receipt;
         operation.state = "confirmed";

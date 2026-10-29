@@ -18,7 +18,11 @@ requires equal Publication identities, including the representation variant.
 mapping and its remote gallery, fence every remote write against current revisions,
 validate publication/access effects, retain stable operation keys, reconcile
 uncertain results before retry, and verify success through complete API readback.
-The port must durably store receipts and enforce leases. No provider credentials,
+The port must durably store receipts and enforce leases. `assertLease` must
+validate ownership of both exclusive leases. The executor rechecks after
+reconciliation and receipt persistence; `writeMembership` must invoke its
+`assertCurrent` callback after adapter preparation and immediately before the
+provider request, and fence durable writes with its lease token. No provider credentials,
 product pricing, entitlement rules or provider-specific permissions belong in core.
 
 An execution adapter must obtain release, capability and access revisions from
