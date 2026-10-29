@@ -54,6 +54,16 @@ export interface WebsiteGallerySettings {
   description?: string; previewAssetId?: string;
   destination?: GalleryDestinationRule; generateLocal?: boolean; canonicalUrl?: string;
 }
+/** A stable named destination, independent of the page/block displaying it. */
+export interface WebsiteNamedGallery {
+  id: string; title: string; slug: string; parentId?: string;
+  kind: 'works' | 'galleries'; access: 'free' | 'preview'; hostingTargetId?: string;
+  publicationIds: readonly string[];
+}
+export const websiteNamedGalleryPath = (site: Pick<Website,'namedGalleries'>, gallery: WebsiteNamedGallery):string => {
+  const parent=gallery.parentId?site.namedGalleries?.find(row=>row.id===gallery.parentId):undefined;
+  return websitePath(`/galleries/collections/${parent?parent.slug+'/':''}${gallery.slug}`);
+};
 export interface WebsiteEmbedding {parentUrl?:string;sourceUrl?:string;responsive?:boolean;mode:'disabled'|'selected'|'any';origins:readonly string[];pageId:string;presentation:'full'|'content';height:number;}
 export interface Website {
   id: string; workspaceId: string; creatorIdentityId: string; revision: number;
@@ -69,6 +79,7 @@ export interface Website {
   basePath: string; publicBaseUrl?: string; noindex?: boolean;
   pages: readonly WebsitePage[]; galleryPublicationIds: readonly string[];
   gallerySettings?: readonly WebsiteGallerySettings[];
+  namedGalleries?: readonly WebsiteNamedGallery[];
   navigationLinks?: readonly { label: string; url: string }[];
   footerLinks?: readonly { label: string; url: string }[];
   redirects: readonly WebsiteRedirect[];
@@ -182,6 +193,17 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     if (setting.slug) { if(setting.slug.includes('/')) throw new WebsiteError('invalid_path','Gallery slug must be a single segment.'); websitePath(setting.slug); }
     if (setting.canonicalUrl) websiteExternalUrl(setting.canonicalUrl);
   }
+  const named=site.namedGalleries??[];
+  if(!Array.isArray(named)||named.length>100||new Set(named.map(g=>g.id)).size!==named.length)throw new WebsiteError('invalid_gallery','Use up to 100 uniquely identified website galleries.');
+  const names=new Set<string>();
+  for(const gallery of named){
+    if(typeof gallery.id!=='string'||!/^[a-zA-Z0-9_:-]{1,160}$/.test(gallery.id)||typeof gallery.title!=='string'||!gallery.title.trim()||gallery.title.length>120||typeof gallery.slug!=='string'||!gallery.slug||gallery.slug.includes('/')||gallery.hostingTargetId!==undefined&&(typeof gallery.hostingTargetId!=='string'||!gallery.hostingTargetId||gallery.hostingTargetId.length>200)||!['works','galleries'].includes(gallery.kind)||!['free','preview'].includes(gallery.access)||!Array.isArray(gallery.publicationIds)||new Set(gallery.publicationIds).size!==gallery.publicationIds.length||gallery.publicationIds.some((id:string)=>!site.galleryPublicationIds.includes(id)))throw new WebsiteError('invalid_gallery','Name each gallery and select publications from this website.');
+    const slug=websitePath(gallery.slug),identity=(gallery.parentId??'')+':'+slug;
+    if(names.has(identity))throw new WebsiteError('invalid_gallery','Gallery paths must be unique within their parent.');names.add(identity);
+    const parent=gallery.parentId?named.find(row=>row.id===gallery.parentId):undefined;
+    if(gallery.parentId&&(!parent||parent.id===gallery.id||parent.parentId||parent.kind!=='galleries'||gallery.kind!=='works'))throw new WebsiteError('invalid_gallery','Galleries support two levels. A gallery of sub-galleries can contain only Work galleries.');
+    if(gallery.kind==='galleries'&&gallery.publicationIds.length)throw new WebsiteError('invalid_gallery','Choose Works or sub-galleries for each gallery; mixed content is not supported yet.');
+  }
   const pages = new Map(site.pages.map(page => [page.id, page]));
   if (pages.size !== site.pages.length || !site.pages.length || site.pages.filter(p => p.kind === 'home').length !== 1 || pages.get(site.homePageId)?.kind !== 'home') throw new WebsiteError('invalid_home', 'Exactly one Home page is required.');
   if (new Set(site.galleryPublicationIds).size !== site.galleryPublicationIds.length) throw new WebsiteError('duplicate_selection', 'Gallery publication selections must be unique.');
@@ -207,6 +229,7 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     if (occupied.has(route)) throw new WebsiteError('route_collision', `Duplicate normalized route: ${route}`);
     occupied.add(route); routes.set(page.id, route);
   }
+  for(const gallery of named){const path=websiteNamedGalleryPath(site,gallery);if(occupied.has(path))throw new WebsiteError('route_collision','A named gallery conflicts with a page route.');occupied.add(path);}
   for (const redirect of site.redirects) {
     const route = websitePath(redirect.from);
     if (occupied.has(route) || route === '/' || /^\/(assets|galleries|updates|page|embed)\//.test(route) || ![301,308].includes(redirect.status)) throw new WebsiteError('route_collision', 'Redirect collides with a page or reserved namespace.');

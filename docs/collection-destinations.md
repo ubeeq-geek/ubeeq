@@ -1,0 +1,42 @@
+# Collection destination contracts
+
+`@ubeeq/core` exports storage-independent collection destination configuration,
+observations, planning and execution contracts. Canonical Works remain members of
+native collections; observed destination membership refers to remote Publication
+identities. A role and a platform audience are separate values.
+
+`validateCollectionMapping` enforces selection membership, one gallery owner, one
+inbound membership authority and one authority per native metadata field. Callers
+must enforce these constraints transactionally with their repositories.
+
+`planCollectionDestination` is pure. It retains missing Publication blockers,
+release/policy exclusions, membership additions and removals. Partial, restricted,
+future-dated or stale observations cannot establish exactness. An exact comparison
+requires equal Publication identities, including the representation variant.
+
+`executeCollectionDestinationPlan` uses the supplied port to serialize both a
+mapping and its remote gallery, fence every remote write against current revisions,
+validate publication/access effects, retain stable operation keys, reconcile
+uncertain results before retry, and verify success through complete API readback.
+The port must durably store receipts and enforce leases. `assertLease` must
+validate ownership of both exclusive leases. The executor rechecks after
+reconciliation and receipt persistence; `writeMembership` must invoke its
+`assertCurrent` callback after adapter preparation and immediately before the
+provider request, and fence durable writes with its lease token. No provider credentials,
+product pricing, entitlement rules or provider-specific permissions belong in core.
+
+An execution adapter must obtain release, capability and access revisions from
+current authoritative records. Passing cached revisions defeats fencing. A readback
+must explicitly establish completeness; finishing pagination alone is insufficient
+for restricted inventories. Manual confirmation is separate from API verification.
+
+## Native publications
+
+`NativeCollectionPublication` and `planNativeCollectionPublication` describe a
+collection's native release and access configuration independently of editorial
+state. Each destination has its own revision, audience, selected scope, release
+snapshot, optional existing offer reference and schedule. Incoming collection
+members are unreleased until explicitly selected for that destination. Eligibility
+results and exclusions remain visible; a successful collection release never
+publishes missing Work representations or grants media entitlements. The product
+must recheck eligibility and existing access grants when serving content.
