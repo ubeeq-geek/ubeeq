@@ -346,3 +346,4 @@ export * from "./websites.js";
 export * from "./website-design.js";
 export * from './website-hosting.js';
 export * from './collection-destinations.js';
+export * from './collection-publications.js';

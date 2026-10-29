@@ -25,3 +25,14 @@ An execution adapter must obtain release, capability and access revisions from
 current authoritative records. Passing cached revisions defeats fencing. A readback
 must explicitly establish completeness; finishing pagination alone is insufficient
 for restricted inventories. Manual confirmation is separate from API verification.
+
+## Native publications
+
+`NativeCollectionPublication` and `planNativeCollectionPublication` describe a
+collection's native release and access configuration independently of editorial
+state. Each destination has its own revision, audience, selected scope, release
+snapshot, optional existing offer reference and schedule. Incoming collection
+members are unreleased until explicitly selected for that destination. Eligibility
+results and exclusions remain visible; a successful collection release never
+publishes missing Work representations or grants media entitlements. The product
+must recheck eligibility and existing access grants when serving content.
