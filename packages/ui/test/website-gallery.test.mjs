@@ -76,3 +76,15 @@ test('the selected gallery and viewer data retain both link groups',()=>{
  assert.match(html,/aria-label="Gallery links"/);
  assert.match(websiteGalleryViewerScript,/cloneNode\(true\)/);
 });
+
+test('the last sub-gallery page has a first-gallery link and the viewer stops at an explicit end screen',()=>{
+ const last=renderWebsiteGalleryGroup(entries,'peaks');assert.match(last,/aria-label="End of galleries"><p>You’ve reached the end of these galleries/);assert.match(last,/<a href="\/portfolio\/galleries\/coast\/">Back to first gallery<\/a>/);
+ const first=renderWebsiteGalleryGroup(entries,'coast');assert.doesNotMatch(first,/website-gallery-end-note/);
+ assert.match(last,/data-gallery-end hidden/);assert.match(last,/data-action="restart">Back to first gallery/);
+ assert.match(websiteGalleryViewerScript,/gallery===entries.length-1\)\{finish\(\);return;/);assert.match(websiteGalleryViewerScript,/playing=false;intro=false;ended=true/);assert.doesNotThrow(()=>new Function(websiteGalleryViewerScript));
+});
+
+test('teaser cards have a theme-aware light border, inner padding and extra row spacing',()=>{
+ assert.match(websiteGalleryCss,/\.website-gallery-teaser\{[^}]*padding:12px;[^}]*border:1px solid color-mix/);
+ assert.match(websiteGalleryCss,/\.website-gallery-tiles\{[^}]*gap:28px 16px/);
+});

@@ -17,3 +17,9 @@ test('cover crop follows focal point, preserves requested rectangles and never r
   assert.throws(() => pickCoverCrop(100, 50, 10, 0, { x: 0.5, y: 0.5 }));
   assert.throws(() => pickCoverCrop(100, 50, 10, 10, { x: Infinity, y: 0.5 }));
 });
+
+test('cover zoom shrinks responsive crops around the focal point and clamps them to the source',()=>{
+ assert.deepEqual(pickCoverCrop(2400,900,2400,900,{x:.5,y:.5},undefined,2),{x:600,y:225,width:1200,height:450});
+ assert.deepEqual(pickCoverCrop(2400,900,900,1200,{x:1,y:0},undefined,2),{x:2062,y:0,width:338,height:450});
+ for(const zoom of [0,.5,3.1,NaN,Infinity])assert.throws(()=>pickCoverCrop(2400,900,2400,900,{x:.5,y:.5},undefined,zoom));
+});

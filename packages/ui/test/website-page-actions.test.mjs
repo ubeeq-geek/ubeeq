@@ -12,3 +12,14 @@ test('homepage deletion requires a Ready replacement and preserves valid page hi
  assert.throws(()=>removeWebsitePage({...site,pages:[site.pages[0]]},'home'),/only page/);
  assert.throws(()=>removeWebsitePage({...site,pages:site.pages.map(page=>page.id==='about'?{...page,state:'draft'}:page)},'home','about'),/Ready page/);
 });
+
+test('gallery ordering moves main galleries with their children and preserves child membership',async()=>{
+ const {moveWebsiteGallery}=await import('../dist/website-page-actions.js');
+ const galleries=[{id:'one'},{id:'one-a',parentId:'one'},{id:'one-b',parentId:'one'},{id:'two'},{id:'two-a',parentId:'two'},{id:'three'}].map(g=>({...g,title:g.id,slug:g.id,kind:g.parentId?'works':'galleries',access:'free',publicationIds:[]}));
+ const site={...fixture(),namedGalleries:galleries},before=structuredClone(site),ids=s=>s.namedGalleries.map(g=>g.id);
+ assert.deepEqual(ids(moveWebsiteGallery(site,'one','two','after')),['two','two-a','one','one-a','one-b','three']);
+ assert.deepEqual(ids(moveWebsiteGallery(site,'three','one','before')),['three','one','one-a','one-b','two','two-a']);
+ const child=moveWebsiteGallery(site,'one-b','one-a','before');assert.deepEqual(ids(child),['one','one-b','one-a','two','two-a','three']);
+ assert.deepEqual(child.namedGalleries.find(g=>g.id==='one-b'),galleries[2]);assert.deepEqual(site,before);
+ assert.equal(moveWebsiteGallery(site,'one-a','two-a'),site);assert.equal(moveWebsiteGallery(site,'missing','one'),site);assert.equal(moveWebsiteGallery(site,'one','one'),site);
+});
