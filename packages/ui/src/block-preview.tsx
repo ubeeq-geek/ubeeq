@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { parseContentBlocks, type ContentBlock, type StoredPostBlock } from '@ubeeq/core';
-import { sanitizeInlineHtml, textToInlineHtml } from './block-content.js';
+import { sanitizeInlineHtml, textToInlineHtml, textBlockHtml, blockListStyle } from './block-content.js';
 
 export interface BlockPreviewMedia {
   mediaId: string;
@@ -43,7 +43,7 @@ export function BlockPreview({ value, mediaOptions = [], label = 'Content previe
     const textAlign=['left','center','right'].includes(String(block.data?.textAlign))?block.data!.textAlign as 'left'|'center'|'right':undefined;
     switch (block.type) {
       case 'section': content = <section>{block.title && <h2>{block.title}</h2>}{block.children?.map(render)}</section>; break;
-      case 'paragraph': content = <p style={{textAlign}}>{inline(block)}</p>; break;
+      case 'paragraph': content = blockListStyle({...block,payload:block.data})?<div style={{textAlign}} dangerouslySetInnerHTML={{__html:textBlockHtml({...block,payload:block.data})}}/>:<p style={{textAlign}}>{inline(block)}</p>; break;
       case 'heading': {
         const Heading = `h${Math.max(2, Math.min(6, block.level || 2))}` as 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
         content = <Heading style={{textAlign}}>{inline(block)}</Heading>; break;

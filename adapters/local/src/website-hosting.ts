@@ -11,7 +11,7 @@ export interface NativeWebsiteHostingProfile {
 }
 const hash=(value:string|Uint8Array)=>createHash('sha256').update(value).digest('hex');
 export const nativeWebsiteKey=(workspaceId:string,targetId:string)=>hash(JSON.stringify([workspaceId,targetId])).slice(0,32);
-const types:Record<string,string>={html:'text/html; charset=utf-8',css:'text/css; charset=utf-8',json:'application/json',xml:'application/xml',txt:'text/plain; charset=utf-8',jpg:'image/jpeg',png:'image/png',webp:'image/webp',avif:'image/avif',gif:'image/gif',mp4:'video/mp4',webm:'video/webm',mp3:'audio/mpeg',ogg:'audio/ogg',wav:'audio/wav',pdf:'application/pdf'};
+const types:Record<string,string>={html:'text/html; charset=utf-8',css:'text/css; charset=utf-8',js:'text/javascript; charset=utf-8',json:'application/json',xml:'application/xml',txt:'text/plain; charset=utf-8',jpg:'image/jpeg',png:'image/png',webp:'image/webp',avif:'image/avif',gif:'image/gif',mp4:'video/mp4',webm:'video/webm',mp3:'audio/mpeg',ogg:'audio/ogg',wav:'audio/wav',pdf:'application/pdf'};
 export const websiteContentType=(path:string)=>types[path.split('.').pop()??'']??'application/octet-stream';
 const safeFile=(file:string)=>{if(!file||isAbsolute(file)||file.includes('\\')||file.split('/').some(p=>!p||p==='.'||p==='..')||/[\u0000-\u001f]/.test(file))throw new WebsiteError('unsafe_hosting_path','Unsafe website file path.');return file;};
 const exists=async(path:string)=>{try{return await lstat(path);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}};

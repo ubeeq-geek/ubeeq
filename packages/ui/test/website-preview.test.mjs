@@ -6,7 +6,7 @@ test('complete previews preserve pages and binary assets once in a bounded archi
  const source=new Map([['index.html',new TextEncoder().encode('<h1>Home</h1>')],['about/index.html',new TextEncoder().encode('<h1>About</h1>')],['assets/image.png',new Uint8Array([0,255,1,128])]]);
  const files=await readWebsitePreviewArchive(new Blob([createWebsiteZip(source)]));
  assert.equal(atob(files['about/index.html']),'<h1>About</h1>');assert.deepEqual(Uint8Array.from(atob(files['assets/image.png']),c=>c.charCodeAt(0)),source.get('assets/image.png'));
- const html=websitePreviewHtml(files,'about/index.html');assert.match(html,/website-preview.navigate/);assert.doesNotMatch(html,/allow-same-origin/);assert.match(html,/script-src 'nonce-/);assert.match(html,/connect-src 'none'/);
+ const html=websitePreviewHtml(files,'about/index.html');assert.match(html,/website-preview.navigate/);assert.match(html,/frame\.setAttribute\('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads'\)/);assert.match(html,/script-src 'nonce-/);assert.match(html,/connect-src 'none'/);
  assert.throws(()=>websitePreviewHtml(files,'missing.html'));
  await assert.rejects(readWebsitePreviewArchive(new Blob(['not a zip'])));
  const unsafe=Buffer.from(createWebsiteZip(new Map([['index.html',new Uint8Array()],['safeimg.html',new Uint8Array()]])));unsafe.write('../evil.html',unsafe.indexOf('safeimg.html'));
@@ -25,10 +25,34 @@ test('queued previews wait automatically and report failed builds without fetchi
 test('preview update metadata remains outside the content sandbox and is escaped',()=>{
  const context={websiteKey:'ubeeq.website-preview:creator:site',revision:7,refreshChannel:'ubeeq.website-preview.refresh:123',editorUrl:'https://example.com/?q=</script><script>bad</script>',pagePaths:{home:'index.html'}};
  const html=websitePreviewHtml({'index.html':btoa('<h1>Old snapshot</h1>')},'index.html',context);
- assert.match(html,/This preview is out of date/);assert.match(html,/Update preview/);assert.match(html,/Dismiss/);assert.match(html,/refresh-request/);assert.match(html,/refresh-accept/);assert.doesNotMatch(html,/<script>bad/);assert.match(html,/\\u003c\/script>/);assert.doesNotMatch(html,/allow-same-origin/);
+ assert.match(html,/This preview is out of date/);assert.match(html,/Update preview/);assert.match(html,/Dismiss/);assert.match(html,/refresh-request/);assert.match(html,/refresh-accept/);assert.doesNotMatch(html,/<script>bad/);assert.match(html,/\\u003c\/script>/);assert.match(html,/frame\.setAttribute\('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads'\)/);
 });
 test('saved revision announcements are monotonic and contain no website content',async()=>{
  const {notifyWebsitePreviewSaved}=await import('../dist/website-preview.js'),originals={window:globalThis.window,localStorage:globalThis.localStorage,BroadcastChannel:globalThis.BroadcastChannel},stored=new Map(),sent=[];
  globalThis.window={};globalThis.localStorage={getItem:key=>stored.get(key)??null,setItem:(key,value)=>stored.set(key,value)};globalThis.BroadcastChannel=class{constructor(key){this.key=key;}postMessage(data){sent.push([this.key,data]);}close(){}};
  try{notifyWebsitePreviewSaved({workspaceId:'creator',id:'site',revision:2,title:'Private title'});notifyWebsitePreviewSaved({workspaceId:'creator',id:'site',revision:1});notifyWebsitePreviewSaved({workspaceId:'other',id:'site',revision:1});assert.deepEqual(sent,[['ubeeq.website-preview:creator:site',{type:'saved',revision:2}],['ubeeq.website-preview:other:site',{type:'saved',revision:1}]]);}finally{for(const[key,value]of Object.entries(originals)){if(value===undefined)delete globalThis[key];else globalThis[key]=value;}}
+});
+
+test('the trusted gallery enhancement is embedded safely for sandboxed previews',async()=>{
+ const {websiteGalleryViewerScript}=await import('../dist/index.js');
+ const files={'index.html':Buffer.from('<html><head><link rel="stylesheet" href="/assets/theme.css"></head><body><section data-gallery-root></section><script src="/assets/gallery-viewer.js" defer></script></body></html>').toString('base64'),'assets/theme.css':Buffer.from('').toString('base64'),'assets/gallery-viewer.js':Buffer.from(websiteGalleryViewerScript).toString('base64')};
+ const html=websitePreviewHtml(files);assert.match(html,/enableGallery/);assert.match(html,/text\('assets\/gallery-viewer.js'\)\s*===\s*galleryScript/);assert.match(html,/frame\.setAttribute\('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads'\)/);
+ const source=html.match(/<script nonce="[^"]+">([\s\S]*)<\/script>/)[1];assert.doesNotThrow(()=>new Function(source));
+});
+
+test('preview admits revalidated provider frames while retaining the opaque page sandbox',()=>{
+ const page='<iframe data-website-media-embed="video" src="https://www.youtube-nocookie.com/embed/M7lc1UVf-VE" srcdoc="unsafe" onload="unsafe()"></iframe><iframe data-website-media-embed="video" src="https://example.com/unsafe"></iframe>';
+ const html=websitePreviewHtml({'index.html':btoa(page)});
+ assert.match(html,/frame-src blob: https:\/\/www.youtube-nocookie.com/);
+ assert.match(html,/"original":"https:\/\/www.youtube-nocookie.com\/embed\/M7lc1UVf-VE"/);
+ assert.doesNotMatch(html,/"original":"https:\/\/example.com/);
+ assert.match(html,/frame\.setAttribute\('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads'\)/);
+ assert.match(html,/authoredFrame\.replaceWith\(slot\)/);
+ assert.match(html,/document\.body\.append\(player\)/);
+ assert.match(html,/player\.referrerPolicy = 'strict-origin-when-cross-origin'/);
+ assert.match(html,/frame-src 'none'/);
+ assert.match(html,/event\.source !== frame\.contentWindow/);
+ assert.match(html,/data\.generation !== playerGeneration/);
+ assert.match(html,/website-preview\.scroll/);
+ assert.match(html,/dialog\[open\]/);
 });

@@ -114,7 +114,7 @@ test('queries paginate deterministically with stable ties, empty states and stat
 const harness=async(options={})=>{
   const snapshot=fixture(),store=new SqliteWebsiteStore(':memory:'),actor={workspaceId:snapshot.website.workspaceId,actorId:'owner'};
   let active=true,allowed=true,eligible=true;const events=[],queued=[];
-  const service=new WebsiteService({store,creatorIdentityAllowed:async(_actor,id)=>id===snapshot.website.creatorIdentityId,membership:async()=>({workspaceId:actor.workspaceId,userId:actor.actorId,role:options.role??'owner',resourceIds:options.resourceIds,status:active?'active':'removed'}),capabilities:async()=>({apiVersion:'1',export:true,...limits,deploymentAdapters:[]}),resolveSnapshot:async(_a,website)=>({...structuredClone(snapshot),website,documents:await Promise.all(website.pages.map(p=>store.getDocument(actor.workspaceId,p.documentId)))}),evaluateRelease:async()=>({decision:allowed?'allow':'hold',revision:'policy-1',reasons:[]}),dependenciesEligible:async()=>eligible,enqueue:async input=>queued.push(input),audit:async e=>events.push(e),now:()=>new Date('2026-10-19T12:00:00Z')});
+  const service=new WebsiteService({store,publishedWebsites:async()=>options.published??[],creatorIdentityAllowed:async(_actor,id)=>id===snapshot.website.creatorIdentityId,membership:async()=>({workspaceId:actor.workspaceId,userId:actor.actorId,role:options.role??'owner',resourceIds:options.resourceIds,status:active?'active':'removed'}),capabilities:async()=>({apiVersion:'1',export:true,...limits,deploymentAdapters:[]}),resolveSnapshot:async(_a,website)=>({...structuredClone(snapshot),website,documents:await Promise.all(website.pages.map(p=>store.getDocument(actor.workspaceId,p.documentId)))}),evaluateRelease:async()=>({decision:allowed?'allow':'hold',revision:'policy-1',reasons:[]}),dependenciesEligible:async()=>eligible,enqueue:async input=>queued.push(input),audit:async e=>events.push(e),now:()=>new Date('2026-10-19T12:00:00Z')});
   for(const doc of snapshot.documents)await service.saveDocument(actor,doc,0);await service.save(actor,snapshot.website,0);
   return {service,store,snapshot,actor,events,queued,setActive:v=>active=v,setAllowed:v=>allowed=v,setEligible:v=>eligible=v};
 };
@@ -238,4 +238,66 @@ test('only generated platform signup forms pass static validation, including sub
  const built=buildWebsiteArtifact(f,limits);const html=Buffer.from(built.files.get('index.html')).toString();assert.match(html,/<form/);
  const {validateWebsiteFiles}=await import('../dist/website-artifact.js');
  for(const invalid of ['<form action="https://evil.example" method="post"></form>','<form data-website-mailing="true" method="post" action="https://evil.example/steal"></form>'])assert.throws(()=>validateWebsiteFiles(f.website,new Map([['index.html',new TextEncoder().encode(invalid)]])),/signup|submission/);
+});
+
+test('gallery viewers export only their trusted script and approved previews',async()=>{
+ const {validateWebsiteFiles}=await import('../dist/website-artifact.js');
+ const snapshot=fixture();snapshot.website.namedGalleries=[{id:'index',title:'Main Gallery',slug:'main',kind:'galleries',access:'free',publicationIds:[]},{id:'preview',title:'Selected previews',slug:'previews',parentId:'index',kind:'works',access:'preview',publicationIds:['premium-private'],purchaseText:'Available as a print',purchaseLinks:[{label:'Buy print',url:'https://shop.example/print',priceText:'$12'}]}];
+ snapshot.documents.find(doc=>doc.id==='doc-home').blocks=[block('gallery_list',{data:{websiteGalleryId:'index'}})];
+ const artifact=buildWebsiteArtifact(snapshot,limits),html=Buffer.from(artifact.files.get('index.html')).toString();
+ assert.match(html,/data-gallery-open="preview"/);assert.match(html,/data-gallery-dialog/);assert.match(html,/Available as a print/);assert.match(html,/assets\/gallery-viewer.js/);assert.ok(artifact.files.has('assets/gallery-viewer.js'));
+ assert.doesNotThrow(()=>validateWebsiteFiles(snapshot.website,artifact.files));
+ const tampered=new Map(artifact.files);tampered.set('assets/gallery-viewer.js',Buffer.from('alert("unexpected")'));assert.throws(()=>validateWebsiteFiles(snapshot.website,tampered),e=>e.code==='unsafe_output');
+ const injected=new Map(artifact.files);injected.set('index.html',Buffer.from(html.replace('</body>','<script>alert("unexpected")</script></body>')));assert.throws(()=>validateWebsiteFiles(snapshot.website,injected),e=>e.code==='unsafe_output');
+});
+
+
+test('saved path changes preserve confirmed published URLs and retarget existing aliases',async t=>{
+ const published=fixture().website,h=await harness({published:[published]});t.after(()=>h.store.close());
+ const changed=structuredClone(published);changed.revision=2;changed.pages.find(p=>p.id==='portfolio').slug='art';
+ const saved=await h.service.save(h.actor,changed,1);
+ assert.deepEqual(saved.redirects.find(r=>r.from==='/portfolio/about/'),{from:'/portfolio/about/',to:'/art/about/',status:301});
+ assert.equal(saved.redirects.find(r=>r.from==='/old-about/').to,'/art/about/');
+ const output=buildWebsiteArtifact({...h.snapshot,website:saved},limits),html=Buffer.from(output.files.get('portfolio/about/index.html')).toString();
+ assert.match(html,/<meta http-equiv="refresh" content="0;url=\/art\/about\/">/);
+ assert.match(html,/href="\/art\/about\/"/);
+ assert.deepEqual(JSON.parse(Buffer.from(output.files.get('redirects.json')).toString()).redirects.find(r=>r.from==='/portfolio/about/'),{from:'/portfolio/about/',to:'/art/about/',status:301});
+ await assert.rejects(h.service.save(h.actor,changed,1),{code:'revision_conflict'});
+});
+
+test('unpublished draft path changes do not become historical redirects',async t=>{
+ const h=await harness();t.after(()=>h.store.close());const changed=structuredClone(h.snapshot.website);changed.revision=2;changed.pages.find(p=>p.id==='portfolio').slug='art';
+ const saved=await h.service.save(h.actor,changed,1);
+ assert.deepEqual(saved.redirects,[{from:'/old-about/',to:'/art/about/',status:301}]);
+});
+
+test('list metadata survives document normalization and exports as semantic lists',()=>{
+ const snapshot=fixture();snapshot.documents[0].blocks=[{id:'list',type:'paragraph',data:{listStyle:'ordered'},html:'<ol><li>First</li><li><strong>Second</strong></li></ol>'}];
+ const normalized=normalizeWebsiteDocument(snapshot.documents[0]);assert.equal(normalized.blocks[0].data.listStyle,'ordered');
+ const output=buildWebsiteArtifact(snapshot,limits),html=Buffer.from(output.files.get('index.html')).toString();assert.match(html,/<ol><li>First<\/li><li><strong>Second<\/strong><\/li><\/ol>/);assert.doesNotMatch(html,/<p[^>]*><ol>/);
+});
+
+test('supported media players pass the complete artifact build while authored or modified frames remain rejected',async()=>{
+ const {validateWebsiteFiles}=await import('../dist/website-artifact.js');
+ const snapshot=fixture('/artist/');
+ const players=[
+  ['video','https://youtu.be/M7lc1UVf-VE'],['video','https://vimeo.com/76979871/abc123'],
+  ['video','https://iframe.mediadelivery.net/embed/123/12345678-1234-1234-1234-123456789012?token=abc&expires=123'],
+  ['audio','https://open.spotify.com/track/0Lr4kGOYn9l83EjuK6cZFQ'],['audio','https://soundcloud.com/artist/track'],
+  ['audio','https://bandcamp.com/EmbeddedPlayer/album=123/size=large/']
+ ];
+ snapshot.documents[0].blocks=players.map(([kind,url],index)=>block('embed',{id:'player-'+index,url,label:'Player '+index,data:{embedKind:kind}}));
+ const artifact=buildWebsiteArtifact(snapshot,limits),html=Buffer.from(artifact.files.get('index.html')).toString();
+ assert.equal((html.match(/<iframe /g)||[]).length,6);assert.ok(artifact.zip.byteLength>0);assert.doesNotThrow(()=>validateWebsiteFiles(snapshot.website,artifact.files));
+ const frame=html.match(/<iframe [\s\S]*?<\/iframe>/)[0];
+ const rejects=value=>{const files=new Map(artifact.files);files.set('index.html',Buffer.from(html.replace(frame,value)));assert.throws(()=>validateWebsiteFiles(snapshot.website,files),error=>error.code==='unsafe_output');};
+ rejects(frame.replace('src="https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"','src="https://example.com/iframe"'));
+ rejects(frame.replace('loading="lazy"','srcdoc="&lt;script&gt;bad()&lt;/script&gt;" loading="lazy"'));
+ rejects(frame.replace('loading="lazy"','onload="bad()" loading="lazy"'));
+ rejects(frame.replace('allow-scripts allow-same-origin allow-presentation allow-popups','allow-scripts allow-same-origin allow-top-navigation'));
+ rejects(frame.replace('data-website-media-embed="video" ',''));
+ rejects(frame.replace('</iframe>','unsafe fallback</iframe>'));
+ rejects('<iframe src="https://www.youtube-nocookie.com/embed/M7lc1UVf-VE"></iframe>');
+ rejects('<object data="https://example.com"></object>');
+ const unrelatedSignedLink=new Map(artifact.files);unrelatedSignedLink.set('index.html',Buffer.from(html.replace('</body>','<a href="https://example.com/?token=not-an-approved-player">Other link</a></body>')));assert.throws(()=>validateWebsiteFiles(snapshot.website,unrelatedSignedLink),error=>error.code==='invalid_url');
 });

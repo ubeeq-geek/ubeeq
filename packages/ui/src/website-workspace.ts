@@ -1,10 +1,12 @@
 import {removeWebsitePage} from './website-page-actions.js';
 import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
-import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteGallerySettings, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
-export interface WebsiteCatalogueOption {id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
+import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
+export interface WebsiteCatalogueOption {workId?:string;id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
 
 export interface WebsiteWorkspaceClient {
+  saveGalleryLink?(galleryId:string,id:string,url:string,expectedUrl:string):Promise<{url:string}>;
+  galleryLinkSuggestions?(galleryId:string):Promise<readonly {label:string;url:string;detail:string;purchase?:boolean;id?:string;browseUrl?:string}[]>;
   pendingUploads?():boolean;
   mailingListStatus?():Promise<{enabled:boolean;emailAvailable:boolean;signupUrl:string;manageUrl:string}>;
   media?(query?:string):Promise<readonly WebsiteMediaOption[]>;
@@ -115,16 +117,33 @@ export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourc
     return buildId;
   }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}
 };
+export interface WebsiteGalleryLinkEditorProps {
+  saveSuggestionUrl?:(id:string,url:string,expectedUrl:string)=>Promise<{url:string}>;
+  loadSuggestions?:()=>Promise<readonly {label:string;url:string;detail:string;purchase?:boolean;id?:string;browseUrl?:string}[]>;
+  heading:string; purchase:boolean; value:{label:string;url:string;priceText?:string}[];
+  onChange:(value:{label:string;url:string;priceText?:string}[])=>void;
+}
+export interface WebsiteGalleryWorksProps {website:Website;galleryId:string;reviewBlocked:()=>string|undefined;}
+export type MountWebsiteGalleryWorks=(host:HTMLElement,props:WebsiteGalleryWorksProps)=>(()=>void);
+export type MountWebsiteGalleryLinkEditor=(host:HTMLElement,props:WebsiteGalleryLinkEditorProps)=>(()=>void);
 /** Shared editor injection keeps the authoritative block format and existing editor. */
-export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void)) => {
+export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void), mountLinks?:MountWebsiteGalleryLinkEditor, mountWorks?:MountWebsiteGalleryWorks) => {
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
+  const cleanupLinks:(()=>void)[]=[];
+  let editorFullscreenCleanup:(()=>void)|undefined,activeTab='Pages',prepareDraft=()=>{};
   const documentDrafts=new Map<string,WebsiteDocument>(),documentBaselines=new Map<string,string>();let savedSite='',reportedDirty=false,operations=0;
   const dirty=()=>Boolean(site&&(JSON.stringify(site)!==savedSite||[...documentDrafts].some(([id,doc])=>JSON.stringify(doc)!==documentBaselines.get(id))||Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')).some(input=>input.value!==input.dataset.websiteDraftInitial)));
-  const reportDirty=()=>{const value=dirty();if(value!==reportedDirty){reportedDirty=value;options.onUnsavedChangesChange?.(value);}};
+  const updatePreviewButton=(button:HTMLButtonElement,value:boolean)=>{
+    const label=value?'Save Changes & Preview':button.dataset.websitePreviewLabel!;
+    if(button.dataset.websitePreviewPageTitle!==undefined){const name=label+' page '+button.dataset.websitePreviewPageTitle;button.setAttribute('aria-label',name);button.title=name;}
+    else button.textContent=label;
+  };
+  const reportDirty=()=>{const value=dirty();for(const button of root.querySelectorAll<HTMLButtonElement>('[data-website-preview-label]'))updatePreviewButton(button,value);if(value!==reportedDirty){reportedDirty=value;options.onUnsavedChangesChange?.(value);}};
   const scheduleDirty=()=>queueMicrotask(()=>{if(!disposed)reportDirty();});root.addEventListener('input',scheduleDirty);root.addEventListener('change',scheduleDirty);
 
   let selectedHostingTarget=options.initialHostingTargetId??'',publishingSelectorExpanded=true;
+  let selectedGallery='',galleryParentFilter='',galleryQuery='',gallerySelectorExpanded=true;
   let selectedLayout='Header',layoutSelectorExpanded=true,previewPending=false,publishingTimer:ReturnType<typeof setTimeout>|undefined;
   const stopPublishingPoll=()=>{if(publishingTimer)clearTimeout(publishingTimer);publishingTimer=undefined;};
   const element=<K extends keyof HTMLElementTagNameMap>(tag:K,text?:string) => {const el=d.createElement(tag);if(text)el.textContent=text;return el;};
@@ -132,6 +151,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const tabs=element('nav'), content=element('section'); tabs.setAttribute('aria-label','Website tools'); root.replaceChildren(tabs,status,content);
   const act=(fn:()=>Promise<void>)=>async()=>{operations++;options.onBusyChange?.(true);try{await fn();}catch(error){status.textContent=error instanceof Error?error.message:'Website operation failed.';}finally{operations--;if(!disposed){reportDirty();options.onBusyChange?.(operations>0);}}};
   const button=(label:string,fn:()=>Promise<void>)=>{const b=element('button',label);b.type='button';b.onclick=act(fn);return b;};
+  const previewButton=(label:string,pageId:()=>string,pageTitle?:string)=>{const b=button(label,()=>previewPage(pageId()));b.dataset.websitePreviewLabel=label;if(pageTitle!==undefined)b.dataset.websitePreviewPageTitle=pageTitle;updatePreviewButton(b,dirty());return b;};
   const dialogs=new Map<HTMLDialogElement,()=>void>();
   const confirmAction=(title:string,description:string,action:string,run:()=>Promise<void>,fields?:HTMLElement)=>new Promise<void>(resolve=>{
     const dialog=element('dialog'),heading=element('h2',title),copy=element('p',description),error=element('p'),actions=element('div');heading.id='website-confirm-'+crypto.randomUUID();dialog.setAttribute('aria-labelledby',heading.id);dialog.className='website-confirm-dialog';error.setAttribute('role','alert');let pending=false,closed=false;const focused=d.activeElement as HTMLElement|null;
@@ -171,11 +191,28 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   const previewPage=async(pageId:string)=>{
     if(previewPending)throw new Error('A website preview is already opening.');
     const popup=win?.open('about:blank','_blank');if(!popup)throw new Error('Allow pop-ups to open this preview in a new tab.');previewPending=true;
-    try{currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';}finally{previewPending=false;}
+    try{
+      if(dirty()){
+        if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');
+        prepareDraft();
+        status.textContent='Saving changes before opening preview…';
+        const wasInert=root.inert;root.inert=true;
+        try{
+          for(const [id,doc] of documentDrafts){
+            if(JSON.stringify(doc)===documentBaselines.get(id))continue;
+            const saved=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);
+            documentBaselines.set(id,JSON.stringify(saved));documentDrafts.delete(id);
+          }
+          await save();await show(activeTab);
+        }catch(error){await show(activeTab);throw error;}finally{root.inert=wasInert;}
+      }
+      currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';
+    }catch(error){popup.close();throw error;}finally{previewPending=false;reportDirty();}
   };
   const show=async(tab:string)=>{
-    const generation=++renderGeneration;stopPublishingPoll();
-    for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.textContent===tab));
+    activeTab=tab;prepareDraft=()=>{};const generation=++renderGeneration;editorFullscreenCleanup?.();stopPublishingPoll();
+    for(const choice of Array.from(tabs.querySelectorAll('button')))choice.setAttribute('aria-pressed',String(choice.dataset.websiteTool===tab));
+    for(const cleanup of cleanupLinks.splice(0))cleanup();
     cleanupEditor?.();cleanupEditor=undefined;cleanupSettings?.();cleanupSettings=undefined;for(const observer of imageObservers)observer.disconnect();imageObservers.length=0;content.replaceChildren(element('h2',tab));
     if(tab==='Settings'){
       const settings=element('div');settings.className='website-site-settings';settings.append(element('p','Site-wide settings for this website.'));
@@ -301,7 +338,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
           },home?fields:undefined);
         });remove.className='website-page-delete';remove.setAttribute('aria-label','Delete page '+page.title);remove.title=site.pages.length===1?'Add another page before deleting the only page.':'Delete page '+page.title;remove.disabled=site.pages.length===1;
         const trash=d.createElementNS('http://www.w3.org/2000/svg','svg'),trashPath=d.createElementNS('http://www.w3.org/2000/svg','path');trash.setAttribute('viewBox','0 0 24 24');trash.setAttribute('fill','none');trash.setAttribute('stroke','currentColor');trash.setAttribute('stroke-width','1.8');trash.setAttribute('aria-hidden','true');trashPath.setAttribute('d','M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7');trash.append(trashPath);remove.append(trash);
-        const preview=button('',()=>previewPage(page.id));preview.className='website-page-preview website-page-delete';preview.setAttribute('aria-label','Preview page '+page.title);preview.title='Preview page '+page.title;
+        const preview=previewButton('Preview',()=>page.id,page.title);preview.textContent='';preview.className='website-page-preview website-page-delete';
         const eye=d.createElementNS('http://www.w3.org/2000/svg','svg');eye.setAttribute('viewBox','0 0 24 24');eye.setAttribute('fill','none');eye.setAttribute('stroke','currentColor');eye.setAttribute('stroke-width','1.8');eye.setAttribute('aria-hidden','true');const eyePath=d.createElementNS('http://www.w3.org/2000/svg','path');eyePath.setAttribute('d','M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z');const pupil=d.createElementNS('http://www.w3.org/2000/svg','circle');pupil.setAttribute('cx','12');pupil.setAttribute('cy','12');pupil.setAttribute('r','3');eye.append(eyePath,pupil);preview.append(eye);pageRow.append(choice,preview,remove);selector.append(pageRow);
       }
       const pageActions=element('div'),newPage=button('New page',async()=>{selectedPage='new';await show('Pages');}),redirect=button('Add a redirect',async()=>{selectedPage='redirects';await show('Pages');});pageActions.className='website-page-selector-actions';newPage.className='website-selector-action website-selector-action-primary';redirect.className='website-selector-action website-selector-action-secondary';for(const [action,symbol] of [[newPage,'+'],[redirect,'↪']] as const){const icon=element('span',symbol);icon.setAttribute('aria-hidden','true');action.prepend(icon);}pageActions.append(newPage,redirect);selector.append(pageActions);
@@ -310,11 +347,28 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       for(const p of site.pages.filter(page=>page.id===selectedPage)) {
         const row=element('div');row.className='website-page-settings-fields';
         const editPage=(patch:Partial<typeof p>)=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,...patch,revision:next.revision+1}:next)};};
-        const heading=element('div'),titleGroup=element('div'),pageTitle=element('h2',p.title),headingFields=element('div');heading.className='website-page-detail-heading';titleGroup.className='website-page-title-group';headingFields.className='website-page-heading-fields';headingFields.hidden=true;headingFields.id='website-page-heading-'+p.id;
-        const edit=button('',async()=>{headingFields.hidden=!headingFields.hidden;edit.setAttribute('aria-expanded',String(!headingFields.hidden));if(!headingFields.hidden)headingFields.querySelector('input')?.focus();});edit.className='website-page-title-edit';edit.setAttribute('aria-label','Edit page title and heading');edit.setAttribute('aria-controls',headingFields.id);edit.setAttribute('aria-expanded','false');edit.title='Edit page title and heading';
-        const pencil=d.createElementNS('http://www.w3.org/2000/svg','svg'),pencilPath=d.createElementNS('http://www.w3.org/2000/svg','path');pencil.setAttribute('viewBox','0 0 24 24');pencil.setAttribute('fill','none');pencil.setAttribute('stroke','currentColor');pencil.setAttribute('stroke-width','1.8');pencil.setAttribute('aria-hidden','true');pencilPath.setAttribute('d','m16 3 5 5M3 21l5-1L21 7a2.1 2.1 0 0 0-4-4L4 16l-1 5Z');pencil.append(pencilPath);edit.append(pencil);
-        titleGroup.append(pageTitle,edit);heading.append(titleGroup,button('Preview in new tab',()=>previewPage(p.id)));surface.append(heading,headingFields);
-        field(headingFields,'Page title',p.title,v=>{editPage({title:v});pageTitle.textContent=v||'Untitled page';topHeading.placeholder=v;});
+        const heading=element('div'),headingFields=element('div'),pageContent=element('div'),settings=element('div');
+        heading.className='portable-section-heading website-page-block-heading';headingFields.className='website-page-heading-fields';
+        pageContent.className='website-page-main-content';pageContent.id='website-page-content-'+p.id;settings.id='website-page-settings-'+p.id;settings.className='website-page-settings';settings.hidden=true;
+        const collapse=button('',async()=>{pageContent.hidden=!pageContent.hidden;collapse.setAttribute('aria-expanded',String(!pageContent.hidden));collapseMark.textContent=pageContent.hidden?'▸':'▾';});collapse.className='portable-section-collapse';collapse.setAttribute('aria-expanded','true');collapse.setAttribute('aria-controls',pageContent.id);
+        const collapseMark=element('span','▾');collapseMark.setAttribute('aria-hidden','true');const pageIcon=d.createElementNS('http://www.w3.org/2000/svg','svg'),pageIconPath=d.createElementNS('http://www.w3.org/2000/svg','path');pageIcon.classList.add('portable-block-type-icon');pageIcon.setAttribute('viewBox','0 0 24 24');pageIcon.setAttribute('fill','none');pageIcon.setAttribute('stroke','currentColor');pageIcon.setAttribute('stroke-width','1.8');pageIcon.setAttribute('stroke-linejoin','round');pageIcon.setAttribute('aria-hidden','true');pageIconPath.setAttribute('d','M5 3h9l5 5v13H5ZM14 3v6h5M9 13h6M9 17h6');pageIcon.append(pageIconPath);collapse.append(collapseMark,pageIcon,d.createTextNode('Page: Main Content Area'));
+        const edit=button('',async()=>{settings.hidden=!settings.hidden;edit.setAttribute('aria-expanded',String(!settings.hidden));settingsMark.textContent=settings.hidden?'▾':'▴';});edit.className='portable-section-more';edit.setAttribute('aria-label','Page settings');edit.setAttribute('aria-controls',settings.id);edit.setAttribute('aria-expanded','false');
+        const gear=element('span','⚙'),settingsMark=element('span','▾');gear.setAttribute('aria-hidden','true');settingsMark.setAttribute('aria-hidden','true');edit.append(gear,d.createTextNode(' Settings '),settingsMark);
+        const helpPanel=element('div','Add and arrange content blocks. Insert an existing Work image or upload an image directly here.');helpPanel.id='website-page-help-'+p.id;helpPanel.className='website-page-content-help';helpPanel.hidden=true;helpPanel.setAttribute('role','region');helpPanel.setAttribute('aria-label','Page content help');
+        const help=button('',async()=>{helpPanel.hidden=!helpPanel.hidden;help.setAttribute('aria-expanded',String(!helpPanel.hidden));});help.className='website-page-help-toggle';help.setAttribute('aria-label','Page content help');help.title='Page content help';help.setAttribute('aria-expanded','false');help.setAttribute('aria-controls',helpPanel.id);
+        const helpIcon=d.createElementNS('http://www.w3.org/2000/svg','svg'),helpCircle=d.createElementNS('http://www.w3.org/2000/svg','circle'),helpPath=d.createElementNS('http://www.w3.org/2000/svg','path');helpIcon.setAttribute('viewBox','0 0 24 24');helpIcon.setAttribute('fill','none');helpIcon.setAttribute('stroke','currentColor');helpIcon.setAttribute('stroke-width','1.8');helpIcon.setAttribute('stroke-linecap','round');helpIcon.setAttribute('aria-hidden','true');helpCircle.setAttribute('cx','12');helpCircle.setAttribute('cy','12');helpCircle.setAttribute('r','9');helpPath.setAttribute('d','M9.5 9a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 3.5M12 16h.01');helpIcon.append(helpCircle,helpPath);help.append(helpIcon);
+        const dismissHelp=(event:KeyboardEvent)=>{if(event.key==='Escape'&&!helpPanel.hidden){event.preventDefault();event.stopPropagation();helpPanel.hidden=true;help.setAttribute('aria-expanded','false');help.focus();}};help.addEventListener('keydown',dismissHelp);helpPanel.addEventListener('keydown',dismissHelp);
+        let fullscreenDialog:HTMLDialogElement|undefined;
+        const openEditorOverlay=()=>{
+          const parent=surface.parentNode!,next=surface.nextSibling,dialog=element('dialog');dialog.className='website-editor-fullscreen-dialog';dialog.setAttribute('aria-label','Full screen page editor');
+          const close=()=>{if(dialog.open)dialog.close();parent.insertBefore(surface,next);dialog.remove();dialogs.delete(dialog);fullscreenDialog=undefined;editorFullscreenCleanup=undefined;updateFullscreen();if(!disposed)fullscreen.focus();};
+          dialog.oncancel=event=>{event.preventDefault();close();};fullscreenDialog=dialog;editorFullscreenCleanup=close;dialogs.set(dialog,close);dialog.append(surface);root.append(dialog);dialog.showModal();updateFullscreen();fullscreen.focus();
+        };
+        const fullscreen=button('',async()=>{if(fullscreenDialog?.open){editorFullscreenCleanup?.();return;}if(d.fullscreenElement===surface){await d.exitFullscreen();return;}try{if(!d.fullscreenEnabled||!surface.requestFullscreen){openEditorOverlay();return;}await surface.requestFullscreen();}catch{openEditorOverlay();}});fullscreen.className='website-page-fullscreen-toggle';fullscreen.setAttribute('aria-label','Full screen editor');fullscreen.title='Full screen editor';fullscreen.setAttribute('aria-pressed','false');
+        const fullscreenIcon=d.createElementNS('http://www.w3.org/2000/svg','svg'),fullscreenPath=d.createElementNS('http://www.w3.org/2000/svg','path');fullscreenIcon.setAttribute('viewBox','0 0 24 24');fullscreenIcon.setAttribute('fill','none');fullscreenIcon.setAttribute('stroke','currentColor');fullscreenIcon.setAttribute('stroke-width','1.8');fullscreenIcon.setAttribute('stroke-linecap','round');fullscreenIcon.setAttribute('aria-hidden','true');fullscreenIcon.append(fullscreenPath);fullscreen.append(fullscreenIcon);
+        const updateFullscreen=()=>{const active=d.fullscreenElement===surface||!!fullscreenDialog?.open;fullscreen.setAttribute('aria-pressed',String(active));fullscreen.setAttribute('aria-label',active?'Exit full screen editor':'Full screen editor');fullscreen.title=active?'Exit full screen editor':'Full screen editor';fullscreenPath.setAttribute('d',active?'M3 8h5V3m8 0v5h5M8 21v-5H3m18 0h-5v5':'M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5');};surface.onfullscreenchange=updateFullscreen;updateFullscreen();
+        heading.append(collapse,edit,help,fullscreen,previewButton('Preview in new tab',()=>p.id));row.append(headingFields);settings.append(row);surface.append(heading,helpPanel,settings,pageContent);
+        field(headingFields,'Page title',p.title,v=>{editPage({title:v});topHeading.placeholder=v;});
         const topHeading=field(headingFields,'Top heading',p.heading??'',v=>editPage({heading:v.trim()?v:undefined}));topHeading.placeholder=p.title;
         headingFields.append(element('p','Leave the top heading blank to use the page title. Save page to keep these changes.'));
         const headingLabel=element('label','Show heading at the top of the page'),showHeading=element('input');headingLabel.className='website-page-heading-toggle';showHeading.type='checkbox';showHeading.checked=p.showHeading!==false;showHeading.onchange=()=>{editPage({showHeading:showHeading.checked});topHeading.disabled=!showHeading.checked;};topHeading.disabled=p.showHeading===false;headingLabel.prepend(showHeading);headingFields.append(headingLabel);
@@ -331,9 +385,9 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         row.append(button('Duplicate document for this page',async()=>{const source=await client.document(p.documentId),id=globalThis.crypto.randomUUID();await client.saveDocument({...documentDrafts.get(p.documentId)??source.document,id,revision:1},0);editPage({documentId:id});await save();await show('Pages');}));
         const openContent=async()=>{
           const result=await client.document(p.documentId);if(disposed||renderGeneration!==generation)return;const editor=element('div');editor.className='website-page-content-editor';documentBaselines.set(p.documentId,JSON.stringify(result.document));let doc=documentDrafts.get(p.documentId)??result.document;
-          if(result.sharedBy.length>1)surface.append(element('p',`This content is shared by: ${result.sharedBy.map(page=>page.title).join(', ')}. Duplicate the document in Page settings to edit this page independently.`));surface.append(editor);
+          if(result.sharedBy.length>1)pageContent.append(element('p',`This content is shared by: ${result.sharedBy.map(page=>page.title).join(', ')}. Duplicate the document in Page settings to edit this page independently.`));pageContent.append(editor);
           const mount=()=>{cleanupEditor?.();cleanupEditor=mountEditor(editor,doc,next=>{doc=next;documentDrafts.set(doc.id,doc);reportDirty();});};mount();
-          let saving=false;const savePage=button('Save page',async()=>{if(saving)return;if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');saving=true;savePage.disabled=true;try{if(documentDrafts.has(doc.id)){doc=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);documentDrafts.delete(doc.id);mount();}await save();status.textContent='Page content and settings saved.';await show('Pages');}finally{saving=false;savePage.disabled=false;}});surface.append(savePage);
+          let saving=false;const savePage=button('Save page',async()=>{if(saving)return;if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');saving=true;savePage.disabled=true;try{if(documentDrafts.has(doc.id)){doc=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);documentDrafts.delete(doc.id);mount();}await save();status.textContent='Page content and settings saved.';await show('Pages');}finally{saving=false;savePage.disabled=false;}});pageContent.append(savePage);
 
         };
         if(p.kind!=='home') {
@@ -344,16 +398,18 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         }
         const label=element('label','Show in top navigation'),check=element('input');check.type='checkbox';check.checked=p.navigation;check.onchange=()=>{site={...site,pages:site.pages.map(next=>next.id===p.id?{...next,navigation:check.checked,revision:next.revision+1}:next)};};label.append(check);row.append(label);
         const footerLabel=element('label','Show in footer navigation'),footerCheck=element('input');footerCheck.type='checkbox';footerCheck.checked=p.footerNavigation??false;footerCheck.onchange=()=>editPage({footerNavigation:footerCheck.checked});footerLabel.append(footerCheck);row.append(footerLabel);
-        row.append(button('Move up',async()=>{const ordered=[...site.pages].sort((a,b)=>a.order-b.order);const i=ordered.findIndex(x=>x.id===p.id);if(i>0)[ordered[i],ordered[i-1]]=[ordered[i-1],ordered[i]];site={...site,pages:ordered.map((p,i)=>({...p,order:i,revision:p.revision+1}))};await save();await show('Pages');}));await openContent();if(disposed||renderGeneration!==generation)return;const settings=element('details');settings.className='website-page-settings';settings.append(element('summary','Page settings'),row);surface.append(settings);
+        row.append(button('Move up',async()=>{const ordered=[...site.pages].sort((a,b)=>a.order-b.order);const i=ordered.findIndex(x=>x.id===p.id);if(i>0)[ordered[i],ordered[i-1]]=[ordered[i-1],ordered[i]];site={...site,pages:ordered.map((p,i)=>({...p,order:i,revision:p.revision+1}))};await save();await show('Pages');}));await openContent();if(disposed||renderGeneration!==generation)return;
       }
       if(selectedPage==='redirects'){
+      surface.append(element('p','Previously published page and collection-gallery paths redirect automatically after a path change. Redirects take effect with your next website publication.'));
       const redirects=element('label','Redirects: one previous path => current path or external URL per line'),text=element('textarea');
-      text.value=site.redirects.map(r=>r.from+' => '+r.to).join('\n');
-      redirects.append(text);surface.append(redirects,button('Save redirects',async()=>{site={...site,redirects:text.value.split('\n').filter(s=>s.trim()).map(line=>{const [from,to,...extra]=line.split('=>').map(s=>s.trim());if(!from||!to||extra.length)throw new Error('Redirects require previous path => destination.');return {from,to,status:301 as const};})};await save();}));
+      text.value=site.redirects.map(r=>r.from+' => '+r.to).join('\n');text.dataset.websiteDraftInitial=text.value;
+      prepareDraft=()=>{site={...site,redirects:text.value.split('\n').filter(s=>s.trim()).map(line=>{const [from,to,...extra]=line.split('=>').map(s=>s.trim());if(!from||!to||extra.length)throw new Error('Redirects require previous path => destination.');return {from,to,status:301 as const};})};};
+      redirects.append(text);surface.append(redirects,button('Save redirects',async()=>{prepareDraft();await save();}));
 
       }
       if(selectedPage==='new'){surface.append(element('h2','New page'));
-      const add=element('div');let title='',slug='',kind:'page'|'portfolio'|'update'='page',template:Website['pages'][number]['template']='standard';field(add,'New page title','',v=>title=v);field(add,'New page path','',v=>slug=v);
+      const add=element('div');let title='',slug='',kind:'page'|'portfolio'|'update'='page',template:Website['pages'][number]['template']='standard';field(add,'New page title','',v=>title=v);field(add,'New page path','',v=>slug=v);prepareDraft=()=>{if(title||slug)throw new Error('Add the new page before previewing your changes.');};
       const select=element('select');select.setAttribute('aria-label','Page kind');for(const k of ['page','portfolio','update'] as const){const o=element('option',k);o.value=k;select.append(o);}select.onchange=()=>kind=select.value as typeof kind;add.append(select);
       const templateSelect=element('select');templateSelect.setAttribute('aria-label','New page template');for(const t of WEBSITE_PAGE_TEMPLATES){const o=element('option',t.title);o.value=t.id;templateSelect.append(o);}templateSelect.onchange=()=>template=templateSelect.value as typeof template;add.append(templateSelect);
       add.append(button('Add page',async()=>{if(!title.trim()||!slug.trim())throw new Error('Page title and path are required.');const id=globalThis.crypto.randomUUID(),documentId=globalThis.crypto.randomUUID();await client.saveDocument({id:documentId,workspaceId:site.workspaceId,revision:1,blocks:template==='gallery'?[{type:'gallery_list',id:globalThis.crypto.randomUUID() as EntityId,data:{sort:'newest',pageSize:12,websiteGalleryId:site.namedGalleries?.[0]?.id}}]:[{type:'paragraph',id:globalThis.crypto.randomUUID() as EntityId,text:template==='profile'?'Introduce yourself and your work.':'Add your page content here.'}]},0);site={...site,pages:[...site.pages,{id,documentId,websiteId:site.id,workspaceId:site.workspaceId,revision:1,kind,title,slug,template,order:site.pages.length,state:'ready',navigation:true,footerNavigation:false}]};selectedPage=id;await save();await show('Pages');}));surface.append(add);}
@@ -440,27 +496,84 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     }
     if(tab==='Galleries') {
       content.append(element('p','Named galleries are publishing destinations. Display any gallery in a gallery block on any page. Galleries support Works or sub-galleries, with two levels. Website content is free or preview-only; paid access stays with your membership platform.'));
-      const catalogue=await client.catalogue?.()??[],hostingTargets=(await client.hostingHistory?.())?.targets??[];
-      const update=(id:string,patch:Partial<NonNullable<Website['namedGalleries']>[number]>)=>{site={...site,namedGalleries:(site.namedGalleries??[]).map(row=>row.id===id?{...row,...patch}:row)};reportDirty();};
+      const hostingTargets=(await client.hostingHistory?.())?.targets??[];
+      if(disposed||renderGeneration!==generation)return;
+      const workspace=element('div'),selector=element('nav'),divider=element('div'),surface=element('div');
+      workspace.className='website-page-workspace website-gallery-workspace'+(gallerySelectorExpanded?'':' website-pages-collapsed');selector.className='website-page-selector website-gallery-selector';selector.id='website-galleries-'+site.id;selector.setAttribute('aria-label','Gallery selector');selector.hidden=!gallerySelectorExpanded;surface.className='website-page-surface website-gallery-detail';
+      divider.className='website-page-divider';const handle=element('div');handle.className='website-page-handle-viewport';const toggle=button('',async()=>{gallerySelectorExpanded=!gallerySelectorExpanded;workspace.classList.toggle('website-pages-collapsed',!gallerySelectorExpanded);selector.hidden=!gallerySelectorExpanded;updateToggle();measurePages();});toggle.className='website-page-toggle';toggle.setAttribute('aria-controls',selector.id);
+      const updateToggle=()=>{toggle.setAttribute('aria-label',gallerySelectorExpanded?'Collapse gallery selector':'Expand gallery selector');toggle.setAttribute('aria-expanded',String(gallerySelectorExpanded));toggle.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="'+(gallerySelectorExpanded?'m15 18-6-6 6-6':'m9 18 6-6-6-6')+'"/></svg>';};updateToggle();handle.append(toggle);divider.append(handle);workspace.append(selector,divider,surface);content.append(workspace);
+      let refreshGalleryLists=()=>{};
+      const update=(id:string,patch:Partial<NonNullable<Website['namedGalleries']>[number]>)=>{site={...site,namedGalleries:(site.namedGalleries??[]).map(row=>row.id===id?{...row,...patch}:row)};reportDirty();refreshGalleryLists();};
+      const parentFilterLabel=element('label','Main gallery'),parentFilter=element('select');parentFilterLabel.append(parentFilter);selector.append(parentFilterLabel);
+      const searchLabel=element('label','Find a gallery'),search=element('input');search.type='search';search.placeholder='Filter by name or path';search.value=galleryQuery;searchLabel.append(search);selector.append(searchLabel);
+      const clear=button('Clear filter',async()=>{galleryQuery='';search.value='';refreshGalleryLists();search.focus();});clear.className='website-gallery-filter-clear';selector.append(clear);
+      const count=element('p');count.className='small';count.setAttribute('role','status');count.setAttribute('aria-live','polite');selector.append(count);
+      const list=element('div');list.className='website-gallery-choices';selector.append(list);const empty=element('p','No galleries match this filter.');selector.append(empty);
+      const galleryRows=new Map<string,{choice:HTMLButtonElement;box:HTMLElement;title:HTMLElement;meta:HTMLElement;heading:HTMLElement;context:HTMLElement}>();
+      const selectGallery=(id:string)=>{selectedGallery=id;refreshGalleryLists();};
+      search.oninput=()=>{galleryQuery=search.value;refreshGalleryLists();};parentFilter.onchange=()=>{galleryParentFilter=parentFilter.value;if(galleryParentFilter)selectedGallery=site.namedGalleries?.find(row=>row.parentId===galleryParentFilter)?.id??galleryParentFilter;refreshGalleryLists();};
       for(const gallery of site.namedGalleries??[]){
-        const box=element('details');box.className='website-named-gallery';box.append(element('summary',(gallery.parentId?'↳ ':'')+gallery.title));content.append(box);
-        field(box,'Gallery name',gallery.title,title=>update(gallery.id,{title}));field(box,'Path segment',gallery.slug,slug=>update(gallery.id,{slug}));
+        const choice=button('',async()=>selectGallery(gallery.id));choice.className='website-page-choice website-gallery-choice';
+        const title=element('strong',gallery.title),meta=element('small');choice.append(title,meta);list.append(choice);
+        const box=element('section');box.className='website-gallery-settings';box.id='website-gallery-panel-'+gallery.id;box.setAttribute('aria-label','Settings for '+gallery.title);choice.setAttribute('aria-controls',box.id);surface.append(box);
+        const heading=element('h3',gallery.title),context=element('p');context.className='small';box.append(heading,context);
+        galleryRows.set(gallery.id,{choice,box,title,meta,heading,context});
+        field(box,'Gallery name',gallery.title,title=>update(gallery.id,{title}));field(box,'Path segment',gallery.slug,slug=>update(gallery.id,{slug}));box.append(element('small','Changing a published path creates a redirect when you next publish.'));
         const parentLabel=element('label','Parent gallery'),parent=element('select');parent.append(element('option','Top level'));parent.options[0].value='';
         for(const candidate of site.namedGalleries??[])if(candidate.id!==gallery.id&&!candidate.parentId&&candidate.kind==='galleries'){const option=element('option',candidate.title);option.value=candidate.id;parent.append(option);}parent.value=gallery.parentId??'';parent.onchange=()=>update(gallery.id,{parentId:parent.value||undefined});parentLabel.append(parent);box.append(parentLabel);
         const kindLabel=element('label','Contents'),kind=element('select');for(const [value,title]of [['works','Works'],['galleries','Sub-galleries']]){const option=element('option',title);option.value=value;kind.append(option);}kind.value=gallery.kind;kind.disabled=!!gallery.parentId;kind.onchange=()=>update(gallery.id,{kind:kind.value as 'works'|'galleries'});kindLabel.append(kind);box.append(kindLabel);
         const accessLabel=element('label','Public access'),access=element('select');for(const [value,title]of [['free','Free gallery'],['preview','Previews only']]){const option=element('option',title);option.value=value;access.append(option);}access.value=gallery.access;access.onchange=()=>update(gallery.id,{access:access.value as 'free'|'preview'});accessLabel.append(access);box.append(accessLabel);
         if(gallery.kind==='works'){
+          for(const [linksKey,textKey,heading,defaultText] of [['purchaseLinks','purchaseText','Purchase Links','Want more?'],['externalLinks','externalLinksText','Additional Platform Links','Also available on:']] as const){
+            const group=element('details');group.className='website-gallery-link-editor';group.append(element('summary',heading),element('p',linksKey==='purchaseLinks'?'Link to purchase or subscription pages. Choose a known published destination or add a link manually.':'Link to other places visitors can find this gallery. Choose a known published destination or add a link manually.'));box.append(group);
+            field(group,heading+' heading',gallery[textKey]??defaultText,value=>update(gallery.id,{[textKey]:value||undefined}));
+            const links=element('div');links.dataset.galleryLinkEditor=gallery.id+':'+linksKey;group.append(links);
+            if(mountLinks){cleanupLinks.push(mountLinks(links,{heading,saveSuggestionUrl:client.saveGalleryLink?(id,url,expectedUrl)=>client.saveGalleryLink!(gallery.id,id,url,expectedUrl):undefined,loadSuggestions:client.galleryLinkSuggestions?()=>client.galleryLinkSuggestions!(gallery.id):undefined,purchase:linksKey==='purchaseLinks',value:[...gallery[linksKey]??[]],onChange:value=>update(gallery.id,{[linksKey]:value})}));}
+            else {
+              const renderLinks=()=>{links.replaceChildren();const current=site.namedGalleries!.find(row=>row.id===gallery.id)!;
+                for(const [index,item]of (current[linksKey]??[]).entries()){
+                  const row=element('fieldset');row.append(element('legend',`Link ${index+1}`));
+                  const patch=(values:{label?:string;url?:string;priceText?:string})=>{const latest=site.namedGalleries!.find(g=>g.id===gallery.id)![linksKey]??[];update(gallery.id,{[linksKey]:latest.map((link,i)=>i===index?{...link,...values}:link)});};
+                  field(row,'Link label',item.label,value=>patch({label:value}));field(row,'URL',item.url,value=>patch({url:value}));
+                  if(linksKey==='purchaseLinks')field(row,'Price or detail text (optional)','priceText' in item?String(item.priceText??''):'',value=>patch({priceText:value||undefined}));
+                  row.append(button('Remove link',async()=>{const latest=site.namedGalleries!.find(g=>g.id===gallery.id)![linksKey]??[];update(gallery.id,{[linksKey]:latest.filter((_,i)=>i!==index)});renderLinks();}));links.append(row);
+                }
+              };renderLinks();group.append(button('Add link',async()=>{const current=site.namedGalleries!.find(row=>row.id===gallery.id)!;if((current[linksKey]?.length??0)>=10)throw Error('Use up to 10 links in each group.');update(gallery.id,{[linksKey]:[...current[linksKey]??[],{label:'',url:''}]});renderLinks();}));
+            }
+          }
           const targetLabel=element('label','Publishing destination'),target=element('select');target.append(element('option',hostingTargets.length===1?'Use the website’s only publishing destination':'Choose a publishing destination…'));target.options[0].value='';for(const host of hostingTargets){const option=element('option',host.label);option.value=host.id;target.append(option);}target.value=gallery.hostingTargetId??'';target.onchange=()=>update(gallery.id,{hostingTargetId:target.value||undefined});targetLabel.append(target);box.append(targetLabel);
-          box.append(element('p','Add selected Works here from Gallery destinations, or choose this gallery in Work publishing destinations. A Work can appear in multiple galleries.'));
-          for(const publicationId of site.galleryPublicationIds){const source=catalogue.find(row=>row.id===publicationId),label=element('label',source?.title??site.gallerySettings?.find(row=>row.publicationId===publicationId)?.title??'Selected Work'),check=element('input');check.type='checkbox';check.checked=gallery.publicationIds.includes(publicationId);check.disabled=source?.premium===true&&gallery.access==='free'&&!check.checked;check.onchange=()=>{const current=site.namedGalleries!.find(row=>row.id===gallery.id)!;update(gallery.id,{publicationIds:check.checked?[...new Set([...current.publicationIds,publicationId])]:current.publicationIds.filter(id=>id!==publicationId)});};label.append(check);box.append(label);}
+          box.append(element('p','Choose this website gallery in Works or Collections → Publishing destinations, then use Review and publish. A Work can appear in multiple galleries.'));
+          if(mountWorks){const host=element('div');box.append(host);cleanupLinks.push(mountWorks(host,{website:site,galleryId:gallery.id,reviewBlocked:()=>dirty()?'Save website changes before reviewing Works.':undefined}));}
+
         }
+        if(gallery.kind==='galleries')box.append(button('Browse sub-galleries',async()=>{galleryParentFilter=gallery.id;galleryQuery='';search.value='';refreshGalleryLists();const first=site.namedGalleries?.find(row=>row.parentId===gallery.id);if(first)selectGallery(first.id);}));
         box.append(button('Remove gallery',async()=>{await confirmAction('Remove '+gallery.title+'?','This removes the gallery and its sub-galleries from this website. The original Works remain. This removal cannot be undone. Blocks displaying a removed gallery will need another gallery selected.','Remove gallery',async()=>{const removed=new Set([gallery.id,...(site.namedGalleries??[]).filter(row=>row.parentId===gallery.id).map(row=>row.id)]);const named=site.namedGalleries?.filter(row=>!removed.has(row.id));const retained=site.galleryPublicationIds.filter(id=>!id.startsWith('website-work-')||named?.some(g=>g.publicationIds.includes(id)));site={...site,namedGalleries:named,galleryPublicationIds:retained,gallerySettings:site.gallerySettings?.filter(setting=>retained.includes(setting.publicationId))};await save();await show('Galleries');});}));
       }
-      const add=element('fieldset');add.className='website-named-gallery-new';add.append(element('legend','New gallery'));let title='',kind:'works'|'galleries'='works';field(add,'Gallery name','',value=>title=value);const select=element('select');select.setAttribute('aria-label','New gallery contents');for(const [value,label]of [['works','Works'],['galleries','Sub-galleries']]){const option=element('option',label);option.value=value;select.append(option);}select.onchange=()=>kind=select.value as typeof kind;add.append(select);
-      add.append(button('Add gallery',async()=>{if(!title.trim())throw Error('Add a gallery name.');const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'gallery';let slug=base,n=2;while(site.namedGalleries?.some(row=>!row.parentId&&row.slug===slug))slug=base+'-'+n++;site={...site,namedGalleries:[...site.namedGalleries??[],{id:crypto.randomUUID(),title:title.trim(),slug,kind,access:'free',publicationIds:[]}]};await save();await show('Galleries');}));content.append(add,button('Save galleries',async()=>{await save();await show('Galleries');}));
+      const add=element('fieldset');add.className='website-named-gallery-new';add.append(element('legend','New gallery'));let title='',kind:'works'|'galleries'='works',newParent=galleryParentFilter;field(add,'Gallery name','',value=>title=value);prepareDraft=()=>{if(selectedGallery==='new'&&title)throw new Error('Add the new gallery before previewing your changes.');};const select=element('select');select.setAttribute('aria-label','New gallery contents');for(const [value,label]of [['works','Works'],['galleries','Sub-galleries']]){const option=element('option',label);option.value=value;select.append(option);}select.onchange=()=>kind=select.value as typeof kind;add.append(select);const newParentLabel=element('label','Main gallery'),newParentSelect=element('select');newParentSelect.append(element('option','Top level'));newParentSelect.options[0].value='';for(const gallery of site.namedGalleries??[])if(!gallery.parentId&&gallery.kind==='galleries'){const option=element('option',gallery.title);option.value=gallery.id;newParentSelect.append(option);}newParentSelect.value=newParent;newParentSelect.onchange=()=>{newParent=newParentSelect.value;if(newParent){kind='works';select.value='works';}select.disabled=!!newParent;};select.disabled=!!newParent;newParentLabel.append(newParentSelect);add.append(newParentLabel);
+      add.append(button('Add gallery',async()=>{if(!title.trim())throw Error('Add a gallery name.');const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'gallery';let slug=base,n=2;while(site.namedGalleries?.some(row=>(row.parentId??'')===newParent&&row.slug===slug))slug=base+'-'+n++;selectedGallery=crypto.randomUUID();site={...site,namedGalleries:[...site.namedGalleries??[],{id:selectedGallery,title:title.trim(),slug,kind,parentId:newParent||undefined,access:'free',publicationIds:[]}]};await save();await show('Galleries');}));surface.append(add);
+      const newChoice=button('+ New gallery',async()=>{if(!title){newParent=galleryParentFilter;newParentSelect.value=newParent;select.disabled=!!newParent;if(newParent){kind='works';select.value='works';}}selectGallery('new');});newChoice.className='website-selector-action website-selector-action-secondary';selector.append(newChoice);
+      const saveGalleries=button('Save galleries',async()=>{await save();await show('Galleries');});saveGalleries.className='website-gallery-save';surface.append(saveGalleries);
+      refreshGalleryLists=()=>{
+        const galleries=site.namedGalleries??[],parents=galleries.filter(gallery=>!gallery.parentId&&gallery.kind==='galleries');
+        if(!parents.some(gallery=>gallery.id===galleryParentFilter))galleryParentFilter='';
+        const all=element('option','All galleries');all.value='';parentFilter.replaceChildren(all);for(const gallery of parents){const option=element('option',gallery.title);option.value=gallery.id;parentFilter.append(option);}parentFilter.value=galleryParentFilter;
+        const members=galleries.filter(gallery=>!galleryParentFilter||gallery.id===galleryParentFilter||gallery.parentId===galleryParentFilter);
+        const query=galleryQuery.trim().toLocaleLowerCase();let matches=0;
+        if(selectedGallery!=='new'&&!galleryRows.has(selectedGallery))selectedGallery=members.find(gallery=>gallery.kind==='works')?.id??members[0]?.id??'new';
+        for(const gallery of galleries){const row=galleryRows.get(gallery.id)!;const parent=galleries.find(item=>item.id===gallery.parentId);
+          row.title.textContent=gallery.title;row.heading.textContent=gallery.title;row.box.setAttribute('aria-label','Settings for '+gallery.title);
+          row.meta.textContent=gallery.kind==='galleries'?`${galleries.filter(child=>child.parentId===gallery.id).length} sub-galleries`:`${gallery.access==='preview'?'Previews only':'Free gallery'} · ${gallery.publicationIds.length} items`;
+          row.context.textContent=parent?'Main gallery: '+parent.title:gallery.kind==='galleries'?'Main gallery':'Top-level gallery';
+          const match=members.includes(gallery)&&(!query||[gallery.title,gallery.slug,parent?.title??''].some(value=>value.toLocaleLowerCase().includes(query)));
+          row.choice.dataset.subgallery=String(Boolean(gallery.parentId));row.choice.hidden=!match;if(match)matches++;row.choice.setAttribute('aria-pressed',String(gallery.id===selectedGallery));row.box.hidden=gallery.id!==selectedGallery;
+        }
+        clear.hidden=!galleryQuery;count.textContent=`${matches} of ${members.length} galleries`;empty.hidden=matches>0;
+        empty.textContent=galleries.length?'No galleries match this filter.':'No galleries yet. Create your first gallery below.';
+        add.hidden=selectedGallery!=='new';saveGalleries.hidden=selectedGallery==='new';newChoice.setAttribute('aria-pressed',String(selectedGallery==='new'));measurePages();
+      };
+      refreshGalleryLists();
     }
-    if(tab==='Gallery destinations') {
-      content.append(element('p','Choose the publications to show in your galleries and where each card opens. Connected links use that exact publication and account. Member content stays at its source; choose a public summary and preview for its card.'));
+    if(tab==='Appearance') {
       const catalogue=client.catalogue?await client.catalogue():undefined;if(disposed||renderGeneration!==generation)return;
       const availableModes=options.destinationModes??['local','manual','connected'];
       const destinationPicker=(parent:HTMLElement,label:string,value:WebsiteDestination|undefined,choices:readonly WebsiteCatalogueOption[],change:(v:WebsiteDestination|undefined)=>void,inherit=false)=>{
@@ -476,24 +589,8 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         const visible=()=>{url.parentElement!.hidden=mode.value!=='manual';connection.hidden=mode.value!=='connected';};
         const update=()=>{visible();change(mode.value==='inherit'?undefined:mode.value==='local'?{mode:'local'}:mode.value==='manual'?{mode:'manual',url:manual}:destinations.get(connection.value)??{mode:'connected',destinationId:'',accountId:''});};mode.onchange=update;connection.onchange=update;visible();
       };
-      destinationPicker(content,'Default gallery destination',site.galleryDefault.destination,catalogue??[],destination=>{if(destination)site={...site,galleryDefault:{destination,missing:'error'}};});
-      content.append(button('Save gallery default',save));
-      if(catalogue)for(const publication of catalogue){
-        const label=element('label',publication.title+' · '+(publication.destinationLabel??'Public Work')+(publication.premium?' · Member content':'')),check=element('input');check.type='checkbox';check.checked=site.galleryPublicationIds.includes(publication.id);
-        check.onchange=()=>{const settings=site.gallerySettings?.filter(s=>s.publicationId!==publication.id)??[];if(check.checked&&publication.destination&&(publication.premium||publication.preferLocal!==true))settings.push({publicationId:publication.id,destination:{destination:publication.destination,missing:'error'}});site={...site,galleryPublicationIds:check.checked?[...site.galleryPublicationIds,publication.id]:site.galleryPublicationIds.filter(id=>id!==publication.id),gallerySettings:settings,...(!check.checked?{namedGalleries:site.namedGalleries?.map(gallery=>({...gallery,publicationIds:gallery.publicationIds.filter(id=>id!==publication.id)}))}:{})};};label.append(check);content.append(label);
-      }else field(content,'Selected publication IDs (comma separated)',site.galleryPublicationIds.join(', '),v=>{site={...site,galleryPublicationIds:v.split(',').map(s=>s.trim()).filter(Boolean)};});
-      content.append(button('Save selection',async()=>{await save();await show('Gallery destinations');}));
-      for(const publicationId of site.galleryPublicationIds){
-        const publication=catalogue?.find(p=>p.id===publicationId),row=element('fieldset');row.className='website-gallery-card';row.append(element('legend',publication?.title??'Selected publication'));
-        let setting:WebsiteGallerySettings=site.gallerySettings?.find(s=>s.publicationId===publicationId)??{publicationId};
-        const change=()=>{site={...site,gallerySettings:[...(site.gallerySettings??[]).filter(s=>s.publicationId!==publicationId),setting]};};
-        field(row,'Website title',setting.title??'',v=>{setting={...setting,title:v||undefined};change();});
-        field(row,'Website slug',setting.slug??'',v=>{setting={...setting,slug:v||undefined};change();});
-        destinationPicker(row,'Publication destination',setting.destination?.destination,publication?[publication]:[],destination=>{setting={...setting,destination:destination?{destination,missing:'error'}:undefined};change();},true);
-        const summaryLabel=element('label','Public card summary'),summary=element('textarea');summary.maxLength=5000;summary.value=setting.description??'';summary.placeholder=publication?.premium?'Write a public summary. Protected descriptions are excluded.':'Use the public publication description';summary.onchange=()=>{setting={...setting,description:summary.value};change();};summaryLabel.append(summary);row.append(summaryLabel);
-        await mediaField(row,'Public card preview',setting.previewAssetId,id=>{setting={...setting,previewAssetId:id};change();});if(disposed||renderGeneration!==generation)return;content.append(row);
-      }
-      content.append(button('Save publication overrides',save));
+      destinationPicker(content,'Default card click behavior',site.galleryDefault.destination,catalogue??[],destination=>{if(destination)site={...site,galleryDefault:{destination,missing:'error'}};});
+      content.append(button('Save card default',save));
     }
     if(tab==='Publishing'&&options.exportEnabled!==false) {
       const exportPanel=element('details');exportPanel.className='website-publishing-export';exportPanel.append(element('summary','Download website ZIP'));content.append(exportPanel);
@@ -507,11 +604,12 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
       if(tab==='Publishing') exportPanel.append(button('Download exact candidate ZIP',async()=>{if(!currentBuild)throw new Error('Build a candidate first.');if(client.download)await client.download(currentBuild);else{const blob=await client.export(currentBuild),url=URL.createObjectURL(blob),a=element('a','Download website ZIP');a.href=url;a.download='website.zip';content.append(a);a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}status.textContent='Exported. Upload the files to your hosting provider to publish.';}));
 
     }
+    reportDirty();
     if(!disposed&&root.isConnected){root.scrollIntoView?.({block:'start'});measurePages();}
   };
-  for(const tab of ['Settings','Pages','Layout','Appearance','Galleries','Gallery destinations','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])])tabs.append(button(tab,async()=>{if(!disposed){if(tab==='Preview')await previewPage(site.homePageId);else await show(tab);}}));
+  for(const tab of ['Settings','Pages','Layout','Appearance','Galleries','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])]){const choice=tab==='Preview'?previewButton('Preview',()=>site.homePageId):button(tab,async()=>{if(!disposed)await show(tab);});choice.dataset.websiteTool=tab;tabs.append(choice);}
   const measureTools=()=>{if(win){const height=win.getComputedStyle(tabs).position==='sticky'?tabs.getBoundingClientRect().height:0;root.style.setProperty('--website-tools-height',`${height}px`);scheduleMeasure();}};
   const toolsObserver=typeof ResizeObserver==='undefined'?undefined:new ResizeObserver(measureTools);toolsObserver?.observe(tabs);measureTools();
   const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);notifyWebsitePreviewSaved(value);if(win)registerPreviewProvider(value,win.location.href,client);await show(options.initialTab??'Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;toolsObserver?.disconnect();root.style.removeProperty('--website-tools-height');root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();root.replaceChildren();}};
+  return {ready,destroy(){disposed=true;toolsObserver?.disconnect();root.style.removeProperty('--website-tools-height');root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();for(const cleanup of cleanupLinks.splice(0))cleanup();root.replaceChildren();}};
 };

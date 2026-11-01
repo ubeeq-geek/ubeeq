@@ -11,7 +11,7 @@ test('optional editor renders editing tools and supplied media without mutating 
   const before = structuredClone(value);
   const html = renderToStaticMarkup(createElement(BlockEditor, { value, onChange: () => assert.fail('Render must not commit edits'), allowMedia: true,
     mediaOptions: [{ mediaId: 'asset', label: 'Private original' }] }));
-  assert.match(html, /Active block tools/);
+  assert.doesNotMatch(html, /Active block tools|Remove block/);
   assert.match(html, /Add media block/);
   assert.match(html, /Private original/);
   assert.match(html, /&lt;script&gt;literal&lt;\/script&gt;/);
@@ -59,7 +59,7 @@ test('structured insertion is opt-in and link/credit values remain inert metadat
     { blockId: 'credit', type: 'credit', author: 'Author', text: '<script>literal</script>', url: 'https://example.test' }];
   const props = { value, onChange: () => assert.fail('Render must not edit') };
   const description = renderToStaticMarkup(createElement(BlockEditor, props));
-  assert.doesNotMatch(description, />Section<|>Link block<|>Credit<\/button>/);
+  assert.doesNotMatch(description.slice(description.indexOf('aria-label="Add content block"')), />Section<|>Link block<|>Credit<\/button>/);
   const body = renderToStaticMarkup(createElement(BlockEditor, { ...props, allowStructured: true }));
   assert.match(body, />Section</); assert.match(body, />Link block</); assert.match(body, />Credit<\/button>/);
   assert.match(body, /Credit author/); assert.match(body, /Link URL/);
@@ -76,7 +76,7 @@ test('website sections are flat, individually removable and have closed properti
   assert.ok(flat.every(section=>section.blocks.every(block=>block.type!=='section')));
   assert.deepEqual(flattenWebsiteSections(flat),flat);assert.deepEqual(value,before);
   const html=renderToStaticMarkup(createElement(BlockEditor,{value,websiteOptions:{pages:[],publications:[]},allowStructured:true,onChange:()=>assert.fail('Rendering must not save changes')}));
-  assert.match(html,/Remove section Mailing list/);assert.match(html,/aria-expanded="false">More Actions/);
+  assert.match(html,/Remove section Mailing list/);assert.match(html,/aria-expanded="false" aria-controls="block-settings-main"/);assert.match(html,/> Settings /);assert.match(html,/Anchor slug/);assert.doesNotMatch(html,/>Section title/);
   assert.equal((html.match(/>Section<\/button>/g)||[]).length,1);
   assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,3);
 });
@@ -85,13 +85,18 @@ test('existing top-level galleries become sections with their filters and headin
  const {flattenWebsiteSections}=await import('../dist/block-content.js');
  const gallery={blockId:'gallery',type:'gallery_list',payload:{publicationIds:['one','two'],creatorIdentityIds:['artist'],tags:['prints'],pageSize:6}};
  const value=[{blockId:'heading',type:'heading',level:2,text:'Selected galleries'},gallery],before=structuredClone(value),flat=flattenWebsiteSections(value);
- assert.equal(flat.length,1);assert.equal(flat[0].title,'Selected galleries');assert.deepEqual(flat[0].blocks,[gallery]);assert.deepEqual(value,before);assert.deepEqual(flattenWebsiteSections(flat),flat);
+ assert.equal(flat.length,1);assert.equal(flat[0].title,'Selected galleries');assert.deepEqual(flat[0].blocks,[value[0],gallery]);assert.deepEqual(value,before);assert.deepEqual(flattenWebsiteSections(flat),flat);
  const bare=flattenWebsiteSections([gallery]);assert.equal(bare[0].title,'Galleries');assert.deepEqual(bare[0].blocks,[gallery]);
  const html=renderToStaticMarkup(createElement(BlockEditor,{value,websiteOptions:{pages:[],publications:[]},allowStructured:true,onChange:()=>assert.fail('Rendering must not save')}));
- assert.match(html,/Remove section Selected galleries/);assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,1);
+ assert.match(html,/Remove section Selected galleries/);assert.equal((html.match(/class="portable-section-heading"/g)||[]).length,2);
 });
 
 test('website images are normal insertable blocks with their own source and layout controls',()=>{
  const html=renderToStaticMarkup(createElement(BlockEditor,{value:[{blockId:'image',type:'image',mediaId:'one',caption:'A caption',payload:{alignment:'right',textFlow:'wrap'}}],allowMedia:true,uploadMedia:async()=>({mediaId:'new',label:'Uploaded'}),mediaOptions:[{mediaId:'one',label:'An existing Work',assetType:'image'},{mediaId:'video',label:'Not an image',assetType:'video'}],websiteOptions:{pages:[],publications:[]},onChange:()=>assert.fail('Rendering must not edit')}));
- assert.match(html,/>Image<\/button>/);assert.match(html,/Choose existing image/);assert.match(html,/Upload image/);assert.match(html,/Image alignment/);assert.match(html,/Text flow/);assert.match(html,/Image description \(alt text\)/);assert.match(html,/An existing Work/);assert.doesNotMatch(html,/Not an image|Add image from existing Works or uploads/);
+ assert.match(html,/>Image<\/button>/);assert.match(html,/Choose existing image/);assert.match(html,/Upload image/);assert.doesNotMatch(html,/<select aria-label="(?:Image alignment|Text flow)"/);assert.match(html,/Image description \(alt text\)/);assert.match(html,/An existing Work/);assert.doesNotMatch(html,/Not an image|Add image from existing Works or uploads/);
+});
+
+test('unselected gallery blocks show two explicit placeholders and the selected gallery name without loading gallery contents',()=>{
+ const html=renderToStaticMarkup(createElement(BlockEditor,{value:[{blockId:'section',type:'section',blocks:[{blockId:'gallery',type:'gallery_list',payload:{websiteGalleryId:'main'}}]}],websiteOptions:{galleries:[{id:'main',title:'Main Gallery'}],pages:[],publications:[]},onChange:()=>assert.fail('Preview must not edit')}));
+ assert.match(html,/Gallery layout preview: Main Gallery/);assert.match(html,/Example gallery 1/);assert.match(html,/Example gallery 2/);assert.doesNotMatch(html,/<img|<iframe|Example gallery 3/);
 });

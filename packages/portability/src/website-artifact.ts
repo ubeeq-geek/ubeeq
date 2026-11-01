@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { parse, type DefaultTreeAdapterMap } from 'parse5';
 import { WebsiteError, websitePath, type Website, type WebsiteDependency, type WebsiteDocument, type WebsiteGallery, type WebsitePublicationMapping } from '@ubeeq/core';
-import { renderStaticWebsite, STATIC_BLOCK_SUPPORT, type StaticWebsiteMedia } from '@ubeeq/ui';
+import { renderStaticWebsite, STATIC_BLOCK_SUPPORT, websiteGalleryViewerScript, resolveMediaEmbed, type StaticWebsiteMedia } from '@ubeeq/ui';
 import { parseContentBlocks, resolveWebsiteGallery, websiteRoutes, websiteExternalUrl } from '@ubeeq/core';
 
 export interface WebsitePublicAsset {
@@ -64,14 +64,35 @@ export const createWebsiteZip = (files: ReadonlyMap<string, Uint8Array>): Uint8A
 /** Inspect the actual generated files, including no-script links and fragments. */
 export const validateWebsiteFiles = (site: Website, files: ReadonlyMap<string, Uint8Array>): void => {
   const base=websitePath(site.basePath).replace(/\/$/,''), origin='https://static.invalid';
+  const verifiedPlayerUrls=new Set<string>();
   const ids=new Map<string, Set<string>>(), references: {file:string; value:string}[]=[];
   for (const [file, bytes] of files) {
     if (file.split('/').some(p => !p || p === '.' || p === '..') || file.startsWith('/') || file.includes('\\')) throw new WebsiteError('invalid_output_path','Unsafe generated path.');
+    if(file.endsWith('.js')&&(file!=='assets/gallery-viewer.js'||Buffer.from(bytes).toString('utf8')!==websiteGalleryViewerScript))throw new WebsiteError('unsafe_output','Only the trusted gallery viewer script may be exported.');
     if (!file.endsWith('.html')) continue;
     const root=parse(Buffer.from(bytes).toString('utf8')), pending: DefaultTreeAdapterMap['node'][]=[root], found=new Set<string>(); ids.set(file,found);
     while(pending.length) {
       const node=pending.pop()!;
-      if ('tagName' in node && ['script','iframe','object','embed'].includes(String(node.tagName))) throw new WebsiteError('unsafe_output','Active authored output is not allowed.');
+      if('tagName' in node&&node.tagName==='script'){
+        const attrs=Object.fromEntries(node.attrs.map(a=>[a.name,a.value])),source=files.get('assets/gallery-viewer.js');
+        if(attrs.src!==base+'/assets/gallery-viewer.js'||!Object.hasOwn(attrs,'defer')||Object.keys(attrs).some(key=>!['src','defer'].includes(key))||node.childNodes.some(child=>'value' in child&&child.value.trim())||!source||Buffer.from(source).toString('utf8')!==websiteGalleryViewerScript)throw new WebsiteError('unsafe_output','Only the trusted gallery viewer script may execute.');
+      }
+      if('tagName' in node&&node.tagName==='iframe'){
+        const attrs=Object.fromEntries(node.attrs.map(attr=>[attr.name,attr.value])),kind=attrs['data-website-media-embed'];
+        let player:ReturnType<typeof resolveMediaEmbed>|undefined;
+        if(kind==='video'||kind==='audio')try{player=resolveMediaEmbed(attrs.src??'',kind);}catch{}
+        const allowed=['data-website-media-embed','src','title','height','loading','allow','allowfullscreen','sandbox','referrerpolicy'];
+        if(node.namespaceURI!=='http://www.w3.org/1999/xhtml'||!player||attrs.src!==player.src||!attrs.title?.trim()
+          ||Object.keys(attrs).some(key=>!allowed.includes(key))
+          ||attrs.loading!=='lazy'||attrs.allow!=='autoplay; encrypted-media; fullscreen; picture-in-picture'
+          ||!Object.hasOwn(attrs,'allowfullscreen')||attrs.allowfullscreen!==''
+          ||attrs.sandbox!=='allow-scripts allow-same-origin allow-presentation allow-popups'
+          ||attrs.referrerpolicy!=='strict-origin-when-cross-origin'
+          ||(player.height?attrs.height!==String(player.height):Object.hasOwn(attrs,'height'))
+          ||node.childNodes.some(child=>child.nodeName!=='#text'||'value' in child&&child.value.trim()))throw new WebsiteError('unsafe_output','Only supported, validated video and audio players may be embedded.');
+        verifiedPlayerUrls.add(player.src);
+      }
+      if ('tagName' in node && ['object','embed'].includes(String(node.tagName))) throw new WebsiteError('unsafe_output','Active authored output is not allowed.');
       if ('tagName' in node && node.tagName==='form') {
         const attrs=Object.fromEntries(node.attrs.map(a=>[a.name,a.value]));
         if(attrs['data-website-mailing']!=='true'||attrs.method!=='post'||!attrs.action)throw new WebsiteError('unsafe_output','Only generated mailing-list signup forms are allowed.');
@@ -89,7 +110,7 @@ export const validateWebsiteFiles = (site: Website, files: ReadonlyMap<string, U
   for (const ref of references) {
     const pagePath=base+'/'+(ref.file === 'index.html' ? '' : ref.file.replace(/index\.html$/,''));
     const target=new URL(ref.value,origin+pagePath);
-    if (target.origin !== origin) { websiteExternalUrl(ref.value,true); continue; }
+    if (target.origin !== origin) { if(!verifiedPlayerUrls.has(ref.value))websiteExternalUrl(ref.value,true); continue; }
     if (!(target.pathname === base+'/' || target.pathname.startsWith(base+'/'))) throw new WebsiteError('broken_link','Generated link escapes the hosting base path.');
     const path=decodeURIComponent(target.pathname.slice(base.length+1)), file=path.endsWith('/') || !path ? path+'index.html' : path;
     if (!files.has(file)) throw new WebsiteError('broken_link',`Missing generated link or asset: ${file}`);

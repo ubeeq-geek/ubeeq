@@ -18,7 +18,7 @@ test('platform actions resolve current settings and unconfigured actions do not 
  input.website.theme.settings.mailingListUrl='javascript:alert(1)';assert.throws(()=>websiteRoutes(input.website));assert.throws(()=>renderStaticWebsite(input));
 });
 test('membership page has editable plans and accessible questions without fabricated prices',()=>{
- const input=fixture();input.documents.set('doc',{blocks:websitePresetBlocks('modernist','membership',()=>crypto.randomUUID())});const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/section-pricing/);assert.match(html,/<details class="website-faq"><summary>/);assert.doesNotMatch(html,/\$\d|<form|<script/);
+ const input=fixture();input.documents.set('doc',{blocks:websitePresetBlocks('modernist','membership',()=>crypto.randomUUID())});const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/section-pricing/);assert.match(html,/<details class="website-faq"[^>]*><summary>/);assert.doesNotMatch(html,/\$\d|<form|<script/);
 });
 test('premium cards link approved previews to the access destination',()=>{
  const input=fixture();input.media.set('preview',{src:'/assets/public.jpg',mimeType:'image/jpeg',alt:'Approved public preview'});input.galleries=[{publicationId:'premium',title:'Members gallery',href:'https://platform.example/gallery/1',local:false,premium:true,previewAssetIds:['preview'],publicAssetIds:[],tags:[],collectionIds:[],date:'2026-10-20'}];const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/href="https:\/\/platform.example\/gallery\/1"><img/);assert.match(html,/Public preview · membership access/);assert.doesNotMatch(html,/Download|unlocked|8K/);
@@ -123,4 +123,55 @@ test('named gallery blocks render two-level child galleries and reuse Work pages
  assert.ok(files.has('galleries/work/index.html'));
  const invalid=structuredClone(input.website);invalid.namedGalleries[0].parentId='free';assert.throws(()=>websiteRoutes(invalid),/two levels/);
  input.website.namedGalleries[1].access='premium';assert.throws(()=>websiteRoutes(input.website),/Name each gallery/);
+});
+
+
+test('section names render as unique fragment anchors without automatic headings',()=>{
+ const input=fixture();
+ input.documents.set('doc',{blocks:[
+  {id:'one',type:'section',title:'Selected Galleries',children:[{id:'explicit',type:'heading',text:'My chosen heading',level:2},{id:'jump',type:'link',label:'Jump',url:'#selected-galleries'}]},
+  {id:'two',type:'section',title:'Selected Galleries',children:[]},
+  {id:'three',type:'section',title:'Unused title',data:{anchor:'Custom Anchor'},children:[]},
+  {id:'four',type:'section',title:'Unused title',data:{anchor:''},children:[]},
+  {id:'reserved',type:'section',title:'main',children:[]},
+  {id:'question',type:'section',title:'Legacy question?',data:{anchor:'question',presentation:'faq_item',summary:'Visible question?'},children:[]}
+ ]});
+ const html=renderStaticWebsite(input).files.get('index.html');
+ assert.match(html,/<section class="section-standard" id="selected-galleries">/);
+ assert.match(html,/id="selected-galleries-2"/);assert.match(html,/id="custom-anchor"/);assert.match(html,/id="section-main"/);
+ assert.match(html,/href="#selected-galleries"/);assert.match(html,/>My chosen heading<\/h2>/);
+ assert.doesNotMatch(html,/<h2[^>]*>Selected Galleries|Unused title|Legacy question/);
+ assert.match(html,/<details class="website-faq" id="question"><summary>Visible question\?<\/summary>/);
+});
+
+
+test('portable gallery redirects forward automatically under the website base path',()=>{
+ const input=fixture();input.website.basePath='/artist/';input.website.namedGalleries=[{id:'collection',title:'Collection',slug:'latest',kind:'works',access:'free',publicationIds:[]}];input.website.redirects=[{from:'/galleries/collections/old/',to:'/galleries/collections/latest/',status:301}];
+ const files=renderStaticWebsite(input).files,html=files.get('galleries/collections/old/index.html');
+ assert.match(html,/<meta http-equiv="refresh" content="0;url=\/artist\/galleries\/collections\/latest\/">/);
+ assert.match(html,/href="\/artist\/galleries\/collections\/latest\/"/);
+ assert.doesNotMatch(html,/window\.location|location\.replace/);
+ assert.deepEqual(JSON.parse(files.get('redirects.json')).redirects,[{from:'/artist/galleries/collections/old/',to:'/artist/galleries/collections/latest/',status:301}]);
+});
+
+test('website lists render semantic ordered and unordered items with safe resolved links',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[{id:'numbered',type:'paragraph',data:{listStyle:'ordered'},html:'<ol><li>First</li><li><a href="https://example.com">Second</a></li></ol>'},{id:'bullets',type:'paragraph',data:{listStyle:'unordered'},html:'<ul><li><em>Third</em></li></ul>'}]});
+ const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/<ol><li>First<\/li><li><a href="https:\/\/example.com\//);assert.match(html,/<ul><li><em>Third<\/em><\/li><\/ul>/);assert.doesNotMatch(html,/<p[^>]*><(?:ol|ul)>/);
+});
+
+test('website export preserves letter and dash list markers',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[
+  {id:'letters',type:'paragraph',data:{listStyle:'ordered',listMarker:'letters'},html:'<ol><li>First</li></ol>'},
+  {id:'dashes',type:'paragraph',data:{listStyle:'unordered',listMarker:'dashes'},html:'<ul><li>Second</li></ul>'}
+ ]});
+ const files=renderStaticWebsite(input).files,html=files.get('index.html');
+ assert.match(html,/<ol type="a"><li>First<\/li><\/ol>/);
+ assert.match(html,/<ul data-list-marker="dashes"><li>Second<\/li><\/ul>/);
+ assert.ok([...files.values()].some(content=>typeof content==='string'&&content.includes('ul[data-list-marker="dashes"]{list-style-type:"– "}')));
+});
+
+test('website media embed blocks export only validated player frames and keep other embeds on link fallback',()=>{
+ const input=fixture();input.documents.set('doc',{blocks:[{id:'video',type:'embed',url:'https://youtu.be/M7lc1UVf-VE',label:'My video',data:{embedKind:'video'}},{id:'audio',type:'embed',url:'https://open.spotify.com/track/0Lr4kGOYn9l83EjuK6cZFQ',data:{embedKind:'audio'}}]});
+ const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/data-website-media-embed="video" src="https:\/\/www.youtube-nocookie.com\/embed\/M7lc1UVf-VE" title="My video"/);assert.match(html,/data-website-media-embed="audio"/);assert.match(html,/allowfullscreen sandbox=/);assert.match(html,/href="https:\/\/www.youtube.com\/watch\?v=M7lc1UVf-VE"/);
+ input.documents.get('doc').blocks[0].url='https://example.com/iframe';assert.throws(()=>renderStaticWebsite(input),/YouTube, Vimeo, or Bunny/);
 });
