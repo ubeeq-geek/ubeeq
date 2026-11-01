@@ -63,3 +63,22 @@ test('Pages lost-response reconciliation distinguishes repeated identical conten
  const adapter=new CloudflarePagesWebsiteHostingAdapter({credential:async()=> 'token',probe:goodProbe,fetch:async(url,init)=>{if(init.method==='POST')posts++;const u=new URL(url);const result=u.pathname.endsWith('/deployments')?[{id:'old',environment:'production',deployment_trigger:{metadata:{...metadata,commit_message:'older-attempt'}}},{id:'new',environment:'production',deployment_trigger:{metadata}}]:u.pathname.endsWith('/deployments/new')?{id:'new',environment:'production',latest_stage:{status:'success'},deployment_trigger:{metadata}}:{id:'remote',canonical_deployment:{id:'new'}};return json({success:true,result});}});
  assert.equal((await adapter.reconcile(c)).releaseId,'new');assert.equal(posts,0);
 });
+
+test('hosting verification checks the trusted gallery script and accepts standard JavaScript MIME types',async()=>{
+ for(const mime of ['text/javascript; charset=utf-8','application/javascript']){
+  const c=context('hostinger');c.artifact.files.set('assets/gallery-viewer.js',Buffer.from('trusted-gallery-fixture'));
+  const seen=[];const probe=createHostingPublicProbe({authorizeUrl:async()=>{},verifyContents:true,fetch:async(url)=>{
+   const file=new URL(url).pathname.slice(1);seen.push(file);
+   if(file==='ubeeq-release.json')return Response.json({release:c.artifact.marker});
+   if(file.startsWith('ubeeq-missing-'))return new Response(null,{status:404});
+   const bytes=c.artifact.files.get(file||'index.html');return new Response(bytes,{headers:{'content-type':file.endsWith('.js')?mime:'text/html'}});
+  }});
+  assert.equal((await probe(c)).publicConfirmed,true);assert.ok(seen.includes('assets/gallery-viewer.js'));
+ }
+});
+
+test('native hosting redirects preserve historical collection-gallery paths under a site prefix',async()=>{
+ const {hostingRedirectFiles}=await import('../dist/website-hosting-http.js');
+ const files=hostingRedirectFiles(new Map([['redirects.json',Buffer.from(JSON.stringify({apiVersion:'1',redirects:[{from:'/artist/galleries/collections/old/',to:'/artist/galleries/collections/new/',status:301}]}))]]));
+ assert.equal(files.get('_redirects').toString(),'/artist/galleries/collections/old/ /artist/galleries/collections/new/ 301\n');
+});

@@ -59,6 +59,10 @@ export interface WebsiteNamedGallery {
   id: string; title: string; slug: string; parentId?: string;
   kind: 'works' | 'galleries'; access: 'free' | 'preview'; hostingTargetId?: string;
   publicationIds: readonly string[];
+  externalLinksText?: string;
+  externalLinks?: readonly {label:string;url:string}[];
+  purchaseText?: string;
+  purchaseLinks?: readonly {label:string;url:string;priceText?:string}[];
 }
 export const websiteNamedGalleryPath = (site: Pick<Website,'namedGalleries'>, gallery: WebsiteNamedGallery):string => {
   const parent=gallery.parentId?site.namedGalleries?.find(row=>row.id===gallery.parentId):undefined;
@@ -198,6 +202,15 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
   const names=new Set<string>();
   for(const gallery of named){
     if(typeof gallery.id!=='string'||!/^[a-zA-Z0-9_:-]{1,160}$/.test(gallery.id)||typeof gallery.title!=='string'||!gallery.title.trim()||gallery.title.length>120||typeof gallery.slug!=='string'||!gallery.slug||gallery.slug.includes('/')||gallery.hostingTargetId!==undefined&&(typeof gallery.hostingTargetId!=='string'||!gallery.hostingTargetId||gallery.hostingTargetId.length>200)||!['works','galleries'].includes(gallery.kind)||!['free','preview'].includes(gallery.access)||!Array.isArray(gallery.publicationIds)||new Set(gallery.publicationIds).size!==gallery.publicationIds.length||gallery.publicationIds.some((id:string)=>!site.galleryPublicationIds.includes(id)))throw new WebsiteError('invalid_gallery','Name each gallery and select publications from this website.');
+    for(const [heading,links] of [[gallery.purchaseText,gallery.purchaseLinks],[gallery.externalLinksText,gallery.externalLinks]] as const){
+      if(heading!==undefined&&(typeof heading!=='string'||heading.length>1000))throw new WebsiteError('invalid_gallery','Link group text must be at most 1,000 characters.');
+      if(links===undefined)continue;
+      if(!Array.isArray(links)||links.length>10)throw new WebsiteError('invalid_gallery','Use up to 10 links per gallery link group.');
+      for(const item of links){
+        if(!item||typeof item.label!=='string'||!item.label.trim()||item.label.length>120||typeof item.url!=='string'||item.url.length>1000||'priceText' in item&&item.priceText!==undefined&&(typeof item.priceText!=='string'||item.priceText.length>120))throw new WebsiteError('invalid_gallery','Each link needs a label and a public web address. Price text is optional.');
+        websiteExternalUrl(item.url);
+      }
+    }
     const slug=websitePath(gallery.slug),identity=(gallery.parentId??'')+':'+slug;
     if(names.has(identity))throw new WebsiteError('invalid_gallery','Gallery paths must be unique within their parent.');names.add(identity);
     const parent=gallery.parentId?named.find(row=>row.id===gallery.parentId):undefined;
@@ -230,11 +243,12 @@ export const websiteRoutes = (site: Website): ReadonlyMap<string, string> => {
     occupied.add(route); routes.set(page.id, route);
   }
   for(const gallery of named){const path=websiteNamedGalleryPath(site,gallery);if(occupied.has(path))throw new WebsiteError('route_collision','A named gallery conflicts with a page route.');occupied.add(path);}
+  const redirectTargets=new Set([...site.pages.filter(p=>p.state==='ready').map(p=>routes.get(p.id)!),...named.map(g=>websiteNamedGalleryPath(site,g))]);
   for (const redirect of site.redirects) {
     const route = websitePath(redirect.from);
-    if (occupied.has(route) || route === '/' || /^\/(assets|galleries|updates|page|embed)\//.test(route) || ![301,308].includes(redirect.status)) throw new WebsiteError('route_collision', 'Redirect collides with a page or reserved namespace.');
+    if (occupied.has(route) || route === '/' || (/^\/(assets|page|embed)\//.test(route)||route.startsWith('/galleries/')&&!/^\/galleries\/collections\/[^/]+\/(?:[^/]+\/)?$/.test(route)||route.startsWith('/updates/')&&!/^\/updates\/[^/]+\/$/.test(route)) || ![301,308].includes(redirect.status)) throw new WebsiteError('route_collision', 'Redirect collides with a page or reserved namespace.');
     occupied.add(route);
-    if (redirect.to.startsWith('/')) { const to = websitePath(redirect.to); if (![...routes.values()].includes(to) || to === route) throw new WebsiteError('invalid_redirect', 'Internal redirects must point directly to an existing page.'); }
+    if (redirect.to.startsWith('/')) { const to = websitePath(redirect.to); if (!redirectTargets.has(to) || to === route) throw new WebsiteError('invalid_redirect', 'Internal redirects must point directly to a ready page or collection gallery.'); }
     else websiteExternalUrl(redirect.to);
   }
   return routes;

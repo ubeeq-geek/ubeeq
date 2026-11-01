@@ -32,7 +32,7 @@ const isSafeLink = (value: string): boolean => {
 /** One inert HTML parser for server and browser. Reconstruct only the inline allowlist;
  * never serialize source nodes or attributes. Input and visited-node budgets fail closed.
  */
-const inlineContent = (value: string, plainText: boolean): string => {
+const inlineContent = (value: string, plainText: boolean, preserveLists = false, resetFormatting = false): string => {
   if (!value) return '';
   if (value.length > 1_048_576) throw new Error('Inline content exceeds its input budget.');
   const root = parseFragment(value);
@@ -41,7 +41,7 @@ const inlineContent = (value: string, plainText: boolean): string => {
   // HTML parsing replaces null characters in source text, so this internal
   // marker cannot collide with text supplied by the editor.
   const paragraphBoundary = '\u0000paragraph\u0000';
-  let visited = 0;
+  let visited = 0;const listCounts=new Map<object,number>();
   while (stack.length) {
     const node = stack.pop()!;
     if (typeof node === 'string') { output.push(node); continue; }
@@ -53,9 +53,11 @@ const inlineContent = (value: string, plainText: boolean): string => {
     if (tag === 'br') { output.push(plainText ? '\n' : '<br>'); continue; }
     let start = '', end = '';
     if (tag === 'div' || tag === 'p') { start = paragraphBoundary; end = paragraphBoundary; }
+    else if (plainText && tag === 'li') { const parent=node.parentNode;const ordered=parent&&'tagName' in parent&&parent.tagName==='ol';const index=parent?(listCounts.get(parent)??0)+1:1;if(parent)listCounts.set(parent,index);const letters=ordered&&parent&&'attrs' in parent&&parent.attrs.some(attr=>attr.name==='type'&&attr.value==='a');const dashes=parent&&'attrs' in parent&&parent.attrs.some(attr=>attr.name==='data-list-marker'&&attr.value==='dashes');let label='';for(let number=index;number>0;number=Math.floor((number-1)/26))label=String.fromCharCode(97+(number-1)%26)+label;start=ordered?`${letters?label:index}. `:dashes?'– ':'• ';end='\n'; }
     else if (!plainText) {
       const normalized = ({ b: 'strong', strong: 'strong', i: 'em', em: 'em', u: 'u', s: 's', strike: 's', code: 'code' } as Record<string, string>)[tag];
-      if (normalized) { start = '<' + normalized + '>'; end = '</' + normalized + '>'; }
+      if (normalized && !resetFormatting) { start = '<' + normalized + '>'; end = '</' + normalized + '>'; }
+      else if (preserveLists && ['ol','ul','li'].includes(tag)) { const marker=!resetFormatting&&tag==='ol'&&node.attrs.some(attr=>attr.name==='type'&&attr.value==='a')?' type="a"':!resetFormatting&&tag==='ul'&&node.attrs.some(attr=>attr.name==='data-list-marker'&&attr.value==='dashes')?' data-list-marker="dashes"':'';start='<'+tag+marker+'>';end='</'+tag+'>'; }
       else if (tag === 'li') { start = '• '; end = '<br>'; }
       else if (tag === 'a') {
         const href = node.attrs.find(attribute => attribute.name === 'href')?.value || '';
@@ -77,6 +79,44 @@ const inlineContent = (value: string, plainText: boolean): string => {
 export const sanitizeInlineHtml = (value: string): string => inlineContent(value, false);
 export const inlineHtmlToText = (value: string): string => inlineContent(value, true);
 
+/** Lists remain paragraph blocks with an explicit presentation, preserving existing storage contracts. */
+export const blockListStyle = (block: Pick<PostBlock,'type'|'payload'>): 'ordered'|'unordered'|undefined => block.type==='paragraph'&&(block.payload?.listStyle==='ordered'||block.payload?.listStyle==='unordered')?block.payload.listStyle:undefined;
+export type ListMarker = 'numbers'|'letters'|'dashes'|'dots';
+export const blockListMarker = (block:Pick<PostBlock,'type'|'payload'>):ListMarker => {
+  const ordered=blockListStyle(block)==='ordered';
+  return ordered?(block.payload?.listMarker==='letters'?'letters':'numbers'):(block.payload?.listMarker==='dashes'?'dashes':'dots');
+};
+export const sanitizeListHtml = (value:string,style:'ordered'|'unordered',marker?:ListMarker):string => {
+  const safe=inlineContent(value,false,true),root=parseFragment(safe),items:string[]=[];let pending:string[]=[];
+  const nesting=root.childNodes.map(node=>({node,depth:1}));while(nesting.length){const {node,depth}=nesting.pop()!;if(depth>128)throw new Error('List content exceeds its nesting limit.');if('childNodes' in node)for(const child of node.childNodes)nesting.push({node:child,depth:depth+1});}
+  const flush=()=>{const content=pending.join('');if(content.trim())items.push('<li>'+content+'</li>');pending=[];};
+  for(const node of root.childNodes){
+    if('tagName' in node&&['ol','ul'].includes(node.tagName)){flush();for(const child of node.childNodes)if('tagName' in child&&child.tagName==='li')items.push(serializeOuter(child));}
+    else if('tagName' in node&&node.tagName==='li'){flush();items.push(serializeOuter(node));}
+    else pending.push(serializeOuter(node));
+  }
+  flush();const tag=style==='ordered'?'ol':'ul';const attributes=style==='ordered'&&marker==='letters'?' type="a"':style==='unordered'&&marker==='dashes'?' data-list-marker="dashes"':'';return `<${tag}${attributes}>${items.join('')||'<li><br></li>'}</${tag}>`;
+};
+export const textBlockHtml = (block:Pick<PostBlock,'type'|'payload'|'html'|'text'|'quote'>):string => {
+  const value=block.html??textToInlineHtml(block.quote||block.text||''),style=blockListStyle(block);
+  return style?sanitizeListHtml(value,style,blockListMarker(block)):sanitizeInlineHtml(value);
+};
+/** Reset presentation overrides while retaining content, links and semantic block types. */
+export function resetBlockPresentation(block:PostBlock):PostBlock {
+  const payload={...block.payload};
+  if(['paragraph','heading','quote'].includes(block.type)){
+    delete payload.textAlign;delete payload.listMarker;
+    const clean=inlineContent(block.html??textToInlineHtml(block.quote||block.text||''),false,true,true);
+    const next={...block,payload,html:clean};
+    const html=textBlockHtml(next),text=inlineHtmlToText(html);
+    return {...next,html,text,...(block.type==='quote'?{quote:text}:{})};
+  }
+  if(block.type==='image')for(const field of ['alignment','textFlow','desktopWidth','mobileWidth'])delete payload[field];
+  if(block.type==='link')delete payload.appearance;
+  return {...block,payload};
+}
+export const createListBlock = (style:'ordered'|'unordered'):PostBlock => ({...createDescriptionBlock(),payload:{listStyle:style},html:sanitizeListHtml('',style)});
+
 export const textToInlineHtml = (value: string): string => escapeHtml(value).replace(/\r\n?|\n/g, '<br>');
 
 export const createDescriptionBlock = (type: DescriptionBlockType = 'paragraph'): PostBlock => ({
@@ -96,6 +136,7 @@ export const createStructuredBlock = (type: 'section' | 'link' | 'credit'): Post
 const blockFromElement = (element: DefaultTreeAdapterMap['element']): PostBlock | null => {
   const tag = element.tagName;
   if (tag === 'hr') return createDescriptionBlock('divider');
+  if(tag==='ol'||tag==='ul'){const block=createListBlock(tag==='ol'?'ordered':'unordered');const marker=tag==='ol'&&element.attrs.some(attr=>attr.name==='type'&&attr.value==='a')?'letters':tag==='ul'&&element.attrs.some(attr=>attr.name==='data-list-marker'&&attr.value==='dashes')?'dashes':undefined;if(marker)block.payload={...block.payload,listMarker:marker};block.html=sanitizeListHtml(serializeOuter(element),blockListStyle(block)!,marker);block.text=inlineHtmlToText(block.html).trim();return block;}
   const html = sanitizeInlineHtml(serialize(element));
   const text = inlineHtmlToText(html).trim();
   if (!text && !html.includes('<br>')) return null;
@@ -152,10 +193,7 @@ export const parseDescriptionBlocks = (value?: string): PostBlock[] => {
   return blocks.length ? blocks : [createDescriptionBlock()];
 };
 
-const inlineHtmlForBlock = (block: PostBlock): string => {
-  if (block.html !== undefined) return sanitizeInlineHtml(block.html);
-  return textToInlineHtml(block.quote || block.text || '');
-};
+const inlineHtmlForBlock = textBlockHtml;
 
 export const normalizeDescriptionBlocks = (blocks: PostBlock[]): PostBlock[] => blocks
   .filter((block) => descriptionBlockTypes.has(block.type))
@@ -166,6 +204,7 @@ export const normalizeDescriptionBlocks = (blocks: PostBlock[]): PostBlock[] => 
     return {
       blockId: block.blockId || createBlockId(),
       type: block.type,
+      ...(blockListStyle(block)?{payload:{listStyle:blockListStyle(block),...(block.payload?.listMarker?{listMarker:blockListMarker(block)}:{})}}:{}),
       ...(block.type === 'heading' ? { level: Math.max(1, Math.min(6, block.level || 2)) } : {}),
       ...(block.type === 'quote' ? { quote: text } : {}),
       text,
@@ -185,6 +224,7 @@ export const serializeDescriptionBlocks = (
     return `<h${level}>${html}</h${level}>`;
   }
   if (block.type === 'quote') return `<blockquote>${html}</blockquote>`;
+  if (blockListStyle(block)) return html;
   return `<p>${html}</p>`;
 }).filter(Boolean).join('');
 
@@ -213,6 +253,25 @@ export const movePostBlock = (blocks: PostBlock[], blockId: string, direction: -
   if (target >= 0 && target < next.length) [next[index], next[target]] = [next[target], next[index]];
   return next;
 };
+
+/** Section names identify fragment links, not visible headings. */
+export function websiteSectionSlug(value:unknown):string {
+  if(typeof value!=='string')return '';
+  const slug=value.normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9_-]+/g,'-').replace(/^-+|-+$/g,'').slice(0,100);
+  return slug&&(!/^[a-z]/.test(slug)||slug==='main'||/^heading-\d+$/.test(slug))?'section-'+slug:slug;
+}
+export function websiteSectionAnchors(blocks:readonly PostBlock[]):Map<string,string> {
+  const anchors=new Map<string,string>(),used=new Set<string>();let sectionNumber=0;
+  const visit=(items:readonly PostBlock[])=>{for(const block of items){
+    if(block.type==='section'){
+      sectionNumber++;
+      const base=websiteSectionSlug(block.payload?.anchor??block.title)||`section${sectionNumber}`;
+      if(base){let slug=base,n=2;while(used.has(slug))slug=base+'-'+n++;used.add(slug);anchors.set(block.blockId,slug);}
+    }
+    if(block.blocks)visit(block.blocks);
+  }};
+  visit(blocks);return anchors;
+}
 
 /** Promote website subsections without dropping content or changing its reading order. */
 export function flattenWebsiteSections(blocks: PostBlock[]): PostBlock[] {
@@ -245,7 +304,8 @@ export function flattenWebsiteSections(blocks: PostBlock[]): PostBlock[] {
   for (let index=0;index<result.length;index++) {
     const block=result[index],next=result[index+1];
     if (block.type==='heading' && (block.level??2)===2 && isGallery(next)) {
-      sections.push({blockId:block.blockId,type:'section',title:block.text || inlineHtmlToText(block.html || '') || 'Galleries',blocks:[next],payload:{presentation:'standard'}});
+      let id=block.blockId+'-section';while(used.has(id))id+='-section';used.add(id);
+      sections.push({blockId:id,type:'section',title:block.text || inlineHtmlToText(block.html || '') || 'Galleries',blocks:[block,next],payload:{presentation:'standard'}});
       index++;
     } else if (isGallery(block)) {
       let id=block.blockId+'-section';

@@ -3,13 +3,24 @@ export { CropCanvas } from './crop-canvas.js';
 export { PrivateMediaPlayer, type PrivateMediaPlayerProps } from './private-media-player.js';
 export { BlockPreview, type BlockPreviewMedia, type BlockMediaRenderer } from './block-preview.js';
 export { WebsiteWorkspace } from './website-workspace-react.js';
+import {MediaEmbedEditor} from './media-embed-react.js';
+import {GalleryBlockPreview,type EditorWebsiteOptions} from './gallery-block-preview.js';
+export type {EditorWebsiteOptions} from './gallery-block-preview.js';
 import type { StoredPostBlock as PostBlock } from '@ubeeq/core';
 import {
   flattenWebsiteSections,
+  websiteSectionSlug,
+  websiteSectionAnchors,
   splitParagraphBlock,
   createDescriptionBlock,
   createStructuredBlock,
-  changeTextBlockType,
+  createListBlock,
+  resetBlockPresentation,
+  blockListStyle,
+  blockListMarker,
+  type ListMarker,
+  textBlockHtml,
+  sanitizeListHtml,
   movePostBlock,
   inlineHtmlToText,
   sanitizeInlineHtml,
@@ -33,13 +44,35 @@ export type BlockEditorProps = {
   allowMedia?: boolean;
   uploadMedia?: (file:File)=>Promise<BlockEditorMediaOption>;
   allowStructured?: boolean;
-  websiteOptions?: { galleries?: readonly {id:string;title:string}[]; creators?: readonly {id:string;title:string}[]; pages: readonly { id: string; title: string }[]; publications: readonly { id: string; title: string }[] };
+  websiteOptions?: EditorWebsiteOptions;
   readOnly?: boolean;
   sectionDepth?: number;
   stickyToolbarOffset?: number;
+  /** Nested editor selection follows its selected parent section. */
+  selectionActive?: boolean;
 };
 
 const textBlockTypes = new Set<PostBlock['type']>(['paragraph', 'heading', 'quote']);
+
+function BlockTypeIcon({type}:{type:string}) {
+  const paths:Record<string,string>={
+    heading:'M5 4v16M19 4v16M5 12h14',
+    paragraph:'M13 4H8a5 5 0 0 0 0 10h5M13 4v16M18 4v16M8 4h12',
+    image:'M3 3h18v18H3ZM3 16l5-5 5 5 3-3 5 5M8 7h.01',
+    gallery_list:'M3 3h7v7H3ZM14 3h7v7h-7ZM3 14h7v7H3ZM14 14h7v7h-7Z',
+    quote:'M4 6h6v7H5c0 3 2 4 4 4M14 6h6v7h-5c0 3 2 4 4 4',
+    ordered_list:'M3 4h1v5M3 9h3M3 14c3-2 4 1 1 3l-1 2h3M10 6h11M10 12h11M10 18h11',
+    unordered_list:'M4 6h.01M4 12h.01M4 18h.01M9 6h12M9 12h12M9 18h12',
+    divider:'M3 12h18M7 7h10M7 17h10',
+    section:'M3 3h18v18H3ZM3 9h18M7 13h10M7 17h7',
+    link:'m10 13 4-4m-6 7-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 0 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0',
+    credit:'M15 7a3 3 0 1 1-6 0 3 3 0 0 1 6 0M5 21v-2a7 7 0 0 1 14 0v2',
+    video:'M3 4h18v16H3ZM10 8l6 4-6 4Z',
+    audio:'M4 10v4M8 6v12M12 3v18M16 6v12M20 10v4',
+    file:'M5 3h9l5 5v13H5ZM14 3v6h5M9 13h6M9 17h6'
+  };
+  return <svg className="portable-block-type-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false"><path d={paths[type]??paths.section}/></svg>;
+}
 
 function EditableBlockContent({
   block,
@@ -53,7 +86,7 @@ function EditableBlockContent({
   readOnly?: boolean;
 }) {
   const elementRef = useRef<HTMLDivElement | null>(null);
-  const html = sanitizeInlineHtml(block.html !== undefined ? block.html : textToInlineHtml(block.quote || block.text || ''));
+  const html = textBlockHtml(block);
 
   useEffect(() => {
     const element = elementRef.current;
@@ -68,6 +101,8 @@ function EditableBlockContent({
       if (element && document.activeElement !== element && element.innerHTML !== html) element.innerHTML = html;
     }}
     className={`portable-block-editor-content portable-block-editor-content-${block.type}`}
+    data-list-marker={blockListStyle(block)?blockListMarker(block):undefined}
+    data-heading-level={block.type==='heading'?Math.max(1,Math.min(6,block.level||2)):undefined}
     style={['left','center','right'].includes(String(block.payload?.textAlign))?{textAlign:block.payload!.textAlign as 'left'|'center'|'right'}:undefined}
     contentEditable={!readOnly}
     suppressContentEditableWarning
@@ -90,23 +125,17 @@ export function BlockEditor({
   allowStructured = false,
   websiteOptions,
   sectionDepth = 0,
-  stickyToolbarOffset = 0,
+  selectionActive = true,
   readOnly = false
 }: BlockEditorProps) {
   const [emptyBlock] = useState(() => createDescriptionBlock());
-  const toolbarRef=useRef<HTMLDivElement>(null);
-  const [toolbarHeight,setToolbarHeight]=useState(0);
-  useEffect(()=>{
-    const toolbar=toolbarRef.current;if(!websiteOptions||!toolbar)return;
-    const measure=()=>setToolbarHeight(toolbar.getBoundingClientRect().height);measure();
-    if(typeof ResizeObserver==='undefined')return;const observer=new ResizeObserver(measure);observer.observe(toolbar);return()=>observer.disconnect();
-  },[Boolean(websiteOptions),readOnly]);
   const normalized = useMemo(() => websiteOptions && sectionDepth === 0 ? flattenWebsiteSections(value) : value, [value, Boolean(websiteOptions), sectionDepth]);
   const blocks = normalized.length ? normalized : [emptyBlock];
+  const sectionAnchors=useMemo(()=>websiteSectionAnchors(blocks),[blocks]);
   const [collapsedSections,setCollapsedSections]=useState<Set<string>>(()=>new Set());
+  const [blockHelp,setBlockHelp]=useState<Set<string>>(()=>new Set());
   const [sectionProperties,setSectionProperties]=useState<Set<string>>(()=>new Set());
   const toggleSection=(id:string,properties=false)=>{const set=properties?setSectionProperties:setCollapsedSections;set(previous=>{const next=new Set(previous);if(next.has(id))next.delete(id);else next.add(id);return next;});};
-  const [imageSettings,setImageSettings]=useState<Record<string,boolean>>({});
   const [uploadBusy,setUploadBusy]=useState(false),[uploadError,setUploadError]=useState('');
   const [uploadTarget,setUploadTarget]=useState(''),[imageErrors,setImageErrors]=useState<Record<string,string>>({});
   const [splitError,setSplitError]=useState(''),[splitStatus,setSplitStatus]=useState('');
@@ -114,6 +143,8 @@ export function BlockEditor({
   const blocksRef=useRef(blocks);blocksRef.current=blocks;
   const editableRefs = useRef(new Map<string, HTMLDivElement>());
   const [activeBlockId, setActiveBlockId] = useState(blocks[0]?.blockId || '');
+  const [hasBlockSelection,setHasBlockSelection]=useState(sectionDepth===0);
+  const selectBlock=(id:string)=>{setHasBlockSelection(true);setActiveBlockId(id);};
   useEffect(() => {
     if (!blocks.some(block => block.blockId === activeBlockId)) setActiveBlockId(blocks[0]?.blockId || '');
   }, [blocks, activeBlockId]);
@@ -121,11 +152,16 @@ export function BlockEditor({
   const activeBlockRef=useRef(activeBlockId);activeBlockRef.current=activeBlockId;
   const activeBlock = useMemo(() => blocks.find((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
   const activeBlockIndex = useMemo(() => blocks.findIndex((block) => block.blockId === activeBlockId), [activeBlockId, blocks]);
-  const canFormat = Boolean(activeBlock && textBlockTypes.has(activeBlock.type));
-  const canSplit=activeBlock?.type==='paragraph'&&/(?:<br\b|<\/(?:p|div)>|[\r\n])/i.test(activeBlock.html??activeBlock.text??'');
-  const splitActiveParagraph=()=>{
-    setSplitError('');setSplitStatus('');const current=blocksRef.current,index=current.findIndex(block=>block.blockId===activeBlockRef.current);if(index<0)return;
-    try{const parts=splitParagraphBlock(current[index]);if(parts.length<2)return;editableRefs.current.get(current[index].blockId)?.blur();onChange([...current.slice(0,index),...parts,...current.slice(index+1)]);setActiveBlockId(parts[0].blockId);setSplitStatus(`Split into ${parts.length} paragraph blocks.`);window.setTimeout(()=>editableRefs.current.get(parts[0].blockId)?.focus(),0);}catch(error){setSplitError(error instanceof Error?error.message:'This paragraph could not be split.');}
+  const hasActiveSelection=selectionActive&&hasBlockSelection;
+  const canFormat = Boolean(hasActiveSelection && activeBlock && textBlockTypes.has(activeBlock.type));
+  const canImageLayout=Boolean(hasActiveSelection&&websiteOptions&&activeBlock?.type==='image');
+  const canResetPresentation=canFormat||canImageLayout||Boolean(hasActiveSelection&&websiteOptions&&activeBlock?.type==='link');
+  const canMoveUp=hasActiveSelection&&activeBlockIndex>0;
+  const canMoveDown=hasActiveSelection&&activeBlockIndex>=0&&activeBlockIndex<blocks.length-1;
+  const canSplitParagraph=(block:PostBlock)=>block.type==='paragraph'&&!blockListStyle(block)&&/(?:<br\b|<\/(?:p|div)>|[\r\n])/i.test(block.html??block.text??'');
+  const splitActiveParagraph=(blockId=activeBlockRef.current)=>{
+    setSplitError('');setSplitStatus('');const current=blocksRef.current,index=current.findIndex(block=>block.blockId===blockId);if(index<0)return;
+    try{const parts=splitParagraphBlock(current[index]);if(parts.length<2)return;editableRefs.current.get(current[index].blockId)?.blur();onChange([...current.slice(0,index),...parts,...current.slice(index+1)]);selectBlock(parts[0].blockId);setSplitStatus(`Split into ${parts.length} paragraph blocks.`);window.setTimeout(()=>editableRefs.current.get(parts[0].blockId)?.focus(),0);}catch(error){setSplitError(error instanceof Error?error.message:'This paragraph could not be split.');}
   };
 
   const replaceBlock = (blockId: string, next: PostBlock) => {
@@ -133,7 +169,8 @@ export function BlockEditor({
   };
 
   const updateTextBlock = (block: PostBlock, htmlValue: string) => {
-    const html = sanitizeInlineHtml(htmlValue);
+    const style=blockListStyle(block);
+    const html = style?sanitizeListHtml(htmlValue,style,blockListMarker(block)):sanitizeInlineHtml(htmlValue);
     const text = inlineHtmlToText(html);
     replaceBlock(block.blockId, {
       ...block,
@@ -143,15 +180,20 @@ export function BlockEditor({
     });
   };
 
-  const addTextBlock = (type: 'paragraph' | 'heading' | 'quote' | 'divider' | 'section' | 'link' | 'credit') => {
-    const block = type === 'section' || type === 'link' || type === 'credit' ? createStructuredBlock(type) : createDescriptionBlock(type);
-    if(type === 'section')setSectionProperties(previous=>new Set([...previous,block.blockId]));
+  const addTextBlock = (type: 'paragraph' | 'heading' | 'quote' | 'divider' | 'section' | 'link' | 'credit' | 'ordered_list' | 'unordered_list' | 'gallery_list' | 'video_embed' | 'audio_embed') => {
+    const block:PostBlock = type==='video_embed'||type==='audio_embed'?{blockId:globalThis.crypto.randomUUID(),type:'embed',url:'',payload:{embedKind:type==='video_embed'?'video':'audio'}}:type==='gallery_list'?{blockId:globalThis.crypto.randomUUID(),type,payload:{publicationIds:[],pageSize:12,websiteGalleryId:websiteOptions?.galleries?.[0]?.id}}:type==='ordered_list'||type==='unordered_list'?createListBlock(type==='ordered_list'?'ordered':'unordered'): type === 'section' || type === 'link' || type === 'credit' ? createStructuredBlock(type) : createDescriptionBlock(type);
+
+    if(type==='section'&&websiteOptions){
+      const used=new Set(websiteSectionAnchors(blocks).values());let number=blocks.filter(item=>item.type==='section').length+1;
+      while(used.has(`section${number}`))number++;
+      block.payload={...block.payload,anchor:`section${number}`};
+    }
     const activeIndex = blocks.findIndex((item) => item.blockId === activeBlockId);
     const insertAt = activeIndex >= 0 ? activeIndex + 1 : blocks.length;
     const next = [...blocks];
     next.splice(insertAt, 0, block);
     onChange(next);
-    setActiveBlockId(block.blockId);
+    selectBlock(block.blockId);
     window.setTimeout(() => editableRefs.current.get(block.blockId)?.focus(), 0);
   };
 
@@ -169,12 +211,12 @@ export function BlockEditor({
     const next = [...current];
     next.splice(activeIndex >= 0 ? activeIndex + 1 : current.length, 0, block);
     onChange(next);
-    setActiveBlockId(block.blockId);
+    selectBlock(block.blockId);
   };
 
   const addImageBlock=()=>{
     const block:PostBlock={blockId:globalThis.crypto?.randomUUID?.()??`image-${Date.now()}`,type:'image',caption:''};
-    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);setActiveBlockId(block.blockId);setImageSettings(previous=>({...previous,[block.blockId]:true}));
+    const current=blocksRef.current,index=current.findIndex(item=>item.blockId===activeBlockRef.current);const next=[...current];next.splice(index<0?current.length:index+1,0,block);onChange(next);selectBlock(block.blockId);setSectionProperties(previous=>new Set(previous).add(block.blockId));
   };
   const patchImage=(id:string,patch:Partial<PostBlock>)=>{const current=blocksRef.current;if(current.some(block=>block.blockId===id))onChange(current.map(block=>block.blockId===id?{...block,...patch}:block));};
   const uploadImage=async(id:string,input:HTMLInputElement)=>{
@@ -193,16 +235,7 @@ export function BlockEditor({
     const next = blocks.filter((block) => block.blockId !== blockId);
     const fallback = next.length ? next : [createDescriptionBlock()];
     onChange(fallback);
-    if (blockId === activeBlockId) setActiveBlockId(fallback[0].blockId);
-  };
-
-  const changeBlockType = (block: PostBlock, type: 'paragraph' | 'heading' | 'quote') => {
-    replaceBlock(block.blockId, changeTextBlockType(block, type));
-  };
-
-  const updateActiveBlockType = (type: 'paragraph' | 'heading' | 'quote') => {
-    if (!activeBlock || !textBlockTypes.has(activeBlock.type)) return;
-    changeBlockType(activeBlock, type);
+    if (blockId === activeBlockId) selectBlock(fallback[0].blockId);
   };
 
   const runInlineCommand = (command: 'bold' | 'italic' | 'underline' | 'unlink') => {
@@ -225,61 +258,136 @@ export function BlockEditor({
 
   return (
     <div className="portable-block-editor">
-      <div className="portable-block-editor-heading">
+      {(label || helpText) && <div className="portable-block-editor-heading">
         <div>
-          <span className="portable-block-editor-label">{label}</span>
-          <small>{helpText}</small>
+          {label && <span className="portable-block-editor-label">{label}</span>}
+          {helpText && <small>{helpText}</small>}
         </div>
-      </div>
+      </div>}
 
       <div className="portable-block-editor-shell">
-        {!readOnly && <div ref={toolbarRef} className="portable-block-editor-toolbar" style={websiteOptions?{top:`calc(var(--website-tools-height, 0px) + ${stickyToolbarOffset}px + .5rem)`,zIndex:10+sectionDepth}:undefined} aria-label="Active block tools">
-          <div className="portable-block-editor-block-tools">
-            {activeBlock && textBlockTypes.has(activeBlock.type) ? <select value={activeBlock.type} onChange={(event) => updateActiveBlockType(event.target.value as 'paragraph' | 'heading' | 'quote')} aria-label="Active block type">
-              <option value="paragraph">Paragraph</option>
-              <option value="heading">Heading</option>
-              <option value="quote">Quote</option>
-            </select> : <span className="portable-block-editor-active-type">{activeBlock?.type || 'Block'}</span>}
-            {activeBlock?.type === 'heading' && <select value={activeBlock.level || 2} onChange={(event) => replaceBlock(activeBlock.blockId, { ...activeBlock, level: Number(event.target.value) })} aria-label="Heading level">
-              <option value="2">H2</option>
-              <option value="3">H3</option>
-            </select>}
-            {websiteOptions&&canFormat&&<div className="portable-block-alignment" role="group" aria-label="Block alignment">{(['','left','center','right'] as const).map(alignment=>{
-              const label=alignment?`Align ${alignment}`:'Use theme alignment';
-              return <button key={alignment} type="button" aria-label={label} title={label} aria-pressed={String(activeBlock?.payload?.textAlign??'')===alignment} onMouseDown={event=>event.preventDefault()} onClick={()=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:alignment||undefined}});}}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{alignment===''?<path d="M8 4 4 8l4 4M4 8h10a6 6 0 0 1 0 12h-3"/>:<path d={alignment==='left'?'M4 5h16M4 10h10M4 15h16M4 20h10':alignment==='center'?'M4 5h16M7 10h10M4 15h16M7 20h10':'M4 5h16M10 10h10M4 15h16M10 20h10'}/>}</svg>
-              </button>;
-            })}</div>}
-            <button type="button" disabled={activeBlockIndex <= 0} onClick={() => moveBlock(activeBlockIndex, -1)} aria-label="Move block up">↑</button>
-            <button type="button" disabled={activeBlockIndex < 0 || activeBlockIndex === blocks.length - 1} onClick={() => moveBlock(activeBlockIndex, 1)} aria-label="Move block down">↓</button>
-          </div>
-          <div className="portable-block-editor-formatting" aria-label="Text formatting">
-            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('bold')} aria-label="Bold"><strong>B</strong></button>
-            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('italic')} aria-label="Italic"><em>I</em></button>
-            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('underline')} aria-label="Underline"><u>U</u></button>
-            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={addLink}>Link</button>
-            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('unlink')}>Unlink</button>
-            <button type="button" disabled={!canSplit} onMouseDown={event=>event.preventDefault()} onClick={splitActiveParagraph} title="Create a separate paragraph block for each non-empty line, preserving text formatting and links">Split into paragraphs</button>
-          </div>
-          <button type="button" className="portable-block-editor-remove" disabled={!activeBlock} onClick={() => activeBlock && removeBlock(activeBlock.blockId)}>Remove block</button>
-        </div>}
+
 
         {splitError&&<p role="alert">{splitError}</p>}{splitStatus&&<p role="status">{splitStatus}</p>}
         <div className="portable-block-editor-canvas" onClick={() => {
-          if (!activeBlockId && blocks[0]) setActiveBlockId(blocks[0].blockId);
+          if (!activeBlockId && blocks[0]) selectBlock(blocks[0].blockId);
         }}>
-        {blocks.map((block) => {
+        {blocks.map((block, blockIndex) => {
           const isTextBlock = textBlockTypes.has(block.type);
+          const isSelected=selectionActive&&hasBlockSelection&&block.blockId===activeBlockId;
+          const showBlockHeading=isSelected||collapsedSections.has(block.blockId);
+          const blockLabel=blockListStyle(block)==='ordered'?'Ordered list':blockListStyle(block)==='unordered'?'Unordered list':block.type==='embed'&&(block.payload?.embedKind==='video'||block.payload?.embedKind==='audio')?(block.payload.embedKind==='video'?'Video embed':'Audio embed'):block.type==='gallery_list'?'Gallery':block.type==='section'?(websiteOptions&&sectionAnchors.get(block.blockId)?'Section: #'+sectionAnchors.get(block.blockId):'Section'):block.type.replaceAll('_',' ').replace(/^./,letter=>letter.toUpperCase());
+          const removeLabel=blockListStyle(block)?'list':block.type==='gallery_list'?'gallery':block.type.replaceAll('_',' ');
+          const settingsOpen=isSelected&&sectionProperties.has(block.blockId);
           const media = block.mediaId ? mediaOptions.find((item) => item.mediaId === block.mediaId) : undefined;
           return (
             <article
               key={block.blockId}
-              className={`portable-block-editor-block portable-block-editor-block-${block.type}${block.blockId === activeBlockId ? ' is-active' : ''}`}
-              onClick={() => setActiveBlockId(block.blockId)}
-              onFocus={() => setActiveBlockId(block.blockId)}
+              className={`portable-block-editor-block portable-block-editor-block-${block.type}${isSelected ? ' is-active' : ''}`}
+              onClick={() => selectBlock(block.blockId)}
+              onFocus={() => selectBlock(block.blockId)}
+              onKeyDown={event=>{if(event.key==='Escape'&&blockHelp.has(block.blockId)){event.preventDefault();event.stopPropagation();setBlockHelp(previous=>{const next=new Set(previous);next.delete(block.blockId);return next;});event.currentTarget.querySelector<HTMLButtonElement>('.portable-section-help-toggle')?.focus();}}}
               tabIndex={isTextBlock ? -1 : 0}
             >
-              {isTextBlock && <EditableBlockContent
+              <div className={`portable-section-heading${isTextBlock?' portable-text-block-heading':''}`} hidden={!showBlockHeading}>
+                <button type="button" className="portable-section-collapse" aria-expanded={!collapsedSections.has(block.blockId)} aria-controls={`block-content-${block.blockId}`} onClick={()=>toggleSection(block.blockId)}><span aria-hidden="true">{collapsedSections.has(block.blockId)?'▸':'▾'}</span><BlockTypeIcon type={blockListStyle(block)==='ordered'?'ordered_list':blockListStyle(block)==='unordered'?'unordered_list':block.type==='embed'?String(block.payload?.embedKind):block.type}/>{blockLabel}</button>
+                {!readOnly&&<button type="button" className="portable-section-more" aria-label={`${blockLabel} settings`} aria-expanded={settingsOpen} aria-controls={`block-settings-${block.blockId}`} onClick={()=>toggleSection(block.blockId,true)}><span aria-hidden="true">⚙</span> Settings <span aria-hidden="true">{settingsOpen?'▴':'▾'}</span></button>}
+                {!readOnly&&websiteOptions&&['section','gallery_list'].includes(block.type)&&<button type="button" className="portable-section-help-toggle" aria-label={block.type==='section'?'Section help':'Gallery help'} title={block.type==='section'?'Section help':'Gallery help'} aria-expanded={isSelected&&blockHelp.has(block.blockId)} aria-controls={`block-help-${block.blockId}`} onClick={()=>setBlockHelp(previous=>{const next=new Set(previous);if(next.has(block.blockId))next.delete(block.blockId);else next.add(block.blockId);return next;})}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 3.5M12 16h.01"/></svg>
+                </button>}
+                {!readOnly&&<button type="button" onClick={()=>removeBlock(block.blockId)} aria-label={block.type==='section'?`Remove section ${block.title||'Untitled section'}`:`Remove ${removeLabel}`}>Remove {removeLabel}</button>}
+              </div>
+              {websiteOptions&&block.type==='section'&&<div id={`block-help-${block.blockId}`} className="portable-section-help" role="region" aria-label="Section help" hidden={!isSelected||!blockHelp.has(block.blockId)}>
+                <p>Sections group related content and make it convenient to link directly to a particular part of your page.</p>
+                <p>Set the Anchor slug in Settings. Use <code>#{sectionAnchors.get(block.blockId)}</code> as a link on this page, or add it to the page’s URL to share a direct link to this section.</p>
+                <p>The anchor slug does not add a visible heading. Add a Heading block within the section if you want one.</p>
+              </div>}
+              {websiteOptions&&block.type==='gallery_list'&&<div id={`block-help-${block.blockId}`} className="portable-section-help" role="region" aria-label="Gallery help" hidden={!isSelected||!blockHelp.has(block.blockId)}>
+                <p>Choose what to display in <strong>Website gallery</strong>:</p>
+                <ul><li>A gallery of Works shows its images.</li><li>A gallery of sub-galleries shows a card for each gallery.</li><li><strong>All selected publications / filters</strong> shows individual Work cards.</li></ul>
+                <p>Create and organize galleries in the <strong>Galleries</strong> tab. The two example cards in this editor are placeholders. Save the page and open Preview to see your content; publish the website to update the live site.</p>
+              </div>}
+        {!readOnly && isSelected && (canResetPresentation||canMoveUp||canMoveDown) && <div className="portable-block-editor-toolbar portable-block-editor-inline-tools" role="group" aria-label="Active block tools">
+          <div className="portable-block-editor-block-tools">
+            {canMoveUp&&<button type="button" onClick={() => moveBlock(activeBlockIndex, -1)} aria-label="Move block up" title="Move block up">↑</button>}
+            {canMoveDown&&<button type="button" onClick={() => moveBlock(activeBlockIndex, 1)} aria-label="Move block down" title="Move block down">↓</button>}
+            {canResetPresentation&&<button type="button" className="portable-block-reset" title={block.type==='image'?'Reset image alignment, text flow, and widths to defaults':block.type==='link'?'Reset link appearance to default':'Reset text formatting, alignment, and list markers to defaults'} onClick={()=>replaceBlock(block.blockId,resetBlockPresentation(block))}>Reset to default</button>}
+            {canImageLayout&&<>
+              <div className="portable-block-alignment" role="group" aria-label="Image alignment">
+                {(['left','center','right','full'] as const).map(alignment=>{
+                  const label=alignment==='full'?'Full-width image':`Align image ${alignment}`;
+                  return <button key={alignment} type="button" aria-label={label} title={label} aria-pressed={String(block.payload?.alignment??'left')===alignment} onClick={()=>patchImage(block.blockId,{payload:{...block.payload,alignment,...(['center','full'].includes(alignment)?{textFlow:'separate'}:{}),...(alignment==='full'?{desktopWidth:100}:{})}})}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 3v18M21 3v18"/><rect x={alignment==='right'?11:alignment==='center'?8:5} y="7" width={alignment==='full'?14:8} height="10" rx="1"/></svg>
+                  </button>;
+                })}
+              </div>
+              <div className="portable-block-alignment" role="group" aria-label="Image text flow">
+                <button type="button" aria-label="Text below image" title="Text below image" aria-pressed={String(block.payload?.textFlow??'separate')==='separate'} onClick={()=>patchImage(block.blockId,{payload:{...block.payload,textFlow:'separate'}})}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><rect x="5" y="3" width="14" height="9" rx="1"/><path d="M3 16h18M3 20h18"/></svg>
+                </button>
+                {['left','right'].includes(String(block.payload?.alignment??'left'))&&<button type="button" aria-label="Wrap text around image" title="Wrap the text blocks that follow around the image" aria-pressed={block.payload?.textFlow==='wrap'} onClick={()=>patchImage(block.blockId,{payload:{...block.payload,textFlow:'wrap'}})}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><rect x={block.payload?.alignment==='right'?13:3} y="3" width="8" height="9" rx="1"/><path d={block.payload?.alignment==='right'?'M3 4h6M3 8h6M3 12h6M3 16h18M3 20h18':'M15 4h6M15 8h6M15 12h6M3 16h18M3 20h18'}/></svg>
+                </button>}
+              </div>
+            </>}
+            {canFormat&&activeBlock?.type === 'heading' && <select value={activeBlock.level || 2} onChange={(event) => replaceBlock(activeBlock.blockId, { ...activeBlock, level: Number(event.target.value) })} aria-label="Heading level">
+              {activeBlock.level===1&&<option value="1">H1</option>}
+              {[2,3,4,5,6].map(level=><option key={level} value={level}>H{level}</option>)}
+            </select>}
+            {websiteOptions&&canFormat&&<div className="portable-block-alignment" role="group" aria-label="Block alignment">{(['left','center','right'] as const).map(alignment=>{
+              const label=`Align ${alignment}`;
+              return <button key={alignment} type="button" aria-label={label} title={label} aria-pressed={String(activeBlock?.payload?.textAlign??'')===alignment} onMouseDown={event=>event.preventDefault()} onClick={()=>{if(activeBlock)replaceBlock(activeBlock.blockId,{...activeBlock,payload:{...activeBlock.payload,textAlign:alignment||undefined}});}}>
+                {<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={alignment==='left'?'M4 5h16M4 10h10M4 15h16M4 20h10':alignment==='center'?'M4 5h16M7 10h10M4 15h16M7 20h10':'M4 5h16M10 10h10M4 15h16M10 20h10'}/></svg>}
+              </button>;
+            })}</div>}
+          </div>
+          {canFormat&&<div className="portable-block-editor-formatting" aria-label="Text formatting">
+            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('bold')} aria-label="Bold"><strong>B</strong></button>
+            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('italic')} aria-label="Italic"><em>I</em></button>
+            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('underline')} aria-label="Underline"><u>U</u></button>
+            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={addLink} aria-label="Add link" title="Add link"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m10 13 4-4m-6 7-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 0 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/></svg></button>
+            <button type="button" disabled={!canFormat} onMouseDown={(event) => event.preventDefault()} onClick={() => runInlineCommand('unlink')} aria-label="Remove link" title="Remove link"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="m3 3 18 18M8 16l-1 1a4 4 0 0 1-6-6l3-3m9-1 1-1a4 4 0 0 1 6 6l-3 3M10 13l2-2"/></svg></button>
+          </div>}
+        </div>}
+              {!readOnly&&<div className="portable-paragraph-properties" id={`block-settings-${block.blockId}`} hidden={!settingsOpen}>
+                {blockIndex>0&&<button type="button" onClick={()=>moveBlock(blockIndex,-1)}>Move up</button>}
+                {blockIndex<blocks.length-1&&<button type="button" onClick={()=>moveBlock(blockIndex,1)}>Move down</button>}
+                {blockListStyle(block)&&<label className="portable-list-marker-setting">List marker<select aria-label="List marker" value={blockListMarker(block)} onChange={event=>{
+                  const marker=event.target.value as ListMarker,style=marker==='numbers'||marker==='letters'?'ordered':'unordered';
+                  const html=sanitizeListHtml(block.html??textToInlineHtml(block.text??''),style,marker);
+                  replaceBlock(block.blockId,{...block,payload:{...block.payload,listStyle:style,listMarker:marker},html,text:inlineHtmlToText(html)});
+                }}><option value="numbers">Numbers · 1, 2, 3</option><option value="letters">Letters · a, b, c</option><option value="dashes">Dashes · –</option><option value="dots">Dots · •</option></select></label>}
+                {block.type==='paragraph'&&!blockListStyle(block)&&<button type="button" disabled={!canSplitParagraph(block)} onMouseDown={event=>event.preventDefault()} onClick={()=>splitActiveParagraph(block.blockId)} title="Create a separate paragraph block for each non-empty line, preserving text formatting and links">Split into paragraphs</button>}
+                {blocks.length===1&&!(block.type==='paragraph'&&!blockListStyle(block))&&!['section','image'].includes(block.type)&&<small>No additional block settings.</small>}
+                {block.type==='section'&&websiteOptions&& <div className="portable-section-properties" hidden={!settingsOpen}>
+                  <div hidden={!settingsOpen}>
+                {websiteOptions && <label>Section layout<select disabled={readOnly} value={String(block.payload?.presentation || 'standard')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,presentation:event.target.value}})}>{['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].map(value=><option key={value} value={value}>{({standard:'Standard',intro:'Hero introduction',callout:'Membership / offer callout',pricing:'Plan comparison',plan:'Plan card',faq:'Questions',faq_item:'Expandable answer',screening:'Featured film',excerpt:'Literary excerpt',bibliography:'Book / publication listing',release:'Audio release / track list',episode:'Featured episode / show notes',episodes:'Episode listing',creators:'Contributing creators'})[value]}</option>)}</select></label>}
+
+                <label>Anchor slug<input value={String(block.payload?.anchor??sectionAnchors.get(block.blockId)??'')} readOnly={readOnly} placeholder="section1" maxLength={100} onChange={event => replaceBlock(block.blockId, { ...block, payload:{...block.payload,anchor:event.target.value} })} onBlur={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,anchor:websiteSectionSlug(event.target.value)||sectionAnchors.get(block.blockId)}})} /></label>
+                <small>{sectionAnchors.get(block.blockId)?`Link to this section with #${sectionAnchors.get(block.blockId)}. `:''}This does not display a heading. Add a Heading block in the section content if desired.</small>
+                  </div>
+                </div>}
+                {block.type==='image'&&websiteOptions&&<div id={`image-settings-${block.blockId}`} className="portable-image-controls" hidden={!settingsOpen}>
+                  <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
+                    <label>Choose existing image<select aria-label="Choose existing image" value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
+                      <option value="">Choose from Works or uploads…</option>
+                      {block.mediaId&&!mediaOptions.some(item=>item.mediaId===block.mediaId)&&<option value={block.mediaId}>Current image</option>}
+                      {mediaOptions.filter(item=>!item.assetType||item.assetType==='image').map(item=><option key={item.mediaId} value={item.mediaId}>{item.label}</option>)}
+                    </select></label>
+                    {uploadMedia&&<label className="portable-block-editor-upload">{uploadTarget===block.blockId?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={readOnly||uploadBusy} onChange={event=>void uploadImage(block.blockId,event.currentTarget)}/></label>}
+                    {imageErrors[block.blockId]&&<p role="alert">{imageErrors[block.blockId]}</p>}
+                  </fieldset>
+                <fieldset disabled={readOnly} className="portable-image-settings">
+                  <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
+                  <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
+                  {(['desktop','mobile'] as const).map(device=><label key={device}>{device==='desktop'?'Desktop width (%)':'Mobile width (%)'}<input type="number" min={1} max={100} step={1} value={Number(block.payload?.[device+'Width']??(device==='desktop'&&block.payload?.textFlow==='wrap'?45:100))} onChange={event=>{const width=event.currentTarget.valueAsNumber;if(Number.isInteger(width)&&width>=1&&width<=100)patchImage(block.blockId,{payload:{...block.payload,[device+'Width']:width,...(device==='desktop'&&width<100&&block.payload?.alignment==='full'?{alignment:'center'}:{})}});}}/></label>)}
+                  <p>Width is a percentage of the page’s content area. Mobile applies at 640px and below. Image proportions are preserved.</p>
+                  <p>Wrap is available for left- and right-aligned images and applies to the text blocks that follow it. Images stack above text on small screens.</p>
+                </fieldset>
+                </div>}
+              </div>}
+              <div id={`block-content-${block.blockId}`} hidden={collapsedSections.has(block.blockId)}>
+              {isTextBlock && <div><EditableBlockContent
                 block={block}
                 setElement={(element) => {
                   if (element) editableRefs.current.set(block.blockId, element);
@@ -287,25 +395,16 @@ export function BlockEditor({
                 }}
                 onInput={(html) => updateTextBlock(block, html)}
                 readOnly={readOnly}
-              />}
+              /></div>}
+              {block.type==='embed'&&(block.payload?.embedKind==='video'||block.payload?.embedKind==='audio')&&<MediaEmbedEditor block={block} selected={isSelected} readOnly={readOnly} onChange={next=>replaceBlock(block.blockId,next)}/>}
               {block.type === 'divider' && <hr />}
               {block.type === 'section' && <div>
-                {websiteOptions && <div className="portable-section-heading">
-                  <button type="button" className="portable-section-collapse" aria-expanded={!collapsedSections.has(block.blockId)} onClick={()=>toggleSection(block.blockId)}><span aria-hidden="true">{collapsedSections.has(block.blockId)?'▸':'▾'}</span> {block.title || 'Untitled section'}</button>
-                  {!readOnly && <button type="button" onClick={()=>removeBlock(block.blockId)} aria-label={`Remove section ${block.title || 'Untitled section'}`}>Remove section</button>}
-                </div>}
-                <div hidden={Boolean(websiteOptions)&&collapsedSections.has(block.blockId)}>
-                {websiteOptions ? <div className="portable-section-properties">
-                  <button type="button" className="portable-section-more" aria-expanded={sectionProperties.has(block.blockId)} onClick={()=>toggleSection(block.blockId,true)}>More Actions <span aria-hidden="true">{sectionProperties.has(block.blockId)?'▴':'▾'}</span></button>
-                  <div hidden={!sectionProperties.has(block.blockId)}>
-                {websiteOptions && <label>Section layout<select disabled={readOnly} value={String(block.payload?.presentation || 'standard')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,presentation:event.target.value}})}>{['standard','intro','callout','pricing','plan','faq','faq_item','screening','excerpt','bibliography','release','episode','episodes','creators'].map(value=><option key={value} value={value}>{({standard:'Standard',intro:'Hero introduction',callout:'Membership / offer callout',pricing:'Plan comparison',plan:'Plan card',faq:'Questions',faq_item:'Expandable answer',screening:'Featured film',excerpt:'Literary excerpt',bibliography:'Book / publication listing',release:'Audio release / track list',episode:'Featured episode / show notes',episodes:'Episode listing',creators:'Contributing creators'})[value]}</option>)}</select></label>}
-
-                <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>
-                  </div>
-                </div> : <label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>}
-                <div onClick={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}} onFocus={event=>{setActiveBlockId(block.blockId);event.stopPropagation();}}>
-                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1} stickyToolbarOffset={stickyToolbarOffset+toolbarHeight}
-                  label="Section content" helpText="Add and arrange content in this section." onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
+                {!websiteOptions&&<label>Section title<input value={block.title || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, title: event.target.value })} /></label>}
+                <div>
+                {websiteOptions&&block.payload?.presentation==='faq_item'&&<label>Question<input value={String(block.payload?.summary??block.title??'Question')} readOnly={readOnly} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,summary:event.target.value}})}/></label>}
+                <div onClick={event=>{selectBlock(block.blockId);event.stopPropagation();}} onFocus={event=>{selectBlock(block.blockId);event.stopPropagation();}}>
+                <BlockEditor value={block.blocks || []} readOnly={readOnly} mediaOptions={mediaOptions} allowMedia={allowMedia} uploadMedia={uploadMedia} allowStructured={allowStructured} websiteOptions={websiteOptions} sectionDepth={sectionDepth+1} selectionActive={isSelected}
+                  label="" helpText="" onChange={next => replaceBlock(block.blockId, { ...block, blocks: next })} />
                 </div></div>
               </div>}
               {block.type === 'link' && <div>
@@ -319,8 +418,9 @@ export function BlockEditor({
                 <label>Credit text<textarea value={block.text || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, text: event.target.value })} /></label>
                 <label>Credit URL<input value={block.url || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, url: event.target.value })} /></label>
               </div>}
-              {websiteOptions && ['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].includes(block.type) && <fieldset disabled={readOnly}>
-                <legend>{block.type.replaceAll('_',' ')}</legend>
+              {websiteOptions&&block.type==='gallery_list'&&!isSelected&&<GalleryBlockPreview block={block} options={websiteOptions}/>}
+              {websiteOptions && (block.type!=='gallery_list'||isSelected) && ['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].includes(block.type) && <fieldset disabled={readOnly}>
+                <legend>{block.type==='gallery_list'?'Gallery':block.type.replaceAll('_',' ')}</legend>
                 {block.type === 'premium_promotion' && <p>Only approved public previews are exported. Access remains at the external destination.</p>}
                 {block.type === 'page_link' ? <label>Page<select value={String(block.payload?.pageId ?? '')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,pageId:event.target.value}})}>
                   <option value="">Choose a page</option>{websiteOptions.pages.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}
@@ -335,7 +435,7 @@ export function BlockEditor({
                 {block.type==='gallery_list'&&!block.payload?.websiteGalleryId&&websiteOptions.creators&&<label>Creator identities · leave unselected for all<select multiple value={(block.payload?.creatorIdentityIds as string[])??[]} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,creatorIdentityIds:Array.from(event.target.selectedOptions).map(option=>option.value)}})}>{[...websiteOptions.creators,...((block.payload?.creatorIdentityIds as string[])??[]).filter(id=>!websiteOptions.creators!.some(creator=>creator.id===id)).map(id=>({id,title:'Disconnected identity · '+id}))].map(creator=><option key={creator.id} value={creator.id}>{creator.title}</option>)}</select></label>}
                 {block.type==='gallery_list'&&!block.payload?.websiteGalleryId&&<label>Tags (comma separated)<input value={((block.payload?.tags as string[])??[]).join(', ')} onChange={event=>replaceBlock(block.blockId,{...block,payload:{...block.payload,tags:event.target.value.split(',').map(t=>t.trim()).filter(Boolean)}})}/></label>}
               </fieldset>}
-              {!isTextBlock && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit', ...(websiteOptions?['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link']:[])].includes(block.type) && <p>Preserved {block.type} block — static export requires an explicit renderer or accepted fallback.</p>}
+              {!isTextBlock && !(block.type==='embed'&&(block.payload?.embedKind==='video'||block.payload?.embedKind==='audio')) && !['section', 'divider', 'image', 'video', 'audio', 'file', 'link', 'credit', ...(websiteOptions?['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link']:[])].includes(block.type) && <p>Preserved {block.type} block — static export requires an explicit renderer or accepted fallback.</p>}
               {block.type === 'file' && <div className="portable-block-editor-file">
                 <p>Attached file: {media?.label || block.label || block.fileId || block.mediaId || 'Unavailable reference'}</p>
                 <label>File label<input value={block.label || ''} readOnly={readOnly} onChange={event => replaceBlock(block.blockId, { ...block, label: event.target.value })} /></label>
@@ -347,28 +447,7 @@ export function BlockEditor({
                   <figure className={`portable-image-preview align-${String(block.payload?.alignment??'left')}`} style={{'--image-desktop-width':`${Number(block.payload?.desktopWidth??(block.payload?.textFlow==='wrap'?45:100))}%`,'--image-mobile-width':`${Number(block.payload?.mobileWidth??100)}%`} as React.CSSProperties}>
                     {media?.thumbnailUrl?<img src={media.thumbnailUrl} alt={String(block.payload?.alt??media.label)}/>:<div className="portable-image-placeholder">{media?.label||(block.mediaId?'Selected image':'Choose an image')}</div>}
                     {block.caption&&<figcaption>{block.caption}</figcaption>}
-                    <button type="button" className="portable-image-settings-toggle" aria-label="Image settings" aria-expanded={imageSettings[block.blockId]??!block.mediaId} aria-controls={`image-settings-${block.blockId}`} onClick={()=>setImageSettings(previous=>({...previous,[block.blockId]:!(previous[block.blockId]??!block.mediaId)}))}><span aria-hidden="true">•••</span></button>
                   </figure>
-                </div>
-                <div id={`image-settings-${block.blockId}`} className="portable-image-controls" hidden={!(imageSettings[block.blockId]??!block.mediaId)}>
-                  <fieldset disabled={readOnly} className="portable-image-source"><legend>Image</legend>
-                    <label>Choose existing image<select aria-label="Choose existing image" value={block.mediaId??''} onChange={event=>patchImage(block.blockId,{mediaId:event.target.value||undefined})}>
-                      <option value="">Choose from Works or uploads…</option>
-                      {block.mediaId&&!mediaOptions.some(item=>item.mediaId===block.mediaId)&&<option value={block.mediaId}>Current image</option>}
-                      {mediaOptions.filter(item=>!item.assetType||item.assetType==='image').map(item=><option key={item.mediaId} value={item.mediaId}>{item.label}</option>)}
-                    </select></label>
-                    {uploadMedia&&<label className="portable-block-editor-upload">{uploadTarget===block.blockId?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={readOnly||uploadBusy} onChange={event=>void uploadImage(block.blockId,event.currentTarget)}/></label>}
-                    {imageErrors[block.blockId]&&<p role="alert">{imageErrors[block.blockId]}</p>}
-                  </fieldset>
-                <fieldset disabled={readOnly} className="portable-image-settings">
-                  <label>Caption<input value={block.caption??''} onChange={event=>patchImage(block.blockId,{caption:event.target.value})}/></label>
-                  <label>Image description (alt text)<input maxLength={2000} value={String(block.payload?.alt??'')} placeholder={media?.label??'Describe the image'} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alt:event.target.value||undefined}})}/></label>
-                  <label>Image alignment<select aria-label="Image alignment" value={String(block.payload?.alignment??'left')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,alignment:event.target.value,...(['center','full'].includes(event.target.value)?{textFlow:'separate'}:{}),...(event.target.value==='full'?{desktopWidth:100}:{})}})}>{[['left','Left'],['center','Center'],['right','Right'],['full','Full width']].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
-                  <label>Text flow<select aria-label="Text flow" value={String(block.payload?.textFlow??'separate')} onChange={event=>patchImage(block.blockId,{payload:{...block.payload,textFlow:event.target.value}})}><option value="separate">Text below image</option><option value="wrap" disabled={!['left','right'].includes(String(block.payload?.alignment??'left'))}>Wrap following text around image</option></select></label>
-                  {(['desktop','mobile'] as const).map(device=><label key={device}>{device==='desktop'?'Desktop width (%)':'Mobile width (%)'}<input type="number" min={1} max={100} step={1} value={Number(block.payload?.[device+'Width']??(device==='desktop'&&block.payload?.textFlow==='wrap'?45:100))} onChange={event=>{const width=event.currentTarget.valueAsNumber;if(Number.isInteger(width)&&width>=1&&width<=100)patchImage(block.blockId,{payload:{...block.payload,[device+'Width']:width,...(device==='desktop'&&width<100&&block.payload?.alignment==='full'?{alignment:'center'}:{})}});}}/></label>)}
-                  <p>Width is a percentage of the page’s content area. Mobile applies at 640px and below. Image proportions are preserved.</p>
-                  <p>Wrap is available for left- and right-aligned images and applies to the following text blocks. Images stack above text on small screens.</p>
-                </fieldset>
                 </div>
               </div> : (block.type === 'image' || block.type === 'video' || block.type === 'audio') && <div className="portable-block-editor-media">
                 {media?.thumbnailUrl && block.type === 'image' ? <img src={media.thumbnailUrl} alt="" /> : <div className="portable-block-editor-media-placeholder">{media?.label || block.mediaId || 'Media'}</div>}
@@ -377,29 +456,29 @@ export function BlockEditor({
                   <input value={block.caption || ''} readOnly={readOnly} onChange={(event) => replaceBlock(block.blockId, { ...block, caption: event.target.value })} />
                 </label>
               </div>}
+              </div>
             </article>
           );
         })}
         </div>
 
         {!readOnly && <div className="portable-block-editor-add" aria-label="Add content block">
-          <span className="portable-block-editor-inserter-icon" aria-hidden="true">+</span>
+          <span className="portable-block-editor-inserter-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" focusable="false"><path d="M12 5v14M5 12h14"/></svg></span>
           <span>Add block</span>
-          <button type="button" onClick={() => addTextBlock('paragraph')}>Paragraph</button>
-          {websiteOptions&&allowMedia&&<button type="button" onClick={addImageBlock}>Image</button>}
-          <button type="button" onClick={() => addTextBlock('heading')}>Heading</button>
-          <button type="button" onClick={() => addTextBlock('quote')}>Quote</button>
-          <button type="button" onClick={() => addTextBlock('divider')}>Divider</button>
+          <button type="button" onClick={() => addTextBlock('heading')}><BlockTypeIcon type="heading"/>Heading</button>
+          <button type="button" onClick={() => addTextBlock('paragraph')}><BlockTypeIcon type="paragraph"/>Paragraph</button>
+          {websiteOptions&&allowMedia&&<button type="button" onClick={addImageBlock}><BlockTypeIcon type="image"/>Image</button>}
+          {websiteOptions&&<button type="button" onClick={()=>addTextBlock('gallery_list')}><BlockTypeIcon type="gallery_list"/>Gallery</button>}
+          {websiteOptions&&<><button type="button" onClick={()=>addTextBlock('video_embed')}><BlockTypeIcon type="video"/>Video embed</button><button type="button" onClick={()=>addTextBlock('audio_embed')}><BlockTypeIcon type="audio"/>Audio embed</button></>}
+          <button type="button" onClick={() => addTextBlock('quote')}><BlockTypeIcon type="quote"/>Quote</button>
+          <button type="button" onClick={() => addTextBlock('ordered_list')}><BlockTypeIcon type="ordered_list"/>Ordered list</button>
+          <button type="button" onClick={() => addTextBlock('unordered_list')}><BlockTypeIcon type="unordered_list"/>Unordered list</button>
+          <button type="button" onClick={() => addTextBlock('divider')}><BlockTypeIcon type="divider"/>Divider</button>
           {allowStructured && <>
-            {(!websiteOptions || sectionDepth === 0) && <button type="button" onClick={() => addTextBlock('section')}>Section</button>}
-            <button type="button" onClick={() => addTextBlock('link')}>Link block</button>
-            <button type="button" onClick={() => addTextBlock('credit')}>Credit</button>
+            {(!websiteOptions || sectionDepth === 0) && <button type="button" onClick={() => addTextBlock('section')}><BlockTypeIcon type="section"/>Section</button>}
+            <button type="button" onClick={() => addTextBlock('link')}><BlockTypeIcon type="link"/>Link block</button>
+            <button type="button" onClick={() => addTextBlock('credit')}><BlockTypeIcon type="credit"/>Credit</button>
           </>}
-          {websiteOptions && <select defaultValue="" aria-label="Add website block" onChange={event=>{
-            const type=event.target.value as PostBlock['type'];if(!type)return;
-            const next:PostBlock={blockId:globalThis.crypto.randomUUID(),type,payload:{...(type==='page_link'?{pageId:''}:type==='update_list'?{pageSize:12}:{publicationIds:[],...(type==='gallery_list'?{pageSize:12,websiteGalleryId:websiteOptions.galleries?.[0]?.id}: {})})}};
-            onChange([...blocks,next]);setActiveBlockId(next.blockId);event.target.value='';
-          }}><option value="">Add website block…</option>{['gallery_preview','premium_promotion','selected_portfolio','gallery_list','update_list','page_link'].map(type=><option key={type} value={type}>{type.replaceAll('_',' ')}</option>)}</select>}
           {!websiteOptions&&allowMedia&&uploadMedia&&<label className="portable-block-editor-upload">{uploadBusy?'Uploading image…':'Upload image'}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" disabled={uploadBusy} onChange={async event=>{
             const input=event.currentTarget,file=input.files?.[0];if(!file||uploadPending.current)return;uploadPending.current=true;setUploadBusy(true);setUploadError('');
             try{const image=await uploadMedia(file);if(mounted.current)addMediaBlock(image.mediaId,image);}catch(error){if(mounted.current)setUploadError(error instanceof Error?error.message:'The image could not be uploaded.');}finally{uploadPending.current=false;if(mounted.current){setUploadBusy(false);input.value='';}}

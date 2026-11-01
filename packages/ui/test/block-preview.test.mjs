@@ -69,3 +69,8 @@ test('preview uses only supplied object URLs and handles bounded trees and missi
   assert.match(render(value), /role="alert"/);
   assert.match(render([]), /No body content yet/);
 });
+
+test('list preview preserves numbered items and excludes unsafe HTML',()=>{
+ const html=render([{blockId:'list',type:'paragraph',payload:{listStyle:'ordered'},html:'<ol><li>First</li><li><strong>Second</strong><script>bad()</script></li></ol>'}]);
+ assert.match(html,/<ol><li>First<\/li><li><strong>Second<\/strong><\/li><\/ol>/);assert.doesNotMatch(html,/<script|<p[^>]*><ol>/);
+});

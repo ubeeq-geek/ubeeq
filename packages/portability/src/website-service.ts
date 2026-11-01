@@ -1,4 +1,4 @@
-import { WebsiteError, membershipAllows, websiteRoutes, type Website, type WebsiteDocument, type WebsiteDependency, type WorkspaceMembership, type WebsiteReleaseDecision, type WebsiteCapabilities } from '@ubeeq/core';
+import { WebsiteError, membershipAllows, websiteRoutes, websiteHistoricalRedirects, type Website, type WebsiteDocument, type WebsiteDependency, type WorkspaceMembership, type WebsiteReleaseDecision, type WebsiteCapabilities } from '@ubeeq/core';
 import type { WebsiteBuildRecord, WebsiteStore } from '@ubeeq/persistence';
 import { buildWebsiteArtifact, validateWebsiteSnapshotBudget, createWebsiteZip, normalizeWebsiteDocument, websiteDigest, websiteFingerprint, type WebsiteSnapshot } from './website-artifact.js';
 import { parse, serialize, type DefaultTreeAdapterMap } from 'parse5';
@@ -18,6 +18,8 @@ export interface WebsiteServicePorts {
   enqueue(input: { buildId: string; workspaceId: string; actorId: string; idempotencyKey: string }): Promise<void>;
   audit(input: { actor: WebsiteActor; action: string; websiteId: string; buildId?: string; artifactDigest?: string; result: string }): Promise<void>;
   retryableBuildError?(error:unknown):boolean;
+  /** Confirmed published snapshots only; previews and pending deployments do not establish URL history. */
+  publishedWebsites?(actor:WebsiteActor,websiteId:string):Promise<readonly Website[]>;
   now?: () => Date; retentionSeconds?: number;
 }
 export class WebsiteService {
@@ -83,8 +85,11 @@ export class WebsiteService {
     await this.authorize(actor,'edit',[candidate.id,...candidate.pages.map(p=>p.documentId)]);
     if(candidate.workspaceId!==actor.workspaceId || candidate.revision!==expectedRevision+1) throw new WebsiteError('revision_conflict','Website workspace or revision does not match.');
     if(!await this.ports.creatorIdentityAllowed(actor,candidate.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is outside this workspace.');
-    websiteRoutes(candidate);
+    websiteRoutes({...candidate,redirects:[]});
     const old=await this.ports.store.getWebsite(actor.workspaceId,site.id);
+    if(old&&old.revision!==expectedRevision)throw new WebsiteError('revision_conflict','Website changed before saving. Reload and try again.');
+    candidate.redirects=websiteHistoricalRedirects(candidate,old,old?await this.ports.publishedWebsites?.(actor,candidate.id)??[]:[]);
+    websiteRoutes(candidate);
     for(const id of candidate.contributingCreatorIds??[])if(!old?.contributingCreatorIds?.includes(id)&&!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is unavailable or not authorized.');
     for(const page of candidate.pages) {
       const document=await this.ports.store.getDocument(actor.workspaceId,page.documentId);
@@ -232,6 +237,7 @@ export class WebsiteService {
     const mimes:Record<string,string>={png:'image/png',jpg:'image/jpeg',webp:'image/webp',avif:'image/avif',gif:'image/gif',mp4:'video/mp4',webm:'video/webm',mp3:'audio/mpeg',ogg:'audio/ogg',wav:'audio/wav',pdf:'application/pdf',txt:'text/plain'};
     while(pending.length) {
       const node=pending.pop()!;
+      if('tagName' in node&&node.tagName==='script'){node.parentNode!.childNodes=node.parentNode!.childNodes.filter(child=>child!==node);continue;}
       if('attrs' in node) for(const attr of node.attrs) if(['href','src','poster'].includes(attr.name)) {
         const at=attr.value.indexOf('/assets/');
         if(!attr.value.startsWith('/') || at<0) continue;

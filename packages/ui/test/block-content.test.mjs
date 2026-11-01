@@ -81,3 +81,52 @@ test('split paragraphs balance inline markup and preserve links, order and the o
  assert.equal(splitParagraphBlock({blockId:'two',type:'paragraph',text:'One\n\nTwo'}).length,2);
  assert.throws(()=>splitParagraphBlock({blockId:'huge',type:'paragraph',text:'Line\n'.repeat(1001)}),/1,000/);
 });
+
+test('ordered and unordered lists preserve items, inline formatting and links across description round trips',async()=>{
+ const {createListBlock,sanitizeListHtml,inlineHtmlToText}=await import('../dist/index.js');
+ for(const [style,tag,marker]of[['ordered','ol','1.'],['unordered','ul','•']]){
+  const block={...createListBlock(style),html:`<${tag}><li><strong>First</strong></li><li><a href="https://example.com">Second</a></li></${tag}>`};
+  const saved=serializeDescriptionBlocks([block]),restored=parseDescriptionBlocks(saved);
+  assert.match(saved,new RegExp(`^<${tag}><li><strong>First</strong></li><li><a`));
+  assert.equal(restored[0].payload.listStyle,style);assert.equal(serializeDescriptionBlocks(restored),saved);
+  assert.match(inlineHtmlToText(saved),new RegExp(marker==='1.'?'1\\. First\\n2\\. Second':'• First\\n• Second'));
+  const clean=sanitizeListHtml('<ol onclick="bad()"><li><img src=x onerror="bad()"><script>bad()</script>Safe <a href="javascript:bad()">link</a></li></ol>',style);
+  assert.doesNotMatch(clean,/onclick|onerror|javascript|<script|<img/);assert.match(clean,/Safe link/);
+  assert.throws(()=>sanitizeListHtml('<ul><li>'.repeat(130)+'text'+'</li></ul>'.repeat(130),style),/nesting/);
+ }
+});
+
+test('list marker changes retain items and formatting through HTML and plain-text round trips',async()=>{
+ const {sanitizeListHtml,textBlockHtml,inlineHtmlToText}=await import('../dist/block-content.js');
+ const initial='<ol><li><strong>First</strong></li><li>Second</li></ol>';
+ for(const [marker,style,tag,prefix] of [['numbers','ordered','ol','1.'],['letters','ordered','ol','a.'],['dashes','unordered','ul','–'],['dots','unordered','ul','•']]){
+  const html=sanitizeListHtml(initial,style,marker),block={blockId:'list',type:'paragraph',payload:{listStyle:style,listMarker:marker},html};
+  assert.match(html,new RegExp(`^<${tag}[ >]`));assert.match(html,/<strong>First<\/strong>/);
+  const saved=serializeDescriptionBlocks([block]),restored=parseDescriptionBlocks(saved);
+  assert.equal(textBlockHtml(restored[0]),saved);assert.equal(serializeDescriptionBlocks(restored),saved);
+  assert.ok(inlineHtmlToText(saved).startsWith(prefix+' First'));
+ }
+ const clean=sanitizeListHtml('<ol type="a" onclick="bad()" style="color:red"><li>Safe</li></ol>','ordered','letters');
+ assert.equal(clean,'<ol type="a"><li>Safe</li></ol>');
+ assert.match(inlineHtmlToText('<ol type="a">'+'<li>Item</li>'.repeat(27)+'</ol>'),/z\. Item\naa\. Item/);
+});
+
+test('untitled sections get sequential fragment links while existing and custom anchors are retained',async()=>{
+ const {websiteSectionAnchors}=await import('../dist/block-content.js');
+ const blocks=[{blockId:'one',type:'section',blocks:[]},{blockId:'two',type:'section',blocks:[]},{blockId:'custom',type:'section',payload:{anchor:'My Gallery'},blocks:[]},{blockId:'legacy',type:'section',title:'Existing section',blocks:[]}];
+ const before=structuredClone(blocks),anchors=websiteSectionAnchors(blocks);
+ assert.equal(anchors.get('one'),'section1');assert.equal(anchors.get('two'),'section2');assert.equal(anchors.get('custom'),'my-gallery');assert.equal(anchors.get('legacy'),'existing-section');assert.deepEqual(blocks,before);
+});
+
+test('resetting block presentation clears formatting overrides and preserves content, links and semantic types',async()=>{
+ const {resetBlockPresentation}=await import('../dist/block-content.js');
+ const quote={blockId:'q',type:'quote',author:'Author',html:'<strong>Bold</strong> <em>italic</em> <u>underline</u> <a href="https://example.com">link</a>',payload:{textAlign:'right',custom:'keep'}};
+ const original=structuredClone(quote),reset=resetBlockPresentation(quote);
+ assert.equal(reset.type,'quote');assert.equal(reset.author,'Author');assert.deepEqual(reset.payload,{custom:'keep'});assert.doesNotMatch(reset.html,/<strong|<em|<u>/);assert.match(reset.html,/<a href="https:\/\/example.com"/);assert.match(reset.quote,/Bold italic underline link/);assert.deepEqual(quote,original);
+ const list=resetBlockPresentation({blockId:'list',type:'paragraph',html:'<ol type="a"><li><strong>First</strong></li></ol>',payload:{listStyle:'ordered',listMarker:'letters',textAlign:'center'}});
+ assert.deepEqual(list.payload,{listStyle:'ordered'});assert.equal(list.html,'<ol><li>First</li></ol>');
+ const image=resetBlockPresentation({blockId:'image',type:'image',mediaId:'asset',caption:'Keep caption',payload:{alignment:'right',textFlow:'wrap',desktopWidth:45,mobileWidth:80,alt:'Keep description'}});
+ assert.equal(image.mediaId,'asset');assert.equal(image.caption,'Keep caption');assert.deepEqual(image.payload,{alt:'Keep description'});
+ const link=resetBlockPresentation({blockId:'link',type:'link',label:'Keep link',url:'https://example.com',payload:{appearance:'primary',action:'custom'}});
+ assert.equal(link.url,'https://example.com');assert.deepEqual(link.payload,{action:'custom'});
+});
