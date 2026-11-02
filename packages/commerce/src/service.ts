@@ -40,7 +40,11 @@ export interface CommerceDiscord {
   addRole(guildId: string, userId: string, roleId: string): Promise<void>;
   removeRole(guildId: string, userId: string, roleId: string): Promise<void>;
 }
+/** Trusted host preparation; never accepted from a customer HTTP command. */
+export interface PreparedCollectionContents {revision:string;collectionRoots:string[];galleryIds:string[];title:string;description:string;assets:Array<Omit<PrivateAsset,keyof RecordBase>>;}
 export interface CommercePorts {
+  prepareCollectionContents?(offer:Offer):Promise<PreparedCollectionContents|undefined>;
+
   store: CommerceStore; provider: CommerceProvider; assets: CommerceAssets;
   publicBaseUrl: string; tokenKey: string; now?: () => Date;
   authorizeCreator(actor: CreatorActor): Promise<void>;
@@ -197,7 +201,7 @@ export class CommerceService {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, environment);
     if (!input.objectId || !Number.isSafeInteger(input.byteLength) || input.byteLength < 0 || !/^[a-f0-9]{64}$/.test(input.checksum)) throw new CommerceError('invalid_asset');
     const asset: PrivateAsset = { ...structuredClone(input), ...this.base(scope) };
-    return this.store.transaction(tx => { if(input.source){const existing=tx.list('asset').find(a=>same(a,scope)&&a.source?.workId===input.source!.workId&&a.source?.assetId===input.source!.assetId&&a.source?.checksum===input.source!.checksum&&a.objectId===input.objectId&&a.checksum===input.checksum&&a.state==='available');if(existing)return existing;}tx.insert('asset', asset); this.audit(tx, scope, actor.subjectId, 'asset.register', asset.id);return asset; });
+    return this.store.transaction(tx => { if(input.source){const existing=tx.list('asset').find(a=>same(a,scope)&&a.source?.workId===input.source!.workId&&a.source?.assetId===input.source!.assetId&&a.source?.checksum===input.source!.checksum&&a.objectId===input.objectId&&a.label===input.label&&a.checksum===input.checksum&&a.state==='available');if(existing)return existing;}tx.insert('asset', asset); this.audit(tx, scope, actor.subjectId, 'asset.register', asset.id);return asset; });
   }
   async setAssetAvailability(actor: CreatorActor, id: string, available: boolean) {
     await this.ports.authorizeCreator(actor);
@@ -212,16 +216,40 @@ export class CommerceService {
       }
       this.audit(tx, asset, actor.subjectId, 'asset.availability', id); });
   }
-  private subscriptionContents(tx:CommerceTransaction,offer:Offer):Offer {
-    if(!offer.billing)return offer;return tx.list('offer').filter(o=>o.offerId===offer.offerId&&same(o,offer)&&o.billing).sort((a,b)=>b.version-a.version)[0]??offer;
+  private accessBenefits(original:Offer,contents:Offer):Benefit[]{
+    if(!contents.collectionRoots)return contents.benefits;
+    return [...contents.benefits.filter(b=>b.type==='gallery'),...(original.benefits.some(b=>b.type==='download')?contents.files.map(resourceId=>({type:'download' as const,resourceId})):[]),...original.benefits.filter(b=>b.type==='package'||b.type==='discord_role')];
+  }
+  private async refreshCollection(offer:Offer){
+    if(!this.ports.prepareCollectionContents)return;
+    const refresh=async()=>{const latest=await this.store.transaction(tx=>tx.list('offer').filter(o=>o.offerId===offer.offerId&&same(o,offer)).sort((a,b)=>b.version-a.version)[0]);if(!latest)return;
+      await this.ports.assertEligible(latest);const prepared=await this.ports.prepareCollectionContents!(latest);if(!prepared||prepared.revision===latest.contentSourceRevision)return;
+      await this.store.transaction(tx=>{const current=tx.list('offer').filter(o=>o.offerId===latest.offerId&&same(o,latest)).sort((a,b)=>b.version-a.version)[0];if(current?.id!==latest.id)throw new CommerceError('stale_content_revision',409);
+        const files:string[]=[];for(const input of prepared.assets){if(input.publicPreview||input.state!=='available'||!input.objectId||!Number.isSafeInteger(input.byteLength)||input.byteLength<0||!/^[a-f0-9]{64}$/.test(input.checksum))throw new CommerceError('invalid_asset');const existing=tx.list('asset').find(a=>same(a,latest)&&a.state==='available'&&!a.publicPreview&&a.objectId===input.objectId&&a.label===input.label&&a.checksum===input.checksum);const asset=existing??{...structuredClone(input),...this.base(latest,key('collection-asset',latest.ownerId,latest.environment,input))};if(!existing)tx.insert('asset',asset);files.push(asset.id);}
+        const id=key('collection-contents',latest.deploymentId,latest.ownerId,latest.environment,latest.id,prepared.revision),version:Offer={...structuredClone(current),...this.base(latest,id),commandHash:undefined,version:latest.version+1,collectionRoots:prepared.collectionRoots,contentSourceRevision:prepared.revision,financialOfferVersionId:latest.financialOfferVersionId??latest.id,title:latest.billing?latest.title:prepared.title,description:prepared.description,files:[...new Set(files)]};
+        version.benefits=[...prepared.galleryIds.map(resourceId=>({type:'gallery' as const,resourceId})),...(latest.benefits.some(b=>b.type==='download')?version.files.map(resourceId=>({type:'download' as const,resourceId})):[]),...latest.benefits.filter(b=>b.type==='package'||b.type==='discord_role')];
+        current.published=false;tx.put('offer',current);tx.insert('offer',version);this.updateAccessContents(tx,version);this.audit(tx,version,'collection-content-worker','collection.contents.updated',version.id);
+        if(version.benefits.some(b=>b.type==='package'))this.ensureContentPackage(tx,version);
+      });
+    };if(this.ports.withStorageLock)await this.ports.withStorageLock(offer,refresh);else await refresh();
+  }
+  private ensureContentPackage(tx:CommerceTransaction,offer:Offer){const id=key('package',offer.id);if(tx.get('package',id))return;tx.insert('package',{...this.base(offer,id),offerVersionId:offer.id,assetId:id,state:'preparing'});tx.insert('asset',{...this.base(offer,id),label:offer.title+'.zip',contentType:'application/zip',byteLength:0,checksum:'0'.repeat(64),objectId:'',publicPreview:false,state:'preparing'});this.queue(tx,offer,'package',id,id);}
+  private async refreshCustomerCollections(subjectId:string){
+    if(!this.ports.prepareCollectionContents)return;
+    const offers=await this.store.transaction(tx=>{const customer=this.customer(tx,subjectId),ids=[...tx.list('purchase').filter(p=>p.customerId===customer.id&&p.state==='active').map(p=>p.offerVersionId),...tx.list('gift').filter(g=>g.state!=='revoked'&&(g.customerId===customer.id||g.state==='pending'&&customer.verifiedEmails.includes(g.recipientEmail))).map(g=>g.offerVersionId)];return [...new Map(ids.map(id=>tx.get('offer',id)).filter((o):o is Offer=>!!o).map(o=>[o.offerId,o])).values()];});
+    for(const offer of offers)try{await this.refreshCollection(offer);}catch{await this.operationalIssue(offer,'collection_content_refresh_failed',offer.id);}
+  }
+  private currentContents(tx:CommerceTransaction,offer:Offer):Offer {
+    const latest=tx.list('offer').filter(o=>o.offerId===offer.offerId&&same(o,offer)&&!!o.billing===!!offer.billing).sort((a,b)=>b.version-a.version)[0]??offer;return offer.billing||offer.collectionRoots||latest.collectionRoots?latest:offer;
   }
   /** Reviewed content changes apply to current paid/gifted periods; financial terms stay pinned. */
-  private updateSubscriptionContents(tx:CommerceTransaction,offer:Offer){
+  private updateAccessContents(tx:CommerceTransaction,offer:Offer){
     const update=(record:import('./model.js').Purchase|import('./model.js').Gift,gift:boolean)=>{
-      const original=tx.get('offer',record.offerVersionId);if(!original?.billing||original.offerId!==offer.offerId||!same(record,offer))return;
+      const original=tx.get('offer',record.offerVersionId);if(!original||(!original.billing&&!offer.collectionRoots)||!!original.billing!==!!offer.billing||original.offerId!==offer.offerId||!same(record,offer))return;
       const grants=tx.list('entitlement').filter(g=>gift?g.giftId===record.id:g.purchaseId===record.id),active=grants.find(g=>isActive(g,this.now()));if(!active)return;
-      for(const grant of grants){if(!offer.benefits.some(b=>JSON.stringify(b)===JSON.stringify(grant.benefit))){grant.state='revoked';grant.contentRemoved=true;tx.put('entitlement',grant);}}
-      for(const benefit of offer.benefits){const existing=grants.find(g=>JSON.stringify(g.benefit)===JSON.stringify(benefit));
+      if(this.accessBenefits(original,offer).some(b=>b.type==='package'))this.ensureContentPackage(tx,offer);
+      for(const grant of grants){if(!this.accessBenefits(original,offer).some(b=>JSON.stringify(b)===JSON.stringify(grant.benefit))){grant.state='revoked';grant.contentRemoved=true;tx.put('entitlement',grant);}}
+      for(const benefit of this.accessBenefits(original,offer)){const existing=grants.find(g=>JSON.stringify(g.benefit)===JSON.stringify(benefit));
         const grant=existing??{...this.base(record,key(gift?'gift-grant':'grant',record.id,benefit)),customerId:record.customerId,...(gift?{giftId:record.id,source:'manual' as const,reason:'Gift: '+offer.title}:{purchaseId:record.id,source:'payment' as const}),benefit:structuredClone(benefit),assetIds:[],startsAt:active.startsAt,endsAt:active.endsAt,state:'active' as const};
         if(grant.contentRemoved){grant.state='active';grant.contentRemoved=undefined;}
         grant.assetIds=benefit.type==='gallery'?[...offer.files]:benefit.type==='download'?[benefit.resourceId]:benefit.type==='package'?[key('package',offer.id)]:[];grant.updatedAt=this.now();tx.put('entitlement',grant);
@@ -232,7 +260,7 @@ export class CommerceService {
     for(const gift of tx.list('gift').filter(g=>g.state==='claimed'))update(gift,true);
   }
   async publishOffer(actor: CreatorActor, input: { environment: Environment;connectionId?:string; offerId?: string; slug: string; title: string; description?: string;
-    billing?:'month'|'year'; requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
+    billing?:'month'|'year'; collectionRoots?:string[]; contentSourceRevision?:string; requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
     external?: { url: string; mappingId: string } }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment,input.connectionId);
@@ -243,6 +271,7 @@ export class CommerceService {
       || !input.title || input.title.length > 300 || !input.terms || input.terms.length > 10000 || !input.benefits.length || input.benefits.length > 2000
       || input.files.length > 1000 || (input.durationSeconds !== undefined && (!Number.isSafeInteger(input.durationSeconds) || input.durationSeconds <= 0 || input.durationSeconds > 315360000)))
       throw new CommerceError('invalid_offer');
+    if(input.collectionRoots&&(!Array.isArray(input.collectionRoots)||input.collectionRoots.some(id=>typeof id!=='string'||!id)))throw new CommerceError('invalid_collection_roots');
     if(input.billing!==undefined&&!['month','year'].includes(input.billing))throw new CommerceError('invalid_subscription_interval');
     if(input.billing&&(input.durationSeconds!==undefined||input.external))throw new CommerceError('invalid_subscription_configuration');
     const supportEmail = email(input.supportEmail);
@@ -274,15 +303,11 @@ export class CommerceService {
       const offer: Offer = { ...this.base(scope,requestId), ...(requestId?{commandHash}:{}), offerId: input.offerId ?? randomUUID(), version: versions.reduce((max, v) => Math.max(max, v.version), 0) + 1,
         slug: input.slug, title: input.title, description: input.description ?? '', supportEmail, connectionId: connection.id, merchantId: connection.merchantId ?? '',
         currency: input.currency, amountMinor: input.amountMinor, benefits: structuredClone(input.benefits), files, previews, terms: input.terms,
-        published: true, ...(input.billing?{billing:input.billing}:{}), ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }), ...(input.external ? { external: structuredClone(input.external) } : {}) };
+        published: true, ...(input.collectionRoots?{collectionRoots:[...new Set(input.collectionRoots)],...(input.contentSourceRevision?{contentSourceRevision:input.contentSourceRevision}:{})}:{}), ...(input.billing?{billing:input.billing}:{}), ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }), ...(input.external ? { external: structuredClone(input.external) } : {}) };
       for(const previous of versions){previous.published=false;tx.put('offer',previous);}
       tx.insert('offer', offer, [key('offer-version', scope, offer.offerId, offer.version)]);
-      this.audit(tx, scope, actor.subjectId, 'offer.publish', offer.id);if(offer.billing)this.updateSubscriptionContents(tx,offer);
-      if (offer.benefits.some(b => b.type === 'package')) {
-        const id = key('package', offer.id); tx.insert('package', { ...this.base(scope, id), offerVersionId: offer.id, assetId: id, state: 'preparing' });
-        tx.insert('asset', { ...this.base(scope, id), label: offer.title + '.zip', contentType: 'application/zip', byteLength: 0, checksum: '0'.repeat(64), objectId: '', publicPreview: false, state: 'preparing' });
-        this.queue(tx, scope, 'package', id, id);
-      }
+      this.audit(tx, scope, actor.subjectId, 'offer.publish', offer.id);if(offer.billing||offer.collectionRoots)this.updateAccessContents(tx,offer);
+      if (offer.benefits.some(b => b.type === 'package')) this.ensureContentPackage(tx,offer);
       return offer;
     });
   }
@@ -300,7 +325,7 @@ export class CommerceService {
     await this.ports.authorizeCreator(actor);
     await this.store.transaction(tx => { const offer = tx.get('offer', offerId); if (!offer || offer.ownerId !== actor.ownerId) throw new CommerceError('offer_not_found', 404);
       if(published&&tx.list('offer').some(o=>o.offerId===offer.offerId&&same(o,offer)&&o.version>offer.version))throw new CommerceError('offer_version_superseded',409);
-      offer.published = published; tx.put('offer', offer); this.audit(tx, offer, actor.subjectId, 'offer.visibility', offerId); });
+      offer.published = published; tx.put('offer', offer);if(!published)for(const version of tx.list('offer').filter(v=>same(v,offer)&&v.offerId===offer.offerId&&(v.financialOfferVersionId??v.id)===(offer.financialOfferVersionId??offer.id))){version.published=false;tx.put('offer',version);} this.audit(tx, offer, actor.subjectId, 'offer.visibility', offerId); });
   }
   async checkout(subjectId: string, offerVersionId: string, idempotencyKey: string) {
     if (!/^[A-Za-z0-9_-]{8,200}$/.test(idempotencyKey)) throw new CommerceError('invalid_idempotency_key');
@@ -390,13 +415,13 @@ export class CommerceService {
     if (notificationEventId) payment.notificationEventId = notificationEventId;
     tx.put('payment', payment);
     if (order) { order.state = invalid ? 'needs_review' : ['completed','partially_refunded','refunded','reversed'].includes(payment.state) ? 'completed' : payment.state === 'failed' ? 'failed' : 'pending'; order.reviewReason = invalid; tx.put('checkout', order); }
-    const contentOffer=offer?this.subscriptionContents(tx,offer):undefined;
+    const contentOffer=offer?this.currentContents(tx,offer):undefined;
     const purchaseId = key('purchase', id), existing = tx.get('purchase', purchaseId);
     if (!invalid && !existing && ['completed', 'partially_refunded'].includes(payment.state)) {
-      const purchase = { ...this.base(scope, purchaseId), paymentId: id, offerVersionId: offer!.id,...(offer!.billing?{contentOfferVersionId:contentOffer!.id}:{}), customerId: order?.customerId,
+      const purchase = { ...this.base(scope, purchaseId), paymentId: id, offerVersionId: offer!.id,...((offer!.billing||contentOffer?.collectionRoots)?{contentOfferVersionId:contentOffer!.id}:{}), customerId: order?.customerId,
         buyerEmail: evidence.buyerEmail ? email(evidence.buyerEmail) : undefined, state: 'active' as const, claimedAt: order ? this.now() : undefined };
-      tx.insert('purchase', purchase, [key('purchase-payment', id)]);
-      for (const benefit of contentOffer!.benefits) tx.insert('entitlement', { ...this.base(scope, key('grant', purchaseId, benefit)), customerId: purchase.customerId,
+      tx.insert('purchase', purchase, [key('purchase-payment', id)]);if(this.accessBenefits(offer!,contentOffer!).some(b=>b.type==='package'))this.ensureContentPackage(tx,contentOffer!);
+      for (const benefit of this.accessBenefits(offer!,contentOffer!)) tx.insert('entitlement', { ...this.base(scope, key('grant', purchaseId, benefit)), customerId: purchase.customerId,
         purchaseId, source: 'payment', benefit: structuredClone(benefit), assetIds: benefit.type === 'gallery' ? [...contentOffer!.files] : benefit.type === 'download' ? [benefit.resourceId] : benefit.type === 'package' ? [key('package', contentOffer!.id)] : [], startsAt: purchase.createdAt,
         ...(offer!.billing ? {endsAt:subscriptionPeriodEnd(evidence.paidAt!,offer!.billing)} : offer!.durationSeconds ? { endsAt: new Date(Date.parse(purchase.createdAt) + offer!.durationSeconds * 1000).toISOString() } : {}), state: 'active' });
       if (!purchase.customerId) this.createClaim(tx, purchaseId);
@@ -455,15 +480,17 @@ export class CommerceService {
     }); return { queued: true };
   }
   async purchases(subjectId: string) {
+    await this.refreshCustomerCollections(subjectId);
     return this.store.transaction(tx => { const c = this.customer(tx, subjectId);
       return tx.list('purchase').filter(p => p.customerId === c.id).map(p => ({ id: p.id, ownerId: p.ownerId, environment: p.environment, state: p.state, createdAt: p.createdAt,
         subscription:tx.list('checkout').find(o=>o.billing&&o.id===tx.get('payment',p.paymentId)?.checkoutId),
         contentOffer:tx.get('offer',p.contentOfferVersionId??p.offerVersionId),
         offer: tx.get('offer', p.offerVersionId), payment: tx.get('payment', p.paymentId), entitlements: tx.list('entitlement').filter(g => g.purchaseId === p.id),
-        packages: tx.list('package').filter(a => a.offerVersionId === p.offerVersionId), discordInvites:tx.list('guild').filter(g=>same(g,p)&&tx.list('entitlement').some(e=>e.purchaseId===p.id&&isActive(e,this.now())&&e.benefit.type==='discord_role'&&e.benefit.guildId===g.guildId)).map(g=>({guildId:g.guildId,inviteUrl:g.inviteUrl})), discordJobs:tx.list('job').filter(j=>j.kind==='discord'&&j.referenceId===c.id&&same(j,p)).map(j=>({state:j.state,lastError:j.lastError})), discord: tx.list('discordRole').filter(r => r.customerId === c.id && r.ownerId === p.ownerId && r.environment === p.environment) })); });
+        packages: tx.list('package').filter(a => a.offerVersionId === (p.contentOfferVersionId??p.offerVersionId)), discordInvites:tx.list('guild').filter(g=>same(g,p)&&tx.list('entitlement').some(e=>e.purchaseId===p.id&&isActive(e,this.now())&&e.benefit.type==='discord_role'&&e.benefit.guildId===g.guildId)).map(g=>({guildId:g.guildId,inviteUrl:g.inviteUrl})), discordJobs:tx.list('job').filter(j=>j.kind==='discord'&&j.referenceId===c.id&&same(j,p)).map(j=>({state:j.state,lastError:j.lastError})), discord: tx.list('discordRole').filter(r => r.customerId === c.id && r.ownerId === p.ownerId && r.environment === p.environment) })); });
   }
   async retryCustomerDiscord(subjectId:string){await this.rateLimit(subjectId,'customer_discord_retry',10,3600);await this.store.transaction(tx=>{const c=this.customer(tx,subjectId),scopes=new Map<string,Scope>();for(const g of tx.list('entitlement').filter(g=>g.customerId===c.id))scopes.set(key(g.ownerId,g.environment),g);for(const s of scopes.values())this.queue(tx,s,'discord',c.id);});return {queued:true};}
   async myAccess(subjectId: string) {
+    await this.refreshCustomerCollections(subjectId);
     return this.store.transaction(tx => { const customer = this.customer(tx, subjectId);this.claimGifts(tx,customer);const entitlements = tx.list('entitlement').filter(g => g.customerId === customer.id && isActive(g, this.now()));
       const ids = new Set(entitlements.flatMap(g => g.assetIds));
       return { entitlements, assets: tx.list('asset').filter(a => ids.has(a.id)).map(({ objectId, source, ...asset }) => asset) }; });
@@ -491,19 +518,20 @@ export class CommerceService {
   async giftOffer(actor:CreatorActor,input:{offerVersionId:string;recipientEmail:string;months?:number;requestId:string}){
     await this.ports.authorizeCreator(actor);if(!/^[A-Za-z0-9_-]{8,200}$/.test(input.requestId))throw new CommerceError('invalid_idempotency_key');
     const recipientEmail=email(input.recipientEmail),offer=await this.store.transaction(tx=>tx.get('offer',input.offerVersionId));
-    if(!offer||offer.ownerId!==actor.ownerId)throw new CommerceError('offer_not_found',404);await this.ports.assertEligible(offer);await this.ports.assertOfferEligible?.(offer,offer);
+    if(!offer||offer.ownerId!==actor.ownerId)throw new CommerceError('offer_not_found',404);await this.ports.assertEligible(offer);await this.refreshCollection(offer);const content=await this.store.transaction(tx=>this.currentContents(tx,offer));await this.ports.assertOfferEligible?.(offer,content);
     if(offer.billing?(!Number.isSafeInteger(input.months)||input.months!<1||input.months!>120):input.months!==undefined)throw new CommerceError('invalid_gift_duration');
     return this.store.transaction(tx=>{const id=key('gift',offer.ownerId,offer.environment,input.requestId),requestHash=hash(JSON.stringify({...input,recipientEmail})),prior=tx.get('gift',id);if(prior){if(prior.requestHash!==requestHash)throw new CommerceError('idempotency_conflict',409);return prior;}
       const gift:import('./model.js').Gift={...this.base(offer,id),offerVersionId:offer.id,recipientEmail,requestHash,...(input.months?{months:input.months}:{}),state:'pending'};tx.insert('gift',gift);this.queue(tx,gift,'gift_email',gift.id,gift.id);this.audit(tx,gift,actor.subjectId,'gift.create',gift.id);return gift;});
   }
   async revokeGift(actor:CreatorActor,id:string){await this.ports.authorizeCreator(actor);await this.store.transaction(tx=>{const gift=tx.get('gift',id);if(!gift||gift.ownerId!==actor.ownerId)throw new CommerceError('gift_not_found',404);gift.state='revoked';tx.put('gift',gift);for(const grant of tx.list('entitlement').filter(g=>g.giftId===id)){grant.state='revoked';tx.put('entitlement',grant);}if(gift.customerId)this.queue(tx,gift,'discord',gift.customerId);this.audit(tx,gift,actor.subjectId,'gift.revoke',id);});return {revoked:true};}
   private claimGifts(tx:CommerceTransaction,customer:Customer){
-    for(const gift of tx.list('gift').filter(g=>g.state==='pending'&&customer.verifiedEmails.includes(g.recipientEmail))){const offer=tx.get('offer',gift.offerVersionId);if(!offer)continue;const contents=this.subscriptionContents(tx,offer);gift.contentOfferVersionId=contents.id;gift.customerId=customer.id;gift.claimedAt=this.now();gift.state='claimed';if(gift.months)gift.endsAt=subscriptionPeriodEnd(this.now(),'month',gift.months);tx.put('gift',gift);
-      for(const benefit of contents.benefits)tx.insert('entitlement',{...this.base(gift,key('gift-grant',gift.id,benefit)),customerId:customer.id,giftId:gift.id,source:'manual',reason:'Gift: '+offer.title,benefit:structuredClone(benefit),assetIds:benefit.type==='gallery'?[...contents.files]:benefit.type==='download'?[benefit.resourceId]:benefit.type==='package'?[key('package',contents.id)]:[],startsAt:this.now(),...(gift.endsAt?{endsAt:gift.endsAt}:{}),state:'active'});
+    for(const gift of tx.list('gift').filter(g=>g.state==='pending'&&customer.verifiedEmails.includes(g.recipientEmail))){const offer=tx.get('offer',gift.offerVersionId);if(!offer)continue;const contents=this.currentContents(tx,offer);gift.contentOfferVersionId=contents.id;gift.customerId=customer.id;gift.claimedAt=this.now();gift.state='claimed';if(gift.months)gift.endsAt=subscriptionPeriodEnd(this.now(),'month',gift.months);tx.put('gift',gift);
+      if(this.accessBenefits(offer,contents).some(b=>b.type==='package'))this.ensureContentPackage(tx,contents);
+      for(const benefit of this.accessBenefits(offer,contents))tx.insert('entitlement',{...this.base(gift,key('gift-grant',gift.id,benefit)),customerId:customer.id,giftId:gift.id,source:'manual',reason:'Gift: '+offer.title,benefit:structuredClone(benefit),assetIds:benefit.type==='gallery'?[...contents.files]:benefit.type==='download'?[benefit.resourceId]:benefit.type==='package'?[key('package',contents.id)]:[],startsAt:this.now(),...(gift.endsAt?{endsAt:gift.endsAt}:{}),state:'active'});
       this.queue(tx,gift,'discord',customer.id);this.audit(tx,gift,customer.subjectId,'gift.claim',gift.id);
     }
   }
-  async gifts(subjectId:string){return this.store.transaction(tx=>{const customer=this.customer(tx,subjectId);this.claimGifts(tx,customer);return tx.list('gift').filter(g=>g.customerId===customer.id).map(g=>({...g,offer:tx.get('offer',g.offerVersionId),contentOffer:tx.get('offer',g.contentOfferVersionId??g.offerVersionId),entitlements:tx.list('entitlement').filter(e=>e.giftId===g.id)}));});}
+  async gifts(subjectId:string){await this.refreshCustomerCollections(subjectId);return this.store.transaction(tx=>{const customer=this.customer(tx,subjectId);this.claimGifts(tx,customer);return tx.list('gift').filter(g=>g.customerId===customer.id).map(g=>({...g,offer:tx.get('offer',g.offerVersionId),contentOffer:tx.get('offer',g.contentOfferVersionId??g.offerVersionId),entitlements:tx.list('entitlement').filter(e=>e.giftId===g.id)}));});}
   async manualGrant(actor: CreatorActor, input: { customerId: string; environment: Environment; benefit: Benefit; reason: string; endsAt?: string }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     if (!input.reason?.trim() || input.reason.length > 1000 || (input.endsAt && (!Number.isFinite(Date.parse(input.endsAt)) || Date.parse(input.endsAt) <= Date.parse(this.now())))) throw new CommerceError('grant_reason_or_duration_invalid');

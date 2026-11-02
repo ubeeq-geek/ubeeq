@@ -5,6 +5,7 @@ export interface Customer extends RecordBase { subjectId: string; verifiedEmails
 export type Benefit = { type: 'gallery' | 'download' | 'package'; resourceId: string } | { type: 'discord_role'; resourceId: string; guildId: string; roleId: string };
 export interface Offer extends RecordBase {
   billing?: 'month' | 'year';
+  collectionRoots?:string[]; contentSourceRevision?:string; financialOfferVersionId?:string;
   commandHash?: string; offerId: string; version: number; slug: string; title: string; description: string; supportEmail: string;
   connectionId: string; merchantId: string; currency: string; amountMinor: number;
   benefits: Benefit[]; files: string[]; previews: string[]; terms: string; durationSeconds?: number;

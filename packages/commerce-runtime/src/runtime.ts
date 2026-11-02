@@ -37,6 +37,7 @@ export interface CommerceRuntimeConfiguration {
   reconciliationBatchSize?:number;
   recentPaymentDays?:number;
   assertOfferEligible?:CommercePorts['assertOfferEligible'];
+  prepareCollectionContents?:CommercePorts['prepareCollectionContents'];
   mail: CommercePorts['mail'];
   discord?: DiscordCommerceConfiguration;
   fetch?: PayPalFetch;
@@ -112,6 +113,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
     try { return (await deps.storage.get(object)).body; } catch { throw new CommerceError('content_unavailable', 409); }
   };
   const service = new CommerceService({ store, provider, publicBaseUrl: baseUrl, tokenKey: config.tokenKey, authorizeCreator: authorize, assertEligible: eligible,
+    prepareCollectionContents:config.prepareCollectionContents,
     assertOfferEligible:async(scope,offer)=>{if(!await deps.contentAvailable(scope.ownerId,'')||!(await Promise.all(offer.files.map(id=>deps.contentAvailable(scope.ownerId,id)))).every(Boolean))throw new CommerceError('offer_not_eligible',403);await config.assertOfferEligible?.(scope,offer);},
     reconciliation:{batchSize:config.reconciliationBatchSize??100,recentPaymentDays:config.recentPaymentDays??30},
     withConnectionLock: (scope, operation) => store.withLock(scope, operation),
@@ -228,7 +230,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
           const asset = access.assets.find(a => a.id === id); if (!asset?.contentType.startsWith('image/') || asset.state !== 'available') continue;
           const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url, thumbnail: authorized.url, title: asset.label, alt: asset.label });
         }
-        send(response, { html: renderWebsiteGalleryGroup([{ id: purchase.id, title: purchase.offer.title, href: '/commerce/purchases', photos }], purchase.id), refreshAfterSeconds: 240 }); return true;
+        send(response, { html: renderWebsiteGalleryGroup([{ id: purchase.id, title: (purchase.contentOffer??purchase.offer).title, href: '/commerce/purchases', photos }], purchase.id), refreshAfterSeconds: 240 }); return true;
       }
       if (path === '/api/me/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailVerification(subjectId, required(b.email)), 202); return true; }
       if (path === '/api/me/email/verify' && method === 'POST') { const b = await parseBody(request); send(response, await service.verifyEmail(subjectId, required(b.id), required(b.token))); return true; }

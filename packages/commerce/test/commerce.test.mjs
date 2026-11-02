@@ -359,3 +359,17 @@ test('reviewed subscription content updates reach paid and gifted subscribers wi
  assert.equal(sub.offer.amountMinor,1000);assert.equal(sub.payment.paidMinor,1000);assert.equal(sub.contentOffer.id,updated.id);assert.deepEqual(sub.entitlements.filter(g=>g.state==='active'&&g.benefit.type==='gallery')[0].assetIds,[b.id]);assert.deepEqual(ongoing.offer.files,[a.id]);assert.deepEqual((await f.service.gifts('gifted'))[0].contentOffer.files,[b.id]);
  const renewal=f.evidence(order,{captureId:'RENEWAL',paidAt:f.service.now(),subscriptionInterval:'month',subscriptionPlanId:'PLAN'});await f.service.reconcile(scope,'connection',[renewal]);const renewed=(await f.service.purchases('buyer')).find(p=>p.payment.providerPaymentId==='RENEWAL');assert.equal(renewed.payment.paidMinor,1000);assert.deepEqual(renewed.contentOffer.files,[b.id]);
 });
+
+test('collection buyers follow current contents on return while their original price, terms and download rights stay pinned',async t=>{
+ const f=await fixture(t),a=await f.asset('First image'),b=await f.asset('Added image');await f.verify();
+ const original=await f.offer(a,{collectionRoots:['collection'],contentSourceRevision:'saved-1',benefits:[{type:'gallery',resourceId:'collection'},{type:'download',resourceId:a.id},{type:'package',resourceId:'collection'}]});
+ const order=await f.checkout(original);await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+ const {id,deploymentId,ownerId,environment,createdAt,updatedAt,...input}=b;let revision='saved-2';
+ f.ports.prepareCollectionContents=async offer=>offer.contentSourceRevision===revision?undefined:{revision,collectionRoots:['collection'],galleryIds:['collection'],title:'Revised collection',description:'Latest description',assets:[{...input,label:'Edited image'}]};
+ let purchases=await f.service.purchases('buyer'),purchase=purchases[0];assert.equal(purchase.offer.amountMinor,1000);assert.equal(purchase.offer.terms,original.terms);assert.equal(purchase.offer.id,original.id);assert.equal(purchase.contentOffer.title,'Revised collection');assert.notDeepEqual(purchase.contentOffer.files,original.files);
+ assert.ok(purchase.entitlements.some(g=>g.state==='active'&&g.benefit.type==='download'&&g.assetIds[0]===purchase.contentOffer.files[0]));
+ await f.service.purchases('buyer');assert.equal((await f.store.transaction(tx=>tx.list('offer'))).length,2);const archiveGrant=purchase.entitlements.find(g=>g.state==='active'&&g.benefit.type==='package');assert.ok(archiveGrant);await f.drain();assert.equal((await f.store.transaction(tx=>tx.list('package').find(p=>p.assetId===archiveGrant.assetIds[0]))).state,'ready');
+ await f.service.setOfferPublished(actor,original.id,false);assert.equal((await f.service.storefront('creator','sandbox')).length,0);
+ revision='saved-3';purchases=await f.service.purchases('buyer');assert.equal(purchases[0].contentOffer.contentSourceRevision,'saved-3');assert.equal((await f.service.storefront('creator','sandbox')).length,0,'content refresh must not restart sales');
+ await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'refunded',refundedMinor:1000})]);assert.equal((await f.service.myAccess('buyer')).assets.length,0);
+});
