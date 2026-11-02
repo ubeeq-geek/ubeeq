@@ -47,19 +47,19 @@ export interface CommerceRuntimeDependencies {
   contentAvailable(ownerId: string, assetId: string): Promise<boolean>;
   pruneCredentials?(referenced: string[], createdBefore: string): Promise<void>;
 }
-export function referenceCommerceConfigurationFromEnvironment(env: NodeJS.ProcessEnv): CommerceRuntimeConfiguration | undefined {
+export function referenceCommerceConfigurationFromEnvironment(env: NodeJS.ProcessEnv, mail?: CommerceRuntimeConfiguration['mail']): CommerceRuntimeConfiguration | undefined {
   if (env.UBEEQ_COMMERCE_ENABLED !== '1') return undefined;
-  const endpoint = new URL(env.UBEEQ_COMMERCE_MAIL_ENDPOINT ?? '');
-  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || !env.UBEEQ_COMMERCE_MAIL_TOKEN) throw new Error('Configure an HTTPS commerce mail relay and its authorization token.');
+  const endpoint = mail ? undefined : new URL(env.UBEEQ_COMMERCE_MAIL_ENDPOINT ?? '');
+  if (!mail && (endpoint!.protocol !== 'https:' || endpoint!.username || endpoint!.password || endpoint!.search || endpoint!.hash || !env.UBEEQ_COMMERCE_MAIL_TOKEN)) throw new Error('Configure an HTTPS commerce mail relay and its authorization token.');
   const environments = (env.UBEEQ_PAYPAL_ENVIRONMENTS ?? 'sandbox').split(',').map(environment);
   return { tokenKey: env.UBEEQ_COMMERCE_TOKEN_KEY ?? '', environments, publicBaseUrl: env.UBEEQ_COMMERCE_PUBLIC_BASE_URL,
     eligibleCreatorIds: env.UBEEQ_COMMERCE_ELIGIBLE_CREATORS?.split(',').map(s => s.trim()).filter(Boolean),
     allowedOrigins: env.UBEEQ_COMMERCE_ALLOWED_ORIGINS?.split(',').map(s => new URL(s.trim()).origin),
     financialRetentionDays: Number(env.UBEEQ_COMMERCE_FINANCIAL_RETENTION_DAYS), storageLimitBytes: env.UBEEQ_COMMERCE_STORAGE_LIMIT_BYTES ? Number(env.UBEEQ_COMMERCE_STORAGE_LIMIT_BYTES) : undefined,
     reconciliationBatchSize:env.UBEEQ_COMMERCE_RECONCILIATION_BATCH?Number(env.UBEEQ_COMMERCE_RECONCILIATION_BATCH):undefined,recentPaymentDays:env.UBEEQ_COMMERCE_RECENT_PAYMENT_DAYS?Number(env.UBEEQ_COMMERCE_RECENT_PAYMENT_DAYS):undefined,
-    mail: { send: async message => {
+    mail: mail ?? { send: async message => {
       let response: Response;
-      try { response = await fetch(endpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30000),
+      try { response = await fetch(endpoint!, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(30000),
         headers: { authorization: 'Bearer ' + env.UBEEQ_COMMERCE_MAIL_TOKEN, 'content-type': 'application/json', 'idempotency-key': message.idempotencyKey }, body: JSON.stringify(message) }); }
       catch { throw new CommerceError('mail_delivery_unavailable', 503); }
       await response.body?.cancel().catch(() => {}); if (!response.ok) throw new CommerceError('mail_delivery_unavailable', 503);
