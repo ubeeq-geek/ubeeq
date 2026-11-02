@@ -20,6 +20,8 @@ export interface CommerceRuntimeConfiguration {
   store?: CommerceRuntimeStore;
   vault?: CredentialVault;
   productName?: string;
+  /** Trusted host presentation only. Never populate these assets from creator/customer input. */
+  customerPage?: {html:string;stylesheet:string;bootstrapJavaScript:string;clientJavaScript?:string;contentSecurityPolicy?:string};
   emailOnly?: boolean;
   assetStreams?:Pick<import('@ubeeq/commerce').CommerceAssets,'open'|'verify'|'putPackageStream'>;
   tokenKey: string;
@@ -188,10 +190,11 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       const ip = createHash('sha256').update(request.socket.remoteAddress ?? 'unknown').digest('hex');
       await service.rateLimit(ip, path.startsWith('/api/webhooks/') ? 'webhook_http' : 'commerce_http', 300, 60);
       if(path==='/commerce/media-privacy.js'&&method==='GET'){response.setHeader('content-type','text/javascript; charset=utf-8');response.end(commercePrivacyJavaScript);return true;}
-      if (method === 'GET' && path === '/commerce/client.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(commerceJavaScript); return true; }
+      if(config.customerPage&&method==='GET'&&(path==='/commerce/customer.css'||path==='/commerce/customer.js')){response.setHeader('content-type',path.endsWith('.css')?'text/css; charset=utf-8':'text/javascript; charset=utf-8');response.end(path.endsWith('.css')?config.customerPage.stylesheet:config.customerPage.bootstrapJavaScript);return true;}
+      if (method === 'GET' && path === '/commerce/client.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(config.customerPage?.clientJavaScript??commerceJavaScript); return true; }
       if (method === 'GET' && path === '/commerce/gallery.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(websiteGalleryViewerScript); return true; }
       if (method === 'GET' && (path === '/commerce' || path.startsWith('/commerce/') || path.startsWith('/buy/'))) {
-        response.setHeader('content-type','text/html; charset=utf-8'); response.setHeader('content-security-policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"); response.end((config.emailOnly?commerceHtml.replace('id="signin"','id="signin" hidden'):commerceHtml).replaceAll('Creator purchases',((config.productName??'Creator')+' purchases').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!))));  return true;
+        response.setHeader('content-type','text/html; charset=utf-8'); response.setHeader('content-security-policy', config.customerPage?.contentSecurityPolicy??"default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"); response.end(config.customerPage?.html??(config.emailOnly?commerceHtml.replace('id="signin"','id="signin" hidden'):commerceHtml).replaceAll('Creator purchases',((config.productName??'Creator')+' purchases').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!))));  return true;
       }
       const webhook = path.match(/^\/api\/webhooks\/paypal\/([A-Za-z0-9_-]+)$/);
       if (method === 'POST' && webhook) {
