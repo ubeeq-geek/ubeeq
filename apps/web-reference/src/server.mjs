@@ -50,16 +50,18 @@ export const createReferenceHandler = ({ referenceApiUrl = process.env.UBEEQ_REF
     if (url.pathname === "/health") return sendJson(response, 200, { status: "ok" });
     if (url.pathname === "/extension-contracts") return sendJson(response, 200, { apiVersion: EXTENSION_API_VERSION, contracts: EXTENSION_CONTRACTS });
     if (url.pathname === "/api-configuration") return sendJson(response, 200, { apiPath: "/api", referenceApiUrl: upstream.origin });
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/v1/") || url.pathname === "/commerce" || url.pathname.startsWith("/commerce/") || url.pathname.startsWith("/buy/")) {
       try {
-        const body = await new Promise((resolve, reject) => { const chunks=[]; request.on("data", chunk=>chunks.push(chunk)); request.on("end",()=>resolve(Buffer.concat(chunks))); request.on("error",reject); });
-        const target = new URL(url.pathname.slice(4) + url.search, upstream);
+        const chunks=[];let bodySize=0;for await (const chunk of request){bodySize+=chunk.length;if(bodySize>8*1024*1024){const error=new Error("payload_too_large");error.code="payload_too_large";throw error;}chunks.push(chunk);}const body=Buffer.concat(chunks);
+        const commercePath = /^\/api\/(?:storefront(?:\/|$)|connections\/paypal(?:\/|$)|webhooks\/paypal\/|offers(?:\/|$)|checkouts(?:\/|$)|purchase-claims(?:\/|$)|downloads\/|private-assets\/|previews\/|me(?:\/|$)|auth\/email(?:\/|$)|discord(?:\/|$)|commerce(?:\/|$))/.test(url.pathname);
+        const target = new URL((url.pathname.startsWith("/api/") && !commercePath ? url.pathname.slice(4) : url.pathname) + url.search, upstream);
         const headers = { "content-type": request.headers["content-type"] || "application/json", ...(request.headers.authorization ? { authorization: request.headers.authorization } : {}), ...(request.headers["idempotency-key"] ? { "idempotency-key": request.headers["idempotency-key"] } : {}) };
-        const upstreamResponse = await fetch(target, { method: request.method, headers, body: body.length ? body : undefined });
+        for (const [name,value] of Object.entries(request.headers)) if ((name.startsWith("paypal-") || name === "origin") && typeof value === "string") headers[name]=value;
+        const upstreamResponse = await fetch(target, { method: request.method, headers, body: body.length ? body : undefined, redirect: "error", signal: AbortSignal.timeout(30000) });
         const forwarded = { "content-type": upstreamResponse.headers.get("content-type") || "application/json" };
-        for (const name of ['cache-control','content-security-policy','content-disposition','x-content-type-options','etag']) { const value=upstreamResponse.headers.get(name);if(value)forwarded[name]=value; }
+        for (const name of ['cache-control','content-security-policy','content-disposition','x-content-type-options','x-request-id','referrer-policy','access-control-allow-origin','access-control-allow-headers','access-control-allow-methods','vary','etag']) { const value=upstreamResponse.headers.get(name);if(value)forwarded[name]=value; }
         response.writeHead(upstreamResponse.status, forwarded); response.end(Buffer.from(await upstreamResponse.arrayBuffer())); return;
-      } catch { return sendJson(response, 502, { error: "reference_api_unavailable" }); }
+      } catch(error) { return sendJson(response, error.code === "payload_too_large" ? 413 : 502, { error: error.code === "payload_too_large" ? "payload_too_large" : "reference_api_unavailable" }); }
     }
     if (url.pathname === "/" || url.pathname === "/workspace") return sendHtml(response, page);
     return sendJson(response, 404, { error: "not_found" });

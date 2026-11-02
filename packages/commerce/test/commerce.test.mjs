@@ -1,0 +1,256 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { CommerceService, CommerceError, amountToMinor, minorToAmount } from '../dist/index.js';
+import { SqliteCommerceStore } from '../../../adapters/local/dist/index.js';
+
+const actor = { subjectId: 'creator-owner', ownerId: 'creator' };
+const scope = { deploymentId: 'deployment', ownerId: 'creator', environment: 'sandbox' };
+const key = 'test-key-with-at-least-thirty-two-characters';
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+async function fixture(t) {
+  const dir = mkdtempSync(join(tmpdir(), 'ubeeq-commerce-')), path = join(dir, 'commerce.sqlite');
+  let at = new Date('2026-11-01T12:00:00Z');
+  let store = new SqliteCommerceStore('deployment', path, key);
+  const files = new Map(), messages = [], providerEvidence = new Map(), members = new Map(), adds = [], removes = [];
+  let captureCalls = 0, providerFailure = false;
+  const provider = {
+    createOrder: async order => ({ orderId: 'ORDER-' + order.id, approvalUrl: 'https://www.sandbox.paypal.com/checkoutnow?token=' + order.id, merchantId: 'merchant' }),
+    capture: async () => { captureCalls++; if (providerFailure) throw Object.assign(Error('PRIVATE provider'), { code: 'rate_limited', retryAfterSeconds: 45 }); },
+    reconcile: async (_scope, _connection, reference) => providerEvidence.get(reference.captureId ?? reference.orderId ?? reference.eventId) ?? []
+  };
+  const discord = {
+    authorizationUrl: state => 'https://discord.com/oauth2/authorize?state=' + state, installUrl: () => 'https://discord.com/oauth2/authorize?scope=bot',
+    exchange: async code => ({ userId: code, accessToken: 'SECRET' }), validateGuild: async () => {}, validateRoles: async () => {},
+    member: async (guild, user) => members.has(guild + ':' + user) ? { roles: [...members.get(guild + ':' + user)] } : undefined,
+    addRole: async (guild, user, role) => { adds.push(role); members.get(guild + ':' + user).add(role); },
+    removeRole: async (guild, user, role) => { removes.push(role); members.get(guild + ':' + user).delete(role); }
+  };
+  const ports = { store, tokenKey: key, publicBaseUrl: 'https://shop.example.test', now: () => at,
+    authorizeCreator: async a => { if (a.ownerId !== actor.ownerId || a.subjectId !== actor.subjectId) throw new CommerceError('forbidden', 403); },
+    assertEligible: async s => { if (s.ownerId !== 'creator') throw new CommerceError('ineligible',403); },
+    connection: async () => ({ id: 'connection', merchantId: 'merchant' }), withConnectionLock: (s, fn) => store.withLock(s, fn),
+    markVerified: async () => {}, provider, mail: { send: async message => { messages.push(message); } }, discord,
+    assets: { read: async asset => { if (!files.has(asset.objectId)) throw new CommerceError('content_unavailable',409); return files.get(asset.objectId); },
+      limitBytes: async () => 1000000, putPackage: async (_scope,id,items) => { const bytes=Buffer.concat(items.map(i=>i.bytes)); files.set(id,bytes); return { objectId:id,byteLength:bytes.length,checksum:digest(bytes) }; } }
+  };
+  let service = new CommerceService(ports);
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  const drain = async () => { for (let i=0;i<100;i++) if (!await service.runNextJob('worker')) return; throw Error('job loop'); };
+  const verify = async (subject='buyer', address='buyer@example.test') => { await service.beginEmailVerification(subject,address); await drain(); const message=messages.filter(m=>m.to===address&&m.subject.includes('Verify')).at(-1); const url=new URL(message.text); await service.verifyEmail(subject,url.searchParams.get('id'),url.searchParams.get('token')); return service.customerProfile(subject); };
+  const asset = async (name='image.png', data=Buffer.from('private-content')) => { const id=name+'-'+files.size; files.set(id,data); return service.registerAsset(actor,'sandbox',{ label:name, contentType:'image/png', objectId:id, checksum:digest(data), byteLength:data.length, publicPreview:false, state:'available' }); };
+  const offer = async (file, extra={}) => service.publishOffer(actor,{ environment:'sandbox',slug:'gallery',title:'Gallery',amountMinor:1000,currency:'USD',files:[file.id],benefits:[{type:'gallery',resourceId:'gallery'},{type:'download',resourceId:file.id}],terms:'One-time purchase. Support for refunds.',supportEmail:'creator@example.test',...extra });
+  const checkout = async (o, subject='buyer', idem='purchase-12345') => { const order=await service.checkout(subject,o.id,idem); await drain(); return (await service.order(subject,order.id)).order; };
+  const evidence = (order, extra={}) => ({ captureId:'CAPTURE-1',orderId:order.providerOrderId,reference:order.reference,merchantId:'merchant',currency:'USD',paidMinor:1000,refundedMinor:0,status:'completed',updatedAt:at.toISOString(),buyerEmail:'payer@example.test',...extra });
+  return { get service(){return service;}, get store(){return store;}, ports, path, files, messages, provider, providerEvidence, members, adds, removes, drain, verify, asset, offer, checkout,evidence,
+    get captureCalls(){return captureCalls;}, set providerFailure(value){providerFailure=value;}, advance: ms=>{at=new Date(at.getTime()+ms);},
+    restart:()=>{store.close();store=new SqliteCommerceStore('deployment',path,key);ports.store=store;service=new CommerceService(ports);} };
+}
+
+test('money conversion is exact and rejects floating amounts, overflows and unsupported currency precision', () => {
+  assert.equal(amountToMinor('123.45','USD'),12345);assert.equal(minorToAmount(12345,'USD'),'123.45');assert.equal(amountToMinor('100.00','JPY'),100);
+  for(const [amount,currency] of [['1.001','USD'],['1.1','JPY'],['1e2','USD'],['-1','USD'],['9007199254740992000','USD'],['1','BHD']])assert.throws(()=>amountToMinor(amount,currency));
+});
+
+test('email proof binds only the signed-in customer, is single-use, and checkout requires verified recovery',async t=>{
+  const f=await fixture(t),a=await f.asset(),o=await f.offer(a);
+  await assert.rejects(f.service.checkout('buyer',o.id,'checkout-123'),{code:'verified_recovery_email_required'});
+  await f.service.beginEmailVerification('buyer','buyer@example.test');await f.drain();const url=new URL(f.messages[0].text),id=url.searchParams.get('id'),token=url.searchParams.get('token');
+  await assert.rejects(f.service.verifyEmail('other',id,token),{code:'invalid_email_proof'});
+  await f.service.verifyEmail('buyer',id,token);await assert.rejects(f.service.verifyEmail('buyer',id,token),{code:'invalid_email_proof'});
+  const order=await f.checkout(o);assert.equal(order.state,'pending');assert.equal((await f.service.purchases('buyer')).length,0);
+});
+
+test('concurrent capture reconciliation, duplicates and process restart create one purchase and grant set',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);
+  f.restart();const data=f.evidence(order);
+  await Promise.all(Array.from({length:5},()=>f.service.reconcile(scope,'connection',[data])));
+  const purchases=await f.service.purchases('buyer');assert.equal(purchases.length,1);assert.equal(purchases[0].entitlements.length,2);
+  assert.equal((await f.store.transaction(tx=>tx.list('payment'))).length,1);
+  assert.equal((await f.service.checkout('buyer',o.id,'purchase-12345')).id,order.id);
+  await assert.rejects(f.service.order('other',order.id),{code:'checkout_not_found'});
+});
+
+test('pending, declined, wrong merchant, amount, currency, mapping and reference never grant access',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);
+  const cases=[{status:'pending'},{status:'failed'},{merchantId:'wrong'},{paidMinor:999},{currency:'CAD'},{reference:'forged'},{orderId:'unknown'},{unsupported:true}];
+  for(let i=0;i<cases.length;i++)await f.service.reconcile(scope,'connection',[f.evidence(order,{captureId:'CAPTURE-'+i,...cases[i]})]);
+  assert.equal((await f.service.purchases('buyer')).length,0);await assert.rejects(f.service.authorizeDownload('buyer',a.id),{code:'access_denied'});
+});
+
+test('full refund before a delayed completion never restores access; another purchase and manual grant survive',async t=>{
+  const f=await fixture(t),customer=await f.verify(),a=await f.asset(),o=await f.offer(a),first=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(first)]);const signed=await f.service.authorizeDownload('buyer',a.id);
+  await f.service.reconcile(scope,'connection',[f.evidence(first,{status:'refunded',refundedMinor:1000})]);
+  await assert.rejects(f.service.download(a.id,new URL(signed.url).searchParams.get('token')),{code:'access_denied'});
+  await f.service.reconcile(scope,'connection',[f.evidence(first)]);assert.equal((await f.service.purchases('buyer'))[0].state,'revoked');
+  const second=await f.checkout(o,'buyer','second-purchase');await f.service.reconcile(scope,'connection',[f.evidence(second,{captureId:'CAPTURE-2'})]);
+  await f.service.authorizeDownload('buyer',a.id);
+  const manual=await f.service.manualGrant(actor,{customerId:customer.id,environment:'sandbox',benefit:{type:'download',resourceId:a.id},reason:'Customer support'});
+  await f.service.reconcile(scope,'connection',[f.evidence(second,{captureId:'CAPTURE-2',status:'reversed'})]);
+  await f.service.authorizeDownload('buyer',a.id);await f.service.revoke(actor,manual.id,'Support grant ended');await assert.rejects(f.service.authorizeDownload('buyer',a.id),{code:'access_denied'});
+});
+
+test('cumulative refund IDs deduplicate; partial refunds remain active and require review',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+  const partial=f.evidence(order,{status:'partially_refunded',refunds:[{id:'REFUND-1',amountMinor:400,state:'COMPLETED'}]});
+  await f.service.reconcile(scope,'connection',[partial]);await f.service.reconcile(scope,'connection',[partial]);
+  let p=(await f.service.purchases('buyer'))[0];assert.equal(p.payment.refundedMinor,400);assert.equal(p.payment.reviewReason,'partial_refund_access_remains_active');await f.service.authorizeDownload('buyer',a.id);
+  await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'partially_refunded',refunds:[{id:'REFUND-2',amountMinor:600,state:'COMPLETED'}]})]);
+  p=(await f.service.purchases('buyer'))[0];assert.equal(p.payment.state,'refunded');assert.equal(p.state,'revoked');
+});
+
+test('offer versions snapshot content and duration; public withdrawal does not revoke purchases',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),b=await f.asset('new.png',Buffer.from('new')),o=await f.offer(a,{durationSeconds:60}),order=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+  await f.offer(a,{offerId:o.offerId,files:[a.id,b.id],benefits:[{type:'gallery',resourceId:'gallery'}]});
+  await assert.rejects(f.service.authorizeDownload('buyer',b.id),{code:'access_denied'});
+  await f.service.setOfferPublished(actor,o.id,false);await f.service.authorizeDownload('buyer',a.id);
+  f.advance(61000);await assert.rejects(f.service.authorizeDownload('buyer',a.id),{code:'access_denied'});
+});
+
+test('signed downloads expire in five minutes and reject other customers, tampering and unavailable content',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+  const link=await f.service.authorizeDownload('buyer',a.id),token=new URL(link.url).searchParams.get('token');assert.deepEqual((await f.service.download(a.id,token)).bytes,f.files.get(a.objectId));
+  await assert.rejects(f.service.authorizeDownload('other',a.id),{code:'access_denied'});await assert.rejects(f.service.preview(a.id),{code:'preview_not_found'});
+  await assert.rejects(f.service.download(a.id,token+'x'),{code:'invalid_download'});
+  await f.service.setAssetAvailability(actor,a.id,false);await assert.rejects(f.service.download(a.id,token),{code:'content_unavailable'});
+  await f.service.setAssetAvailability(actor,a.id,true);f.advance(300001);await assert.rejects(f.service.download(a.id,token),{code:'invalid_download'});
+});
+
+test('direct purchases need demonstrated mapping and verified-email claims; guessed, reused and expired claims fail',async t=>{
+  const f=await fixture(t),a=await f.asset(),o=await f.offer(a,{external:{url:'https://www.paypal.com/ncp/payment/LINK',mappingId:'SKU-1'}});
+  const evidence={captureId:'EXTERNAL',merchantId:'merchant',currency:'USD',paidMinor:1000,refundedMinor:0,status:'completed',updatedAt:'2026-11-01T12:00:00Z',buyerEmail:'purchase@example.test',mappingId:'SKU-1'};
+  await f.store.acceptEvent({connection:{...scope,id:'connection'},eventId:'LINK-EVENT',eventType:'PAYMENT.CAPTURE.COMPLETED',rawBody:Buffer.from('{"id":"LINK-EVENT"}'),receivedAt:'2026-11-01T12:00:00Z'});
+  const eventId=(await f.store.transaction(tx=>tx.list('event')))[0].id;
+  const [review]=await f.service.reconcile(scope,'connection',[evidence],eventId);assert.equal(review.state,'needs_review');assert.equal((await f.store.transaction(tx=>tx.list('purchase'))).length,0);
+  f.providerEvidence.set('EXTERNAL',[evidence]);await f.service.validateExternalMapping(actor,o.id,review.id);await f.drain();
+  const mail=f.messages.find(m=>m.subject==='Claim your purchase'),url=new URL(mail.text),id=url.searchParams.get('id'),token=url.searchParams.get('token');
+  await f.verify('wrong','other@example.test');await assert.rejects(f.service.redeemClaim('wrong',id,token),{code:'purchase_email_verification_required'});
+  await f.verify('buyer','purchase@example.test');await assert.rejects(f.service.redeemClaim('buyer',id,'guessed'),{code:'invalid_claim'});
+  await f.service.redeemClaim('buyer',id,token);await assert.rejects(f.service.redeemClaim('buyer',id,token),{code:'invalid_claim'});
+  await f.service.authorizeDownload('buyer',a.id);
+  const serialized=JSON.stringify(await f.store.transaction(tx=>tx.list('claim')));assert.equal(serialized.includes(token),false);
+  const extra={...evidence,captureId:'EXTERNAL-2'};await f.service.reconcile(scope,'connection',[extra]);await f.drain();const latest=new URL(f.messages.filter(m=>m.subject==='Claim your purchase').at(-1).text);f.advance(86400001);
+  await assert.rejects(f.service.redeemClaim('buyer',latest.searchParams.get('id'),latest.searchParams.get('token')),{code:'invalid_claim'});
+});
+
+test('approval queues capture without access; retries survive restarts and keep capture idempotency stable',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);
+  await f.store.acceptEvent({connection:{...scope,id:'connection'},eventId:'APPROVED',eventType:'CHECKOUT.ORDER.APPROVED',rawBody:Buffer.from(JSON.stringify({id:'APPROVED',resource:{id:order.providerOrderId}})),receivedAt:'2026-11-01T12:00:00Z'});
+  f.providerFailure=true;await f.drain();assert.equal((await f.service.purchases('buyer')).length,0);assert.equal(f.captureCalls,1);
+  const captureJob=(await f.store.transaction(tx=>tx.list('job'))).find(j=>j.kind==='capture');assert.equal(captureJob.state,'failed');assert.equal(captureJob.lastError,'rate_limited');
+  f.restart();f.advance(46000);f.providerFailure=false;f.providerEvidence.set(order.providerOrderId,[f.evidence(order)]);await f.drain();assert.equal((await f.service.purchases('buyer')).length,1);assert.equal(f.captureCalls,2);
+});
+
+test('durable inbox deduplicates atomically with jobs, encrypts raw data, and isolates deployments',async t=>{
+  const f=await fixture(t),event={connection:{...scope,id:'connection'},eventId:'EVENT',eventType:'PAYMENT.CAPTURE.COMPLETED',rawBody:Buffer.from('{"private":"sensitive-payer-data"}'),receivedAt:'2026-11-01T12:00:00Z'};
+  assert.equal(await f.store.acceptEvent(event),'accepted');assert.equal(await f.store.acceptEvent(event),'duplicate');
+  assert.equal((await f.store.transaction(tx=>tx.list('job'))).length,1);f.restart();assert.equal(await f.store.acceptEvent(event),'duplicate');
+  const other=new SqliteCommerceStore('other-deployment',f.path,key);assert.deepEqual(await other.transaction(tx=>tx.list('event')),[]);other.close();
+  const {readFileSync}=await import('node:fs');assert.equal(readFileSync(f.path).includes(Buffer.from('sensitive-payer-data')),false);
+});
+
+test('package content is built once per immutable version and policy unavailability blocks archive access',async t=>{
+  const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a,{benefits:[{type:'gallery',resourceId:'gallery'},{type:'package',resourceId:'package'}]}),order=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(order)]);const purchase=(await f.service.purchases('buyer'))[0],pack=purchase.packages[0];assert.equal(pack.state,'ready');
+  const link=await f.service.authorizeDownload('buyer',pack.assetId);await f.service.download(pack.assetId,new URL(link.url).searchParams.get('token'));
+  await f.service.setAssetAvailability(actor,a.id,false);await assert.rejects(f.service.authorizeDownload('buyer',pack.assetId),{code:'content_unavailable'});
+});
+
+test('Discord uses bound OAuth identity, retries membership failures and preserves independently supported roles',async t=>{
+  const f=await fixture(t);await f.verify();const auth=await f.service.beginDiscord(actor.subjectId,actor,'sandbox'),state=new URL(auth.authorizationUrl).searchParams.get('state');
+  await f.service.completeDiscord(actor.subjectId,state,'999',{guildId:'10',roleIds:['20'],inviteUrl:'https://discord.gg/invite'});
+  const begin=await f.service.beginDiscord('buyer'),oauth=new URL(begin.authorizationUrl).searchParams.get('state');
+  await assert.rejects(f.service.completeDiscord('other',oauth,'111'),{code:'invalid_oauth_state'});await f.service.completeDiscord('buyer',oauth,'111');
+  await assert.rejects(f.service.completeDiscord('buyer',oauth,'111'),{code:'invalid_oauth_state'});
+  const a=await f.asset(),o=await f.offer(a,{benefits:[{type:'gallery',resourceId:'gallery'},{type:'discord_role',resourceId:'10:20',guildId:'10',roleId:'20'}]}),order=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(order)]);await f.drain();await f.service.authorizeDownload('buyer',a.id);
+  assert.equal((await f.store.transaction(tx=>tx.list('discordRole')))[0].status,'needs_membership');
+  f.members.set('10:111',new Set());f.advance(1000000);await f.drain();assert.deepEqual(f.adds,['20']);
+  const second=await f.checkout(o,'buyer','purchase-second');await f.service.reconcile(scope,'connection',[f.evidence(second,{captureId:'CAPTURE-2'})]);await f.drain();
+  await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'refunded',refundedMinor:1000})]);await f.drain();assert.deepEqual(f.removes,[]);
+  await f.service.reconcile(scope,'connection',[f.evidence(second,{captureId:'CAPTURE-2',status:'reversed'})]);await f.drain();assert.deepEqual(f.removes,['20']);
+});
+
+test('Discord does not remove roles that predate management',async t=>{
+  const f=await fixture(t);await f.verify();const setup=await f.service.beginDiscord(actor.subjectId,actor,'sandbox');await f.service.completeDiscord(actor.subjectId,new URL(setup.authorizationUrl).searchParams.get('state'),'999',{guildId:'10',roleIds:['20'],inviteUrl:'https://discord.gg/invite'});
+  f.members.set('10:111',new Set(['20','unrelated']));const auth=await f.service.beginDiscord('buyer');await f.service.completeDiscord('buyer',new URL(auth.authorizationUrl).searchParams.get('state'),'111');
+  const a=await f.asset(),o=await f.offer(a,{benefits:[{type:'discord_role',resourceId:'10:20',guildId:'10',roleId:'20'}]}),order=await f.checkout(o);
+  await f.service.reconcile(scope,'connection',[f.evidence(order)]);await f.drain();await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'reversed'})]);await f.drain();assert.deepEqual(f.removes,[]);assert.equal(f.members.get('10:111').has('unrelated'),true);
+});
+
+test('failed transactions roll back all writes and enforce database uniqueness',async t=>{
+  const f=await fixture(t),customer=await f.service.customerProfile('buyer');
+  await assert.rejects(f.store.transaction(tx=>{tx.insert('customer',{...customer,id:'new'},['unique']);tx.insert('customer',{...customer,id:'new2'},['unique']);}));
+  assert.equal((await f.store.transaction(tx=>tx.list('customer'))).length,1);
+});
+
+test('passwordless customer sign-in hashes credentials, survives restart and rejects expired or reused links',async t=>{
+ const f=await fixture(t);await f.service.beginEmailLogin('guest@example.test');await f.drain();const link=new URL(f.messages.at(-1).text),id=link.searchParams.get('id'),proof=link.searchParams.get('token');
+ const session=await f.service.redeemEmailLogin(id,proof);f.restart();const subject=await f.service.customerSubject(session.token);assert.ok(subject.startsWith('customer-'));assert.deepEqual((await f.service.customerProfile(subject)).verifiedEmails,['guest@example.test']);
+ await assert.rejects(f.service.redeemEmailLogin(id,proof),{code:'invalid_sign_in_link'});const stored=JSON.stringify(await f.store.transaction(tx=>tx.list('session')));assert.equal(stored.includes(session.token.split('.')[1]),false);
+ await f.service.beginEmailLogin('another@example.test');await f.drain();const expired=new URL(f.messages.at(-1).text);f.advance(900001);await assert.rejects(f.service.redeemEmailLogin(expired.searchParams.get('id'),expired.searchParams.get('token')),{code:'invalid_sign_in_link'});
+});
+
+test('customer erasure revokes issued access while preserving required financial records',async t=>{
+ const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+ const authorized=await f.service.authorizeDownload('buyer',a.id);await f.service.eraseCustomer('buyer');
+ await assert.rejects(f.service.download(a.id,new URL(authorized.url).searchParams.get('token')),{code:'access_denied'});
+ await assert.rejects(f.service.customerProfile('buyer'),{code:'customer_erased'});
+ const snapshot=await f.store.transaction(tx=>({payments:tx.list('payment'),customers:tx.list('customer'),grants:tx.list('entitlement')}));assert.equal(snapshot.payments.length,1);assert.equal(snapshot.payments[0].state,'completed');assert.deepEqual(snapshot.customers[0].verifiedEmails,[]);assert.ok(snapshot.grants.every(g=>g.state==='revoked'));
+});
+
+test('expired lifecycle leases fence stale checkout transactions and do not release a successor lease',async t=>{
+ const f=await fixture(t),scopeKey=JSON.stringify([scope.deploymentId,scope.ownerId,scope.environment]);
+ await f.store.withLock(scope,async()=>{
+  f.store.db.prepare('UPDATE commerce_locks SET token=?,expires=? WHERE scope=?').run('successor',Date.now()+90000,scopeKey);
+  await assert.rejects(f.store.transaction(tx=>tx.list('checkout')),{code:'connection_lock_lost'});
+ });
+ assert.equal(f.store.db.prepare('SELECT token FROM commerce_locks WHERE scope=?').get(scopeKey).token,'successor');
+});
+
+test('Discord setup tokens stay in the encrypted port and server/role selection requires creator authority',async t=>{
+ const f=await fixture(t),tokens=new Map();f.ports.discordTokens={write:async(_scope,value)=>{tokens.set('ref',value);return 'ref';},read:async ref=>tokens.get(ref),revoke:async ref=>tokens.delete(ref)};
+ f.ports.discord.guilds=async()=>[{id:'10',name:'Creator server'}];f.ports.discord.roles=async()=>[{id:'20',name:'Supporter'}];
+ const begin=await f.service.beginDiscord(actor.subjectId,actor,'sandbox'),state=new URL(begin.authorizationUrl).searchParams.get('state');
+ assert.equal((await f.service.discordFlow(actor.subjectId,state)).creator,true);
+ const setup=await f.service.completeDiscord(actor.subjectId,state,'999');assert.equal(JSON.stringify(setup).includes('SECRET'),false);assert.equal(tokens.size,1);
+ await assert.rejects(f.service.discordSetupRoles({ownerId:'creator',subjectId:'other'},setup.creatorSessionId,'10'),{code:'forbidden'});
+ assert.deepEqual(await f.service.discordSetupRoles(actor,setup.creatorSessionId,'10'),[{id:'20',name:'Supporter'}]);
+ await f.service.configureDiscordSetup(actor,setup.creatorSessionId,{guildId:'10',roleIds:['20'],inviteUrl:'https://discord.gg/invite'});assert.equal(tokens.size,0);assert.equal((await f.service.creatorHistory(actor)).guilds[0].roleLabels['20'],'Supporter');
+});
+
+test('transaction handles cannot mutate records after their atomic callback ends',async t=>{
+ const f=await fixture(t);let escaped;await f.store.transaction(tx=>{escaped=tx;});
+ assert.throws(()=>escaped.list('customer'),{code:'commerce_transaction_ended'});
+ assert.throws(()=>escaped.remove('customer','nonexistent'),{code:'commerce_transaction_ended'});
+});
+
+test('superseded offer prices cannot create new orders, while an earlier idempotent checkout stays recoverable',async t=>{
+ const f=await fixture(t);await f.verify();const a=await f.asset(),first=await f.offer(a),order=await f.checkout(first);
+ const next=await f.offer(a,{offerId:first.offerId,amountMinor:2000});
+ await assert.rejects(f.service.checkout('buyer',first.id,'new-stale-checkout'),{code:'offer_not_found'});
+ assert.equal((await f.service.checkout('buyer',first.id,'purchase-12345')).id,order.id);
+ await assert.rejects(f.service.setOfferPublished(actor,first.id,true),{code:'offer_version_superseded'});
+ assert.equal((await f.service.storefront('creator','sandbox'))[0].amountMinor,next.amountMinor);
+ f.ports.connection=async()=>{throw new CommerceError('payment_connection_unavailable',409);};
+ assert.equal((await f.service.storefront('creator','sandbox'))[0].availableForCheckout,false);
+});
+
+test('deployment offer eligibility gates both public discovery and new checkout',async t=>{
+ const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a);
+ f.ports.assertOfferEligible=async()=>{throw new CommerceError('offer_not_eligible',403);};
+ assert.deepEqual(await f.service.storefront('creator','sandbox'),[]);
+ await assert.rejects(f.service.checkout('buyer',o.id,'blocked-offer-checkout'),{code:'offer_not_eligible'});
+});
+
+test('capture rechecks eligibility after checkout and does not charge a policy-held offer',async t=>{
+ const f=await fixture(t);await f.verify();const a=await f.asset(),o=await f.offer(a),order=await f.checkout(o);
+ f.ports.assertOfferEligible=async()=>{throw new CommerceError('offer_not_eligible',403);};await f.service.capture('buyer',order.id);await f.drain();
+ assert.equal(f.captureCalls,0);assert.equal((await f.service.purchases('buyer')).length,0);
+});

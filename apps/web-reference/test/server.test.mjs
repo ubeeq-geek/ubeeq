@@ -32,3 +32,16 @@ test("serves a neutral workspace and proxies only to the configured reference AP
   const proxied = await fetch(`http://127.0.0.1:${address.port}/api/health`);
   assert.deepEqual(await proxied.json(), { status: "ok" });
 });
+
+test('preserves commerce paths, original callback bytes and PayPal headers alongside legacy proxy paths', async context => {
+  const {createServer}=await import('node:http');
+  const upstream=createServer(async(request,response)=>{const chunks=[];for await(const chunk of request)chunks.push(chunk);response.setHeader('content-type','application/json');response.setHeader('cache-control','private, no-store');response.end(JSON.stringify({path:request.url,signature:request.headers['paypal-transmission-sig'],body:Buffer.concat(chunks).toString()}));});
+  await new Promise(resolve=>upstream.listen(0,'127.0.0.1',resolve));
+  const app=createReferenceApp({referenceApiUrl:'http://127.0.0.1:'+upstream.address().port});await new Promise(resolve=>app.listen(0,'127.0.0.1',resolve));
+  context.after(()=>{app.close();upstream.close();});const base='http://127.0.0.1:'+app.address().port;
+  assert.equal((await (await fetch(base+'/api/health')).json()).path,'/health');
+  assert.equal((await (await fetch(base+'/api/v1/creators/me')).json()).path,'/v1/creators/me');
+  assert.equal((await (await fetch(base+'/api/storefront?owner=creator')).json()).path,'/api/storefront?owner=creator');
+  const raw='{ "id": "EVENT", "resource": {} }';const result=await fetch(base+'/api/webhooks/paypal/connection',{method:'POST',headers:{'content-type':'application/json','paypal-transmission-sig':'verified-fixture-signature'},body:raw});
+  assert.equal(result.headers.get('cache-control'),'private, no-store');assert.deepEqual(await result.json(),{path:'/api/webhooks/paypal/connection',signature:'verified-fixture-signature',body:raw});
+});

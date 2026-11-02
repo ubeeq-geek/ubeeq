@@ -1,4 +1,5 @@
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
+import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
 import { WebsiteError, normalizeContentSlug } from '@ubeeq/core';
 import { handleWebsiteHostingRequest } from './website-hosting.js';
@@ -63,6 +64,7 @@ export interface RegionalControlPlane {
 }
 
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
+  commerce?: ReferenceCommerceConfiguration;
   publicBaseUrl: string;
   instanceId?: string;
   cellId?: string;
@@ -99,6 +101,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
     region: environment.UBEEQ_CELL_REGION ?? "local",
     operator: environment.UBEEQ_CELL_OPERATOR ?? "self-hosted",
     credentialEncryptionKey: environment.UBEEQ_CREDENTIAL_ENCRYPTION_KEY,
+    commerce: referenceCommerceConfigurationFromEnvironment(environment),
     nativeWebsiteProfiles:environment.UBEEQ_WEBSITE_HOSTING_ROOT&&environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE?[{id:'local',root:environment.UBEEQ_WEBSITE_HOSTING_ROOT,publicUrlTemplate:environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE,persistent:true,writerMode:'single'}]:[],
   };
 };
@@ -313,8 +316,23 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     enqueue:async payload=>{await adapters.jobs.enqueue({cellId,type:'website.deploy',payload,idempotencyKey:payload.idempotencyKey,maxAttempts:20});},
     audit:async event=>{await audit({action:event.action,actorId:event.actor.actorId,subjectId:event.targetId??event.intentId??event.actor.workspaceId,payload:{generation:event.generation,digest:event.digest,result:event.result}});}
   }):undefined);
+  if (configuration.commerce && ((!localAdapters && !(configuration.commerce.store && configuration.commerce.vault)) || (!configuration.commerce.vault && (!configuration.credentialEncryptionKey || configuration.credentialEncryptionKey.length < 32)))) throw new Error('Commerce requires a durable store and an encrypted vault; local vaults require an explicit encryption key of at least 32 characters.');
+  const commerce = configuration.commerce ? createReferenceCommerce(configuration.commerce, {
+    deploymentId: configuration.instanceId ?? 'local-reference', cellId, publicBaseUrl: configuration.publicBaseUrl, dataDirectory: localConfiguration.dataDirectory,
+    vault: configuration.commerce.vault ?? localAdapters!.credentials, storage: adapters.storage, subject: async request => (await session(request)).subject.id,
+    creator: async(subjectId,ownerId)=>{if(!ownerId)return creatorFor(subjectId);const creator=await repositories.creators.get(ownerId);if(!creator)throw new HttpError(404,'creator_not_found','Creator was not found.');
+      if(creator.subjectId!==subjectId){const at=new Date().toISOString(),delegations=await adapters.identity.listDelegations({creatorId:ownerId,subjectId,at});
+        if(!delegations.some(d=>d.creatorId===ownerId&&d.subjectId===subjectId&&(!d.expiresAt||d.expiresAt>at)&&d.scopes.includes('commerce.manage')))throw new HttpError(403,'creator_authorization_denied','Commerce management delegation is required.');}
+      return creator;},
+    publicCreator:async ownerId=>{const creator=await repositories.creators.get(ownerId);return creator?{displayName:creator.displayName,handle:creator.handle,bio:creator.bio}:undefined;},
+    contentAvailable: async (ownerId, assetId) => !(await allRecords(repositories.moderationHolds)).some(h => h.state === 'active' && (h.subjectId === ownerId || h.subjectId === assetId)),
+    pruneCredentials: localAdapters&&!configuration.commerce.vault ? (references,cutoff)=>localAdapters.credentials.pruneCommerceOrphans(references,cutoff) : undefined
+  }) : undefined;
   let lastWebsitePolicyScan=0;
+  let commerceTurn=true;
   const runNextJob = async (workerId: string) => {
+    if (commerce && commerceTurn) { commerceTurn=false; const job = await commerce.runNextJob(workerId); if (job) return job; }
+    commerceTurn=true;
     // Recover policy changes from authoritative hold records, even if the process crashed after the hold committed.
     if(publishing&&websiteStore&&!configuration.websitePublishing&&Date.now()-lastWebsitePolicyScan>=5000){
       const subjects=(await allRecords(repositories.moderationHolds)).filter(h=>h.state==='active').map(h=>h.subjectId);
@@ -347,7 +365,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     }
 
     const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: 60, workerId });
-    if (!lease) return undefined;
+    if (!lease) return commerce?.runNextJob(workerId);
     try {
       if (lease.job.cellId !== cellId) throw new Error(`Foreign-cell job ${lease.job.cellId} rejected by ${cellId}`);
       const asset = await repositories.assets.get(lease.job.payload.assetId);
@@ -390,6 +408,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     try {
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
+      if (commerce && await commerce.handle(request, response, url)) return;
       // Fail closed for the entire operations namespace, including future routes.
       // Product/deployment composition must explicitly define operator authority.
       if (url.pathname === '/v1/operations' || url.pathname.startsWith('/v1/operations/')) await operatorSession(request);
@@ -657,7 +676,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     }
   };
   const server = createServer((request, response) => { void handle(request, response); });
-  return { server, handle, runNextJob, close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : (websiteStore?.close(), resolve()))) };
+  return { server, handle, runNextJob, close: () => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : (websiteStore?.close(), commerce?.close(), resolve()))) };
 };
 
 if (process.argv[1] && process.argv[1].endsWith("server.js")) {
