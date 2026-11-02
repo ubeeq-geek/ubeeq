@@ -301,3 +301,31 @@ test('supported media players pass the complete artifact build while authored or
  rejects('<object data="https://example.com"></object>');
  const unrelatedSignedLink=new Map(artifact.files);unrelatedSignedLink.set('index.html',Buffer.from(html.replace('</body>','<a href="https://example.com/?token=not-an-approved-player">Other link</a></body>')));assert.throws(()=>validateWebsiteFiles(snapshot.website,unrelatedSignedLink),error=>error.code==='invalid_url');
 });
+
+test('bundles only approved named gallery covers and rejects foreign or missing cover references',()=>{
+ const snapshot=fixture();snapshot.website.namedGalleries=[{id:'main',title:'Main',slug:'main',kind:'galleries',access:'free',publicationIds:[]},{id:'collection',title:'Collection',slug:'collection',parentId:'main',kind:'works',access:'preview',publicationIds:['preview-private']}];
+ snapshot.namedGalleryCovers={collection:snapshot.assets[0].id};assert.doesNotThrow(()=>buildWebsiteArtifact(snapshot,limits));
+ snapshot.namedGalleryCovers={missing:snapshot.assets[0].id};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),/Gallery covers/);
+ snapshot.namedGalleryCovers={collection:'not-approved'};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),/Gallery covers/);
+});
+
+test('preview candidate queries validate only the latest ready and active builds for the saved revision',async t=>{
+ const h=await harness();t.after(()=>h.store.close());
+ const base=await h.service.requestBuild(h.actor,h.snapshot.website.id,1,'preview-base');await h.service.execute(h.actor.workspaceId,base.id);
+ const ready=await h.store.getBuild(h.actor.workspaceId,base.id);
+ const seed=async(id,state,createdAt,websiteRevision=1)=>h.store.saveBuild({...ready,id,state,createdAt,websiteRevision,revision:1,idempotencyKey:id},0);
+ await seed('latest','ready','2026-10-19T12:01:00Z');await seed('queued','queued','2026-10-19T12:02:00Z');await seed('older','ready','2026-10-19T11:00:00Z');await seed('other-revision','ready','2026-10-19T13:00:00Z',2);
+ const checked=[],original=h.service.build.bind(h.service);h.service.build=async(actor,id)=>{checked.push(id);return original(actor,id);};
+ const candidates=await h.service.builds(h.actor,h.snapshot.website.id,1);
+ assert.deepEqual(checked,['latest','queued']);assert.deepEqual(candidates.map(b=>[b.id,b.stale]),[['latest',false],['queued',false]]);
+ await assert.rejects(h.service.builds(h.actor,h.snapshot.website.id,NaN),{code:'stale_revision'});
+ h.setActive(false);await assert.rejects(h.service.builds(h.actor,h.snapshot.website.id,1),{code:'authorization_denied'});
+});
+
+test('build document freshness checks use bounded concurrency and detect changed revisions',async t=>{
+ const h=await harness();t.after(()=>h.store.close());const base=await h.service.requestBuild(h.actor,h.snapshot.website.id,1,'parallel-checks');
+ const dependencies=Array.from({length:12},(_,i)=>({kind:'document',id:'parallel-'+i,revision:'1'}));await h.store.saveBuild({...base,revision:base.revision+1,dependencies},base.revision);
+ let active=0,peak=0;const read=h.store.getDocument.bind(h.store);
+ h.store.getDocument=async(workspace,id)=>{if(!id.startsWith('parallel-'))return read(workspace,id);peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return {id,revision:id==='parallel-11'?2:1};};
+ assert.equal((await h.service.build(h.actor,base.id)).stale,true);assert.equal(peak,5);assert.equal(active,0);
+});
