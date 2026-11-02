@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { CommerceError, CommerceService, type CommercePorts, type CommerceStore, type CreatorActor, type Environment, type PrivateAsset, type Scope } from '@ubeeq/commerce';
+import { CommerceError, CommerceService, type CommercePorts, type CommerceStore, type CreatorActor, type Environment, type PrivateAsset, type Offer, type Scope } from '@ubeeq/commerce';
 import { SqliteCommerceStore } from '@ubeeq/adapter-local';
 import { PayPalConnections, PayPalCommerceProvider, PayPalError, DiscordCommerceClient, type CredentialVault, type PayPalConnection, type PayPalConnectionAudit, type PayPalConnectionStore, type PayPalFetch, type DiscordCommerceConfiguration } from '@ubeeq/integrations';
 import { createWebsiteZip } from '@ubeeq/portability';
@@ -50,6 +50,7 @@ export interface CommerceRuntimeDependencies {
   subject(request: IncomingMessage): Promise<string>;
   customerSubject?(request:IncomingMessage):Promise<string>;
   creator(subjectId: string, ownerId?:string): Promise<{ id: string; homeCellId: string }>;
+  publicOfferCollection?(offer:Pick<Offer,'id'|'ownerId'|'collectionRoots'|'benefits'|'description'|'published'>):Promise<{title:string;description?:string;coverUrl?:string;coverAlt?:string}|undefined>;
   publicCreator?(ownerId:string):Promise<{displayName:string;handle?:string;bio?:string}|undefined>;
   contentAvailable(ownerId: string, assetId: string): Promise<boolean>;
   pruneCredentials?(referenced: string[], createdBefore: string): Promise<void>;
@@ -212,7 +213,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
         response.setHeader('content-security-policy', "default-src 'none'; sandbox");
         response.setHeader('content-disposition', (result.asset.contentType.startsWith('image/') ? 'inline' : 'attachment') + '; filename="' + result.asset.label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0,150) + '"'); if(streaming){for await(const chunk of result.bytes as AsyncIterable<Uint8Array>){if(response.destroyed)throw new CommerceError('download_cancelled');if(!response.write(chunk))await new Promise<void>((resolve,reject)=>{const clear=()=>{response.off('drain',done);response.off('close',closed);response.off('error',failed);},done=()=>{clear();resolve();},closed=()=>{clear();reject(new CommerceError('download_cancelled'));},failed=(error:Error)=>{clear();reject(error);};response.once('drain',done);response.once('close',closed);response.once('error',failed);});}response.end();}else response.end(Buffer.from(result.bytes as Uint8Array)); return true;
       }
-      if (method === 'GET' && path === '/api/storefront') { const ownerId=required(url.searchParams.get('owner'));send(response, { offers: await service.storefront(ownerId, environment(url.searchParams.get('environment') ?? 'live')),creator:await deps.publicCreator?.(ownerId) }); return true; }
+      if (method === 'GET' && path === '/api/storefront') { const ownerId=required(url.searchParams.get('owner'));send(response, { offers: await Promise.all((await service.storefront(ownerId, environment(url.searchParams.get('environment') ?? 'live'))).map(async offer=>({...offer,collection:await deps.publicOfferCollection?.(offer)}))),creator:await deps.publicCreator?.(ownerId) }); return true; }
       if (path === '/api/auth/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailLogin(required(b.email),b.returnPath), 202); return true; }
       if (path === '/api/auth/email/context' && method === 'POST') { const b = await parseBody(request); send(response, await service.emailLoginContext(required(b.id),required(b.token))); return true; }
       if (path === '/api/auth/email/redeem' && method === 'POST') { const b = await parseBody(request); send(response, await service.redeemEmailLogin(required(b.id), required(b.token))); return true; }
@@ -246,7 +247,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (download && method === 'POST') { send(response, await service.authorizeDownload(subjectId, download[1])); return true; }
       if (path === '/api/checkouts' && method === 'POST') { const b = await parseBody(request); send(response, { order: await service.checkout(subjectId, required(b.offerVersionId), required(request.headers['idempotency-key'])) }, 202); return true; }
       const order = path.match(/^\/api\/checkouts\/([^/]+)(\/capture)?$/);
-      if (order && method === 'GET' && !order[2]) { send(response, await service.order(subjectId, order[1])); return true; }
+      if (order && method === 'GET' && !order[2]) { const result=await service.order(subjectId, order[1]);const offer=await store.transaction(tx=>tx.get('offer',result.order.offerVersionId));send(response,{...result,collection:offer?await deps.publicOfferCollection?.(offer):undefined}); return true; }
       if (order && method === 'POST' && order[2]) { send(response, await service.capture(subjectId, order[1]), 202); return true; }
       if (path === '/api/connections/paypal') {
         const a = await actor(), paypalActor = { deploymentId: deps.deploymentId, ownerId: a.ownerId, actorId: subjectId };
