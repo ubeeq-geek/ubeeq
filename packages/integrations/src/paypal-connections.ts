@@ -21,6 +21,7 @@ export interface PayPalConnection extends PayPalScope {
   state: PayPalConnectionState;
   acceptsCheckouts: boolean;
   lastError?: string;
+  registrationOutcomeUnknown?: boolean;
   createdAt: string;
   updatedAt: string;
   /** Only the future authoritative payment processor may set this after merchant/order reconciliation. */
@@ -144,10 +145,17 @@ export class PayPalConnections {
         ...scope, id: randomUUID(), revision: 0, clientId: input.clientId, retiredCredentialReferences: [],
         webhookUrl: '', subscribedEvents: [], state: 'validating', acceptsCheckouts: false, createdAt: this.now(), updatedAt: this.now()
       };
-      c.webhookUrl ||= this.callbackBase + '/api/webhooks/paypal/' + c.id;
+      const callback = this.callbackBase + '/api/webhooks/paypal/' + c.id;
+      // A permanently rejected registration created no hook; allow repairing its endpoint.
+      if(c.webhookUrl&&c.webhookUrl!==callback){
+        if(c.webhookId||c.registrationOutcomeUnknown||!['provider_rejected','invalid_credentials'].includes(c.lastError??''))throw new PayPalError('callback_change_requires_review');
+        c.webhookUrl=callback;
+      }
+      c.webhookUrl ||= callback;
       const stored = await this.ports.vault.write({ cellId: c.deploymentId, ownerId: c.ownerId, value: Buffer.from(input.clientSecret) });
       if (c.pendingCredentialReference) c.retiredCredentialReferences.push(c.pendingCredentialReference);
       c.pendingCredentialReference = stored.reference;
+      if(c.lastError==='provider_outcome_unknown')c.registrationOutcomeUnknown=true;
       c.state = 'validating'; c.acceptsCheckouts = false; c.lastError = undefined;
       try { await this.save(c, actor.actorId, 'paypal.connect_started'); }
       catch (error) { await this.ports.vault.revoke({ cellId: c.deploymentId, reference: stored.reference }).catch(() => {}); throw error; }
@@ -161,6 +169,7 @@ export class PayPalConnections {
         if (PAYPAL_EVENT_TYPES.some(name => !hook.event_types.some(event => event.name === name))) hook = await client.updateWebhook(hook.id);
         if (hook.url !== c.webhookUrl || PAYPAL_EVENT_TYPES.some(name => !hook.event_types.some(event => event.name === name)))
           throw new PayPalError('webhook_registration_mismatch');
+        c.registrationOutcomeUnknown=false;
         c.webhookId = hook.id; c.subscribedEvents = hook.event_types.map(event => event.name);
         if (c.credentialReference) c.retiredCredentialReferences.push(c.credentialReference);
         c.credentialReference = stored.reference; c.pendingCredentialReference = undefined;
@@ -173,6 +182,7 @@ export class PayPalConnections {
         const committed = await this.ports.store.find(scope);
         if (!committed) throw error;
         committed.state = 'action_required'; committed.acceptsCheckouts = false; committed.lastError = errorCode(error);
+        if(committed.lastError==='provider_outcome_unknown')committed.registrationOutcomeUnknown=true;
         await this.save(committed, actor.actorId, 'paypal.connect_failed', committed.lastError);
         throw error instanceof PayPalError ? error : new PayPalError('connection_operation_failed');
       }

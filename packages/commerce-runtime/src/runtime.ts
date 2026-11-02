@@ -28,6 +28,8 @@ export interface CommerceRuntimeConfiguration {
   eligibleCreatorIds?: string[];
   allowedOrigins?: string[];
   publicBaseUrl?: string;
+  /** Public webhook intake may be separate from local customer pages. */
+  webhookBaseUrl?: string;
   databasePath?: string;
   storageLimitBytes?: number;
   /** Required jurisdiction-specific policy, in days. This module never silently deletes financial records. */
@@ -52,7 +54,7 @@ export function referenceCommerceConfigurationFromEnvironment(env: NodeJS.Proces
   const endpoint = mail ? undefined : new URL(env.UBEEQ_COMMERCE_MAIL_ENDPOINT ?? '');
   if (!mail && (endpoint!.protocol !== 'https:' || endpoint!.username || endpoint!.password || endpoint!.search || endpoint!.hash || !env.UBEEQ_COMMERCE_MAIL_TOKEN)) throw new Error('Configure an HTTPS commerce mail relay and its authorization token.');
   const environments = (env.UBEEQ_PAYPAL_ENVIRONMENTS ?? 'sandbox').split(',').map(environment);
-  return { tokenKey: env.UBEEQ_COMMERCE_TOKEN_KEY ?? '', environments, publicBaseUrl: env.UBEEQ_COMMERCE_PUBLIC_BASE_URL,
+  return { tokenKey: env.UBEEQ_COMMERCE_TOKEN_KEY ?? '', environments, publicBaseUrl: env.UBEEQ_COMMERCE_PUBLIC_BASE_URL, webhookBaseUrl: env.UBEEQ_COMMERCE_WEBHOOK_BASE_URL,
     eligibleCreatorIds: env.UBEEQ_COMMERCE_ELIGIBLE_CREATORS?.split(',').map(s => s.trim()).filter(Boolean),
     allowedOrigins: env.UBEEQ_COMMERCE_ALLOWED_ORIGINS?.split(',').map(s => new URL(s.trim()).origin),
     financialRetentionDays: Number(env.UBEEQ_COMMERCE_FINANCIAL_RETENTION_DAYS), storageLimitBytes: env.UBEEQ_COMMERCE_STORAGE_LIMIT_BYTES ? Number(env.UBEEQ_COMMERCE_STORAGE_LIMIT_BYTES) : undefined,
@@ -95,7 +97,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
     read: async input => input.cellId === deps.deploymentId ? deps.vault.read({ ...input, cellId: deps.cellId }) : undefined,
     revoke: async input => { if (input.cellId !== deps.deploymentId) throw new CommerceError('foreign_deployment', 403); await deps.vault.revoke({ ...input, cellId: deps.cellId }); }
   };
-  const connections = new PayPalConnections({ store, vault, callbackBaseUrl: baseUrl, fetch: config.fetch, checkoutReady: true,
+  const connections = new PayPalConnections({ store, vault, callbackBaseUrl: config.webhookBaseUrl ?? baseUrl, fetch: config.fetch, checkoutReady: true,
     authorize: async actor => { if (actor.deploymentId !== deps.deploymentId) throw new CommerceError('foreign_deployment', 403); await authorize({ subjectId: actor.actorId, ownerId: actor.ownerId }); }, assertEnabled: eligible });
   const provider = new PayPalCommerceProvider({ publicBaseUrl: baseUrl, fetch: config.fetch, credentials: async (scope, id) => {
     const c = await store.get(deps.deploymentId, id);
@@ -149,7 +151,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       // Explicit app migrations retain old credentials/webhooks until their draining deadline.
       const recordedConnections=await store.listConnections();
       for (const c of recordedConnections) {
-        const workerConnections = new PayPalConnections({ store, vault, callbackBaseUrl: baseUrl, fetch: config.fetch, authorize: async a => { if (a.actorId !== 'migration-worker' || a.ownerId !== c.ownerId) throw new CommerceError('authorization_denied',403); }, assertEnabled: eligible });
+        const workerConnections = new PayPalConnections({ store, vault, callbackBaseUrl: config.webhookBaseUrl ?? baseUrl, fetch: config.fetch, authorize: async a => { if (a.actorId !== 'migration-worker' || a.ownerId !== c.ownerId) throw new CommerceError('authorization_denied',403); }, assertEnabled: eligible });
         if(c.retiredCredentialReferences.length)await workerConnections.retryCredentialCleanup({deploymentId:deps.deploymentId,ownerId:c.ownerId,actorId:'migration-worker'},c.environment,c.id);
         if (!(c.drainingUntil && c.drainingUntil <= new Date().toISOString() && c.state !== 'disconnected')) continue;
         if (await store.countUnconfirmedOrders(c)) {
