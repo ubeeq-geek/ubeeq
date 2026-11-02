@@ -248,6 +248,7 @@ export const websiteGalleryCss=`
 .website-gallery-teaser{min-width:0;text-align:left;box-sizing:border-box;padding:12px;border:1px solid color-mix(in srgb,var(--color-text) 18%,transparent);border-radius:14px}
 .website-gallery-tile{display:flex;flex-direction:column;gap:12px;color:var(--color-text);text-decoration:none}
 .website-gallery-cover{position:relative;display:block;width:100%;aspect-ratio:4/5;border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--color-muted) 15%,var(--color-canvas))}
+.website-gallery-teaser .website-gallery-cover{aspect-ratio:1/1}
 .website-gallery-cover img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .5s ease}
 .website-gallery-tile:hover img,.website-gallery-tile:focus-visible img{transform:scale(1.04)}
 .website-gallery-tile:focus-visible{outline:3px solid var(--color-focus);outline-offset:4px;border-radius:12px}
