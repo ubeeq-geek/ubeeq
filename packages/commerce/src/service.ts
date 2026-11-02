@@ -45,7 +45,7 @@ export interface CommercePorts {
   assertEligible(scope: Scope): Promise<void>;
   assertOfferEligible?(scope:Scope,offer:{offerId?:string;files:readonly string[];benefits:readonly Benefit[]}):Promise<void>;
   /** Must reject disabled/disconnected/draining connections and enforce app migration deadlines. */
-  connection(ownerId: string, environment: Environment): Promise<{ id: string; merchantId?: string }>;
+  connection(ownerId: string, environment: Environment,connectionId?:string): Promise<{ id: string; merchantId?: string }>;
   withConnectionLock<T>(scope: Scope, operation: () => Promise<T>): Promise<T>;
   withStorageLock?<T>(scope: Scope, operation: () => Promise<T>): Promise<T>;
   markVerified(scope: Scope, connectionId: string, merchantId: string, at: string): Promise<void>;
@@ -208,11 +208,11 @@ export class CommerceService {
       }
       this.audit(tx, asset, actor.subjectId, 'asset.availability', id); });
   }
-  async publishOffer(actor: CreatorActor, input: { environment: Environment; offerId?: string; slug: string; title: string; description?: string;
+  async publishOffer(actor: CreatorActor, input: { environment: Environment;connectionId?:string; offerId?: string; slug: string; title: string; description?: string;
     requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
     external?: { url: string; mappingId: string } }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
-    await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment);
+    await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment,input.connectionId);
     currencyExponent(input.currency);
     if (typeof input.slug !== 'string' || !Array.isArray(input.benefits) || !Array.isArray(input.files) || (input.previews !== undefined && !Array.isArray(input.previews))) throw new CommerceError('invalid_offer');
     if (!Number.isSafeInteger(input.amountMinor) || input.amountMinor <= 0 || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(input.slug)
@@ -262,13 +262,13 @@ export class CommerceService {
   }
   async storefront(ownerId: string, environment: Environment) {
     const scope = this.scope(ownerId, environment); await this.ports.assertEligible(scope);
-    const connection=await this.ports.connection(ownerId,environment).catch(()=>undefined);
     const offers=await this.store.transaction(tx => {
       const latest = new Map<string, Offer>();
       for (const offer of tx.list('offer').filter(o => same(o, scope))) if (!latest.has(offer.offerId) || latest.get(offer.offerId)!.version < offer.version) latest.set(offer.offerId, offer);
-      return [...latest.values()].filter(o => o.published).map(({ merchantId, connectionId, ...o }) => ({ ...o,availableForCheckout:connection?.id===connectionId, includedFiles:o.files.map(id=>({id,label:tx.get('asset',id)?.label??'Unavailable item'})), external: o.external ? { ...o.external, automatic: !!o.external.validatedAt&&connection?.id===connectionId } : undefined }));
+      return [...latest.values()].filter(o => o.published).map(({ merchantId, ...o }) => ({ ...o, includedFiles:o.files.map(id=>({id,label:tx.get('asset',id)?.label??'Unavailable item'})) }));
     });
-    const eligible:typeof offers=[];for(const offer of offers){try{await this.ports.assertOfferEligible?.(scope,offer);eligible.push(offer);}catch{/* Policy-held offers are unavailable in public discovery. */}}return eligible;
+    const eligible:Array<Omit<(typeof offers)[number],'connectionId'>&{availableForCheckout:boolean;external?:Offer['external']&{automatic:boolean}}>=[];
+    for(const {connectionId,...offer} of offers){try{await this.ports.assertOfferEligible?.(scope,offer);const connection=await this.ports.connection(ownerId,environment,connectionId).catch(()=>undefined);eligible.push({...offer,availableForCheckout:connection?.id===connectionId,external:offer.external?{...offer.external,automatic:!!offer.external.validatedAt&&connection?.id===connectionId}:undefined});}catch{/* Policy-held offers are unavailable in public discovery. */}}return eligible;
   }
   async setOfferPublished(actor: CreatorActor, offerId: string, published: boolean) {
     await this.ports.authorizeCreator(actor);
@@ -284,7 +284,7 @@ export class CommerceService {
     if (!offer?.published) throw new CommerceError('offer_not_found', 404);
     return this.ports.withConnectionLock(offer, async () => {
     await this.ports.assertOfferEligible?.(offer,offer);
-    await this.ports.assertEligible(offer); const connection = await this.ports.connection(offer.ownerId, offer.environment);
+    await this.ports.assertEligible(offer); const connection = await this.ports.connection(offer.ownerId, offer.environment,offer.connectionId);
     if (connection.id !== offer.connectionId) throw new CommerceError('offer_connection_requires_republish', 409);
     await this.rateLimit(subjectId, 'checkout', 30, 3600);
     return this.store.transaction(tx => {
@@ -325,6 +325,7 @@ export class CommerceService {
     // version by current visibility, price or database ordering.
     const candidates = order ? [] : tx.list('offer').filter(o => same(o, scope) && o.external?.validatedAt && o.external.mappingId === evidence.mappingId && o.merchantId === evidence.merchantId);
     const offer = order ? tx.get('offer', order.offerVersionId) : prior?.offerVersionId ? tx.get('offer', prior.offerVersionId) : mapping ? tx.get('offer',mapping.offerVersionId) : candidates.length === 1 ? candidates[0] : undefined;
+    if((prior&&prior.connectionId!==connectionId)||(order&&order.connectionId!==connectionId)||(offer&&offer.connectionId!==connectionId))throw new CommerceError('payment_connection_mismatch',409);
     let invalid = !offer ? candidates.length > 1 ? 'ambiguous_offer_mapping' : 'unknown_offer_mapping' : evidence.unsupported ? 'unsupported_payment_configuration' : undefined;
     if (order && (order.reference !== evidence.reference || order.merchantId !== evidence.merchantId)) invalid = 'order_or_merchant_mismatch';
     if (offer && (evidence.currency !== (order?.currency ?? offer.currency) || evidence.paidMinor !== (order?.amountMinor ?? offer.amountMinor))) invalid = 'amount_or_currency_mismatch';
@@ -594,6 +595,7 @@ export class CommerceService {
     await this.ports.authorizeCreator(actor);
     const result = await this.store.transaction(tx => ({ offer: tx.get('offer', offerId), payment: tx.get('payment', paymentId) }));
     if (!result.offer?.external || result.offer.ownerId !== actor.ownerId || !result.payment || !same(result.offer, result.payment)) throw new CommerceError('mapping_evidence_not_found', 404);
+    if(result.offer.connectionId!==result.payment.connectionId)throw new CommerceError('payment_connection_mismatch',409);
     if (!result.payment.notificationEventId) throw new CommerceError('real_notification_evidence_required', 409);
     const evidence = await this.ports.provider.reconcile(result.offer, result.payment.connectionId, { captureId: result.payment.providerPaymentId });
     const proof = evidence.find(e => e.captureId === result.payment!.providerPaymentId && e.mappingId === result.offer!.external!.mappingId

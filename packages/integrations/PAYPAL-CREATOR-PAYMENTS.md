@@ -23,14 +23,19 @@ website gallery renderer, responsive viewer, navigation, and viewer CSS.
 
 ## Connection and payment behavior
 
-Each deployment/creator/environment has one active connection. Credentials go
+A deployment/creator/environment may have multiple named connections, with one
+active binding per client app. Add uses `createNew`; updates, rename and disconnect
+select an explicit connection ID. Offers bind that ID, and checkout never falls
+back to another seller. Existing offers and purchases retain their original
+connection. Legacy calls can omit a selector only while the choice is unambiguous.
+Credentials go
 only to an encrypted vault. Persisted opaque IDs select callbacks; they do not
 authenticate notifications. Exact managed callback URLs are reused after retries
 and unknown registration outcomes. Subscription repairs and disconnect affect
 only those managed URLs. Configured means registration succeeded; Verified
 requires a reconciled payment. Same-app rotation retains the callback.
 
-A different app requires an explicit `migrationUntil` deadline (up to 90 days).
+Replacing a selected app requires an explicit `migrationUntil` deadline (up to 90 days).
 The old connection, credentials and callback remain available for outstanding
 orders and events; new offers use the new active connection. At the deadline,
 cleanup waits if unconfirmed orders remain and records an actionable audit/state.

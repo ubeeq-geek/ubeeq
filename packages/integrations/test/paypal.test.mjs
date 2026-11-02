@@ -55,10 +55,11 @@ function fixture() {
         let release; const next = new Promise(resolve => { release = resolve; }); state.locks.set(key, next);
         await previous; try { return await operation(); } finally { release(); }
       },
-      find: async scope => structuredClone(state.records.get(scopeKey(scope))),
+      find: async scope => {const matches=[...state.records.values()].filter(c=>c.deploymentId===scope.deploymentId&&c.ownerId===scope.ownerId&&c.environment===scope.environment&&!c.drainingUntil);return matches.length===1?structuredClone(matches[0]):undefined;},
+      listConnections:async owner=>[...state.records.values()].filter(c=>!owner||c.ownerId===owner).map(c=>structuredClone(c)),
       get: async (deployment, id) => structuredClone([...state.records.values()].find(c => c.deploymentId === deployment && c.id === id)),
       save: async (record, expected, audit) => {
-        const key = scopeKey(record), old = state.records.get(key);
+        const key = record.id, old = state.records.get(key);
         assert.equal(old?.revision ?? 0, expected, 'compare-and-swap');
         state.records.set(key, structuredClone(record)); state.audits.push(structuredClone(audit));
       },
@@ -232,3 +233,5 @@ test('a permanently rejected registration can adopt a repaired callback without 
 test('a callback change never silently migrates an existing hook or ambiguous registration',async()=>{for(const ambiguous of [false,true]){const {service,state,ports}=fixture();if(ambiguous){state.dropCreateResponse=true;await assert.rejects(service.connect(actor,input));}else await service.connect(actor,input);const repaired=new PayPalConnections({...ports,callbackBaseUrl:'https://receiver.example.test'});await assert.rejects(repaired.connect(actor,input),{code:'callback_change_requires_review'});assert.equal(state.creates,1);assert.equal(state.deletes,0);}});
 
 test('an ambiguous create stays fenced across a later credential failure',async()=>{const {service,state,ports}=fixture();state.dropCreateResponse=true;await assert.rejects(service.connect(actor,input));state.tokenFailure=true;await assert.rejects(service.connect(actor,input),{code:'invalid_credentials'});state.tokenFailure=false;await assert.rejects(new PayPalConnections({...ports,callbackBaseUrl:'https://receiver.example.test'}).connect(actor,input),{code:'callback_change_requires_review'});assert.equal(state.creates,1);assert.equal(state.deletes,0);});
+
+test('named connections coexist in one environment and all mutations target the selected connection',async()=>{const {service,state}=fixture();const a=await service.connect(actor,{...input,createNew:true,label:'Main business'}),b=await service.connect(actor,{...input,clientId:'second-app',createNew:true,label:'Second business'});assert.notEqual(a.id,b.id);assert.equal((await service.list(actor)).length,2);await assert.rejects(service.get(actor,'sandbox'),{code:'connection_selection_required'});assert.equal((await service.get(actor,'sandbox',b.id)).id,b.id);await assert.rejects(service.get(actor,'live',b.id),{code:'connection_not_found'});assert.equal(state.hooks.length,2);await assert.rejects(service.connect(actor,{...input,createNew:true}),{code:'connection_already_exists'});await assert.rejects(service.connect(actor,input),{code:'connection_selection_required'});const renamed=await service.rename(actor,'sandbox',b.id,'Updated business');assert.equal(renamed.label,'Updated business');await service.connect(actor,{environment:'sandbox',connectionId:b.id,clientSecret:'NEW-private'});assert.equal((await service.list(actor)).find(c=>c.id===a.id).label,'Main business');await service.disconnect(actor,'sandbox',b.id);const list=await service.list(actor);assert.equal(list.find(c=>c.id===a.id).state,'configured');assert.equal(list.find(c=>c.id===b.id).state,'disconnected');assert.equal(state.hooks.length,1);});

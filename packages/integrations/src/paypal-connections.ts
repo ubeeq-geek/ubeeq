@@ -10,6 +10,7 @@ export interface PayPalConnection extends PayPalScope {
   id: string;
   revision: number;
   clientId: string;
+  label?: string;
   merchantId?: string;
   drainingUntil?: string;
   credentialReference?: string;
@@ -28,7 +29,7 @@ export interface PayPalConnection extends PayPalScope {
   lastVerifiedPaymentAt?: string;
 }
 export interface PayPalConnectionStatus extends PayPalScope {
-  id: string; maskedClientId: string; webhookId?: string; webhookUrl: string;
+  id: string; label?:string; maskedClientId: string; webhookId?: string; webhookUrl: string;
   state: PayPalConnectionState; acceptsCheckouts: boolean; lastError?: string;
   lastVerifiedPaymentAt?: string; credentialCleanupPending: boolean;
   merchantId?: string; drainingUntil?: string;
@@ -42,7 +43,7 @@ export interface PayPalConnectionStore {
   withLock<T>(scope: PayPalScope, operation: () => Promise<T>): Promise<T>;
   find(scope: PayPalScope): Promise<PayPalConnection | undefined>;
   get(deploymentId: string, connectionId: string): Promise<PayPalConnection | undefined>;
-  /** Atomic compare-and-swap plus append-only audit. Unique deployment/owner/environment and opaque ID. */
+  /** Atomic compare-and-swap plus append-only audit. Unique active deployment/owner/environment/client app and opaque ID. */
   save(record: PayPalConnection, expectedRevision: number, audit: PayPalConnectionAudit): Promise<void>;
   countUnconfirmedOrders(connection: PayPalConnection): Promise<number>;
   listConnections?(ownerId?: string): Promise<PayPalConnection[]>;
@@ -67,7 +68,7 @@ export interface PayPalConnectionPorts {
 
 const status = (c: PayPalConnection): PayPalConnectionStatus => ({
   id: c.id, deploymentId: c.deploymentId, ownerId: c.ownerId, environment: c.environment,
-  maskedClientId: '••••' + c.clientId.slice(-4), webhookId: c.webhookId, webhookUrl: c.webhookUrl,
+  label: c.label, maskedClientId: '••••' + c.clientId.slice(-4), webhookId: c.webhookId, webhookUrl: c.webhookUrl,
   state: c.state, acceptsCheckouts: c.acceptsCheckouts, lastError: c.lastError,
   lastVerifiedPaymentAt: c.lastVerifiedPaymentAt, credentialCleanupPending: c.retiredCredentialReferences.length > 0
   , merchantId: c.merchantId, drainingUntil: c.drainingUntil
@@ -94,9 +95,11 @@ export class PayPalConnections {
     await this.ports.store.save(structuredClone(next), c.revision, { actorId, action, code, at: next.updatedAt });
     Object.assign(c, next);
   }
-  async get(actor: PayPalActor, environment: PayPalEnvironment): Promise<PayPalConnectionStatus | undefined> {
+  async get(actor: PayPalActor, environment: PayPalEnvironment,connectionId?:string): Promise<PayPalConnectionStatus | undefined> {
     await this.ports.authorize(actor, 'read');
-    const c = await this.ports.store.find(this.scope(actor, environment));
+    const scope=this.scope(actor,environment),c=connectionId?await this.ports.store.get(scope.deploymentId,connectionId):await this.ports.store.find(scope);
+    if(c&&(c.ownerId!==scope.ownerId||c.environment!==environment))throw new PayPalError('connection_not_found');
+    if(!c&&!connectionId&&this.ports.store.listConnections&&(await this.ports.store.listConnections(scope.ownerId)).filter(c=>c.environment===environment&&!c.drainingUntil).length>1)throw new PayPalError('connection_selection_required');
     return c ? status(c) : undefined;
   }
   async list(actor: PayPalActor) {
@@ -126,15 +129,27 @@ export class PayPalConnections {
       await this.save(c, actorId, 'paypal.credential_retired');
     }
   }
-  async connect(actor: PayPalActor, input: { environment: PayPalEnvironment; clientId: string; clientSecret: string; migrationUntil?: string }): Promise<PayPalConnectionStatus> {
+  async connect(actor: PayPalActor, input: { environment: PayPalEnvironment; clientId?: string; clientSecret: string; migrationUntil?: string;connectionId?:string;createNew?:boolean;label?:string }): Promise<PayPalConnectionStatus> {
     await this.ports.authorize(actor, 'manage');
     const scope = this.scope(actor, input.environment);
     await this.ports.assertEnabled(scope);
-    // Validate before writing to the vault or database. Never retain a client instance across rotation.
-    new PayPalClient(input.environment, input, this.ports.fetch);
+    if(input.connectionId!==undefined&&(typeof input.connectionId!=='string'||!/^[A-Za-z0-9_-]{1,200}$/.test(input.connectionId)))throw new PayPalError('invalid_connection_command');
+    if(input.clientId!==undefined&&typeof input.clientId!=='string')throw new PayPalError('invalid_credentials');
+    if(input.createNew!==undefined&&typeof input.createNew!=='boolean')throw new PayPalError('invalid_connection_command');
+    if(input.connectionId&&input.createNew)throw new PayPalError('invalid_connection_command');
+    if(input.label!==undefined&&(typeof input.label!=='string'||!input.label.trim()||input.label.trim().length>120))throw new PayPalError('invalid_connection_label');
     return this.ports.store.withLock(scope, async () => {
-      let prior = await this.ports.store.find(scope);
-      if (prior && prior.clientId !== input.clientId) {
+      let prior:PayPalConnection|undefined;
+      if(input.connectionId){prior=await this.ports.store.get(scope.deploymentId,input.connectionId);if(!prior||prior.ownerId!==scope.ownerId||prior.environment!==scope.environment||prior.drainingUntil)throw new PayPalError('connection_not_found');}
+      else if(input.createNew){
+        if(!this.ports.store.listConnections)throw new PayPalError('multiple_connections_unavailable');
+        if((await this.ports.store.listConnections(scope.ownerId)).some(c=>c.deploymentId===scope.deploymentId&&c.environment===scope.environment&&!c.drainingUntil&&c.clientId===input.clientId))throw new PayPalError('connection_already_exists');
+      }else{prior=await this.ports.store.find(scope);if(!prior&&this.ports.store.listConnections&&(await this.ports.store.listConnections(scope.ownerId)).some(c=>c.deploymentId===scope.deploymentId&&c.environment===scope.environment&&!c.drainingUntil))throw new PayPalError('connection_selection_required');}
+      const clientId=input.clientId?.trim()||prior?.clientId;
+      if(!clientId)throw new PayPalError('invalid_credentials');
+      new PayPalClient(input.environment,{clientId,clientSecret:input.clientSecret},this.ports.fetch);
+
+      if (prior && prior.clientId !== clientId) {
         if (!input.migrationUntil || !this.ports.store.archive) throw new PayPalError('app_replacement_requires_migration');
         const deadline = Date.parse(input.migrationUntil), current = Date.parse(this.now());
         if (!Number.isFinite(deadline) || deadline <= current || deadline > current + 90 * 86400000) throw new PayPalError('invalid_migration_deadline');
@@ -142,13 +157,14 @@ export class PayPalConnections {
         prior = undefined;
       }
       const c: PayPalConnection = prior ? structuredClone(prior) : {
-        ...scope, id: randomUUID(), revision: 0, clientId: input.clientId, retiredCredentialReferences: [],
+        ...scope, id: randomUUID(), revision: 0, clientId, retiredCredentialReferences: [],
         webhookUrl: '', subscribedEvents: [], state: 'validating', acceptsCheckouts: false, createdAt: this.now(), updatedAt: this.now()
       };
+      if(input.label!==undefined)c.label=input.label.trim();
       const callback = this.callbackBase + '/api/webhooks/paypal/' + c.id;
       // A permanently rejected registration created no hook; allow repairing its endpoint.
       if(c.webhookUrl&&c.webhookUrl!==callback){
-        if(c.webhookId||c.registrationOutcomeUnknown||!['provider_rejected','invalid_credentials'].includes(c.lastError??''))throw new PayPalError('callback_change_requires_review');
+        if(c.state!=='disconnected'&&(c.webhookId||c.registrationOutcomeUnknown||!['provider_rejected','invalid_credentials'].includes(c.lastError??'')))throw new PayPalError('callback_change_requires_review');
         c.webhookUrl=callback;
       }
       c.webhookUrl ||= callback;
@@ -179,7 +195,7 @@ export class PayPalConnections {
         await this.save(c, actor.actorId, 'paypal.configured');
       } catch (error) {
         // Reload committed state: a failed commit must not retire the working credential.
-        const committed = await this.ports.store.find(scope);
+        const committed = await this.ports.store.get(scope.deploymentId,c.id);
         if (!committed) throw error;
         committed.state = 'action_required'; committed.acceptsCheckouts = false; committed.lastError = errorCode(error);
         if(committed.lastError==='provider_outcome_unknown')committed.registrationOutcomeUnknown=true;
@@ -189,6 +205,12 @@ export class PayPalConnections {
       await this.cleanup(c, actor.actorId);
       return status(c);
     });
+  }
+  async rename(actor:PayPalActor,environment:PayPalEnvironment,connectionId:string,label:string){
+    await this.ports.authorize(actor,'manage');const scope=this.scope(actor,environment);
+    if(typeof connectionId!=='string'||!connectionId)throw new PayPalError('connection_not_found');
+    if(typeof label!=='string'||!label.trim()||label.trim().length>120)throw new PayPalError('invalid_connection_label');
+    return this.ports.store.withLock(scope,async()=>{const c=await this.ports.store.get(scope.deploymentId,connectionId);if(!c||c.ownerId!==scope.ownerId||c.environment!==environment||c.drainingUntil)throw new PayPalError('connection_not_found');c.label=label.trim();await this.save(c,actor.actorId,'paypal.connection_renamed');return status(c);});
   }
   async disconnect(actor: PayPalActor, environment: PayPalEnvironment, connectionId?: string): Promise<PayPalConnectionStatus> {
     await this.ports.authorize(actor, 'manage');

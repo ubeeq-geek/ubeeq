@@ -23,7 +23,8 @@ export class SqliteCommerceStore implements CommerceStore, PayPalConnectionStore
       CREATE INDEX IF NOT EXISTS commerce_records_scope ON commerce_records(deployment,kind,owner,environment);
       CREATE TABLE IF NOT EXISTS commerce_uniques(deployment TEXT NOT NULL,kind TEXT NOT NULL,key TEXT NOT NULL,record_id TEXT NOT NULL,PRIMARY KEY(deployment,kind,key));
       CREATE TABLE IF NOT EXISTS commerce_connections(deployment TEXT NOT NULL,id TEXT NOT NULL,owner TEXT NOT NULL,environment TEXT NOT NULL,active INTEGER NOT NULL,revision INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(deployment,id));
-      CREATE UNIQUE INDEX IF NOT EXISTS commerce_connection_active ON commerce_connections(deployment,owner,environment) WHERE active=1;
+      DROP INDEX IF EXISTS commerce_connection_active;
+      CREATE UNIQUE INDEX IF NOT EXISTS commerce_connection_client ON commerce_connections(deployment,owner,environment,json_extract(payload,'$.clientId')) WHERE active=1;
       CREATE TABLE IF NOT EXISTS commerce_connection_audit(id TEXT PRIMARY KEY,deployment TEXT NOT NULL,connection TEXT NOT NULL,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS commerce_locks(scope TEXT PRIMARY KEY,token TEXT NOT NULL,expires INTEGER NOT NULL);`);
   }
@@ -103,8 +104,8 @@ export class SqliteCommerceStore implements CommerceStore, PayPalConnectionStore
   }
   async find(scope: PayPalScope) {
     this.scopeKey(scope);
-    const row = this.db.prepare('SELECT payload FROM commerce_connections WHERE deployment=? AND owner=? AND environment=? AND active=1').get(this.deploymentId, scope.ownerId, scope.environment) as { payload: string } | undefined;
-    return row ? JSON.parse(row.payload) as PayPalConnection : undefined;
+    const rows = this.db.prepare('SELECT payload FROM commerce_connections WHERE deployment=? AND owner=? AND environment=? AND active=1').all(this.deploymentId, scope.ownerId, scope.environment) as {payload:string}[];
+    return rows.length===1?JSON.parse(rows[0].payload) as PayPalConnection:undefined;
   }
   async get(deploymentId: string, id: string) {
     if (deploymentId !== this.deploymentId) return undefined;

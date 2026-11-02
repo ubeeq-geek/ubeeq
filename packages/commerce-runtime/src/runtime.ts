@@ -116,8 +116,11 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
     reconciliation:{batchSize:config.reconciliationBatchSize??100,recentPaymentDays:config.recentPaymentDays??30},
     withConnectionLock: (scope, operation) => store.withLock(scope, operation),
     withStorageLock: (scope, operation) => store.withLock({ ...scope, environment: 'live' }, operation),
-    connection: async (ownerId, environment) => { const c = await store.find({ deploymentId: deps.deploymentId, ownerId, environment });
-      if (!c || !c.acceptsCheckouts || !['configured','verified'].includes(c.state) || c.drainingUntil) throw new CommerceError('payment_connection_unavailable', 409); return { id: c.id, merchantId: c.merchantId }; },
+    connection: async (ownerId, environment,connectionId) => {
+      const matches=(await store.listConnections(ownerId)).filter(c=>c.ownerId===ownerId&&c.environment===environment&&!c.drainingUntil&&c.acceptsCheckouts&&['configured','verified'].includes(c.state));
+      if(!connectionId&&matches.length>1)throw new CommerceError('payment_connection_selection_required',409);
+      const c=connectionId?matches.find(c=>c.id===connectionId):matches[0];
+      if(!c)throw new CommerceError('payment_connection_unavailable',409);return {id:c.id,merchantId:c.merchantId}; },
     markVerified: async (scope, id, merchantId, at) => store.withLock(scope, async () => {
       const c = await store.get(deps.deploymentId, id); if (!c || c.state === 'disconnected') return;
       if (c.merchantId && c.merchantId !== merchantId) throw new CommerceError('connection_merchant_mismatch', 409);
@@ -237,11 +240,11 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (order && method === 'POST' && order[2]) { send(response, await service.capture(subjectId, order[1]), 202); return true; }
       if (path === '/api/connections/paypal') {
         const a = await actor(), paypalActor = { deploymentId: deps.deploymentId, ownerId: a.ownerId, actorId: subjectId };
-        if (method === 'GET') { const connection=await connections.get(paypalActor, environment(url.searchParams.get('environment') ?? 'sandbox'));
+        if (method === 'GET') { const all=await connections.list(paypalActor),env=environment(url.searchParams.get('environment')??'sandbox'),selectedId=url.searchParams.get('connectionId')??undefined;const connection=selectedId||all.filter(c=>c.environment===env&&!c.drainingUntil).length===1?await connections.get(paypalActor,env,selectedId):undefined;
           const last=connection?await store.transaction(tx=>tx.list('event').filter(e=>e.connectionId===connection.id).sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0]?.createdAt):undefined;
-          send(response, { connection:connection?{...connection,lastVerifiedEventAt:last}:undefined }); return true; }
+          send(response, { connections:all,connection:connection?{...connection,lastVerifiedEventAt:last}:undefined }); return true; }
         const b = await parseBody(request);
-        if (method === 'POST') { send(response, { connection: await connections.connect(paypalActor, { environment: environment(b.environment), clientId: required(b.clientId), clientSecret: required(b.clientSecret), migrationUntil: b.migrationUntil }) }); return true; }
+        if (method === 'POST') { send(response, { connection: b.action==='rename'?await connections.rename(paypalActor,environment(b.environment),required(b.connectionId),required(b.label)):await connections.connect(paypalActor, { environment: environment(b.environment), clientId:b.clientId===undefined?undefined:required(b.clientId), clientSecret: required(b.clientSecret), migrationUntil: b.migrationUntil,connectionId:b.connectionId,createNew:b.createNew,label:b.label }) }); return true; }
         if (method === 'DELETE') { send(response, { connection: await connections.disconnect(paypalActor, environment(b.environment), b.connectionId) }); return true; }
       }
       if (path === '/api/commerce/history' && method === 'GET') { const a=await actor(); send(response, {...await service.creatorHistory(a),connections:await connections.list({deploymentId:deps.deploymentId,ownerId:a.ownerId,actorId:a.subjectId}),connectionAudits:await store.connectionAudits(a.ownerId)}); return true; }
