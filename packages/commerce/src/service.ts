@@ -213,6 +213,7 @@ export class CommerceService {
     external?: { url: string; mappingId: string } }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment,input.connectionId);
+    if(input.connectionId&&connection.id!==input.connectionId)throw new CommerceError('payment_connection_mismatch',409);
     currencyExponent(input.currency);
     if (typeof input.slug !== 'string' || !Array.isArray(input.benefits) || !Array.isArray(input.files) || (input.previews !== undefined && !Array.isArray(input.previews))) throw new CommerceError('invalid_offer');
     if (!Number.isSafeInteger(input.amountMinor) || input.amountMinor <= 0 || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(input.slug)

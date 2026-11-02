@@ -149,6 +149,7 @@ export class PayPalConnections {
       if(!clientId)throw new PayPalError('invalid_credentials');
       new PayPalClient(input.environment,{clientId,clientSecret:input.clientSecret},this.ports.fetch);
 
+      if(prior&&prior.clientId!==clientId&&this.ports.store.listConnections&&(await this.ports.store.listConnections(scope.ownerId)).some(c=>c.id!==prior!.id&&c.deploymentId===scope.deploymentId&&c.environment===scope.environment&&!c.drainingUntil&&c.clientId===clientId))throw new PayPalError('connection_already_exists');
       if (prior && prior.clientId !== clientId) {
         if (!input.migrationUntil || !this.ports.store.archive) throw new PayPalError('app_replacement_requires_migration');
         const deadline = Date.parse(input.migrationUntil), current = Date.parse(this.now());
