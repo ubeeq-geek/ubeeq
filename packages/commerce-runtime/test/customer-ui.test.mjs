@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {commerceJavaScript} from '../dist/page.js';
 function fixture({search='',pathname='/commerce',initialToken,fetch=async()=>({ok:true,json:async()=>({})})}={}){
- const nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
+ const listeners=new Map(),nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
  const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},replaceChildren(...children){this.children=children;},scrollIntoView(){},get lastChild(){return this.children.at(-1);}});
  const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
- vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){}},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,setTimeout,clearTimeout});
- return {get,calls,location};
+ vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,setTimeout,clearTimeout});
+ return {get,calls,location,listeners};
 }
 test('processing buttons expose busy state, reject duplicate submission and recover after completion',async()=>{
  let finish;const pending=new Promise(resolve=>{finish=resolve;});const f=fixture({fetch:async()=>{await pending;return {ok:true,json:async()=>({})};}}),submitter={tagName:'BUTTON',disabled:false,attributes:{},setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];}},event={submitter,preventDefault(){}};
@@ -38,4 +38,20 @@ for(const [route,endpoint,expected]of [['sign-in','/api/auth/email/redeem','Sign
  const f=fixture({pathname:'/commerce/'+route,search:'?id=proof&token=token',initialToken:route==='sign-in'?undefined:'existing-session',fetch:async path=>({ok:true,json:async()=>path===endpoint?{token:'new-session'}:path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[]}:path==='/api/me/access'?{entitlements:[]}:{}})});await new Promise(setImmediate);await f.get('redeemProof').onclick({preventDefault(){}});
  assert.equal(f.get('notice').textContent,expected);assert.equal(f.location.pathname,'/commerce/purchases');assert.equal(f.calls.filter(([path])=>path===endpoint).length,1);
  if(route!=='claim')assert.equal(f.calls.some(([path])=>path==='/api/purchase-claims'),false);
+});
+
+
+test('an account signed in from another tab refreshes the buyer identity without submitting a purchase',async()=>{
+ const f=fixture({pathname:'/buy/creator/gallery',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:{offers:[]}})});await new Promise(setImmediate);
+ assert.equal(f.get('emailSignin').hidden,false);
+ f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:'new-account-session'}});await new Promise(setImmediate);
+ assert.equal(f.get('emailSignin').hidden,true);assert.equal(f.get('signin').hidden,true);
+ const request=f.calls.find(([path])=>path==='/api/me');assert.equal(request[1].headers.authorization,'Bearer new-account-session');
+ assert.equal(f.calls.some(([path])=>path.includes('/capture')||path==='/api/checkouts'),false);
+ f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:''}});await new Promise(setImmediate);
+ assert.equal(f.get('emailSignin').hidden,false);
+});
+test('an expired account session does not prevent viewing the public collection',async()=>{
+ const f=fixture({initialToken:'expired-session',pathname:'/buy/creator/gallery',fetch:async path=>({ok:path!=='/api/me',json:async()=>path==='/api/me'?{error:{code:'authentication_required'}}:{offers:[]}})});await new Promise(setImmediate);
+ assert.equal(f.get('emailSignin').hidden,false);assert.ok(f.calls.some(([path])=>path.startsWith('/api/storefront')));
 });
