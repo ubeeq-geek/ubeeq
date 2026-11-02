@@ -21,6 +21,7 @@ export interface CommerceRuntimeConfiguration {
   vault?: CredentialVault;
   productName?: string;
   emailOnly?: boolean;
+  assetStreams?:Pick<import('@ubeeq/commerce').CommerceAssets,'open'|'verify'|'putPackageStream'>;
   tokenKey: string;
   /** Explicitly enable each eligible provider environment; absent configuration means unavailable. */
   environments: Environment[];
@@ -132,7 +133,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       read: async reference=>{const value=await vault.read({cellId:deps.deploymentId,reference});return value?Buffer.from(value).toString():undefined;},
       revoke: reference=>vault.revoke({cellId:deps.deploymentId,reference})
     },
-    assets: { read: assetRead, limitBytes: async ownerId => (config.storageLimitBytes ?? 100 * 1024 * 1024) - await store.transaction(tx => tx.list('asset').filter(a => a.ownerId === ownerId).reduce((sum,a) => sum + a.byteLength,0)),
+    assets: { ...config.assetStreams,read: assetRead, limitBytes: async ownerId => (config.storageLimitBytes ?? 100 * 1024 * 1024) - await store.transaction(tx => tx.list('asset').filter(a => a.ownerId === ownerId).reduce((sum,a) => sum + a.byteLength,0)),
       putPackage: async (scope, id, files, maxBytes) => {
         const bytes = createWebsiteZip(new Map(files.map(f => [f.name, f.bytes]))); if (bytes.length > maxBytes) throw new CommerceError('creator_storage_limit', 409);
         const object: StoredObject = { bucket: deps.cellId, key: cellScopedObjectKey({ cellId: deps.cellId, creatorId: scope.ownerId, kind: 'uploads', objectId: 'commerce-package-' + id }),
@@ -192,10 +193,11 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       }
       const privateAsset = path.match(/^\/api\/private-assets\/([^/]+)$/), preview = path.match(/^\/api\/previews\/([^/]+)$/);
       if (method === 'GET' && (privateAsset || preview)) {
-        const result = privateAsset ? await service.download(privateAsset[1], required(url.searchParams.get('token'))) : await service.preview(preview![1]);
-        response.setHeader('content-type', result.asset.contentType); response.setHeader('content-length', result.bytes.length);
+        const streaming=!!privateAsset&&!!service.ports.assets.open;
+        const result = privateAsset ? streaming?await service.openDownload(privateAsset[1],required(url.searchParams.get('token'))):await service.download(privateAsset[1], required(url.searchParams.get('token'))) : await service.preview(preview![1]);
+        response.setHeader('content-type', result.asset.contentType); response.setHeader('content-length', result.asset.byteLength);
         response.setHeader('content-security-policy', "default-src 'none'; sandbox");
-        response.setHeader('content-disposition', (result.asset.contentType.startsWith('image/') ? 'inline' : 'attachment') + '; filename="' + result.asset.label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0,150) + '"'); response.end(Buffer.from(result.bytes)); return true;
+        response.setHeader('content-disposition', (result.asset.contentType.startsWith('image/') ? 'inline' : 'attachment') + '; filename="' + result.asset.label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0,150) + '"'); if(streaming){for await(const chunk of result.bytes as AsyncIterable<Uint8Array>){if(response.destroyed)throw new CommerceError('download_cancelled');if(!response.write(chunk))await new Promise<void>((resolve,reject)=>{const clear=()=>{response.off('drain',done);response.off('close',closed);response.off('error',failed);},done=()=>{clear();resolve();},closed=()=>{clear();reject(new CommerceError('download_cancelled'));},failed=(error:Error)=>{clear();reject(error);};response.once('drain',done);response.once('close',closed);response.once('error',failed);});}response.end();}else response.end(Buffer.from(result.bytes as Uint8Array)); return true;
       }
       if (method === 'GET' && path === '/api/storefront') { const ownerId=required(url.searchParams.get('owner'));send(response, { offers: await service.storefront(ownerId, environment(url.searchParams.get('environment') ?? 'live')),creator:await deps.publicCreator?.(ownerId) }); return true; }
       if (path === '/api/auth/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailLogin(required(b.email)), 202); return true; }
@@ -282,6 +284,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/discord/creator/configure' && method === 'POST') { const b=await parseBody(request);send(response,await service.configureDiscordSetup(await actor(),required(b.sessionId),b.guild));return true; }
       throw new CommerceError('commerce_route_not_found', 404);
     } catch (error) {
+      if(response.headersSent){response.destroy();return true;}
       const paypal = error instanceof PayPalError;
       const code = error instanceof CommerceError || paypal ? error.code : 'commerce_unavailable';
       const authError = error as { status?: number; code?: string };

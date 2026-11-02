@@ -17,6 +17,9 @@ export interface CommerceProvider {
   reconcile(scope: Scope, connectionId: string, reference: { orderId?: string; captureId?: string; eventId?: string; eventType?: string; payload?: string }): Promise<PaymentEvidence[]>;
 }
 export interface CommerceAssets {
+  open?(asset:PrivateAsset):Promise<AsyncIterable<Uint8Array>>;
+  verify?(asset:PrivateAsset):Promise<void>;
+  putPackageStream?(scope:Scope,id:string,assets:readonly PrivateAsset[],maxBytes:number):Promise<{objectId:string;checksum:string;byteLength:number}>;
   read(asset: PrivateAsset): Promise<Uint8Array>;
   putPackage(scope: Scope, id: string, files: { name: string; bytes: Uint8Array }[], maxBytes: number): Promise<{ objectId: string; checksum: string; byteLength: number }>;
   /** Policy/storage quota, checked before building archives. */
@@ -480,7 +483,7 @@ export class CommerceService {
       const signature = createHmac('sha256', this.ports.tokenKey).update('download:' + payload).digest('base64url');
       return { url: this.baseUrl + '/api/private-assets/' + assetId + '?token=' + payload + '.' + signature, expiresAt }; });
   }
-  async download(assetId: string, token: string) {
+  private async downloadAsset(assetId: string, token: string) {
     const [payload, signature, extra] = token.split('.'); if (!payload || !signature || extra || payload.length > 4000) throw new CommerceError('invalid_download', 403);
     if (!safeEqual(signature, createHmac('sha256', this.ports.tokenKey).update('download:' + payload).digest('base64url'))) throw new CommerceError('invalid_download', 403);
     let claims: any; try { claims = JSON.parse(Buffer.from(payload, 'base64url').toString()); } catch { throw new CommerceError('invalid_download', 403); }
@@ -491,8 +494,20 @@ export class CommerceService {
     if (sources) for (const source of sources) {
       if (!source || source.state !== 'available') throw new CommerceError('content_unavailable',409);
       // A cached archive must not bypass a source policy removal or deleted original.
-      await this.ports.assets.read(source);
+      if(this.ports.assets.verify)await this.ports.assets.verify(source);else await this.ports.assets.read(source);
     }
+    if(this.ports.assets.verify)await this.ports.assets.verify(asset);
+    return asset;
+  }
+  async openDownload(assetId:string,token:string){
+    const asset=await this.downloadAsset(assetId,token),ports=this.ports.assets;
+    if(!ports.open)throw new CommerceError('stream_unavailable',503);
+    const source=await ports.open(asset);
+    async function* checked(){let length=0,last:Uint8Array|undefined;const hash=createHash('sha256');for await(const chunk of source){length+=chunk.length;if(length>asset.byteLength)throw new CommerceError('content_unavailable',409);hash.update(chunk);if(last)yield last;last=chunk;}if(length!==asset.byteLength||hash.digest('hex')!==asset.checksum)throw new CommerceError('content_unavailable',409);if(last)yield last;}
+    return {asset,bytes:checked()};
+  }
+  async download(assetId:string,token:string){
+    const asset=await this.downloadAsset(assetId,token);
     const bytes = await this.ports.assets.read(asset);
     if (bytes.length !== asset.byteLength || createHash('sha256').update(bytes).digest('hex') !== asset.checksum) throw new CommerceError('content_unavailable', 409);
     return { asset, bytes };
@@ -736,10 +751,13 @@ export class CommerceService {
     if (snapshot.assets.some(a => !a || a.state !== 'available' || a.publicPreview || !same(a, job))) throw new CommerceError('package_content_unavailable', 409);
     const limit = await this.ports.assets.limitBytes(job.ownerId);
     if (snapshot.assets.reduce((n, a) => n + a!.byteLength, 0) > limit) throw new CommerceError('creator_storage_limit', 409);
-    const files: { name: string; bytes: Uint8Array }[] = [];
-    for (const asset of snapshot.assets) { const bytes = await this.ports.assets.read(asset!); if (bytes.length !== asset!.byteLength || hashBytes(bytes) !== asset!.checksum) throw new CommerceError('content_unavailable', 409);
-      files.push({ name: asset!.id + '-' + asset!.label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 100), bytes }); }
-    const stored = await this.ports.assets.putPackage(job, snapshot.pack.assetId, files, limit);
+    let stored:{objectId:string;checksum:string;byteLength:number};
+    if(this.ports.assets.putPackageStream)stored=await this.ports.assets.putPackageStream(job,snapshot.pack.assetId,snapshot.assets as PrivateAsset[],limit);
+    else {const files: { name: string; bytes: Uint8Array }[] = [];
+      for (const asset of snapshot.assets) { const bytes = await this.ports.assets.read(asset!); if (bytes.length !== asset!.byteLength || hashBytes(bytes) !== asset!.checksum) throw new CommerceError('content_unavailable', 409);
+        files.push({ name: asset!.id + '-' + asset!.label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 100), bytes }); }
+      stored=await this.ports.assets.putPackage(job,snapshot.pack.assetId,files,limit);
+    }
     await this.store.transaction(tx => { const pack = tx.get('package', job.referenceId)!;
       tx.put('asset', { ...this.base(job, pack.assetId), label: snapshot.offer.title + '.zip', contentType: 'application/zip', ...stored, state: 'available', publicPreview: false });
       pack.state = 'ready'; tx.put('package', pack); });
