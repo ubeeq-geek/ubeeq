@@ -20,6 +20,7 @@ export interface CommerceRuntimeConfiguration {
   store?: CommerceRuntimeStore;
   vault?: CredentialVault;
   productName?: string;
+  emailOnly?: boolean;
   tokenKey: string;
   /** Explicitly enable each eligible provider environment; absent configuration means unavailable. */
   environments: Environment[];
@@ -181,7 +182,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (method === 'GET' && path === '/commerce/client.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(commerceJavaScript); return true; }
       if (method === 'GET' && path === '/commerce/gallery.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(websiteGalleryViewerScript); return true; }
       if (method === 'GET' && (path === '/commerce' || path.startsWith('/commerce/') || path.startsWith('/buy/'))) {
-        response.setHeader('content-type','text/html; charset=utf-8'); response.setHeader('content-security-policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"); response.end(commerceHtml.replaceAll('Creator purchases',((config.productName??'Creator')+' purchases').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!))));  return true;
+        response.setHeader('content-type','text/html; charset=utf-8'); response.setHeader('content-security-policy', "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; img-src 'self' blob:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"); response.end((config.emailOnly?commerceHtml.replace('id="signin"','id="signin" hidden'):commerceHtml).replaceAll('Creator purchases',((config.productName??'Creator')+' purchases').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!))));  return true;
       }
       const webhook = path.match(/^\/api\/webhooks\/paypal\/([A-Za-z0-9_-]+)$/);
       if (method === 'POST' && webhook) {
@@ -213,6 +214,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/me/gallery' && method === 'GET') {
         const purchase = (await service.purchases(subjectId)).find(p => p.id === url.searchParams.get('purchase'));
         if (!purchase?.offer) throw new CommerceError('purchase_not_found', 404);
+        if(!purchase.entitlements.some(g=>g.benefit.type==='gallery'&&g.state==='active'&&(!g.endsAt||g.endsAt>new Date().toISOString())))throw new CommerceError('gallery_access_required',403);
         const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string }[] = [];
         for (const id of purchase.offer.files) {
           const asset = access.assets.find(a => a.id === id); if (!asset?.contentType.startsWith('image/') || asset.state !== 'available') continue;

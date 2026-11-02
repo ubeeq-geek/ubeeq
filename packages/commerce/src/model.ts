@@ -60,7 +60,9 @@ export interface DiscordRole extends RecordBase {
 }
 export interface OAuthState extends RecordBase { customerId: string; creatorSubjectId?: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
 export interface DiscordSetup extends RecordBase { customerId: string; subjectId: string; credentialReference: string; expiresAt: string; }
+export interface ExternalMapping extends RecordBase {merchantId:string;mappingId:string;offerVersionId:string;evidenceId:string;}
 export interface CommerceRecords {
+  externalMapping:ExternalMapping;
   customer: Customer; offer: Offer; checkout: Checkout; payment: Payment; refund: Refund; purchase: Purchase;
   entitlement: Entitlement; claim: Claim; emailProof: EmailProof; asset: PrivateAsset; package: PackageRecord;
   job: DeliveryJob; event: ProviderEvent; audit: Audit; rate: RateLimit; guild: DiscordGuild; discordRole: DiscordRole; oauth: OAuthState;

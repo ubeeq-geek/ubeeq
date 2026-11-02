@@ -55,6 +55,7 @@ try{
  await call('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
  await call('Page.navigate',{url:base+'/commerce?owner=creator&environment=sandbox'});await wait("document.querySelector('#offers h3')?.textContent==='Autumn collection'");await evaluate("document.querySelector('#store').scrollIntoView()");await screenshot('desktop-storefront.png');
  await call('Page.navigate',{url:base+'/commerce/purchases'});await wait("document.querySelector('#purchaseList h3')?.textContent==='Autumn collection'");
+ assert.equal(await evaluate("Array.from(document.querySelectorAll('#purchaseList button')).some(b=>b.textContent==='Download file')"),false,'gallery-only entitlements must not display download controls');
  await evaluate("Array.from(document.querySelectorAll('#purchaseList button')).find(b=>b.textContent==='Open gallery').click()");await wait("!!document.querySelector('[data-gallery-root] [aria-haspopup=dialog]')");await evaluate("document.querySelector('[data-gallery-open]').click()");await wait("document.querySelector('[data-gallery-dialog]').open");await screenshot('desktop-gallery.png');
  await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
  await call('Page.navigate',{url:base+'/commerce/creator'});await wait("!!document.querySelector('#history h3')");await evaluate("document.querySelector('#creator').scrollIntoView()");

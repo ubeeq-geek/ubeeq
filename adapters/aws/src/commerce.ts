@@ -57,7 +57,7 @@ export class DynamoCommerceStore implements PayPalConnectionStore {
    }
   }throw new CommerceError('commerce_busy',409);
  }
- private async collect(revision:number){for(const row of await this.rows('DATA#')){const sk=String(row[this.s]);if(Number(sk.split('#')[1])<revision)await this.client.send(new DeleteCommand({TableName:this.tableName,Key:this.key(sk)}));}}
+ private async collect(_revision:number){const head=await this.head();if(!head)return;for(const row of await this.rows('DATA#')){const sk=String(row[this.s]),revision=Number(sk.split('#')[1]);if(revision<=head.revision&&!sk.startsWith(head.prefix))await this.client.send(new DeleteCommand({TableName:this.tableName,Key:this.key(sk)}));}}
  async transaction<T>(operation:(tx:CommerceTransaction)=>T):Promise<T>{return this.mutate(state=>{
   let active=true;const check=()=>{if(!active)throw new CommerceError('commerce_transaction_ended');};
   const get:CommerceTransaction['get']=(kind,id)=>{check();return structuredClone(state.records[kind]?.[id]) as any;};

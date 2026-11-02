@@ -315,10 +315,13 @@ export class CommerceService {
     currencyExponent(evidence.currency);
     const id = key('payment', scope.deploymentId, scope.ownerId, scope.environment, evidence.merchantId, evidence.captureId);
     const prior = tx.get('payment', id), order = tx.list('checkout').find(o => same(o, scope) && o.providerOrderId === evidence.orderId && !!evidence.orderId);
-    // Existing payments remain pinned to their immutable offer version. A new
-    // external payment must resolve exactly one published, proven mapping.
-    const candidates = order ? [] : tx.list('offer').filter(o => same(o, scope) && o.published && o.external?.validatedAt && o.external.mappingId === evidence.mappingId && o.merchantId === evidence.merchantId);
-    const offer = order ? tx.get('offer', order.offerVersionId) : prior?.offerVersionId ? tx.get('offer', prior.offerVersionId) : candidates.length === 1 ? candidates[0] : undefined;
+    // Existing payments and provider product identifiers remain pinned to their
+    // immutable offer versions, including delayed payments after withdrawal.
+    const mapping=tx.get('externalMapping',key('external-mapping',scope.deploymentId,scope.ownerId,scope.environment,evidence.merchantId,evidence.mappingId));
+    // Legacy proven mappings can be read only when unambiguous. Never choose a
+    // version by current visibility, price or database ordering.
+    const candidates = order ? [] : tx.list('offer').filter(o => same(o, scope) && o.external?.validatedAt && o.external.mappingId === evidence.mappingId && o.merchantId === evidence.merchantId);
+    const offer = order ? tx.get('offer', order.offerVersionId) : prior?.offerVersionId ? tx.get('offer', prior.offerVersionId) : mapping ? tx.get('offer',mapping.offerVersionId) : candidates.length === 1 ? candidates[0] : undefined;
     let invalid = !offer ? candidates.length > 1 ? 'ambiguous_offer_mapping' : 'unknown_offer_mapping' : evidence.unsupported ? 'unsupported_payment_configuration' : undefined;
     if (order && (order.reference !== evidence.reference || order.merchantId !== evidence.merchantId)) invalid = 'order_or_merchant_mismatch';
     if (offer && (evidence.currency !== (order?.currency ?? offer.currency) || evidence.paidMinor !== (order?.amountMinor ?? offer.amountMinor))) invalid = 'amount_or_currency_mismatch';
@@ -423,7 +426,7 @@ export class CommerceService {
   async myAccess(subjectId: string) {
     return this.store.transaction(tx => { const customer = this.customer(tx, subjectId), entitlements = tx.list('entitlement').filter(g => g.customerId === customer.id && isActive(g, this.now()));
       const ids = new Set(entitlements.flatMap(g => g.assetIds));
-      return { entitlements, assets: tx.list('asset').filter(a => ids.has(a.id)).map(({ objectId, ...asset }) => asset) }; });
+      return { entitlements, assets: tx.list('asset').filter(a => ids.has(a.id)).map(({ objectId, source, ...asset }) => asset) }; });
   }
   async creatorHistory(actor: CreatorActor) {
     await this.ports.authorizeCreator(actor);
@@ -582,7 +585,9 @@ export class CommerceService {
       && e.buyerEmail && !e.unsupported && e.currency === result.offer!.currency && e.paidMinor === result.offer!.amountMinor && e.status === 'completed');
     if (!proof) throw new CommerceError('external_mapping_not_proven', 409);
     await this.store.transaction(tx => { const o = tx.get('offer', offerId)!;
-      if (!o.published || tx.list('offer').some(other => other.id !== o.id && same(other,o) && other.published && other.external?.validatedAt && other.external.mappingId === o.external!.mappingId && other.merchantId === proof.merchantId)) throw new CommerceError('external_mapping_conflict',409);
+      const mappingId=key('external-mapping',o.deploymentId,o.ownerId,o.environment,proof.merchantId,o.external!.mappingId),existingMapping=tx.get('externalMapping',mappingId);
+      if (!o.published || existingMapping&&existingMapping.offerVersionId!==o.id || tx.list('offer').some(other => other.id !== o.id && same(other,o) && other.external?.validatedAt && other.external.mappingId === o.external!.mappingId && other.merchantId === proof.merchantId)) throw new CommerceError('external_mapping_conflict',409);
+      if(!existingMapping)tx.insert('externalMapping',{...this.base(o,mappingId),merchantId:proof.merchantId,mappingId:o.external!.mappingId,offerVersionId:o.id,evidenceId:paymentId},[mappingId]);
       o.merchantId = proof.merchantId; o.external!.validatedAt = this.now(); o.external!.evidenceId = paymentId; tx.put('offer', o);
       this.audit(tx, o, actor.subjectId, 'external_mapping.validate', o.id); this.queue(tx, o, 'reconcile', paymentId); }); return { validated: true };
   }

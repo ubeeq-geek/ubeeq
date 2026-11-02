@@ -221,6 +221,8 @@ access require the same persistent encryption key after restarts.
 Discord updates are serialized by server/user/role across customers and creators,
 then rechecked after remote writes. Scheduled reconciliation repairs interrupted
 updates while retaining preexisting independent roles. External notifications must
-resolve one published, validated offer mapping. Existing payments retain their
+resolve one immutable, validated provider identifier mapping. New offer versions
+require distinct provider identifiers once a mapping has been activated, so delayed
+payments cannot be assigned to newer content. Existing payments retain their
 original offer version; reused ambiguous mappings fail closed. Offer publication
 supports a reviewed request ID, with exact-value idempotency conflict detection.

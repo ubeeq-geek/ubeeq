@@ -272,21 +272,22 @@ test('revocation during an in-flight Discord grant converges without retaining p
 test('external payment mappings use the current proven version and preserve prior purchases',async t=>{
  const f=await fixture(t),a=await f.asset(),b=await f.asset('new.png',Buffer.from('new version'));
  const first=await f.offer(a,{external:{url:'https://www.paypal.com/ncp/payment/LINK',mappingId:'SKU-1'}});
- async function observe(captureId){
-  const evidence={captureId,merchantId:'merchant',currency:'USD',paidMinor:1000,refundedMinor:0,status:'completed',updatedAt:f.service.now(),buyerEmail:'purchase@example.test',mappingId:'SKU-1'};
+ async function observe(captureId,mappingId='SKU-1'){
+  const evidence={captureId,merchantId:'merchant',currency:'USD',paidMinor:1000,refundedMinor:0,status:'completed',updatedAt:f.service.now(),buyerEmail:'purchase@example.test',mappingId};
   await f.store.acceptEvent({connection:{...scope,id:'connection'},eventId:captureId,eventType:'PAYMENT.CAPTURE.COMPLETED',rawBody:Buffer.from(JSON.stringify({id:captureId})),receivedAt:f.service.now()});
   const event=(await f.store.transaction(tx=>tx.list('event'))).find(e=>e.eventId===captureId);
   const [payment]=await f.service.reconcile(scope,'connection',[evidence],event.id);f.providerEvidence.set(captureId,[evidence]);return payment;
  }
  const oldPayment=await observe('OLD');await f.service.validateExternalMapping(actor,first.id,oldPayment.id);await f.drain();
- const second=await f.offer(b,{offerId:first.offerId,external:{url:'https://www.paypal.com/ncp/payment/LINK',mappingId:'SKU-1'}});
- const newPayment=await observe('NEW');await f.service.validateExternalMapping(actor,second.id,newPayment.id);await f.drain();
+ const second=await f.offer(b,{offerId:first.offerId,external:{url:'https://www.paypal.com/ncp/payment/LINK2',mappingId:'SKU-2'}});
+ const newPayment=await observe('NEW','SKU-2');await f.service.validateExternalMapping(actor,second.id,newPayment.id);await f.drain();
  const purchases=await f.store.transaction(tx=>tx.list('purchase'));
  assert.equal(purchases.find(p=>p.paymentId===oldPayment.id).offerVersionId,first.id);
  assert.equal(purchases.find(p=>p.paymentId===newPayment.id).offerVersionId,second.id);
+ const delayed=await observe('DELAYED-OLD-SKU');assert.equal((await f.store.transaction(tx=>tx.get('purchase',tx.list('purchase').find(p=>p.paymentId===delayed.id).id))).offerVersionId,first.id);
  await f.service.reconcile(scope,'connection',[{...f.providerEvidence.get('OLD')[0],status:'refunded',refundedMinor:1000}]);
  assert.equal((await f.store.transaction(tx=>tx.get('payment',oldPayment.id))).offerVersionId,first.id);
- const other=await f.offer(a,{slug:'another-product',external:{url:'https://www.paypal.com/ncp/payment/OTHER',mappingId:'SKU-1'}});
+ const other=await f.offer(a,{slug:'another-product',external:{url:'https://www.paypal.com/ncp/payment/OTHER',mappingId:'SKU-2'}});
  await assert.rejects(f.service.validateExternalMapping(actor,other.id,newPayment.id),{code:'external_mapping_conflict'});
 });
 
