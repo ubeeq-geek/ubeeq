@@ -12,6 +12,8 @@ export interface WebsitePublicAsset {
   approvedPublic: boolean; metadataStripped: boolean;
 }
 export interface WebsiteSnapshot {
+  /** Approved cover rendition per named gallery; independent of its Work images. */
+  namedGalleryCovers?:Readonly<Record<string,string>>;
   copyrightYear?:number;
   creatorIdentities?:readonly {id:string;title:string}[];
   mailingList?: {signupUrl:string;submitUrl:string;consentText:string;offers:readonly {id:string;title:string}[]};
@@ -146,6 +148,10 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     return {...g,...resolveWebsiteGallery(site,g,snapshot.mappings)};
   });
   const needed=new Set<string>();
+  for(const [galleryId,assetId] of Object.entries(snapshot.namedGalleryCovers??{})){
+    if(!site.namedGalleries?.some(g=>g.id===galleryId)||typeof assetId!=='string'||!snapshot.assets.some(a=>a.id===assetId&&a.mimeType.startsWith('image/')))throw new WebsiteError('invalid_media','Gallery covers must reference an approved image for an existing gallery.');
+    needed.add(assetId);
+  }
   for(const id of [site.theme.settings.logoAssetId,site.theme.settings.faviconAssetId,...site.pages.filter(p=>p.state==='ready').flatMap(p=>[p.socialAssetId,p.coverAssetId,p.backgroundAssetId])]) if(id) needed.add(id);
   const visit=(blocks: WebsiteDocument['blocks']) => { for (const b of blocks) { if (['image','video','audio','file','pdf_preview'].includes(b.type)) needed.add(b.fileId ?? b.assetId ?? ''); if (b.children) visit(b.children); } };
   for (const page of site.pages.filter(p=>p.state==='ready')) { const doc=documents.get(page.documentId); if(!doc) throw new WebsiteError('missing_document','A ready page has no resolved document.'); visit(doc.blocks); }
@@ -166,7 +172,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,namedGalleryCovers:snapshot.namedGalleryCovers,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');

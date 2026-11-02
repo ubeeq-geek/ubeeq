@@ -88,3 +88,10 @@ test('teaser cards have a theme-aware light border, inner padding and extra row 
  assert.match(websiteGalleryCss,/\.website-gallery-teaser\{[^}]*padding:12px;[^}]*border:1px solid color-mix/);
  assert.match(websiteGalleryCss,/\.website-gallery-tiles\{[^}]*gap:28px 16px/);
 });
+
+test('gallery teasers prefer an explicit cover without adding it to viewer photos or counts',()=>{
+ const gallery={...entries[0],cover:{src:'/assets/collection-cover.jpg',alt:'Collection cover'}};
+ const html=renderWebsiteGalleryGroup([gallery]),teaser=html.split('<div hidden data-gallery-data>')[0];
+ assert.match(teaser,/src="\/assets\/collection-cover.jpg" alt="Collection cover"/);assert.doesNotMatch(teaser,/src="\/portfolio\/assets\/full.jpg"/);assert.match(teaser,/2 images/);
+ const selected=renderWebsiteGalleryGroup([gallery],gallery.id).split('<div hidden data-gallery-data>')[0];assert.match(selected,/src="\/portfolio\/assets\/full.jpg"/);assert.doesNotMatch(selected,/src="\/assets\/collection-cover.jpg"/);
+});

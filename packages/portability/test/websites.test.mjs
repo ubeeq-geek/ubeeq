@@ -301,3 +301,10 @@ test('supported media players pass the complete artifact build while authored or
  rejects('<object data="https://example.com"></object>');
  const unrelatedSignedLink=new Map(artifact.files);unrelatedSignedLink.set('index.html',Buffer.from(html.replace('</body>','<a href="https://example.com/?token=not-an-approved-player">Other link</a></body>')));assert.throws(()=>validateWebsiteFiles(snapshot.website,unrelatedSignedLink),error=>error.code==='invalid_url');
 });
+
+test('bundles only approved named gallery covers and rejects foreign or missing cover references',()=>{
+ const snapshot=fixture();snapshot.website.namedGalleries=[{id:'main',title:'Main',slug:'main',kind:'galleries',access:'free',publicationIds:[]},{id:'collection',title:'Collection',slug:'collection',parentId:'main',kind:'works',access:'preview',publicationIds:['preview-private']}];
+ snapshot.namedGalleryCovers={collection:snapshot.assets[0].id};assert.doesNotThrow(()=>buildWebsiteArtifact(snapshot,limits));
+ snapshot.namedGalleryCovers={missing:snapshot.assets[0].id};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),/Gallery covers/);
+ snapshot.namedGalleryCovers={collection:'not-approved'};assert.throws(()=>buildWebsiteArtifact(snapshot,limits),/Gallery covers/);
+});
