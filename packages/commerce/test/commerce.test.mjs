@@ -254,3 +254,44 @@ test('capture rechecks eligibility after checkout and does not charge a policy-h
  f.ports.assertOfferEligible=async()=>{throw new CommerceError('offer_not_eligible',403);};await f.service.capture('buyer',order.id);await f.drain();
  assert.equal(f.captureCalls,0);assert.equal((await f.service.purchases('buyer')).length,0);
 });
+
+test('revocation during an in-flight Discord grant converges without retaining paid access',async t=>{
+ const f=await fixture(t),customer=await f.verify();
+ await f.store.transaction(tx=>{tx.put('customer',{...customer,discordUserId:'discord-user'});tx.insert('guild',{...scope,id:'guild-config',guildId:'guild',roleIds:['role'],inviteUrl:'https://discord.gg/test',createdAt:f.service.now(),updatedAt:f.service.now()});});
+ f.members.set('guild:discord-user',new Set());
+ const grant=await f.service.manualGrant(actor,{customerId:customer.id,environment:'sandbox',benefit:{type:'discord_role',resourceId:'role',guildId:'guild',roleId:'role'},reason:'Purchase access'});
+ let release,entered;const blocked=new Promise(resolve=>release=resolve),started=new Promise(resolve=>entered=resolve),add=f.ports.discord.addRole;
+ f.ports.discord.addRole=async(...args)=>{entered();await blocked;return add(...args);};
+ const first=f.service.runNextJob('grant-worker');await started;
+ let second;try{await f.service.revoke(actor,grant.id,'Refund');second=f.service.runNextJob('revoke-worker');await new Promise(setImmediate);}finally{release();await first;await second;}
+ await f.drain();f.advance(100000);await f.drain();
+ assert.equal(f.members.get('guild:discord-user').has('role'),false);
+ assert.ok((await f.store.transaction(tx=>tx.list('discordRole'))).every(r=>!r.desired&&!r.actual));
+});
+
+test('external payment mappings use the current proven version and preserve prior purchases',async t=>{
+ const f=await fixture(t),a=await f.asset(),b=await f.asset('new.png',Buffer.from('new version'));
+ const first=await f.offer(a,{external:{url:'https://www.paypal.com/ncp/payment/LINK',mappingId:'SKU-1'}});
+ async function observe(captureId){
+  const evidence={captureId,merchantId:'merchant',currency:'USD',paidMinor:1000,refundedMinor:0,status:'completed',updatedAt:f.service.now(),buyerEmail:'purchase@example.test',mappingId:'SKU-1'};
+  await f.store.acceptEvent({connection:{...scope,id:'connection'},eventId:captureId,eventType:'PAYMENT.CAPTURE.COMPLETED',rawBody:Buffer.from(JSON.stringify({id:captureId})),receivedAt:f.service.now()});
+  const event=(await f.store.transaction(tx=>tx.list('event'))).find(e=>e.eventId===captureId);
+  const [payment]=await f.service.reconcile(scope,'connection',[evidence],event.id);f.providerEvidence.set(captureId,[evidence]);return payment;
+ }
+ const oldPayment=await observe('OLD');await f.service.validateExternalMapping(actor,first.id,oldPayment.id);await f.drain();
+ const second=await f.offer(b,{offerId:first.offerId,external:{url:'https://www.paypal.com/ncp/payment/LINK',mappingId:'SKU-1'}});
+ const newPayment=await observe('NEW');await f.service.validateExternalMapping(actor,second.id,newPayment.id);await f.drain();
+ const purchases=await f.store.transaction(tx=>tx.list('purchase'));
+ assert.equal(purchases.find(p=>p.paymentId===oldPayment.id).offerVersionId,first.id);
+ assert.equal(purchases.find(p=>p.paymentId===newPayment.id).offerVersionId,second.id);
+ await f.service.reconcile(scope,'connection',[{...f.providerEvidence.get('OLD')[0],status:'refunded',refundedMinor:1000}]);
+ assert.equal((await f.store.transaction(tx=>tx.get('payment',oldPayment.id))).offerVersionId,first.id);
+ const other=await f.offer(a,{slug:'another-product',external:{url:'https://www.paypal.com/ncp/payment/OTHER',mappingId:'SKU-1'}});
+ await assert.rejects(f.service.validateExternalMapping(actor,other.id,newPayment.id),{code:'external_mapping_conflict'});
+});
+
+test('offer publication retries return the exact version and reject changed reviewed values',async t=>{
+ const f=await fixture(t),asset=await f.asset(),first=await f.offer(asset,{requestId:'reviewed-offer-request'});
+ const repeated=await f.offer(asset,{requestId:'reviewed-offer-request'});assert.equal(repeated.id,first.id);assert.equal((await f.store.transaction(tx=>tx.list('offer'))).length,1);
+ await assert.rejects(f.offer(asset,{requestId:'reviewed-offer-request',amountMinor:2000}),{code:'idempotency_conflict'});
+});

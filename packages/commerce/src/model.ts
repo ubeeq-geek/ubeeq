@@ -4,7 +4,7 @@ export interface RecordBase extends Scope { id: string; createdAt: string; updat
 export interface Customer extends RecordBase { subjectId: string; verifiedEmails: string[]; discordUserId?: string; erasedAt?: string; }
 export type Benefit = { type: 'gallery' | 'download' | 'package'; resourceId: string } | { type: 'discord_role'; resourceId: string; guildId: string; roleId: string };
 export interface Offer extends RecordBase {
-  offerId: string; version: number; slug: string; title: string; description: string; supportEmail: string;
+  commandHash?: string; offerId: string; version: number; slug: string; title: string; description: string; supportEmail: string;
   connectionId: string; merchantId: string; currency: string; amountMinor: number;
   benefits: Benefit[]; files: string[]; previews: string[]; terms: string; durationSeconds?: number;
   published: boolean; external?: { url: string; mappingId: string; validatedAt?: string; evidenceId?: string };
@@ -39,6 +39,7 @@ export interface EmailProof extends RecordBase { customerId: string; email: stri
 export interface EmailLogin extends RecordBase { subjectId: string; email: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
 export interface CustomerSession extends RecordBase { customerId: string; tokenHash: string; expiresAt: string; }
 export interface PrivateAsset extends RecordBase {
+  source?: {workId:string;assetId:string;checksum:string};
   label: string; contentType: string; byteLength: number; checksum: string; objectId: string;
   state: 'available' | 'unavailable' | 'preparing'; publicPreview: boolean;
 }

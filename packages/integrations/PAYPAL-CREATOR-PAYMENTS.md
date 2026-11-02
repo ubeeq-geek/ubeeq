@@ -200,3 +200,27 @@ actual link-notification tests; exercise creator/customer pages on mobile and
 desktop with those services; confirm operating/content eligibility, jurisdiction
 and customer-data handling; then conduct the specified eligible live pilot.
 No real payment, provider registration or deployment is performed by the tests.
+
+## Hosted composition and reconciliation updates
+
+`@ubeeq/commerce-runtime` exports the reusable runtime previously embedded in the
+reference API. Product hosts supply their authentication, content eligibility,
+private storage, vault and mail adapters. Unknown API routes are left to the host.
+
+`@ubeeq/adapter-aws` exports `DynamoCommerceStore`. It uses encrypted, chunked
+snapshots and an atomic revision pointer, so a checkout/payment/grant/outbox
+transaction is visible wholly or not at all, including transactions larger than
+DynamoDB's per-item or transaction-item-count limits. Reads use strong consistency;
+concurrent writers retry optimistic conflicts; lifecycle leases fence stale writes.
+Old snapshots are collected after commit, including logically removed raw payloads.
+The v1 adapter loads one deployment snapshot per transaction and serializes its
+commits. This prioritizes correctness for an initial hosted cohort; larger hosts
+can inject an indexed adapter without changing the domain contracts. Recovery and
+access require the same persistent encryption key after restarts.
+
+Discord updates are serialized by server/user/role across customers and creators,
+then rechecked after remote writes. Scheduled reconciliation repairs interrupted
+updates while retaining preexisting independent roles. External notifications must
+resolve one published, validated offer mapping. Existing payments retain their
+original offer version; reused ambiguous mappings fail closed. Offer publication
+supports a reviewed request ID, with exact-value idempotency conflict detection.

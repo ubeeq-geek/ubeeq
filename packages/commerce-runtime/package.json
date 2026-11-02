@@ -1,0 +1,24 @@
+{
+  "name": "@ubeeq/commerce-runtime",
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ubeeq/commerce": "^0.1.0",
+    "@ubeeq/integrations": "^0.1.0",
+    "@ubeeq/adapter-local": "^0.1.0",
+    "@ubeeq/storage": "^0.1.0",
+    "@ubeeq/portability": "^0.1.0",
+    "@ubeeq/ui": "^0.1.0"
+  }
+}

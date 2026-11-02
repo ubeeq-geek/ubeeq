@@ -190,7 +190,7 @@ export class CommerceService {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, environment);
     if (!input.objectId || !Number.isSafeInteger(input.byteLength) || input.byteLength < 0 || !/^[a-f0-9]{64}$/.test(input.checksum)) throw new CommerceError('invalid_asset');
     const asset: PrivateAsset = { ...structuredClone(input), ...this.base(scope) };
-    await this.store.transaction(tx => { tx.insert('asset', asset); this.audit(tx, scope, actor.subjectId, 'asset.register', asset.id); }); return asset;
+    return this.store.transaction(tx => { if(input.source){const existing=tx.list('asset').find(a=>same(a,scope)&&a.source?.workId===input.source!.workId&&a.source?.assetId===input.source!.assetId&&a.source?.checksum===input.source!.checksum&&a.objectId===input.objectId&&a.checksum===input.checksum&&a.state==='available');if(existing)return existing;}tx.insert('asset', asset); this.audit(tx, scope, actor.subjectId, 'asset.register', asset.id);return asset; });
   }
   async setAssetAvailability(actor: CreatorActor, id: string, available: boolean) {
     await this.ports.authorizeCreator(actor);
@@ -206,7 +206,7 @@ export class CommerceService {
       this.audit(tx, asset, actor.subjectId, 'asset.availability', id); });
   }
   async publishOffer(actor: CreatorActor, input: { environment: Environment; offerId?: string; slug: string; title: string; description?: string;
-    amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
+    requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
     external?: { url: string; mappingId: string } }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment);
@@ -221,6 +221,9 @@ export class CommerceService {
     if (input.external) { const url = new URL(input.external.url); if (url.protocol !== 'https:' || !['paypal.com', 'www.paypal.com', 'paypal.me', 'www.paypal.me'].includes(url.hostname)
       || url.username || url.password || !input.external.mappingId || input.external.mappingId.length > 200) throw new CommerceError('invalid_external_link'); }
     return this.store.transaction(tx => {
+      if(input.requestId&&!/^[A-Za-z0-9_-]{8,200}$/.test(input.requestId))throw new CommerceError('invalid_idempotency_key');
+      const commandHash=hash(JSON.stringify(input)),requestId=input.requestId?key('offer-command',scope,input.requestId):undefined,prior=requestId?tx.get('offer',requestId):undefined;
+      if(prior){if(prior.commandHash!==commandHash)throw new CommerceError('idempotency_conflict',409);return prior;}
       const versions = tx.list('offer').filter(o => o.offerId === input.offerId && same(o, scope));
       if (input.offerId && !versions.length) throw new CommerceError('offer_not_found', 404);
       const slugOwner = tx.list('offer').find(o => o.slug === input.slug && same(o, scope) && o.offerId !== input.offerId);
@@ -239,7 +242,7 @@ export class CommerceService {
           if (!guild) throw new CommerceError('discord_role_not_configured');
         }
       }
-      const offer: Offer = { ...this.base(scope), offerId: input.offerId ?? randomUUID(), version: versions.reduce((max, v) => Math.max(max, v.version), 0) + 1,
+      const offer: Offer = { ...this.base(scope,requestId), ...(requestId?{commandHash}:{}), offerId: input.offerId ?? randomUUID(), version: versions.reduce((max, v) => Math.max(max, v.version), 0) + 1,
         slug: input.slug, title: input.title, description: input.description ?? '', supportEmail, connectionId: connection.id, merchantId: connection.merchantId ?? '',
         currency: input.currency, amountMinor: input.amountMinor, benefits: structuredClone(input.benefits), files, previews, terms: input.terms,
         published: true, ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }), ...(input.external ? { external: structuredClone(input.external) } : {}) };
@@ -312,8 +315,11 @@ export class CommerceService {
     currencyExponent(evidence.currency);
     const id = key('payment', scope.deploymentId, scope.ownerId, scope.environment, evidence.merchantId, evidence.captureId);
     const prior = tx.get('payment', id), order = tx.list('checkout').find(o => same(o, scope) && o.providerOrderId === evidence.orderId && !!evidence.orderId);
-    let offer = order ? tx.get('offer', order.offerVersionId) : tx.list('offer').find(o => same(o, scope) && o.external?.validatedAt && o.external.mappingId === evidence.mappingId && o.merchantId === evidence.merchantId);
-    let invalid = !offer ? 'unknown_offer_mapping' : evidence.unsupported ? 'unsupported_payment_configuration' : undefined;
+    // Existing payments remain pinned to their immutable offer version. A new
+    // external payment must resolve exactly one published, proven mapping.
+    const candidates = order ? [] : tx.list('offer').filter(o => same(o, scope) && o.published && o.external?.validatedAt && o.external.mappingId === evidence.mappingId && o.merchantId === evidence.merchantId);
+    const offer = order ? tx.get('offer', order.offerVersionId) : prior?.offerVersionId ? tx.get('offer', prior.offerVersionId) : candidates.length === 1 ? candidates[0] : undefined;
+    let invalid = !offer ? candidates.length > 1 ? 'ambiguous_offer_mapping' : 'unknown_offer_mapping' : evidence.unsupported ? 'unsupported_payment_configuration' : undefined;
     if (order && (order.reference !== evidence.reference || order.merchantId !== evidence.merchantId)) invalid = 'order_or_merchant_mismatch';
     if (offer && (evidence.currency !== (order?.currency ?? offer.currency) || evidence.paidMinor !== (order?.amountMinor ?? offer.amountMinor))) invalid = 'amount_or_currency_mismatch';
     if (!order && !evidence.buyerEmail) invalid = 'verified_buyer_email_required';
@@ -576,6 +582,7 @@ export class CommerceService {
       && e.buyerEmail && !e.unsupported && e.currency === result.offer!.currency && e.paidMinor === result.offer!.amountMinor && e.status === 'completed');
     if (!proof) throw new CommerceError('external_mapping_not_proven', 409);
     await this.store.transaction(tx => { const o = tx.get('offer', offerId)!;
+      if (!o.published || tx.list('offer').some(other => other.id !== o.id && same(other,o) && other.published && other.external?.validatedAt && other.external.mappingId === o.external!.mappingId && other.merchantId === proof.merchantId)) throw new CommerceError('external_mapping_conflict',409);
       o.merchantId = proof.merchantId; o.external!.validatedAt = this.now(); o.external!.evidenceId = paymentId; tx.put('offer', o);
       this.audit(tx, o, actor.subjectId, 'external_mapping.validate', o.id); this.queue(tx, o, 'reconcile', paymentId); }); return { validated: true };
   }
@@ -597,6 +604,12 @@ export class CommerceService {
       }
       const stalled=new Map<string,Scope>();for(const job of tx.list('job').filter(j=>j.state!=='done'&&Date.parse(j.createdAt)<at-900000))stalled.set(key(job.ownerId,job.environment),job);
       for(const scope of stalled.values())if(this.rate(tx,key(scope.ownerId,scope.environment),'backlog_alert',1,3600)){this.audit(tx,scope,'worker','operations.reconciliation_backlog',scope.ownerId);this.queue(tx,scope,'creator_notice',scope.ownerId,key('backlog',scope.ownerId,day));}
+      // Periodic convergence repairs interrupted/stale remote side effects as well
+      // as roles removed outside the application.
+      const roleCustomers = new Map<string, {scope: Scope; customerId: string}>();
+      for (const role of tx.list('discordRole')) roleCustomers.set(key(role.ownerId,role.environment,role.customerId),{scope:role,customerId:role.customerId});
+      for (const grant of tx.list('entitlement').filter(g=>g.benefit.type==='discord_role'&&g.customerId&&isActive(g,this.now()))) roleCustomers.set(key(grant.ownerId,grant.environment,grant.customerId),{scope:grant,customerId:grant.customerId!});
+      for (const {scope,customerId} of roleCustomers.values()) this.queue(tx,scope,'discord',customerId,key('discord-converge',scope.ownerId,scope.environment,customerId,quarter));
       // Expiry affects role state even when no payment event arrives.
       for (const grant of tx.list('entitlement').filter(g => g.benefit.type === 'discord_role' && g.endsAt && g.endsAt <= this.now() && g.state === 'active')) {
         grant.state = 'revoked'; tx.put('entitlement', grant); if (grant.customerId) this.queue(tx, grant, 'discord', grant.customerId);
@@ -735,27 +748,38 @@ export class CommerceService {
     for (const grant of snapshot.grants) if (userId && grant.benefit.type === 'discord_role') targets.set(key(grant.benefit.guildId, grant.benefit.roleId, userId), { guildId: grant.benefit.guildId, roleId: grant.benefit.roleId, userId, desired: true });
     for (const old of snapshot.roles) { const id = key(old.guildId, old.roleId, old.discordUserId); if (!targets.has(id)) targets.set(id, { guildId: old.guildId, roleId: old.roleId, userId: old.discordUserId, desired: false }); }
     for (const target of targets.values()) {
-      const id = key('discord-role', job.ownerId, job.environment, job.referenceId, target.guildId, target.roleId, target.userId);
-      const member = await discord.member(target.guildId, target.userId);
-      const role = await this.store.transaction(tx => { const old = tx.get('discordRole', id), actual = member?.roles.includes(target.roleId) ?? false;
-        const record = old ?? { ...this.base(job, id), customerId: job.referenceId, discordUserId: target.userId, guildId: target.guildId, roleId: target.roleId,
-          managed: false, preexisting: actual, desired: target.desired, actual, status: 'pending' as const };
-        record.desired = target.desired; record.actual = actual; record.status = !member && target.desired ? 'needs_membership' : 'pending';
-        if (member && target.desired && !actual) record.managed = true; // Persist add intent before the remote side effect.
-        tx.put('discordRole', record); return record;
+      // The same Discord role may be supported by several customers/creators.
+      // Serialize its remote writes across all of them, not just one job ID.
+      const lock = {...job,ownerId:'discord-role-'+key(target.guildId,target.roleId,target.userId),environment:'live' as const};
+      await this.ports.withConnectionLock(lock,async()=>{
+        const id = key('discord-role', job.ownerId, job.environment, job.referenceId, target.guildId, target.roleId, target.userId);
+        const member = await discord.member(target.guildId, target.userId);
+        const role = await this.store.transaction(tx => {
+          const old = tx.get('discordRole', id), actual = member?.roles.includes(target.roleId) ?? false;
+          const related = tx.list('discordRole').filter(r=>r.guildId===target.guildId&&r.roleId===target.roleId&&r.discordUserId===target.userId);
+          const managed = related.some(r=>r.managed&&!r.preexisting);
+          const desired = tx.list('entitlement').some(g=>g.benefit.type==='discord_role'&&g.benefit.guildId===target.guildId&&g.benefit.roleId===target.roleId&&isActive(g,this.now())&&tx.get('customer',g.customerId??'')?.discordUserId===target.userId);
+          const record = old ?? {...this.base(job,id),customerId:job.referenceId,discordUserId:target.userId,guildId:target.guildId,roleId:target.roleId,managed,preexisting:actual&&!managed,desired,actual,status:'pending' as const};
+          record.desired=desired;record.actual=actual;record.status=!member&&desired?'needs_membership':'pending';
+          if(member&&desired&&!actual)record.managed=true;
+          if(managed)record.managed=true;
+          tx.put('discordRole',record);return record;
+        });
+        if(!member&&role.desired)throw new CommerceError('discord_membership_required',409);
+        try {
+          if(member&&role.desired&&!role.actual){await discord.validateRoles(target.guildId,[target.roleId]);await discord.addRole(target.guildId,target.userId,target.roleId);role.actual=true;}
+          else if(member&&!role.desired&&role.actual&&role.managed&&!role.preexisting){await discord.validateRoles(target.guildId,[target.roleId]);await discord.removeRole(target.guildId,target.userId,target.roleId);role.actual=false;}
+          role.status='delivered';role.lastError=undefined;
+        }catch(error){role.status='conflict';role.lastError='discord_delivery_conflict';await this.store.transaction(tx=>{tx.put('discordRole',role);this.audit(tx,role,'worker','discord.conflict',role.id,role.lastError);});throw error;}
+        await this.store.transaction(tx=>{
+          // Revocation can occur during the provider call. Persist the observation,
+          // then queue a fresh comparison rather than declaring stale intent current.
+          const desired=tx.list('entitlement').some(g=>g.benefit.type==='discord_role'&&g.benefit.guildId===target.guildId&&g.benefit.roleId===target.roleId&&isActive(g,this.now())&&tx.get('customer',g.customerId??'')?.discordUserId===target.userId);
+          role.desired=desired;tx.put('discordRole',role);
+          if(desired!==role.actual&&(desired||role.managed&&!role.preexisting))this.queue(tx,job,'discord',job.referenceId);
+          else if(tx.get('customer',job.referenceId)?.erasedAt)tx.remove('discordRole',role.id);
+        });
       });
-      if (!member && target.desired) throw new CommerceError('discord_membership_required', 409);
-      try {
-        if (member && target.desired && !role.actual) { await discord.validateRoles(target.guildId, [target.roleId]); await discord.addRole(target.guildId, target.userId, target.roleId); role.actual = true; }
-        else if (member && !target.desired && role.actual && role.managed && !role.preexisting) {
-          // Roles can also be independently supported by a second linked customer or manual grant.
-          const supported = await this.store.transaction(tx => tx.list('entitlement').some(g => g.benefit.type === 'discord_role' && g.benefit.guildId === target.guildId && g.benefit.roleId === target.roleId
-            && isActive(g, this.now()) && tx.get('customer', g.customerId ?? '')?.discordUserId === target.userId));
-          if (!supported) { await discord.validateRoles(target.guildId, [target.roleId]); await discord.removeRole(target.guildId, target.userId, target.roleId); role.actual = false; }
-        }
-        role.status = 'delivered'; role.lastError = undefined;
-      } catch (error) { role.status = 'conflict'; role.lastError = 'discord_delivery_conflict'; await this.store.transaction(tx => { tx.put('discordRole', role); this.audit(tx, role, 'worker', 'discord.conflict', role.id, role.lastError); }); throw error; }
-      await this.store.transaction(tx => { if (snapshot.customer?.erasedAt) tx.remove('discordRole', role.id); else tx.put('discordRole', role); });
     }
   }
 }
