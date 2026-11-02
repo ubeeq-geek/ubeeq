@@ -1,3 +1,4 @@
+import {customerReturnPath} from './customerReturnPath.js';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { CommerceError, currencyExponent, subscriptionPeriodEnd, type Audit, type Benefit, type Checkout, type Claim, type CommerceStore,
   type CommerceTransaction, type Customer, type DeliveryJob, type Environment, type Offer, type Payment,
@@ -148,14 +149,15 @@ export class CommerceService {
       for (const scope of scopes.values()) { this.queue(tx, scope, 'discord', customer.id); this.audit(tx, scope, 'customer', 'customer.erase', customer.id, 'Financial records retained under configured policy'); }
     }); return { erased: true };
   }
-  async beginEmailLogin(address: string) {
+  async beginEmailLogin(address: string,returnTo?:unknown) {
+    const returnPath=customerReturnPath(returnTo);
     const normalized = email(address); await this.rateLimit(hash(normalized), 'email_login', 5, 3600);
     await this.store.transaction(tx => {
       const matches = tx.list('customer').filter(c => !c.erasedAt && c.verifiedEmails.includes(normalized));
       // Ambiguous recovery never silently chooses or merges application accounts.
       if (matches.length > 1) return;
       const id = randomUUID(), subjectId = matches[0]?.subjectId ?? 'customer-' + randomUUID();
-      tx.insert('login', { ...this.base(this.scope('customer-auth', 'live'), id), subjectId, email: normalized,
+      tx.insert('login', { ...this.base(this.scope('customer-auth', 'live'), id), subjectId, email: normalized, ...(returnPath?{returnPath}:{}),
         tokenHash: hash(this.token('login', id)), expiresAt: new Date(Date.parse(this.now()) + 900000).toISOString() });
       this.queue(tx, this.scope('customer-auth', 'live'), 'login_email', id);
     }); return { queued: true };
@@ -167,7 +169,7 @@ export class CommerceService {
       login.consumedAt = this.now(); tx.put('login', login);
       const sessionId = randomUUID(), secret = this.token('session', sessionId), expiresAt = new Date(Date.parse(this.now()) + 86400000).toISOString();
       tx.insert('session', { ...this.base(this.scope(customer.id, 'live'), sessionId), customerId: customer.id, tokenHash: hash(secret), expiresAt });
-      return { token: sessionId + '.' + secret, expiresAt };
+      return { token: sessionId + '.' + secret, expiresAt,returnPath:customerReturnPath(login.returnPath) };
     });
   }
   async customerSubject(credential: string): Promise<string | undefined> {

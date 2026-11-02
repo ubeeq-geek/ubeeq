@@ -39,7 +39,7 @@ export interface Claim extends RecordBase {
   purchaseId: string; email: string; tokenHash: string; expiresAt: string; consumedAt?: string;
 }
 export interface EmailProof extends RecordBase { customerId: string; email: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
-export interface EmailLogin extends RecordBase { subjectId: string; email: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
+export interface EmailLogin extends RecordBase { returnPath?:string; subjectId: string; email: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
 export interface CustomerSession extends RecordBase { customerId: string; tokenHash: string; expiresAt: string; }
 export interface PrivateAsset extends RecordBase {
   source?: {workId:string;assetId:string;checksum:string};

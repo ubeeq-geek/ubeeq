@@ -373,3 +373,12 @@ test('collection buyers follow current contents on return while their original p
  revision='saved-3';purchases=await f.service.purchases('buyer');assert.equal(purchases[0].contentOffer.contentSourceRevision,'saved-3');assert.equal((await f.service.storefront('creator','sandbox')).length,0,'content refresh must not restart sales');
  await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'refunded',refundedMinor:1000})]);assert.equal((await f.service.myAccess('buyer')).assets.length,0);
 });
+
+test('email sign-in preserves a validated customer return destination across restart without creating a checkout',async t=>{
+ const f=await fixture(t),target='/buy/creator/collection?environment=sandbox';await f.service.beginEmailLogin('returning@example.test',target);await f.drain();const link=new URL(f.messages.at(-1).text);f.restart();
+ const result=await f.service.redeemEmailLogin(link.searchParams.get('id'),link.searchParams.get('token'));assert.equal(result.returnPath,target);assert.equal((await f.store.transaction(tx=>tx.list('checkout'))).length,0);assert.equal((await f.store.transaction(tx=>tx.list('purchase'))).length,0);assert.equal((await f.store.transaction(tx=>tx.list('entitlement'))).length,0);
+});
+test('email sign-in refuses external, proof, creator and malformed return destinations',async t=>{
+ const f=await fixture(t);for(const path of ['https://evil.example','//evil.example','/\\evil.example','/commerce/sign-in?id=proof&token=secret','/commerce/claim','/commerce/creator','/studio/workspace','/buy/creator/collection?environment=unknown','/buy/creator/collection#fragment','/buy/creator/collection?environment=sandbox&environment=live','/commerce?owner=creator&token=secret'])await assert.rejects(f.service.beginEmailLogin('invalid@example.test',path),{code:'invalid_return_path'});
+ assert.equal((await f.store.transaction(tx=>tx.list('login'))).length,0);
+});

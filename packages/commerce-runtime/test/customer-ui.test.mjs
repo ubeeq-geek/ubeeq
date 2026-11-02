@@ -2,12 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {commerceJavaScript} from '../dist/page.js';
-function fixture({search='',fetch=async()=>({ok:true,json:async()=>({})})}={}){
- const nodes=new Map(),calls=[];
+function fixture({search='',pathname='/commerce',initialToken,fetch=async()=>({ok:true,json:async()=>({})})}={}){
+ const nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
  const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},replaceChildren(...children){this.children=children;},scrollIntoView(){},get lastChild(){return this.children.at(-1);}});
  const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
- vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){}},sessionStorage:{getItem:()=>null},localStorage:{getItem:()=>null},location:{search,pathname:'/commerce'},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,setTimeout,clearTimeout});
- return {get,calls};
+ vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){}},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,setTimeout,clearTimeout});
+ return {get,calls,location};
 }
 test('processing buttons expose busy state, reject duplicate submission and recover after completion',async()=>{
  let finish;const pending=new Promise(resolve=>{finish=resolve;});const f=fixture({fetch:async()=>{await pending;return {ok:true,json:async()=>({})};}}),submitter={tagName:'BUTTON',disabled:false,attributes:{},setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];}},event={submitter,preventDefault(){}};
@@ -22,4 +22,20 @@ test('storefront keeps included files and terms collapsible and guides signed-ou
  const f=fixture({search:'?owner=creator&environment=sandbox',fetch:async()=>({ok:true,json:async()=>({creator:{displayName:'Artist'},offers:[offer]})})});await new Promise(setImmediate);
  const card=f.get('offers').children[0];assert.ok(card);const details=card.children.filter(n=>n.tagName==='DETAILS');assert.equal(details.length,2);assert.equal(details[0].children[0].textContent,'Included content (1)');assert.equal(details[1].children[0].textContent,'Purchase and refund terms');assert.ok(details.every(n=>!n.open));
  const purchase=card.children.find(n=>n.tagName==='BUTTON');assert.equal(purchase.textContent,'Purchase with PayPal');await purchase.onclick({currentTarget:purchase,preventDefault(){}});assert.equal(f.get('emailSignin').elements.email.focused,true);assert.equal(f.calls.some(([path])=>path==='/api/checkouts'),false);assert.match(f.get('notice').textContent,/Sign in with your email/);
+});
+
+test('requesting sign-in from a collection retains that collection and its sandbox environment',async()=>{
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',fetch:async path=>({ok:true,json:async()=>path.startsWith('/api/storefront')?{offers:[]}:{}})});await new Promise(setImmediate);await f.get('emailSignin').onsubmit({preventDefault(){}});
+ const body=JSON.parse(f.calls.find(([path])=>path==='/api/auth/email')[1].body);assert.equal(body.returnPath,'/buy/creator/collection?environment=sandbox');
+});
+test('redeeming sign-in returns to the collection without claiming, purchasing or charging',async()=>{
+ const target='/buy/creator/collection?environment=sandbox';const f=fixture({pathname:'/commerce/sign-in',search:'?id=proof&token=login-token',fetch:async path=>({ok:true,json:async()=>path==='/api/auth/email/redeem'?{token:'session',returnPath:target}:path==='/api/me'?{verifiedEmails:['buyer@example.test']}:{offers:[]}})});await new Promise(setImmediate);
+ assert.equal(f.get('proofTitle').textContent,'Sign in');assert.match(f.get('proofDescription').textContent,/Signing in does not make a payment/);await f.get('redeemProof').onclick({preventDefault(){}});
+ assert.equal(f.location.pathname,'/buy/creator/collection');assert.equal(f.location.search,'?environment=sandbox');assert.match(f.get('notice').textContent,/Signed in/);assert.doesNotMatch(f.get('notice').textContent,/claimed/i);assert.ok(f.calls.some(([path])=>path==='/api/storefront?owner=creator&environment=sandbox'));assert.equal(f.calls.some(([path])=>path==='/api/purchase-claims'||path==='/api/checkouts'),false);
+});
+
+for(const [route,endpoint,expected]of [['sign-in','/api/auth/email/redeem','Signed in.'],['claim','/api/purchase-claims','Purchase claimed.'],['verify-email','/api/me/email/verify','Recovery email verified.']])test(`${route} reports only its own successful action`,async()=>{
+ const f=fixture({pathname:'/commerce/'+route,search:'?id=proof&token=token',initialToken:route==='sign-in'?undefined:'existing-session',fetch:async path=>({ok:true,json:async()=>path===endpoint?{token:'new-session'}:path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[]}:path==='/api/me/access'?{entitlements:[]}:{}})});await new Promise(setImmediate);await f.get('redeemProof').onclick({preventDefault(){}});
+ assert.equal(f.get('notice').textContent,expected);assert.equal(f.location.pathname,'/commerce/purchases');assert.equal(f.calls.filter(([path])=>path===endpoint).length,1);
+ if(route!=='claim')assert.equal(f.calls.some(([path])=>path==='/api/purchase-claims'),false);
 });
