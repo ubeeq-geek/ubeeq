@@ -148,7 +148,7 @@ test("mapping selections cannot reference foreign Works", () => {
     code: "invalid_mapping",
   });
 });
-test("independent edits require detach or duplicate for mirrors", () => {
+test("independent edits require detaching mirrors", () => {
   assert.throws(
     () =>
       assertIndependentCollectionMembership("collection", [
