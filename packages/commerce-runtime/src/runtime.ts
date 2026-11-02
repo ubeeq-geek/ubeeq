@@ -6,7 +6,7 @@ import { PayPalConnections, PayPalCommerceProvider, PayPalError, DiscordCommerce
 import { createWebsiteZip } from '@ubeeq/portability';
 import type { ObjectStorage, StoredObject } from '@ubeeq/storage';
 import { cellScopedObjectKey } from '@ubeeq/storage';
-import { commerceHtml, commerceJavaScript } from './page.js';
+import { commerceHtml, commerceJavaScript,commercePrivacyJavaScript } from './page.js';
 import { renderWebsiteGalleryGroup, websiteGalleryViewerScript } from '@ubeeq/ui';
 
 export interface CommerceRuntimeStore extends CommerceStore, PayPalConnectionStore {
@@ -187,6 +187,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (method === 'OPTIONS') { response.statusCode = 204; response.end(); return true; }
       const ip = createHash('sha256').update(request.socket.remoteAddress ?? 'unknown').digest('hex');
       await service.rateLimit(ip, path.startsWith('/api/webhooks/') ? 'webhook_http' : 'commerce_http', 300, 60);
+      if(path==='/commerce/media-privacy.js'&&method==='GET'){response.setHeader('content-type','text/javascript; charset=utf-8');response.end(commercePrivacyJavaScript);return true;}
       if (method === 'GET' && path === '/commerce/client.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(commerceJavaScript); return true; }
       if (method === 'GET' && path === '/commerce/gallery.js') { response.setHeader('content-type','text/javascript; charset=utf-8'); response.end(websiteGalleryViewerScript); return true; }
       if (method === 'GET' && (path === '/commerce' || path.startsWith('/commerce/') || path.startsWith('/buy/'))) {

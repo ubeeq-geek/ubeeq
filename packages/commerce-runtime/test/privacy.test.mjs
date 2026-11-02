@@ -1,0 +1,12 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import {commercePrivacyJavaScript,commerceHtml} from '../dist/page.js';
+function fixture(){const values=new Map([['ubeeq.stealth.activeAccount','viewer'],['ubeeq.stealth.viewer',JSON.stringify({defaultMode:'hide',creators:{own:'off'},aliases:{}})]]),listeners=new Map(),elements=[];let blocked=false;
+ const element=type=>{const node={type,children:[],value:'',append(...children){this.children.push(...children);},replaceChildren(){this.children=[];},setAttribute(){},addEventListener(type,fn){this[type]=fn;}};elements.push(node);return node;};
+ const document={documentElement:{dataset:{}},head:element('head'),body:element('body'),addEventListener:(type,fn)=>listeners.set(type,fn),createElement:element};const window={addEventListener:(type,fn)=>listeners.set(type,fn)};
+ vm.runInNewContext(commercePrivacyJavaScript,{window,document,location:{href:'https://example.test/buy/other/gallery'},URL,localStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>{if(blocked)throw Error('Storage blocked');values.set(key,value);}}});
+ return {document,values,listeners,elements,set blocked(value){blocked=value;}};
+}
+test('purchase pages apply the user default before rendering images and switch to selected creator overrides',()=>{const f=fixture();assert.match(commerceHtml,/src="\/commerce\/media-privacy.js"/);assert.equal(f.document.documentElement.dataset.stealthMode,'hide');assert.equal(f.document.body.children.length,0,'mode must already be active before body rendering');f.listeners.get('ubeeq:commerce-media-scope')({detail:{ownerId:'own'}});assert.equal(f.document.documentElement.dataset.stealthMode,'off');f.listeners.get('ubeeq:commerce-media-scope')({detail:{ownerId:'someone-else'}});assert.equal(f.document.documentElement.dataset.stealthMode,'hide');});
+test('purchase privacy controls persist scoped changes and retain visual privacy when storage is blocked',()=>{const f=fixture();f.listeners.get('DOMContentLoaded')();const control=f.elements.find(e=>e.type==='select');control.value='blur';control.change();assert.equal(f.document.documentElement.dataset.stealthMode,'blur');assert.equal(JSON.parse(f.values.get('ubeeq.stealth.viewer')).creators.other,'blur');f.blocked=true;control.value='hide';control.change();assert.equal(f.document.documentElement.dataset.stealthMode,'hide');});
