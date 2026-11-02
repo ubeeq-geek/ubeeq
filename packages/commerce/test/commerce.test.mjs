@@ -382,3 +382,16 @@ test('email sign-in refuses external, proof, creator and malformed return destin
  const f=await fixture(t);for(const path of ['https://evil.example','//evil.example','/\\evil.example','/commerce/sign-in?id=proof&token=secret','/commerce/claim','/commerce/creator','/studio/workspace','/buy/creator/collection?environment=unknown','/buy/creator/collection#fragment','/buy/creator/collection?environment=sandbox&environment=live','/commerce?owner=creator&token=secret'])await assert.rejects(f.service.beginEmailLogin('invalid@example.test',path),{code:'invalid_return_path'});
  assert.equal((await f.store.transaction(tx=>tx.list('login'))).length,0);
 });
+
+test('host Ever provisioning happens only after valid email proof and retains existing purchase references',async t=>{
+ const f=await fixture(t);await f.verify();const a=await f.asset(),offer=await f.offer(a),order=await f.checkout(offer);await f.service.reconcile(scope,'connection',[f.evidence(order)]);const before=await f.service.purchases('buyer');
+ let provisions=0;f.service.ports.accounts={provision:async input=>{provisions++;await f.store.transaction(tx=>tx.list('customer'));return {userId:'ever-member',username:'ever-member',displayName:'Ever',email:input.email,passwordSetupRequired:true,commerceSubjectId:input.commerceSubjectId};}};
+ await f.service.beginEmailLogin('buyer@example.test');await f.drain();const link=new URL(f.messages.at(-1).text);await assert.rejects(f.service.redeemEmailLogin(link.searchParams.get('id'),'invalid'),{code:'invalid_sign_in_link'});assert.equal(provisions,0);
+ const signed=await f.service.redeemEmailLogin(link.searchParams.get('id'),link.searchParams.get('token'));assert.equal(signed.account.userId,'ever-member');assert.equal((await f.service.accountSession(signed.token)).userId,'ever-member');assert.equal(await f.service.customerSubject(signed.token),'buyer');const after=await f.service.purchases('buyer');assert.equal(after[0].id,before[0].id);assert.equal(after[0].paymentId,before[0].paymentId);assert.equal(provisions,1);
+ await assert.rejects(f.service.redeemEmailLogin(link.searchParams.get('id'),link.searchParams.get('token')),{code:'invalid_sign_in_link'});assert.equal(provisions,1);
+});
+
+test('local native account email and password hash are encrypted at rest and survive restart',async t=>{
+ const f=await fixture(t),now=new Date().toISOString(),record={...scope,id:'member',ownerId:'eversally-members',createdAt:now,updatedAt:now,userId:'ever-user',email:'private-member@example.test',commerceSubjectId:'buyer',provider:'local',passwordHash:'salt:private-hash',passwordSetupRequired:false};await f.store.transaction(tx=>tx.insert('memberAccount',record));
+ const {DatabaseSync}=await import('node:sqlite'),raw=new DatabaseSync(f.path),payload=raw.prepare('SELECT payload FROM commerce_records WHERE deployment=? AND kind=? AND id=?').get('deployment','memberAccount','member').payload;raw.close();assert.ok(payload.includes('encryptedMemberAccount'));assert.equal(payload.includes(record.email),false);assert.equal(payload.includes(record.passwordHash),false);f.restart();assert.deepEqual(await f.store.transaction(tx=>tx.get('memberAccount','member')),record);
+});

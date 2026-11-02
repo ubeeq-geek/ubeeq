@@ -45,11 +45,12 @@ export class SqliteCommerceStore implements CommerceStore, PayPalConnectionStore
   }
   private encode(kind: string, value: RecordBase): string {
     const record = structuredClone(value) as any;
+    if(kind==='memberAccount')return JSON.stringify({encryptedMemberAccount:this.seal(JSON.stringify(record))});
     if (kind === 'event' && record.payload) record.payload = this.seal(record.payload);
     return JSON.stringify(record);
   }
   private decode<K extends keyof CommerceRecords>(kind: K, payload: string): CommerceRecords[K] {
-    const value = JSON.parse(payload); if (kind === 'event' && value.payload) value.payload = this.open(value.payload); return value;
+    let value = JSON.parse(payload);if(kind==='memberAccount'&&typeof value.encryptedMemberAccount==='string')value=JSON.parse(this.open(value.encryptedMemberAccount)); if (kind === 'event' && value.payload) value.payload = this.open(value.payload); return value;
   }
   async transaction<T>(operation: (tx: CommerceTransaction) => T): Promise<T> {
     return this.atomic(() => {

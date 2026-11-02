@@ -19,6 +19,7 @@ export interface CommerceRuntimeConfiguration {
   /** Managed hosts supply their own durable adapter and encrypted vault. Local hosts default to SQLite. */
   store?: CommerceRuntimeStore;
   vault?: CredentialVault;
+  accounts?:CommercePorts['accounts'];
   productName?: string;
   /** Trusted host presentation only. Never populate these assets from creator/customer input. */
   customerPage?: {html:string;stylesheet:string;bootstrapJavaScript:string;clientJavaScript?:string;contentSecurityPolicy?:string};
@@ -47,6 +48,7 @@ export interface CommerceRuntimeConfiguration {
 export interface CommerceRuntimeDependencies {
   deploymentId: string; cellId: string; publicBaseUrl: string; dataDirectory: string; vault: CredentialVault; storage: ObjectStorage;
   subject(request: IncomingMessage): Promise<string>;
+  customerSubject?(request:IncomingMessage):Promise<string>;
   creator(subjectId: string, ownerId?:string): Promise<{ id: string; homeCellId: string }>;
   publicCreator?(ownerId:string):Promise<{displayName:string;handle?:string;bio?:string}|undefined>;
   contentAvailable(ownerId: string, assetId: string): Promise<boolean>;
@@ -136,7 +138,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (c.merchantId && c.merchantId !== merchantId) throw new CommerceError('connection_merchant_mismatch',409);
       if (!c.merchantId) await store.save({ ...c, merchantId, revision: c.revision+1 }, c.revision, { actorId: 'checkout-worker', action: 'paypal.merchant_bound', at: new Date().toISOString() });
     }),
-    mail: config.mail, discord: config.discord ? new DiscordCommerceClient(config.discord) : undefined,
+    accounts:config.accounts,mail: config.mail, discord: config.discord ? new DiscordCommerceClient(config.discord) : undefined,
     discordTokens: {
       write: async (scope,value)=>(await vault.write({cellId:deps.deploymentId,ownerId:'discord-setup:'+scope.ownerId,value:Buffer.from(value),expiresAt:new Date(Date.now()+600000).toISOString()})).reference,
       read: async reference=>{const value=await vault.read({cellId:deps.deploymentId,reference});return value?Buffer.from(value).toString():undefined;},
@@ -214,7 +216,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/auth/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailLogin(required(b.email),b.returnPath), 202); return true; }
       if (path === '/api/auth/email/redeem' && method === 'POST') { const b = await parseBody(request); send(response, await service.redeemEmailLogin(required(b.id), required(b.token))); return true; }
       let subjectId: string;
-      try { subjectId = await deps.subject(request); }
+      try { subjectId = await (deps.customerSubject??deps.subject)(request); }
       catch (error) { const resolved = await service.customerSubject(request.headers.authorization?.replace(/^Bearer\s+/i,'') ?? ''); if (!resolved) throw error; subjectId = resolved; }
       // A customer magic-link session carries no creator management authority, even for the same email/subject.
       const actor = async (): Promise<CreatorActor> => { const managementSubject = await deps.subject(request); return { subjectId: managementSubject, ownerId: (await deps.creator(managementSubject,url.searchParams.get('owner')??undefined)).id }; };

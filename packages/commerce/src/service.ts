@@ -4,6 +4,7 @@ import { CommerceError, currencyExponent, subscriptionPeriodEnd, type Audit, typ
   type CommerceTransaction, type Customer, type DeliveryJob, type Environment, type Offer, type Payment,
   type PrivateAsset, type RecordBase, type Scope } from './model.js';
 
+export interface CommerceMemberAccount {commerceSubjectId?:string;userId:string;username:string;displayName:string;email:string;passwordSetupRequired:boolean;}
 export interface CreatorActor { subjectId: string; ownerId: string; }
 export interface PaymentEvidence {
   captureId: string; orderId?: string; reference?: string; mappingId?: string; merchantId: string;
@@ -57,6 +58,7 @@ export interface CommercePorts {
   withStorageLock?<T>(scope: Scope, operation: () => Promise<T>): Promise<T>;
   markVerified(scope: Scope, connectionId: string, merchantId: string, at: string): Promise<void>;
   bindMerchant?(scope: Scope, connectionId: string, merchantId: string): Promise<void>;
+  accounts?:{provision(input:{email:string;commerceSubjectId:string}):Promise<CommerceMemberAccount>};
   mail: { send(input: { to: string; subject: string; text: string; html?: string; idempotencyKey: string }): Promise<void> };
   discord?: CommerceDiscord;
   reconciliation?:{batchSize:number;recentPaymentDays:number};
@@ -163,15 +165,33 @@ export class CommerceService {
     }); return { queued: true };
   }
   async redeemEmailLogin(id: string, token: string) {
+    const proof=await this.store.transaction(tx=>{const login=tx.get('login',id);if(!login||login.consumedAt||login.expiresAt<=this.now()||!safeEqual(login.tokenHash,hash(token)))throw new CommerceError('invalid_sign_in_link',403);return login;});
+    // Account provisioning is host-owned network work, outside the short commerce transaction.
+    const account=await this.ports.accounts?.provision({email:proof.email,commerceSubjectId:proof.subjectId});
     return this.store.transaction(tx => { const login = tx.get('login', id);
       if (!login || login.consumedAt || login.expiresAt <= this.now() || !safeEqual(login.tokenHash, hash(token))) throw new CommerceError('invalid_sign_in_link', 403);
-      const customer = this.customer(tx, login.subjectId); customer.verifiedEmails = [...new Set([...customer.verifiedEmails, login.email])]; tx.put('customer', customer);
+      const canonical=account?.commerceSubjectId??login.subjectId;
+      if(canonical!==login.subjectId){const old=tx.get('customer',key('customer',login.subjectId));if(old&&(tx.list('purchase').some(p=>p.customerId===old.id)||tx.list('entitlement').some(e=>e.customerId===old.id)||tx.list('gift').some(g=>g.customerId===old.id)))throw new CommerceError('account_identity_conflict',409);}
+      const customer = this.customer(tx, canonical);
+      if(account){if(customer.accountUserId&&customer.accountUserId!==account.userId)throw new CommerceError('account_identity_conflict',409);customer.accountUserId=account.userId;}
+      customer.verifiedEmails = [...new Set([...customer.verifiedEmails, login.email])]; tx.put('customer', customer);
       login.consumedAt = this.now(); tx.put('login', login);
-      const sessionId = randomUUID(), secret = this.token('session', sessionId), expiresAt = new Date(Date.parse(this.now()) + 86400000).toISOString();
-      tx.insert('session', { ...this.base(this.scope(customer.id, 'live'), sessionId), customerId: customer.id, tokenHash: hash(secret), expiresAt });
-      return { token: sessionId + '.' + secret, expiresAt,returnPath:customerReturnPath(login.returnPath) };
+      const session=this.createSession(tx,customer,'email');
+      return {...session,returnPath:customerReturnPath(login.returnPath),...(account?{account:{userId:account.userId,username:account.username,displayName:account.displayName,email:account.email,passwordSetupRequired:account.passwordSetupRequired}}: {})};
     });
   }
+  private createSession(tx:CommerceTransaction,customer:Customer,assurance:'email'|'password'){
+    const sessionId=randomUUID(),secret=this.token('session',sessionId),expiresAt=new Date(Date.parse(this.now())+86400000).toISOString();
+    tx.insert('session',{...this.base(this.scope(customer.id,'live'),sessionId),customerId:customer.id,tokenHash:hash(secret),expiresAt,...(customer.accountUserId?{accountUserId:customer.accountUserId,assurance}:{})});
+    return {token:sessionId+'.'+secret,expiresAt};
+  }
+  async attachAccountCustomer(subjectId:string,accountUserId:string,address:string){const normalized=email(address);await this.store.transaction(tx=>{const customer=this.customer(tx,subjectId);if(customer.accountUserId&&customer.accountUserId!==accountUserId)throw new CommerceError('account_identity_conflict',409);customer.accountUserId=accountUserId;customer.verifiedEmails=[...new Set([...customer.verifiedEmails,normalized])];tx.put('customer',customer);});}
+  async issueAccountSession(commerceSubjectId:string,accountUserId:string){return this.store.transaction(tx=>{const customer=this.customer(tx,commerceSubjectId);if(customer.accountUserId!==accountUserId)throw new CommerceError('account_identity_conflict',403);return this.createSession(tx,customer,'password');});}
+  async accountSession(credential:string){
+    if(credential.length>1000)return undefined;const [id,secret,extra]=credential.split('.');if(!id||!secret||extra)return undefined;
+    return this.store.transaction(tx=>{const session=tx.get('session',id);if(!session?.accountUserId||session.expiresAt<=this.now()||!safeEqual(session.tokenHash,hash(secret)))return undefined;const customer=tx.get('customer',session.customerId);if(!customer||customer.erasedAt||customer.accountUserId!==session.accountUserId)return undefined;return {userId:session.accountUserId,commerceSubjectId:customer.subjectId,assurance:session.assurance??'email',issuedAt:session.createdAt,expiresAt:session.expiresAt};});
+  }
+  async revokeAccountSession(credential:string){const [id,secret,extra]=credential.split('.');if(!id||!secret||extra)return;await this.store.transaction(tx=>{const session=tx.get('session',id);if(session&&safeEqual(session.tokenHash,hash(secret)))tx.remove('session',id);});}
   async customerSubject(credential: string): Promise<string | undefined> {
     if (credential.length > 1000) return undefined;
     const [id, token, extra] = credential.split('.'); if (!id || !token || extra) return undefined;
