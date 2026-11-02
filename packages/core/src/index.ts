@@ -144,7 +144,7 @@ export const contentAvailabilityFor = (
 };
 
 export type CreatorStatus = "active" | "inactive";
-export type CollectionType = "collection" | "gallery" | "series" | "playlist";
+export type CollectionType = "collection" | "gallery" | "series" | "playlist" | "volume";
 export type CollectionStatus = "draft" | "published" | "archived" | "deleted";
 export type PublicationVisibility = "private" | "unlisted" | "public";
 export type PublicationStatus = "draft" | "scheduled" | "queued" | "publishing" | "live" | "updating" | "failed" | "missing" | "removed" | "unknown";
@@ -165,6 +165,8 @@ export interface Creator extends CellOwned {
 }
 
 export interface Collection extends CellOwned {
+  volumeIds?: readonly EntityId[];
+  purchaseSettings?: {premium:boolean};
   id: EntityId;
   instanceId: EntityId;
   creatorId: EntityId;

@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { CommerceError, currencyExponent, type Audit, type Benefit, type Checkout, type Claim, type CommerceStore,
+import { CommerceError, currencyExponent, subscriptionPeriodEnd, type Audit, type Benefit, type Checkout, type Claim, type CommerceStore,
   type CommerceTransaction, type Customer, type DeliveryJob, type Environment, type Offer, type Payment,
   type PrivateAsset, type RecordBase, type Scope } from './model.js';
 
@@ -7,11 +7,13 @@ export interface CreatorActor { subjectId: string; ownerId: string; }
 export interface PaymentEvidence {
   captureId: string; orderId?: string; reference?: string; mappingId?: string; merchantId: string;
   currency: string; paidMinor: number; refundedMinor: number; status: 'pending' | 'completed' | 'failed' | 'partially_refunded' | 'refunded' | 'reversed';
-  updatedAt: string; buyerEmail?: string; unsupported?: boolean;
+  updatedAt: string; paidAt?:string; subscriptionInterval?:'month'|'year'; subscriptionPlanId?:string; buyerEmail?: string; unsupported?: boolean;
   refunds?: { id: string; amountMinor: number; state: string }[]; dispute?: string;
 }
 export interface CommerceProvider {
-  createOrder(order: Checkout, offer: Offer): Promise<{ orderId: string; approvalUrl: string; merchantId: string }>;
+  cancelSubscription?(order:Checkout):Promise<void>;
+  subscriptionStatus?(order:Checkout):Promise<string>;
+  createOrder(order: Checkout, offer: Offer): Promise<{ orderId: string; approvalUrl: string; merchantId: string; planId?:string }>;
   capture(order: Checkout): Promise<void>;
   orderStatus?(order: Checkout): Promise<'pending' | 'approved' | 'failed'>;
   reconcile(scope: Scope, connectionId: string, reference: { orderId?: string; captureId?: string; eventId?: string; eventType?: string; payload?: string }): Promise<PaymentEvidence[]>;
@@ -126,6 +128,7 @@ export class CommerceService {
   async eraseCustomer(subjectId: string) {
     await this.store.transaction(tx => {
       const customer = this.customer(tx, subjectId), previousSubject = customer.subjectId;
+      if(tx.list('checkout').some(o=>o.customerId===customer.id&&o.billing&&!['CANCELLED','EXPIRED'].includes(o.subscriptionState??'')&&o.state!=='failed'))throw new CommerceError('cancel_subscriptions_before_erasure',409);
       customer.erasedAt = this.now(); customer.subjectId = 'erased'; customer.verifiedEmails = []; customer.discordUserId = undefined; tx.put('customer', customer);
       const scopes = new Map<string, Scope>();
       for (const grant of tx.list('entitlement').filter(g => g.customerId === customer.id)) { grant.state = 'revoked'; tx.put('entitlement', grant); scopes.set(key(grant.ownerId,grant.environment),grant); }
@@ -133,6 +136,7 @@ export class CommerceService {
         purchase.buyerEmail = undefined; tx.put('purchase', purchase);
         for (const claim of tx.list('claim').filter(c => c.purchaseId === purchase.id)) tx.remove('claim', claim.id);
       }
+      for(const gift of tx.list('gift').filter(g=>g.customerId===customer.id)){gift.recipientEmail='erased';tx.put('gift',gift);}
       for (const proof of tx.list('emailProof').filter(p => p.customerId === customer.id)) tx.remove('emailProof', proof.id);
       for (const state of tx.list('oauth').filter(p => p.customerId === customer.id)) tx.remove('oauth', state.id);
       for (const session of tx.list('session').filter(p => p.customerId === customer.id)) tx.remove('session', session.id);
@@ -208,8 +212,27 @@ export class CommerceService {
       }
       this.audit(tx, asset, actor.subjectId, 'asset.availability', id); });
   }
+  private subscriptionContents(tx:CommerceTransaction,offer:Offer):Offer {
+    if(!offer.billing)return offer;return tx.list('offer').filter(o=>o.offerId===offer.offerId&&same(o,offer)&&o.billing).sort((a,b)=>b.version-a.version)[0]??offer;
+  }
+  /** Reviewed content changes apply to current paid/gifted periods; financial terms stay pinned. */
+  private updateSubscriptionContents(tx:CommerceTransaction,offer:Offer){
+    const update=(record:import('./model.js').Purchase|import('./model.js').Gift,gift:boolean)=>{
+      const original=tx.get('offer',record.offerVersionId);if(!original?.billing||original.offerId!==offer.offerId||!same(record,offer))return;
+      const grants=tx.list('entitlement').filter(g=>gift?g.giftId===record.id:g.purchaseId===record.id),active=grants.find(g=>isActive(g,this.now()));if(!active)return;
+      for(const grant of grants){if(!offer.benefits.some(b=>JSON.stringify(b)===JSON.stringify(grant.benefit))){grant.state='revoked';grant.contentRemoved=true;tx.put('entitlement',grant);}}
+      for(const benefit of offer.benefits){const existing=grants.find(g=>JSON.stringify(g.benefit)===JSON.stringify(benefit));
+        const grant=existing??{...this.base(record,key(gift?'gift-grant':'grant',record.id,benefit)),customerId:record.customerId,...(gift?{giftId:record.id,source:'manual' as const,reason:'Gift: '+offer.title}:{purchaseId:record.id,source:'payment' as const}),benefit:structuredClone(benefit),assetIds:[],startsAt:active.startsAt,endsAt:active.endsAt,state:'active' as const};
+        if(grant.contentRemoved){grant.state='active';grant.contentRemoved=undefined;}
+        grant.assetIds=benefit.type==='gallery'?[...offer.files]:benefit.type==='download'?[benefit.resourceId]:benefit.type==='package'?[key('package',offer.id)]:[];grant.updatedAt=this.now();tx.put('entitlement',grant);
+      }
+      record.contentOfferVersionId=offer.id;if(gift)tx.put('gift',record as import('./model.js').Gift);else tx.put('purchase',record as import('./model.js').Purchase);if(record.customerId)this.queue(tx,record,'discord',record.customerId);
+    };
+    for(const purchase of tx.list('purchase').filter(p=>p.state==='active'))update(purchase,false);
+    for(const gift of tx.list('gift').filter(g=>g.state==='claimed'))update(gift,true);
+  }
   async publishOffer(actor: CreatorActor, input: { environment: Environment;connectionId?:string; offerId?: string; slug: string; title: string; description?: string;
-    requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
+    billing?:'month'|'year'; requestId?:string; amountMinor: number; currency: string; benefits: Benefit[]; files: string[]; previews?: string[]; terms: string; supportEmail: string; durationSeconds?: number;
     external?: { url: string; mappingId: string } }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     await this.ports.assertEligible(scope); const connection = await this.ports.connection(actor.ownerId, input.environment,input.connectionId);
@@ -220,6 +243,8 @@ export class CommerceService {
       || !input.title || input.title.length > 300 || !input.terms || input.terms.length > 10000 || !input.benefits.length || input.benefits.length > 2000
       || input.files.length > 1000 || (input.durationSeconds !== undefined && (!Number.isSafeInteger(input.durationSeconds) || input.durationSeconds <= 0 || input.durationSeconds > 315360000)))
       throw new CommerceError('invalid_offer');
+    if(input.billing!==undefined&&!['month','year'].includes(input.billing))throw new CommerceError('invalid_subscription_interval');
+    if(input.billing&&(input.durationSeconds!==undefined||input.external))throw new CommerceError('invalid_subscription_configuration');
     const supportEmail = email(input.supportEmail);
     await this.ports.assertOfferEligible?.(scope,input);
     if (input.external) { const url = new URL(input.external.url); if (url.protocol !== 'https:' || !['paypal.com', 'www.paypal.com', 'paypal.me', 'www.paypal.me'].includes(url.hostname)
@@ -249,10 +274,10 @@ export class CommerceService {
       const offer: Offer = { ...this.base(scope,requestId), ...(requestId?{commandHash}:{}), offerId: input.offerId ?? randomUUID(), version: versions.reduce((max, v) => Math.max(max, v.version), 0) + 1,
         slug: input.slug, title: input.title, description: input.description ?? '', supportEmail, connectionId: connection.id, merchantId: connection.merchantId ?? '',
         currency: input.currency, amountMinor: input.amountMinor, benefits: structuredClone(input.benefits), files, previews, terms: input.terms,
-        published: true, ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }), ...(input.external ? { external: structuredClone(input.external) } : {}) };
+        published: true, ...(input.billing?{billing:input.billing}:{}), ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }), ...(input.external ? { external: structuredClone(input.external) } : {}) };
       for(const previous of versions){previous.published=false;tx.put('offer',previous);}
       tx.insert('offer', offer, [key('offer-version', scope, offer.offerId, offer.version)]);
-      this.audit(tx, scope, actor.subjectId, 'offer.publish', offer.id);
+      this.audit(tx, scope, actor.subjectId, 'offer.publish', offer.id);if(offer.billing)this.updateSubscriptionContents(tx,offer);
       if (offer.benefits.some(b => b.type === 'package')) {
         const id = key('package', offer.id); tx.insert('package', { ...this.base(scope, id), offerVersionId: offer.id, assetId: id, state: 'preparing' });
         tx.insert('asset', { ...this.base(scope, id), label: offer.title + '.zip', contentType: 'application/zip', byteLength: 0, checksum: '0'.repeat(64), objectId: '', publicPreview: false, state: 'preparing' });
@@ -294,7 +319,7 @@ export class CommerceService {
       const id = key('checkout', customer.id, idempotencyKey), prior = tx.get('checkout', id);
       if (prior) { if (prior.offerVersionId !== offerVersionId) throw new CommerceError('idempotency_conflict', 409); return prior; }
       const current = tx.get('offer', offer.id); if (!current?.published) throw new CommerceError('offer_unavailable', 409);
-      const order: Checkout = { ...this.base(offer, id), customerId: customer.id, offerVersionId: offer.id, connectionId: connection.id,
+      const order: Checkout = { ...this.base(offer, id), customerId: customer.id, offerVersionId: offer.id, ...(offer.billing?{billing:offer.billing}:{}), connectionId: connection.id,
         merchantId: connection.merchantId ?? offer.merchantId, currency: offer.currency, amountMinor: offer.amountMinor, reference: randomUUID(), idempotencyKey,
         captureRequestId: randomUUID(), state: 'creating' };
       tx.insert('checkout', order, [key('checkout-idempotency', customer.id, idempotencyKey), key('order-reference', order.reference)]);
@@ -306,6 +331,11 @@ export class CommerceService {
     return this.store.transaction(tx => { const c = this.customer(tx, subjectId), order = tx.get('checkout', id);
       if (!order || order.customerId !== c.id) throw new CommerceError('checkout_not_found', 404);
       return { order, payments: tx.list('payment').filter(p => p.checkoutId === id), purchases: tx.list('purchase').filter(p => p.customerId === c.id && tx.get('payment', p.paymentId)?.checkoutId === id) }; });
+  }
+  async cancelSubscription(subjectId:string,id:string){
+    const {order}=await this.order(subjectId,id);if(!order.billing||!order.providerOrderId||!this.ports.provider.cancelSubscription)throw new CommerceError('subscription_unavailable',409);
+    await this.ports.provider.cancelSubscription(order);
+    await this.store.transaction(tx=>{const current=tx.get('checkout',id)!;current.subscriptionState='CANCELLED';tx.put('checkout',current);this.audit(tx,current,subjectId,'subscription.cancel',id);});return {cancelled:true};
   }
   async capture(subjectId: string, id: string) {
     return this.store.transaction(tx => { const c = this.customer(tx, subjectId), order = tx.get('checkout', id);
@@ -329,6 +359,8 @@ export class CommerceService {
     if((prior&&prior.connectionId!==connectionId)||(order&&order.connectionId!==connectionId)||(offer&&offer.connectionId!==connectionId))throw new CommerceError('payment_connection_mismatch',409);
     let invalid = !offer ? candidates.length > 1 ? 'ambiguous_offer_mapping' : 'unknown_offer_mapping' : evidence.unsupported ? 'unsupported_payment_configuration' : undefined;
     if (order && (order.reference !== evidence.reference || order.merchantId !== evidence.merchantId)) invalid = 'order_or_merchant_mismatch';
+    if(offer?.billing&&(!order?.billing||order.billing!==offer.billing||evidence.subscriptionInterval!==order.billing||!order.providerPlanId||order.providerPlanId!==evidence.subscriptionPlanId))invalid='subscription_plan_mismatch';
+    if(offer?.billing&&(!evidence.paidAt||!Number.isFinite(Date.parse(evidence.paidAt))||Date.parse(evidence.paidAt)>Date.parse(this.now())+300000))invalid='subscription_payment_period_missing';
     if (offer && (evidence.currency !== (order?.currency ?? offer.currency) || evidence.paidMinor !== (order?.amountMinor ?? offer.amountMinor))) invalid = 'amount_or_currency_mismatch';
     if (!order && !evidence.buyerEmail) invalid = 'verified_buyer_email_required';
     if (prior && (prior.paidMinor !== evidence.paidMinor || prior.currency !== evidence.currency || prior.checkoutId !== order?.id)) invalid = 'payment_identity_mismatch';
@@ -358,14 +390,15 @@ export class CommerceService {
     if (notificationEventId) payment.notificationEventId = notificationEventId;
     tx.put('payment', payment);
     if (order) { order.state = invalid ? 'needs_review' : ['completed','partially_refunded','refunded','reversed'].includes(payment.state) ? 'completed' : payment.state === 'failed' ? 'failed' : 'pending'; order.reviewReason = invalid; tx.put('checkout', order); }
+    const contentOffer=offer?this.subscriptionContents(tx,offer):undefined;
     const purchaseId = key('purchase', id), existing = tx.get('purchase', purchaseId);
     if (!invalid && !existing && ['completed', 'partially_refunded'].includes(payment.state)) {
-      const purchase = { ...this.base(scope, purchaseId), paymentId: id, offerVersionId: offer!.id, customerId: order?.customerId,
+      const purchase = { ...this.base(scope, purchaseId), paymentId: id, offerVersionId: offer!.id,...(offer!.billing?{contentOfferVersionId:contentOffer!.id}:{}), customerId: order?.customerId,
         buyerEmail: evidence.buyerEmail ? email(evidence.buyerEmail) : undefined, state: 'active' as const, claimedAt: order ? this.now() : undefined };
       tx.insert('purchase', purchase, [key('purchase-payment', id)]);
-      for (const benefit of offer!.benefits) tx.insert('entitlement', { ...this.base(scope, key('grant', purchaseId, benefit)), customerId: purchase.customerId,
-        purchaseId, source: 'payment', benefit: structuredClone(benefit), assetIds: benefit.type === 'gallery' ? [...offer!.files] : benefit.type === 'download' ? [benefit.resourceId] : benefit.type === 'package' ? [key('package', offer!.id)] : [], startsAt: purchase.createdAt,
-        ...(offer!.durationSeconds ? { endsAt: new Date(Date.parse(purchase.createdAt) + offer!.durationSeconds * 1000).toISOString() } : {}), state: 'active' });
+      for (const benefit of contentOffer!.benefits) tx.insert('entitlement', { ...this.base(scope, key('grant', purchaseId, benefit)), customerId: purchase.customerId,
+        purchaseId, source: 'payment', benefit: structuredClone(benefit), assetIds: benefit.type === 'gallery' ? [...contentOffer!.files] : benefit.type === 'download' ? [benefit.resourceId] : benefit.type === 'package' ? [key('package', contentOffer!.id)] : [], startsAt: purchase.createdAt,
+        ...(offer!.billing ? {endsAt:subscriptionPeriodEnd(evidence.paidAt!,offer!.billing)} : offer!.durationSeconds ? { endsAt: new Date(Date.parse(purchase.createdAt) + offer!.durationSeconds * 1000).toISOString() } : {}), state: 'active' });
       if (!purchase.customerId) this.createClaim(tx, purchaseId);
       else this.queue(tx, scope, 'discord', purchase.customerId);
     }
@@ -424,12 +457,14 @@ export class CommerceService {
   async purchases(subjectId: string) {
     return this.store.transaction(tx => { const c = this.customer(tx, subjectId);
       return tx.list('purchase').filter(p => p.customerId === c.id).map(p => ({ id: p.id, ownerId: p.ownerId, environment: p.environment, state: p.state, createdAt: p.createdAt,
+        subscription:tx.list('checkout').find(o=>o.billing&&o.id===tx.get('payment',p.paymentId)?.checkoutId),
+        contentOffer:tx.get('offer',p.contentOfferVersionId??p.offerVersionId),
         offer: tx.get('offer', p.offerVersionId), payment: tx.get('payment', p.paymentId), entitlements: tx.list('entitlement').filter(g => g.purchaseId === p.id),
         packages: tx.list('package').filter(a => a.offerVersionId === p.offerVersionId), discordInvites:tx.list('guild').filter(g=>same(g,p)&&tx.list('entitlement').some(e=>e.purchaseId===p.id&&isActive(e,this.now())&&e.benefit.type==='discord_role'&&e.benefit.guildId===g.guildId)).map(g=>({guildId:g.guildId,inviteUrl:g.inviteUrl})), discordJobs:tx.list('job').filter(j=>j.kind==='discord'&&j.referenceId===c.id&&same(j,p)).map(j=>({state:j.state,lastError:j.lastError})), discord: tx.list('discordRole').filter(r => r.customerId === c.id && r.ownerId === p.ownerId && r.environment === p.environment) })); });
   }
   async retryCustomerDiscord(subjectId:string){await this.rateLimit(subjectId,'customer_discord_retry',10,3600);await this.store.transaction(tx=>{const c=this.customer(tx,subjectId),scopes=new Map<string,Scope>();for(const g of tx.list('entitlement').filter(g=>g.customerId===c.id))scopes.set(key(g.ownerId,g.environment),g);for(const s of scopes.values())this.queue(tx,s,'discord',c.id);});return {queued:true};}
   async myAccess(subjectId: string) {
-    return this.store.transaction(tx => { const customer = this.customer(tx, subjectId), entitlements = tx.list('entitlement').filter(g => g.customerId === customer.id && isActive(g, this.now()));
+    return this.store.transaction(tx => { const customer = this.customer(tx, subjectId);this.claimGifts(tx,customer);const entitlements = tx.list('entitlement').filter(g => g.customerId === customer.id && isActive(g, this.now()));
       const ids = new Set(entitlements.flatMap(g => g.assetIds));
       return { entitlements, assets: tx.list('asset').filter(a => ids.has(a.id)).map(({ objectId, source, ...asset }) => asset) }; });
   }
@@ -438,6 +473,7 @@ export class CommerceService {
     return this.store.transaction(tx => ({ payments: tx.list('payment').filter(p => p.ownerId === actor.ownerId), purchases: tx.list('purchase').filter(p => p.ownerId === actor.ownerId),
       jobs: tx.list('job').filter(p => p.ownerId === actor.ownerId).map(({ leaseId, ...j }) => j), audits: tx.list('audit').filter(p => p.ownerId === actor.ownerId),
       offers: tx.list('offer').filter(p => p.ownerId === actor.ownerId), assets: tx.list('asset').filter(p => p.ownerId === actor.ownerId),
+      gifts:tx.list('gift').filter(g=>g.ownerId===actor.ownerId),
       checkouts: tx.list('checkout').filter(p => p.ownerId === actor.ownerId),
       guilds: tx.list('guild').filter(p=>p.ownerId===actor.ownerId),
       discord: tx.list('discordRole').filter(p => p.ownerId === actor.ownerId) }));
@@ -452,6 +488,22 @@ export class CommerceService {
       this.queue(tx, record, kind, reference); this.audit(tx, record, actor.subjectId, kind + '.retry', id);
     });
   }
+  async giftOffer(actor:CreatorActor,input:{offerVersionId:string;recipientEmail:string;months?:number;requestId:string}){
+    await this.ports.authorizeCreator(actor);if(!/^[A-Za-z0-9_-]{8,200}$/.test(input.requestId))throw new CommerceError('invalid_idempotency_key');
+    const recipientEmail=email(input.recipientEmail),offer=await this.store.transaction(tx=>tx.get('offer',input.offerVersionId));
+    if(!offer||offer.ownerId!==actor.ownerId)throw new CommerceError('offer_not_found',404);await this.ports.assertEligible(offer);await this.ports.assertOfferEligible?.(offer,offer);
+    if(offer.billing?(!Number.isSafeInteger(input.months)||input.months!<1||input.months!>120):input.months!==undefined)throw new CommerceError('invalid_gift_duration');
+    return this.store.transaction(tx=>{const id=key('gift',offer.ownerId,offer.environment,input.requestId),requestHash=hash(JSON.stringify({...input,recipientEmail})),prior=tx.get('gift',id);if(prior){if(prior.requestHash!==requestHash)throw new CommerceError('idempotency_conflict',409);return prior;}
+      const gift:import('./model.js').Gift={...this.base(offer,id),offerVersionId:offer.id,recipientEmail,requestHash,...(input.months?{months:input.months}:{}),state:'pending'};tx.insert('gift',gift);this.queue(tx,gift,'gift_email',gift.id,gift.id);this.audit(tx,gift,actor.subjectId,'gift.create',gift.id);return gift;});
+  }
+  async revokeGift(actor:CreatorActor,id:string){await this.ports.authorizeCreator(actor);await this.store.transaction(tx=>{const gift=tx.get('gift',id);if(!gift||gift.ownerId!==actor.ownerId)throw new CommerceError('gift_not_found',404);gift.state='revoked';tx.put('gift',gift);for(const grant of tx.list('entitlement').filter(g=>g.giftId===id)){grant.state='revoked';tx.put('entitlement',grant);}if(gift.customerId)this.queue(tx,gift,'discord',gift.customerId);this.audit(tx,gift,actor.subjectId,'gift.revoke',id);});return {revoked:true};}
+  private claimGifts(tx:CommerceTransaction,customer:Customer){
+    for(const gift of tx.list('gift').filter(g=>g.state==='pending'&&customer.verifiedEmails.includes(g.recipientEmail))){const offer=tx.get('offer',gift.offerVersionId);if(!offer)continue;const contents=this.subscriptionContents(tx,offer);gift.contentOfferVersionId=contents.id;gift.customerId=customer.id;gift.claimedAt=this.now();gift.state='claimed';if(gift.months)gift.endsAt=subscriptionPeriodEnd(this.now(),'month',gift.months);tx.put('gift',gift);
+      for(const benefit of contents.benefits)tx.insert('entitlement',{...this.base(gift,key('gift-grant',gift.id,benefit)),customerId:customer.id,giftId:gift.id,source:'manual',reason:'Gift: '+offer.title,benefit:structuredClone(benefit),assetIds:benefit.type==='gallery'?[...contents.files]:benefit.type==='download'?[benefit.resourceId]:benefit.type==='package'?[key('package',contents.id)]:[],startsAt:this.now(),...(gift.endsAt?{endsAt:gift.endsAt}:{}),state:'active'});
+      this.queue(tx,gift,'discord',customer.id);this.audit(tx,gift,customer.subjectId,'gift.claim',gift.id);
+    }
+  }
+  async gifts(subjectId:string){return this.store.transaction(tx=>{const customer=this.customer(tx,subjectId);this.claimGifts(tx,customer);return tx.list('gift').filter(g=>g.customerId===customer.id).map(g=>({...g,offer:tx.get('offer',g.offerVersionId),contentOffer:tx.get('offer',g.contentOfferVersionId??g.offerVersionId),entitlements:tx.list('entitlement').filter(e=>e.giftId===g.id)}));});}
   async manualGrant(actor: CreatorActor, input: { customerId: string; environment: Environment; benefit: Benefit; reason: string; endsAt?: string }) {
     await this.ports.authorizeCreator(actor); const scope = this.scope(actor.ownerId, input.environment);
     if (!input.reason?.trim() || input.reason.length > 1000 || (input.endsAt && (!Number.isFinite(Date.parse(input.endsAt)) || Date.parse(input.endsAt) <= Date.parse(this.now())))) throw new CommerceError('grant_reason_or_duration_invalid');
@@ -617,7 +669,7 @@ export class CommerceService {
     await this.store.transaction(tx => {
       const at = Date.parse(this.now()), quarter = Math.floor(at / 900000), day = Math.floor(at / 86400000);
       const batch=this.ports.reconciliation?.batchSize??100, recentDays=this.ports.reconciliation?.recentPaymentDays??30;let scheduled=0;
-      for (const order of tx.list('checkout').filter(o => ['creating','pending'].includes(o.state))) {
+      for (const order of tx.list('checkout').filter(o => ['creating','pending'].includes(o.state)||(o.billing&&o.state==='completed'&&!['CANCELLED','EXPIRED'].includes(o.subscriptionState??'')))) {
         if(scheduled>=batch)break;
         if (order.state === 'creating') scheduled+=Number(this.queue(tx, order, 'create_order', order.id, order.id));
         else scheduled+=Number(this.queue(tx, order, 'reconcile', order.id, key('pending-order', order.id, quarter)));
@@ -688,7 +740,7 @@ export class CommerceService {
       await this.ports.bindMerchant?.(snapshot.order, snapshot.order.connectionId, created.merchantId);
       await this.store.transaction(tx => { const order = tx.get('checkout', job.referenceId)!;
         if (order.providerOrderId && order.providerOrderId !== created.orderId) throw new CommerceError('provider_order_conflict');
-        order.providerOrderId = created.orderId; order.approvalUrl = created.approvalUrl; order.merchantId = created.merchantId; order.state = 'pending'; tx.put('checkout', order); }); return;
+        order.providerOrderId = created.orderId; order.providerPlanId=created.planId; order.approvalUrl = created.approvalUrl; order.merchantId = created.merchantId; order.state = 'pending'; tx.put('checkout', order); }); return;
     }
     if (job.kind === 'capture') {
       const order = await this.store.transaction(tx => tx.get('checkout', job.referenceId)); if (!order?.providerOrderId || order.state === 'completed' || order.state === 'failed') return;
@@ -717,7 +769,8 @@ export class CommerceService {
     if (job.kind === 'reconcile') {
       const reference = await this.store.transaction(tx => ({ payment: tx.get('payment', job.referenceId), order: tx.get('checkout', job.referenceId) }));
       const c = reference.payment ?? reference.order; if (!c) return;
-      const evidence = await this.ports.provider.reconcile(c, c.connectionId, reference.payment ? { captureId: reference.payment.providerPaymentId } : { orderId: reference.order!.providerOrderId });
+      if(reference.order?.billing&&this.ports.provider.subscriptionStatus){const status=await this.ports.provider.subscriptionStatus(reference.order);await this.store.transaction(tx=>{const current=tx.get('checkout',reference.order!.id)!;current.subscriptionState=status;tx.put('checkout',current);});}
+      const evidence = await this.ports.provider.reconcile(c, c.connectionId, reference.payment ? (reference.payment.providerOrderId?.startsWith('I-')?{orderId:reference.payment.providerOrderId}:{ captureId: reference.payment.providerPaymentId }) : { orderId: reference.order!.providerOrderId });
       await this.reconcile(c, c.connectionId, evidence);
       if (!evidence.length && reference.order?.providerOrderId && this.ports.provider.orderStatus) {
         const status = await this.ports.provider.orderStatus(reference.order);
@@ -728,6 +781,7 @@ export class CommerceService {
       }
       return;
     }
+    if(job.kind==='gift_email'){const gift=await this.store.transaction(tx=>tx.get('gift',job.referenceId));if(gift&&gift.state!=='revoked')await this.ports.mail.send({to:gift.recipientEmail,subject:'You received a collection gift',text:'A creator has gifted you collection access. Sign in with this email address at '+this.baseUrl+'/commerce/purchases'+(gift.months?' to claim '+gift.months+' months of subscription access.':' to claim ongoing access.'),idempotencyKey:job.id});return;}
     if (job.kind === 'claim_email' || job.kind === 'verify_email' || job.kind === 'login_email') {
       const proof = await this.store.transaction(tx => job.kind === 'claim_email' ? tx.get('claim', job.referenceId) : job.kind === 'login_email' ? tx.get('login', job.referenceId) : tx.get('emailProof', job.referenceId));
       if (!proof || proof.consumedAt || proof.expiresAt <= this.now()) return;

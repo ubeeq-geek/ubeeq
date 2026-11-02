@@ -103,7 +103,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
     const c = await store.get(deps.deploymentId, id);
     if (!c || c.ownerId !== scope.ownerId || c.environment !== scope.environment || scope.deploymentId !== deps.deploymentId || !c.credentialReference || c.state === 'disconnected') throw new CommerceError('payment_credentials_unavailable', 503);
     const secret = await vault.read({ cellId: deps.deploymentId, reference: c.credentialReference });
-    if (!secret) throw new CommerceError('payment_credentials_unavailable', 503); return { clientId: c.clientId, clientSecret: Buffer.from(secret).toString('utf8'), merchantId: c.merchantId };
+    if (!secret) throw new CommerceError('payment_credentials_unavailable', 503); return { clientId: c.clientId, clientSecret: Buffer.from(secret).toString('utf8'), merchantId: c.merchantId,webhookId:c.webhookId };
   } });
   const assetRead = async (asset: PrivateAsset) => {
     if (!await deps.contentAvailable(asset.ownerId, asset.id)) throw new CommerceError('content_unavailable', 409);
@@ -174,7 +174,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
   };
   const handle = async (request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean> => {
     const path = url.pathname, method = request.method ?? 'GET';
-    if(path.startsWith('/api/')&&!/^\/api\/(?:webhooks\/paypal\/|private-assets\/|previews\/|storefront$|auth\/email(?:\/|$)|me(?:$|\/(?:purchases$|purchase-claims\/|access$|gallery$|email(?:\/|$)|discord\/))|downloads\/|checkouts(?:$|\/)|connections\/paypal$|commerce\/|offers(?:$|\/)|discord\/)/.test(path))return false;
+    if(path.startsWith('/api/')&&!/^\/api\/(?:webhooks\/paypal\/|private-assets\/|previews\/|storefront$|auth\/email(?:\/|$)|me(?:$|\/(?:purchases$|purchase-claims\/|subscriptions\/|access$|gallery$|email(?:\/|$)|discord\/))|downloads\/|checkouts(?:$|\/)|connections\/paypal$|commerce\/|offers(?:$|\/)|discord\/)/.test(path))return false;
     if (!(path === '/commerce' || path.startsWith('/commerce/') || path.startsWith('/buy/') || path.startsWith('/api/'))) return false;
     const correlationId=randomUUID();response.setHeader('x-request-id',correlationId);
     response.setHeader('cache-control', 'private, no-store'); response.setHeader('x-content-type-options', 'nosniff'); response.setHeader('referrer-policy', 'no-referrer');
@@ -216,14 +216,15 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/me' && method === 'DELETE') { send(response, await service.eraseCustomer(subjectId)); return true; }
       if (path === '/api/me/purchase-claims/resend' && method === 'POST') { send(response, await service.recoverClaims(subjectId), 202); return true; }
       if (path === '/api/me/discord/retry' && method === 'POST') { send(response, await service.retryCustomerDiscord(subjectId),202);return true; }
-      if (path === '/api/me/purchases' && method === 'GET') { send(response, { purchases: await service.purchases(subjectId) }); return true; }
+      const cancelSubscription=path.match(/^\/api\/me\/subscriptions\/([^/]+)\/cancel$/);if(cancelSubscription&&method==='POST'){send(response,await service.cancelSubscription(subjectId,cancelSubscription[1]));return true;}
+      if (path === '/api/me/purchases' && method === 'GET') { send(response, { purchases: await service.purchases(subjectId),gifts:await service.gifts(subjectId) }); return true; }
       if (path === '/api/me/access' && method === 'GET') { send(response, await service.myAccess(subjectId)); return true; }
       if (path === '/api/me/gallery' && method === 'GET') {
-        const purchase = (await service.purchases(subjectId)).find(p => p.id === url.searchParams.get('purchase'));
+        const purchase = url.searchParams.has('gift')?(await service.gifts(subjectId)).find(g=>g.id===url.searchParams.get('gift')):(await service.purchases(subjectId)).find(p => p.id === url.searchParams.get('purchase'));
         if (!purchase?.offer) throw new CommerceError('purchase_not_found', 404);
         if(!purchase.entitlements.some(g=>g.benefit.type==='gallery'&&g.state==='active'&&(!g.endsAt||g.endsAt>new Date().toISOString())))throw new CommerceError('gallery_access_required',403);
         const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string }[] = [];
-        for (const id of purchase.offer.files) {
+        for (const id of (purchase.contentOffer??purchase.offer).files) {
           const asset = access.assets.find(a => a.id === id); if (!asset?.contentType.startsWith('image/') || asset.state !== 'available') continue;
           const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url, thumbnail: authorized.url, title: asset.label, alt: asset.label });
         }

@@ -9,6 +9,7 @@ export const PAYPAL_EVENT_TYPES = [
   'PAYMENT.CAPTURE.COMPLETED', 'PAYMENT.CAPTURE.PENDING', 'PAYMENT.CAPTURE.DECLINED',
   'PAYMENT.CAPTURE.REFUNDED', 'PAYMENT.CAPTURE.REVERSED', 'CHECKOUT.ORDER.APPROVED',
   'CHECKOUT.PAYMENT-APPROVAL.REVERSED', 'PAYMENT.REFUND.PENDING', 'PAYMENT.REFUND.FAILED',
+  'BILLING.SUBSCRIPTION.CREATED','BILLING.SUBSCRIPTION.ACTIVATED','BILLING.SUBSCRIPTION.UPDATED','BILLING.SUBSCRIPTION.EXPIRED','BILLING.SUBSCRIPTION.CANCELLED','BILLING.SUBSCRIPTION.SUSPENDED','BILLING.SUBSCRIPTION.PAYMENT.FAILED','PAYMENT.SALE.COMPLETED','PAYMENT.SALE.REFUNDED','PAYMENT.SALE.REVERSED',
   'CUSTOMER.DISPUTE.CREATED', 'CUSTOMER.DISPUTE.UPDATED', 'CUSTOMER.DISPUTE.RESOLVED'
 ] as const;
 
@@ -95,6 +96,13 @@ export class PayPalClient {
       payment_source: { paypal: { experience_context: { return_url: input.returnUrl, cancel_url: input.cancelUrl,
         user_action: 'PAY_NOW', shipping_preference: 'NO_SHIPPING' } } } }, { 'PayPal-Request-Id': input.requestId, Prefer: 'return=representation' });
   }
+  async createSubscriptionProduct(name:string,requestId:string){return this.api('/v1/catalogs/products','POST',{name:name.slice(0,127),type:'SERVICE',category:'DIGITAL_MEDIA_BOOKS_MOVIES_MUSIC'},{'PayPal-Request-Id':requestId});}
+  async createSubscriptionPlan(productId:string,name:string,currency:string,amount:string,interval:'month'|'year',requestId:string){return this.api('/v1/billing/plans','POST',{product_id:productId,name:name.slice(0,127),status:'ACTIVE',billing_cycles:[{frequency:{interval_unit:interval==='month'?'MONTH':'YEAR',interval_count:1},tenure_type:'REGULAR',sequence:1,total_cycles:0,pricing_scheme:{fixed_price:{currency_code:currency,value:amount}}}],payment_preferences:{auto_bill_outstanding:false,payment_failure_threshold:1}},{'PayPal-Request-Id':requestId});}
+  async createSubscription(planId:string,reference:string,returnUrl:string,cancelUrl:string,requestId:string){return this.api('/v1/billing/subscriptions','POST',{plan_id:planId,custom_id:reference,application_context:{user_action:'SUBSCRIBE_NOW',shipping_preference:'NO_SHIPPING',return_url:returnUrl,cancel_url:cancelUrl}},{'PayPal-Request-Id':requestId,Prefer:'return=representation'});}
+  async getSubscription(id:string){return this.api('/v1/billing/subscriptions/'+pathId(id));}
+  async getSubscriptionPlan(id:string){return this.api('/v1/billing/plans/'+pathId(id));}
+  async subscriptionTransactions(id:string,start:string,end:string){return this.api('/v1/billing/subscriptions/'+pathId(id)+'/transactions?start_time='+encodeURIComponent(start)+'&end_time='+encodeURIComponent(end));}
+  async cancelSubscription(id:string){return this.api('/v1/billing/subscriptions/'+pathId(id)+'/cancel','POST',{reason:'Cancelled by the subscriber'});}
   async getOrder(id: string) { return this.api('/v2/checkout/orders/' + pathId(id)); }
   async captureOrder(id: string, requestId: string) { return this.api('/v2/checkout/orders/' + pathId(id) + '/capture', 'POST', {}, { 'PayPal-Request-Id': requestId, Prefer: 'return=representation' }); }
   async getCapture(id: string) { return this.api('/v2/payments/captures/' + pathId(id)); }

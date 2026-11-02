@@ -231,3 +231,11 @@ require distinct provider identifiers once a mapping has been activated, so dela
 payments cannot be assigned to newer content. Existing payments retain their
 original offer version; reused ambiguous mappings fail closed. Offer publication
 supports a reviewed request ID, with exact-value idempotency conflict detection.
+
+## Recurring collection access and gifts
+
+Creator commerce offers may use monthly or yearly PayPal subscriptions in addition to one-time purchases. The provider pins connection, custom reference, plan, exact currency/amount and calendar period. It accepts only independently retrieved completed transactions; approval alone grants no access. Existing seller identity is reused; a new seller is identified through a never-captured verification order. Product, plan, subscription and verification-order writes use separate stable request IDs. Subscriptions with per-subscriber overrides, extra cycles, nonzero taxes/setup fees or incomplete transaction history fail closed.
+
+Subscription events and sale completed/refunded/reversed events are registered with the same signature-verified receiver. Periodic reconciliation covers delayed notifications. Cancellation stops future billing and retains paid access. Active agreements keep the connection’s credentials from being disconnected. Each reviewed offer version can update the content of active paid/gifted subscriptions in that plan family while preserving the billing offer and price. One-time purchases remain immutable.
+
+Creator gifts use scoped, idempotent invitation records and verified recipient emails, with no provider payment or subscription. One-time gifts have ongoing access until revoked. Subscription gifts have a creator-selected fixed calendar duration beginning on claim, receive reviewed content updates while active, and never renew. Revocation preserves separate entitlements. Provider sandbox subscription/renewal/cancellation/refund acceptance remains required before live rollout.

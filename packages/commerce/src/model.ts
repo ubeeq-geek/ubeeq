@@ -4,15 +4,17 @@ export interface RecordBase extends Scope { id: string; createdAt: string; updat
 export interface Customer extends RecordBase { subjectId: string; verifiedEmails: string[]; discordUserId?: string; erasedAt?: string; }
 export type Benefit = { type: 'gallery' | 'download' | 'package'; resourceId: string } | { type: 'discord_role'; resourceId: string; guildId: string; roleId: string };
 export interface Offer extends RecordBase {
+  billing?: 'month' | 'year';
   commandHash?: string; offerId: string; version: number; slug: string; title: string; description: string; supportEmail: string;
   connectionId: string; merchantId: string; currency: string; amountMinor: number;
   benefits: Benefit[]; files: string[]; previews: string[]; terms: string; durationSeconds?: number;
   published: boolean; external?: { url: string; mappingId: string; validatedAt?: string; evidenceId?: string };
 }
 export interface Checkout extends RecordBase {
+  billing?: 'month' | 'year'; subscriptionState?: string;
   customerId: string; offerVersionId: string; connectionId: string; merchantId: string;
   currency: string; amountMinor: number; reference: string; idempotencyKey: string;
-  providerOrderId?: string; approvalUrl?: string; state: 'creating' | 'pending' | 'completed' | 'failed' | 'needs_review';
+  providerOrderId?: string; providerPlanId?:string; approvalUrl?: string; state: 'creating' | 'pending' | 'completed' | 'failed' | 'needs_review';
   captureRequestId: string; reviewReason?: string;
 }
 export type PaymentState = 'pending' | 'completed' | 'failed' | 'partially_refunded' | 'refunded' | 'reversed' | 'needs_review';
@@ -24,11 +26,11 @@ export interface Payment extends RecordBase {
 }
 export interface Refund extends RecordBase { paymentId: string; providerRefundId: string; amountMinor: number; state: string; }
 export interface Purchase extends RecordBase {
-  paymentId: string; offerVersionId: string; customerId?: string; buyerEmail?: string;
+  paymentId: string; offerVersionId: string; contentOfferVersionId?:string; customerId?: string; buyerEmail?: string;
   state: 'active' | 'revoked'; claimedAt?: string;
 }
 export interface Entitlement extends RecordBase {
-  customerId?: string; purchaseId?: string; source: 'payment' | 'manual'; reason?: string;
+  customerId?: string; purchaseId?: string; giftId?:string; contentRemoved?:boolean; source: 'payment' | 'manual'; reason?: string;
   benefit: Benefit; startsAt: string; endsAt?: string; state: 'active' | 'revoked';
   assetIds: string[];
 }
@@ -45,7 +47,7 @@ export interface PrivateAsset extends RecordBase {
 }
 export interface PackageRecord extends RecordBase { offerVersionId: string; assetId: string; state: 'preparing' | 'ready' | 'unavailable'; }
 export interface DeliveryJob extends RecordBase {
-  kind: 'create_order' | 'capture' | 'event' | 'reconcile' | 'claim_email' | 'verify_email' | 'login_email' | 'creator_notice' | 'discord' | 'package' | 'cleanup';
+  kind: 'gift_email' | 'create_order' | 'capture' | 'event' | 'reconcile' | 'claim_email' | 'verify_email' | 'login_email' | 'creator_notice' | 'discord' | 'package' | 'cleanup';
   referenceId: string; state: 'pending' | 'running' | 'done' | 'failed'; attempts: number; dueAt: string;
   leaseId?: string; leaseUntil?: string; lastError?: string; eventType?: string;
 }
@@ -61,7 +63,9 @@ export interface DiscordRole extends RecordBase {
 export interface OAuthState extends RecordBase { customerId: string; creatorSubjectId?: string; tokenHash: string; expiresAt: string; consumedAt?: string; }
 export interface DiscordSetup extends RecordBase { customerId: string; subjectId: string; credentialReference: string; expiresAt: string; }
 export interface ExternalMapping extends RecordBase {merchantId:string;mappingId:string;offerVersionId:string;evidenceId:string;}
+export interface Gift extends RecordBase {offerVersionId:string;contentOfferVersionId?:string;recipientEmail:string;requestHash:string;months?:number;customerId?:string;claimedAt?:string;endsAt?:string;state:'pending'|'claimed'|'revoked';}
 export interface CommerceRecords {
+  gift:Gift;
   externalMapping:ExternalMapping;
   customer: Customer; offer: Offer; checkout: Checkout; payment: Payment; refund: Refund; purchase: Purchase;
   entitlement: Entitlement; claim: Claim; emailProof: EmailProof; asset: PrivateAsset; package: PackageRecord;
@@ -104,3 +108,10 @@ export const minorToAmount = (value: number, currency: string): string => {
   const exponent = currencyExponent(currency), digits = String(value).padStart(exponent + 1, '0');
   return exponent ? digits.slice(0, -exponent) + '.' + digits.slice(-exponent) : digits;
 };
+
+/** Calendar billing periods clamp month ends rather than overflowing into the following month. */
+export function subscriptionPeriodEnd(start:string,interval:'month'|'year',count=1):string {
+ const date=new Date(start);if(!Number.isFinite(date.getTime()))throw new CommerceError('invalid_subscription_period');
+ const day=date.getUTCDate();date.setUTCDate(1);if(interval==='month')date.setUTCMonth(date.getUTCMonth()+count);else date.setUTCFullYear(date.getUTCFullYear()+count);
+ const end=new Date(date.getTime());end.setUTCMonth(end.getUTCMonth()+1);end.setUTCDate(0);date.setUTCDate(Math.min(day,end.getUTCDate()));return date.toISOString();
+}

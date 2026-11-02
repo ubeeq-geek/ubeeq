@@ -1,10 +1,11 @@
+import {createHash} from 'node:crypto';
 import { amountToMinor, minorToAmount, CommerceError, type Checkout, type CommerceProvider, type Offer, type PaymentEvidence, type Scope } from '@ubeeq/commerce';
 import { PayPalClient, type PayPalFetch } from './paypal-client.js';
 
 export interface PayPalCommercePorts {
   publicBaseUrl: string; fetch?: PayPalFetch;
   /** Restricted vault resolver must check deployment/creator/environment and support explicitly draining connections. */
-  credentials(scope: Scope, connectionId: string): Promise<{ clientId: string; clientSecret: string; merchantId?: string }>;
+  credentials(scope: Scope, connectionId: string): Promise<{ clientId: string; clientSecret: string; merchantId?: string;webhookId?:string }>;
 }
 /** Only independently retrieved provider resources are converted into payment evidence. */
 export class PayPalCommerceProvider implements CommerceProvider {
@@ -12,6 +13,20 @@ export class PayPalCommerceProvider implements CommerceProvider {
   private async client(scope: Scope, connectionId: string) { return new PayPalClient(scope.environment, await this.ports.credentials(scope, connectionId), this.ports.fetch); }
   async createOrder(order: Checkout, _offer: Offer) {
     const client = await this.client(order, order.connectionId), base = this.ports.publicBaseUrl.replace(/\/$/, '');
+    if(_offer.billing){
+      const credentials=await this.ports.credentials(order,order.connectionId);let merchantId=credentials.merchantId;
+      if(credentials.webhookId)await client.updateWebhook(credentials.webhookId);
+      const request=(kind:string)=>createHash('sha256').update(order.reference+':'+kind).digest('hex').slice(0,38);
+      // An uncaptured order identifies this app's actual payee without charging anyone.
+      if(!merchantId){const verification=await client.createOrder({reference:order.reference,currency:order.currency,amount:minorToAmount(order.amountMinor,order.currency),returnUrl:base+'/commerce/checkout/'+order.id,cancelUrl:base+'/commerce/checkout/'+order.id,requestId:request('seller')});const snapshot=await client.getOrder(verification.id),unit=snapshot.purchase_units?.[0];if(snapshot.id!==verification.id||snapshot.purchase_units?.length!==1||unit?.custom_id!==order.reference||unit?.amount?.currency_code!==order.currency||amountToMinor(unit.amount.value,order.currency)!==order.amountMinor||!unit.payee?.merchant_id)throw new CommerceError('provider_order_snapshot_mismatch');merchantId=unit.payee.merchant_id;}
+      const product=await client.createSubscriptionProduct(_offer.title,request('product'));
+      const plan=await client.createSubscriptionPlan(product.id,_offer.title,order.currency,minorToAmount(order.amountMinor,order.currency),_offer.billing,request('plan'));
+      const remotePlan=await client.getSubscriptionPlan(plan.id);this.subscriptionInterval(remotePlan,order.currency,order.amountMinor,_offer.billing);
+      const result=await client.createSubscription(plan.id,order.reference,base+'/commerce/checkout/'+order.id,base+'/commerce/checkout/'+order.id+'?cancelled=1',request('subscription'));
+      const remote=await client.getSubscription(result.id);if(remote.id!==result.id||remote.custom_id!==order.reference||remote.plan_id!==plan.id)throw new CommerceError('subscription_identity_mismatch');
+      const approval=result.links?.find((link:any)=>link.rel==='approve')?.href;if(typeof approval!=='string')throw new CommerceError('provider_approval_missing');
+      return {orderId:result.id,approvalUrl:approval,merchantId:merchantId!,planId:plan.id};
+    }
     const result = await client.createOrder({ reference: order.reference, currency: order.currency, amount: minorToAmount(order.amountMinor, order.currency),
       returnUrl: base + '/commerce/checkout/' + order.id, cancelUrl: base + '/commerce/checkout/' + order.id + '?cancelled=1', requestId: order.reference });
     const snapshot = await client.getOrder(result.id), unit = snapshot.purchase_units?.[0];
@@ -21,7 +36,16 @@ export class PayPalCommerceProvider implements CommerceProvider {
     if (typeof approval !== 'string') throw new CommerceError('provider_approval_missing');
     return { orderId: result.id, approvalUrl: approval, merchantId: unit.payee.merchant_id };
   }
+  private subscriptionInterval(plan:any,currency?:string,amountMinor?:number,expected?:'month'|'year'):'month'|'year'{
+    const cycle=plan.billing_cycles?.[0],price=cycle?.pricing_scheme?.fixed_price;
+    const interval=cycle?.frequency?.interval_unit==='MONTH'?'month':cycle?.frequency?.interval_unit==='YEAR'?'year':undefined;
+    if(!interval||plan.billing_cycles.length!==1||cycle.tenure_type!=='REGULAR'||cycle.frequency.interval_count!==1||cycle.total_cycles!==0||!price||(plan.taxes&&Number(plan.taxes.percentage??0)!==0)||Number(plan.payment_preferences?.setup_fee?.value??0)!==0||(expected&&expected!==interval)||(currency&&price.currency_code!==currency)||(amountMinor!==undefined&&amountToMinor(price.value,price.currency_code)!==amountMinor))throw new CommerceError('unsupported_subscription_plan');return interval;
+  }
+  async subscriptionStatus(order:Checkout){const remote=await(await this.client(order,order.connectionId)).getSubscription(order.providerOrderId!);if(remote.id!==order.providerOrderId||remote.custom_id!==order.reference||remote.plan_id!==order.providerPlanId)throw new CommerceError('subscription_identity_mismatch');return String(remote.status);}
+  async cancelSubscription(order:Checkout){const client=await this.client(order,order.connectionId);const state=await this.subscriptionStatus(order);if(!['CANCELLED','EXPIRED'].includes(state))await client.cancelSubscription(order.providerOrderId!);}
   async capture(order: Checkout) {
+    if(order.billing)return; // PayPal collects recurring payments; approval never grants access.
+
     const client = await this.client(order, order.connectionId);
     // A previous attempt may have captured before its response was lost, including outside the provider idempotency window.
     const current = await client.getOrder(order.providerOrderId!);
@@ -30,6 +54,7 @@ export class PayPalCommerceProvider implements CommerceProvider {
     await client.captureOrder(order.providerOrderId!, order.captureRequestId);
   }
   async orderStatus(order: Checkout): Promise<'pending' | 'approved' | 'failed'> {
+    if(order.billing){const state=await this.subscriptionStatus(order);return ['CANCELLED','EXPIRED'].includes(state)?'failed':'pending';}
     const remote = await (await this.client(order, order.connectionId)).getOrder(order.providerOrderId!);
     if (remote.id !== order.providerOrderId) throw new CommerceError('provider_order_snapshot_mismatch');
     return remote.status === 'VOIDED' ? 'failed' : remote.status === 'APPROVED' ? 'approved' : 'pending';
@@ -37,6 +62,19 @@ export class PayPalCommerceProvider implements CommerceProvider {
   async reconcile(scope: Scope, connectionId: string, reference: { orderId?: string; captureId?: string; eventId?: string; eventType?: string; payload?: string }): Promise<PaymentEvidence[]> {
     const credentials = await this.ports.credentials(scope, connectionId), client = new PayPalClient(scope.environment, credentials, this.ports.fetch);
     const event = reference.payload ? JSON.parse(reference.payload) : undefined;
+    const subscriptionId=reference.orderId?.startsWith('I-')?reference.orderId:reference.eventType?.startsWith('BILLING.SUBSCRIPTION.')?event?.resource?.id:reference.eventType?.startsWith('PAYMENT.SALE.')?event?.resource?.billing_agreement_id:undefined;
+    if(subscriptionId){
+      if(event&&event.id!==reference.eventId)throw new CommerceError('event_reference_mismatch');
+      const subscription=await client.getSubscription(subscriptionId);if(subscription.id!==subscriptionId||!subscription.custom_id||!credentials.merchantId||subscription.plan_overridden||subscription.quantity&&subscription.quantity!=='1')throw new CommerceError('subscription_identity_mismatch');
+      const plan=await client.getSubscriptionPlan(subscription.plan_id),interval=this.subscriptionInterval(plan);
+      const results:PaymentEvidence[]=[];const now=Date.now(),oldest=Math.max(Date.parse(subscription.create_time),now-400*86400000);if(!Number.isFinite(oldest))throw new CommerceError('invalid_subscription_period');
+      for(let start=oldest;start<now;start+=179*86400000){const list=await client.subscriptionTransactions(subscriptionId,new Date(start).toISOString(),new Date(Math.min(now,start+179*86400000)).toISOString());
+        if(!Array.isArray(list.transactions)||(list.total_pages??1)>1)throw new CommerceError('subscription_transactions_incomplete');
+        for(const sale of list.transactions){const statuses:Record<string,PaymentEvidence['status']>={COMPLETED:'completed',PARTIALLY_REFUNDED:'partially_refunded',REFUNDED:'refunded',REVERSED:'reversed'};if(!statuses[sale.status])continue;const amount=sale.amount_with_breakdown?.gross_amount;if(!amount||typeof sale.id!=='string'||!sale.time)throw new CommerceError('invalid_provider_evidence');
+          results.push({captureId:sale.id,orderId:subscriptionId,reference:subscription.custom_id,merchantId:credentials.merchantId,currency:amount.currency_code,paidMinor:amountToMinor(amount.value,amount.currency_code),refundedMinor:sale.status==='REFUNDED'?amountToMinor(amount.value,amount.currency_code):0,status:statuses[sale.status],updatedAt:sale.time,paidAt:sale.time,subscriptionInterval:interval,subscriptionPlanId:subscription.plan_id});
+        }
+      }return results;
+    }
     let captureId = reference.captureId, orderId = reference.orderId, refund: any, dispute: any;
     if (event && event.id !== reference.eventId) throw new CommerceError('event_reference_mismatch');
     if (event && reference.eventType?.startsWith('CUSTOMER.DISPUTE.')) {

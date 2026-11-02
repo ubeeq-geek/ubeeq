@@ -140,7 +140,7 @@ export class SqliteCommerceStore implements CommerceStore, PayPalConnectionStore
       this.db.prepare('INSERT INTO commerce_connection_audit(id,deployment,connection,payload) VALUES(?,?,?,?)').run(randomUUID(), this.deploymentId, record.id, JSON.stringify(audit)); });
   }
   async countUnconfirmedOrders(connection: PayPalConnection) {
-    return this.transaction(tx => tx.list('checkout').filter(o => o.connectionId === connection.id && !['completed','failed'].includes(o.state)).length);
+    return this.transaction(tx => tx.list('checkout').filter(o => o.connectionId === connection.id && (!['completed','failed'].includes(o.state)||(o.billing&&!['CANCELLED','EXPIRED'].includes(o.subscriptionState??'')))).length);
   }
   async acceptEvent(input: Parameters<PayPalConnectionStore['acceptEvent']>[0]): Promise<'accepted' | 'duplicate'> {
     if (input.connection.deploymentId !== this.deploymentId) throw new PayPalError('foreign_deployment');

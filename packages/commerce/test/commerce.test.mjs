@@ -302,3 +302,60 @@ test('offers and checkouts keep explicit seller connections and reject cross-con
 test('SQLite preserves legacy connections while migrating to multiple distinct apps',async t=>{const f=await fixture(t),a={...scope,id:'app-a',clientId:'client-a',revision:1,retiredCredentialReferences:[],state:'configured',acceptsCheckouts:true},b={...a,id:'app-b',clientId:'client-b',label:'Second account'};await f.store.withLock(scope,()=>f.store.save(a,0,{actorId:'owner',action:'connect',at:'now'}));const {DatabaseSync}=await import('node:sqlite'),legacy=new DatabaseSync(f.path);legacy.exec('DROP INDEX commerce_connection_client;CREATE UNIQUE INDEX commerce_connection_active ON commerce_connections(deployment,owner,environment) WHERE active=1');legacy.close();f.restart();await f.store.withLock(scope,()=>f.store.save(b,0,{actorId:'owner',action:'connect',at:'now'}));assert.equal((await f.store.listConnections('creator')).length,2);assert.equal(await f.store.find(scope),undefined);await assert.rejects(f.store.withLock(scope,()=>f.store.save({...a,id:'duplicate'},0,{actorId:'owner',action:'connect',at:'now'})));f.restart();assert.equal((await f.store.get('deployment','app-a')).clientId,'client-a');assert.equal((await f.store.get('deployment','app-b')).label,'Second account');});
 
 test('an older host connection resolver cannot silently ignore an explicit seller',async t=>{const f=await fixture(t),file=await f.asset();await assert.rejects(f.offer(file,{connectionId:'another-seller'}),{code:'payment_connection_mismatch'});assert.equal((await f.store.transaction(tx=>tx.list('offer'))).length,0);});
+
+test('subscription renewals expire by paid calendar period while a one-time purchase retains ongoing access',async t=>{
+ const f=await fixture(t),file=await f.asset();await f.verify();
+ f.provider.createOrder=async order=>({orderId:'I-'+order.id,planId:'PLAN',merchantId:'merchant',approvalUrl:'https://www.sandbox.paypal.com/approve'});
+ let cancelled=0;f.provider.cancelSubscription=async()=>{cancelled++;};
+ const plan=await f.offer(file,{slug:'monthly',billing:'month'}),order=await f.checkout(plan);
+ assert.equal(order.billing,'month');assert.equal(order.providerPlanId,'PLAN');
+ const evidence=f.evidence(order,{paidAt:'2026-11-01T12:00:00Z',subscriptionInterval:'month',subscriptionPlanId:'PLAN'});
+ await f.service.reconcile(scope,'connection',[evidence,evidence]);assert.equal((await f.service.purchases('buyer')).length,1);
+ assert.equal((await f.service.myAccess('buyer')).entitlements[0].endsAt,'2026-12-01T12:00:00.000Z');
+ await assert.rejects(f.service.cancelSubscription('other',order.id),{code:'checkout_not_found'});await assert.rejects(f.service.eraseCustomer('buyer'),{code:'cancel_subscriptions_before_erasure'});
+ await f.service.cancelSubscription('buyer',order.id);assert.equal(cancelled,1);assert.ok((await f.service.myAccess('buyer')).assets.length);
+ f.advance(31*86400000);assert.equal((await f.service.myAccess('buyer')).assets.length,0);
+ const one=await f.offer(file,{slug:'ongoing'}),buy=await f.checkout(one,'buyer','one-time-12345');
+ await f.service.reconcile(scope,'connection',[f.evidence(buy,{captureId:'ONE-TIME'})]);
+ f.advance(366*86400000);assert.equal((await f.service.myAccess('buyer')).assets.length,1);
+});
+test('subscription evidence must match its immutable provider plan, interval and payment time',async t=>{
+ const f=await fixture(t),file=await f.asset();await f.verify();f.provider.createOrder=async order=>({orderId:'I-'+order.id,planId:'PLAN',merchantId:'merchant',approvalUrl:'https://www.sandbox.paypal.com/approve'});
+ const plan=await f.offer(file,{billing:'year'}),order=await f.checkout(plan);
+ for(const patch of [{subscriptionPlanId:'OTHER',subscriptionInterval:'year',paidAt:'2026-11-01T12:00:00Z'},{subscriptionPlanId:'PLAN',subscriptionInterval:'month',paidAt:'2026-11-01T12:00:00Z'},{subscriptionPlanId:'PLAN',subscriptionInterval:'year'}]){await f.service.reconcile(scope,'connection',[f.evidence(order,patch)]);assert.equal((await f.service.myAccess('buyer')).assets.length,0);}
+ const paid=f.evidence(order,{subscriptionPlanId:'PLAN',subscriptionInterval:'year',paidAt:'2026-11-01T12:00:00Z'});await f.service.reconcile(scope,'connection',[paid]);assert.equal((await f.service.myAccess('buyer')).entitlements[0].endsAt,'2027-11-01T12:00:00.000Z');
+ await f.service.reconcile(scope,'connection',[{...paid,status:'refunded',refundedMinor:1000}]);assert.equal((await f.service.myAccess('buyer')).assets.length,0);
+});
+
+test('creator gifts require the recipient verified email, never charge PayPal, and revoke independently',async t=>{
+ const f=await fixture(t),file=await f.asset(),offer=await f.offer(file);let creates=0;f.provider.createOrder=async()=>{creates++;throw Error('No payment expected');};
+ const gift=await f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'recipient@example.test',requestId:'gift-one-time-123'});
+ assert.equal((await f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'recipient@example.test',requestId:'gift-one-time-123'})).id,gift.id);
+ await assert.rejects(f.service.giftOffer({subjectId:'other',ownerId:'creator'},{offerVersionId:offer.id,recipientEmail:'recipient@example.test',requestId:'unauthorized-gift'}),{code:'forbidden'});
+ await f.verify('wrong','wrong@example.test');assert.equal((await f.service.gifts('wrong')).length,0);assert.equal((await f.service.myAccess('wrong')).assets.length,0);
+ await f.verify('recipient','recipient@example.test');assert.equal((await f.service.gifts('recipient'))[0].state,'claimed');assert.equal((await f.service.myAccess('recipient')).assets.length,1);assert.equal(creates,0);assert.equal((await f.store.transaction(tx=>tx.list('payment'))).length,0);
+ const second=await f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'recipient@example.test',requestId:'second-gift-123'});await f.service.gifts('recipient');
+ await f.service.revokeGift(actor,gift.id);assert.equal((await f.service.myAccess('recipient')).assets.length,1);await f.service.revokeGift(actor,second.id);assert.equal((await f.service.myAccess('recipient')).assets.length,0);
+ await f.drain();assert.ok(f.messages.some(m=>m.subject==='You received a collection gift'));
+});
+test('subscription gifts start a fixed duration on claim and never renew; pending revocation prevents claiming',async t=>{
+ const f=await fixture(t),file=await f.asset(),offer=await f.offer(file,{billing:'month'});
+ await assert.rejects(f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'recipient@example.test',requestId:'missing-duration'}),{code:'invalid_gift_duration'});
+ const pending=await f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'recipient@example.test',months:2,requestId:'fixed-duration-123'});
+ f.advance(10*86400000);await f.verify('recipient','recipient@example.test');let gifts=await f.service.gifts('recipient');assert.equal(gifts[0].endsAt,'2027-01-11T12:00:00.000Z');
+ f.advance(62*86400000);assert.equal((await f.service.myAccess('recipient')).assets.length,0);gifts=await f.service.gifts('recipient');assert.equal(gifts[0].endsAt,'2027-01-11T12:00:00.000Z');
+ const revoked=await f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'other@example.test',months:1,requestId:'revoke-pending-123'});await f.service.revokeGift(actor,revoked.id);await f.verify('other','other@example.test');assert.equal((await f.service.gifts('other')).length,0);
+});
+
+test('reviewed subscription content updates reach paid and gifted subscribers without changing price or one-time snapshots',async t=>{
+ const f=await fixture(t),a=await f.asset('a.png'),b=await f.asset('b.png');await f.verify();
+ f.provider.createOrder=async order=>({orderId:'I-'+order.id,planId:'PLAN',merchantId:'merchant',approvalUrl:'https://www.sandbox.paypal.com/approve'});
+ const plan=await f.offer(a,{slug:'membership',billing:'month'}),order=await f.checkout(plan);
+ await f.service.reconcile(scope,'connection',[f.evidence(order,{paidAt:f.service.now(),subscriptionInterval:'month',subscriptionPlanId:'PLAN'})]);
+ const one=await f.offer(a,{slug:'one-time'}),buy=await f.checkout(one,'buyer','one-time-12345');await f.service.reconcile(scope,'connection',[f.evidence(buy,{captureId:'ONE'})]);
+ await f.service.giftOffer(actor,{offerVersionId:plan.id,recipientEmail:'gift@example.test',months:3,requestId:'subscription-gift'});await f.verify('gifted','gift@example.test');await f.service.gifts('gifted');
+ const updated=await f.offer(b,{offerId:plan.offerId,slug:'membership',billing:'month',amountMinor:2000});
+ const purchases=await f.service.purchases('buyer'),sub=purchases.find(p=>p.offer.billing),ongoing=purchases.find(p=>!p.offer.billing);
+ assert.equal(sub.offer.amountMinor,1000);assert.equal(sub.payment.paidMinor,1000);assert.equal(sub.contentOffer.id,updated.id);assert.deepEqual(sub.entitlements.filter(g=>g.state==='active'&&g.benefit.type==='gallery')[0].assetIds,[b.id]);assert.deepEqual(ongoing.offer.files,[a.id]);assert.deepEqual((await f.service.gifts('gifted'))[0].contentOffer.files,[b.id]);
+ const renewal=f.evidence(order,{captureId:'RENEWAL',paidAt:f.service.now(),subscriptionInterval:'month',subscriptionPlanId:'PLAN'});await f.service.reconcile(scope,'connection',[renewal]);const renewed=(await f.service.purchases('buyer')).find(p=>p.payment.providerPaymentId==='RENEWAL');assert.equal(renewed.payment.paidMinor,1000);assert.deepEqual(renewed.contentOffer.files,[b.id]);
+});
