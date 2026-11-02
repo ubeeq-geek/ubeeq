@@ -395,3 +395,22 @@ test('local native account email and password hash are encrypted at rest and sur
  const f=await fixture(t),now=new Date().toISOString(),record={...scope,id:'member',ownerId:'eversally-members',createdAt:now,updatedAt:now,userId:'ever-user',email:'private-member@example.test',commerceSubjectId:'buyer',provider:'local',passwordHash:'salt:private-hash',passwordSetupRequired:false};await f.store.transaction(tx=>tx.insert('memberAccount',record));
  const {DatabaseSync}=await import('node:sqlite'),raw=new DatabaseSync(f.path),payload=raw.prepare('SELECT payload FROM commerce_records WHERE deployment=? AND kind=? AND id=?').get('deployment','memberAccount','member').payload;raw.close();assert.ok(payload.includes('encryptedMemberAccount'));assert.equal(payload.includes(record.email),false);assert.equal(payload.includes(record.passwordHash),false);f.restart();assert.deepEqual(await f.store.transaction(tx=>tx.get('memberAccount','member')),record);
 });
+
+test('email continuation context shows the public collection title without consuming proof or creating an account',async t=>{
+ const f=await fixture(t),offer=await f.offer(await f.asset(),{title:'A collection & its works'});
+ await f.service.beginEmailLogin('context@example.test','/buy/creator/gallery?environment=sandbox');await f.drain();
+ const link=new URL(f.messages.at(-1).text),id=link.searchParams.get('id'),token=link.searchParams.get('token');
+ await assert.rejects(f.service.emailLoginContext(id,'wrong'),{code:'invalid_sign_in_link'});
+ assert.deepEqual(await f.service.emailLoginContext(id,token),{collectionTitle:'A collection & its works'});
+ assert.deepEqual(await f.service.emailLoginContext(id,token),{collectionTitle:'A collection & its works'});
+ assert.equal((await f.store.transaction(tx=>tx.list('session'))).length,0);
+ await f.service.setOfferPublished(actor,offer.id,false);
+ assert.deepEqual(await f.service.emailLoginContext(id,token),{});
+ await f.service.redeemEmailLogin(id,token);
+ await assert.rejects(f.service.emailLoginContext(id,token),{code:'invalid_sign_in_link'});
+ await f.service.beginEmailLogin('general@example.test','/commerce/purchases');await f.drain();
+ const general=new URL(f.messages.at(-1).text);
+ assert.deepEqual(await f.service.emailLoginContext(general.searchParams.get('id'),general.searchParams.get('token')),{});
+ f.advance(900001);
+ await assert.rejects(f.service.emailLoginContext(general.searchParams.get('id'),general.searchParams.get('token')),{code:'invalid_sign_in_link'});
+});

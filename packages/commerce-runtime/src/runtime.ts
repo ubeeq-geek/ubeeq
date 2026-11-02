@@ -214,6 +214,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       }
       if (method === 'GET' && path === '/api/storefront') { const ownerId=required(url.searchParams.get('owner'));send(response, { offers: await service.storefront(ownerId, environment(url.searchParams.get('environment') ?? 'live')),creator:await deps.publicCreator?.(ownerId) }); return true; }
       if (path === '/api/auth/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailLogin(required(b.email),b.returnPath), 202); return true; }
+      if (path === '/api/auth/email/context' && method === 'POST') { const b = await parseBody(request); send(response, await service.emailLoginContext(required(b.id),required(b.token))); return true; }
       if (path === '/api/auth/email/redeem' && method === 'POST') { const b = await parseBody(request); send(response, await service.redeemEmailLogin(required(b.id), required(b.token))); return true; }
       let subjectId: string;
       try { subjectId = await (deps.customerSubject??deps.subject)(request); }

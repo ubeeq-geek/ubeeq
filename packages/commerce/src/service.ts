@@ -164,6 +164,17 @@ export class CommerceService {
       this.queue(tx, this.scope('customer-auth', 'live'), 'login_email', id);
     }); return { queued: true };
   }
+  /** Read only public destination copy; never consumes the email proof or signs in. */
+  async emailLoginContext(id: string, token: string) {
+    const proof=await this.store.transaction(tx=>{const login=tx.get('login',id);if(!login||login.consumedAt||login.expiresAt<=this.now()||!safeEqual(login.tokenHash,hash(token)))throw new CommerceError('invalid_sign_in_link',403);return login;});
+    const path=customerReturnPath(proof.returnPath);
+    if(!path)return {};
+    const url=new URL(path,this.baseUrl),match=/^\/buy\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if(!match)return {};
+    const offers=await this.storefront(match[1],url.searchParams.get('environment')==='sandbox'?'sandbox':'live');
+    const offer=offers.find(offer=>offer.slug===match[2]);
+    return offer?{collectionTitle:offer.title}:{};
+  }
   async redeemEmailLogin(id: string, token: string) {
     const proof=await this.store.transaction(tx=>{const login=tx.get('login',id);if(!login||login.consumedAt||login.expiresAt<=this.now()||!safeEqual(login.tokenHash,hash(token)))throw new CommerceError('invalid_sign_in_link',403);return login;});
     // Account provisioning is host-owned network work, outside the short commerce transaction.
