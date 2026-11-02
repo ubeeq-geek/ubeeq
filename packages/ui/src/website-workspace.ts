@@ -1,3 +1,4 @@
+import {saveWebsitePreviewDrafts} from './website-preview-drafts.js';
 import {attachWebsiteDragScroll} from './website-drag-scroll.js';
 import {moveWebsiteGallery,removeWebsitePage} from './website-page-actions.js';
 import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
@@ -29,7 +30,7 @@ export interface WebsiteWorkspaceClient {
   document(id: string): Promise<{ document: WebsiteDocument; sharedBy: readonly { title: string }[] }>;
   saveDocument(document: WebsiteDocument, expectedRevision: number): Promise<WebsiteDocument>;
   requestBuild(revision: number, key: string): Promise<{ id: string; state: string }>;
-  builds?(): Promise<readonly {id:string;state:string;websiteRevision:number}[]>;
+  builds?(previewRevision?:number): Promise<readonly {id:string;state:string;websiteRevision:number;stale?:boolean}[]>;
   previewSite?(id:string):Promise<Blob>;
   previewPages?(id:string): Promise<readonly string[]>;
   build(id: string): Promise<{ id: string; state: string; errorCode?: string; warnings: readonly string[]; stale?: boolean }>;
@@ -45,8 +46,8 @@ const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(
     const saved=await client.get(),selected=saved.pages.find(p=>p.id===(pageId??saved.homePageId)),page=fallback&&selected?.state!=='ready'?saved.pages.find(p=>p.id===saved.homePageId):selected;
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
     let buildId:string|undefined;
-    const candidates=await client.builds?.()??[];
-    for(const candidate of candidates)if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(await client.build(candidate.id)).stale){buildId=candidate.id;break;}}
+    const candidates=await client.builds?.(saved.revision)??[];
+    for(const candidate of candidates)if(candidate.state==='ready'&&candidate.websiteRevision===saved.revision){if(!(candidate.stale??(await client.build(candidate.id)).stale)){buildId=candidate.id;break;}}
     if(!buildId){
       const existing=candidates.find(b=>b.websiteRevision===saved.revision&&!['ready','failed','cancelled'].includes(b.state));
       const requested=existing??await client.requestBuild(saved.revision,globalThis.crypto.randomUUID());buildId=requested.id;
@@ -199,11 +200,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
         status.textContent='Saving changes before opening preview…';
         const wasInert=root.inert;root.inert=true;
         try{
-          for(const [id,doc] of documentDrafts){
-            if(JSON.stringify(doc)===documentBaselines.get(id))continue;
-            const saved=await client.saveDocument({...doc,revision:doc.revision+1},doc.revision);
-            documentBaselines.set(id,JSON.stringify(saved));documentDrafts.delete(id);
-          }
+          await saveWebsitePreviewDrafts(documentDrafts,documentBaselines,(doc,revision)=>client.saveDocument(doc,revision));
           await save();await show(activeTab);
         }catch(error){await show(activeTab);throw error;}finally{root.inert=wasInert;}
       }

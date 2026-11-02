@@ -30,7 +30,7 @@ export class WebsiteClient implements WebsiteWorkspaceClient {
   async saveDocument(document:WebsiteDocument,expectedRevision:number) {return (await(await this.request('/documents/'+encodeURIComponent(document.id),'PUT',{document,expectedRevision})).json()).document as WebsiteDocument;}
   async requestBuild(expectedRevision:number,idempotencyKey:string) {return (await(await this.request('/'+encodeURIComponent(this.websiteId)+'/builds','POST',{expectedRevision,idempotencyKey})).json()).build;}
   async build(id:string) {return (await(await this.request('/builds/'+encodeURIComponent(id))).json()).build;}
-  async builds() {return (await(await this.request('/'+encodeURIComponent(this.websiteId)+'/builds')).json()).builds;}
+  async builds(previewRevision?:number) {return (await(await this.request('/'+encodeURIComponent(this.websiteId)+'/builds'+(previewRevision===undefined?'':'?previewRevision='+previewRevision))).json()).builds;}
   async previewSite(id:string) {return (await this.request('/builds/'+encodeURIComponent(id)+'/preview-site')).blob();}
   async previewPages(id:string) {return (await(await this.request('/builds/'+encodeURIComponent(id)+'/pages')).json()).pages;}
   async export(id:string) {return (await this.request('/builds/'+encodeURIComponent(id)+'/export')).blob();}

@@ -56,3 +56,40 @@ test('preview admits revalidated provider frames while retaining the opaque page
  assert.match(html,/website-preview\.scroll/);
  assert.match(html,/dialog\[open\]/);
 });
+
+test('preview reuses a freshly checked candidate without another status request',async()=>{
+ const {openWebsitePreview}=await import('../dist/website-workspace.js');
+ const site={id:'site',workspaceId:'workspace',creatorIdentityId:'creator',revision:7,title:'Website',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'local'}},mediaMode:'bundled',basePath:'/',pages:[{id:'home',websiteId:'site',workspaceId:'workspace',revision:1,documentId:'doc',kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]};
+ let requestedRevision,downloads=0;
+ const client={get:async()=>site,builds:async revision=>{requestedRevision=revision;return [{id:'cached',state:'ready',websiteRevision:7,stale:false}];},build:async()=>assert.fail('Candidate already checked'),requestBuild:async()=>assert.fail('Candidate is reusable'),previewSite:async()=>{downloads++;return new Blob([createWebsiteZip(new Map([['index.html',new TextEncoder().encode('<h1>Ready</h1>')]]))]);}};
+ const popup={closed:false,document:{body:{textContent:''},open(){},write(){},close(){},getElementById(){return null;}}};
+ assert.equal(await openWebsitePreview(client,popup,'https://example.com/'),'cached');assert.equal(requestedRevision,7);assert.equal(downloads,1);
+});
+
+test('preview archive worker preserves binary data, rejects unsafe paths and releases resources',async()=>{
+ const {Worker:Thread}=await import('node:worker_threads');
+ const originalWorker=globalThis.Worker,create=URL.createObjectURL,revoke=URL.revokeObjectURL,blobs=new Map();let terminated=0,revoked=0;
+ URL.createObjectURL=blob=>{const id=String(blobs.size);blobs.set(id,blob);return id;};URL.revokeObjectURL=id=>{blobs.delete(id);revoked++;};
+ globalThis.Worker=class {
+   constructor(url){this.ready=blobs.get(url).text().then(source=>{this.thread=new Thread(`const {parentPort}=require('node:worker_threads');globalThis.postMessage=data=>parentPort.postMessage(data);${source};parentPort.on('message',data=>globalThis.onmessage({data}));`,{eval:true});this.thread.on('message',data=>this.onmessage?.({data}));this.thread.on('error',error=>this.onerror?.(error));return this.thread;});}
+   postMessage(buffer,transfer){this.ready.then(thread=>thread.postMessage(buffer,transfer));}
+   terminate(){terminated++;this.ready.then(thread=>thread.terminate());}
+ };
+ try{
+   const bytes=new Uint8Array([0,255,128,1]),files=await readWebsitePreviewArchive(new Blob([createWebsiteZip(new Map([['index.html',new Uint8Array([65])],['assets/image.png',bytes]]))]));
+   assert.deepEqual(Uint8Array.from(atob(files['assets/image.png']),c=>c.charCodeAt(0)),bytes);
+   const unsafe=Buffer.from(createWebsiteZip(new Map([['index.html',new Uint8Array()],['safeimg.html',new Uint8Array()]])));unsafe.write('../evil.html',unsafe.indexOf('safeimg.html'));
+   await assert.rejects(readWebsitePreviewArchive(new Blob([unsafe])),/Invalid website preview file/);
+   assert.equal(terminated,2);assert.equal(revoked,2);assert.equal(blobs.size,0);
+ }finally{if(originalWorker===undefined)delete globalThis.Worker;else globalThis.Worker=originalWorker;URL.createObjectURL=create;URL.revokeObjectURL=revoke;}
+});
+
+test('preview still validates archives when browser policy blocks worker startup',async()=>{
+ const previous=globalThis.Worker;let terminated=false;
+ globalThis.Worker=class {postMessage(){setImmediate(()=>this.onerror({preventDefault(){}}));}terminate(){terminated=true;}};
+ try{
+   assert.equal(atob((await readWebsitePreviewArchive(new Blob([createWebsiteZip(new Map([['index.html',new Uint8Array([65])]]))])))['index.html']),'A');
+   assert.equal(terminated,true);
+   await assert.rejects(readWebsitePreviewArchive(new Blob(['invalid'])),/incomplete/);
+ }finally{if(previous===undefined)delete globalThis.Worker;else globalThis.Worker=previous;}
+});
