@@ -3,6 +3,15 @@ import type { WebsiteBuildRecord, WebsiteStore } from '@ubeeq/persistence';
 import { buildWebsiteArtifact, validateWebsiteSnapshotBudget, createWebsiteZip, normalizeWebsiteDocument, websiteDigest, websiteFingerprint, type WebsiteSnapshot } from './website-artifact.js';
 import { parse, serialize, type DefaultTreeAdapterMap } from 'parse5';
 
+/** Bound storage and policy reads while preserving result order and waiting for in-flight work on failure. */
+async function mapWebsiteChecks<T,R>(items:readonly T[],operation:(item:T)=>Promise<R>):Promise<R[]> {
+  const results:R[]=new Array(items.length),errors:unknown[]=[];let next=0;
+  await Promise.all(Array.from({length:Math.min(5,items.length)},async()=>{
+    while(next<items.length){const index=next++;try{results[index]=await operation(items[index]);}catch(error){errors.push(error);}}
+  }));
+  if(errors.length)throw errors[0];
+  return results;
+}
 export interface WebsiteActor { actorId: string; workspaceId: string; }
 /** All callbacks are trusted server composition. Never accept their output as request data. */
 export interface WebsiteServicePorts {
@@ -182,15 +191,23 @@ export class WebsiteService {
     const current=await this.ports.store.getWebsite(actor.workspaceId,build.websiteId);
     if(!current)throw new WebsiteError('website_not_found','Website was deleted or is unavailable.');
     let stale=current.revision!==build.websiteRevision;
-    for(const dep of build.dependencies.filter(d=>d.kind==='document')) {
-      if(String((await this.ports.store.getDocument(actor.workspaceId,dep.id))?.revision)!==dep.revision) stale=true;
-    }
+    const documentChanges=await mapWebsiteChecks(build.dependencies.filter(d=>d.kind==='document'),async dep=>String((await this.ports.store.getDocument(actor.workspaceId,dep.id))?.revision)!==dep.revision);
+    if(documentChanges.some(Boolean))stale=true;
     if(this.ports.dependenciesCurrent && !await this.ports.dependenciesCurrent(actor,build.dependencies)) stale=true;
     return {...build,stale:Boolean(build.invalidated) || stale || !await this.ports.dependenciesEligible(actor,build.dependencies)};
   }
-  async builds(actor:WebsiteActor,websiteId:string) {
+  async builds(actor:WebsiteActor,websiteId:string,previewRevision?:number) {
     await this.get(actor,websiteId);
-    return Promise.all([...await this.ports.store.listBuilds(actor.workspaceId,websiteId)].sort((a,b)=>b.createdAt.localeCompare(a.createdAt)||b.id.localeCompare(a.id)).map(b=>this.build(actor,b.id)));
+    if(previewRevision!==undefined&&(!Number.isSafeInteger(previewRevision)||previewRevision<1))throw new WebsiteError('stale_revision','A valid saved website revision is required.');
+    let candidates=[...await this.ports.store.listBuilds(actor.workspaceId,websiteId)].sort((a,b)=>b.createdAt.localeCompare(a.createdAt)||b.id.localeCompare(a.id));
+    if(previewRevision!==undefined){
+      // Preview needs one reusable artifact or one active job, not the complete publishing history.
+      const relevant=candidates.filter(b=>b.websiteRevision===previewRevision);
+      const ready=relevant.find(b=>b.state==='ready'&&!b.invalidated&&Date.parse(b.expiresAt)>this.now().getTime());
+      const active=relevant.find(b=>!['ready','failed','cancelled'].includes(b.state));
+      candidates=[...(ready?[ready]:[]),...(active?[active]:[])];
+    }
+    return mapWebsiteChecks(candidates,b=>this.build(actor,b.id));
   }
   private async artifact(actor: WebsiteActor, buildId: string, action: 'preview' | 'export') {
     const build=await this.build(actor,buildId);

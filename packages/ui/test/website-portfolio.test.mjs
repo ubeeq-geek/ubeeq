@@ -175,3 +175,11 @@ test('website media embed blocks export only validated player frames and keep ot
  const html=renderStaticWebsite(input).files.get('index.html');assert.match(html,/data-website-media-embed="video" src="https:\/\/www.youtube-nocookie.com\/embed\/M7lc1UVf-VE" title="My video"/);assert.match(html,/data-website-media-embed="audio"/);assert.match(html,/allowfullscreen sandbox=/);assert.match(html,/href="https:\/\/www.youtube.com\/watch\?v=M7lc1UVf-VE"/);
  input.documents.get('doc').blocks[0].url='https://example.com/iframe';assert.throws(()=>renderStaticWebsite(input),/YouTube, Vimeo, or Bunny/);
 });
+
+test('named gallery teasers resolve their approved collection cover independently from Work photos',()=>{
+ const input=fixture();input.website.namedGalleries=[{id:'main',title:'Main',slug:'main',kind:'galleries',access:'free',publicationIds:[]},{id:'collection',title:'Collection',slug:'collection',parentId:'main',kind:'works',access:'free',publicationIds:['work']}];input.website.galleryPublicationIds=['work'];
+ input.documents.set('doc',{blocks:[{id:'gallery-block',type:'gallery_list',data:{websiteGalleryId:'main'}}]});
+ input.galleries=[{publicationId:'work',workId:'work',title:'Work',slug:'work',local:true,href:'/galleries/work/',premium:false,previewAssetIds:['work-image'],publicAssetIds:['work-image'],tags:[],collectionIds:[]}];
+ input.media.set('work-image',{src:'/assets/work.jpg',mimeType:'image/jpeg',alt:'Work image'});input.media.set('collection-image',{src:'/assets/collection.jpg',mimeType:'image/jpeg',alt:'Chosen cover'});input.namedGalleryCovers={collection:'collection-image'};
+ const html=renderStaticWebsite(input).files.get('index.html').split('<div hidden data-gallery-data>')[0];assert.match(html,/src="\/assets\/collection.jpg" alt="Chosen cover"/);assert.doesNotMatch(html,/src="\/assets\/work.jpg"/);assert.match(html,/1 image/);
+});

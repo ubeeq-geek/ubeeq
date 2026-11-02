@@ -3,6 +3,7 @@ import {galleryLinkPlatforms} from './gallery-link-platforms.js';
 
 export interface WebsiteViewerGallery {
   id:string;title:string;href:string;
+  cover?:{src:string;alt:string};
   photos:readonly {src:string;thumbnail:string;alt:string;title?:string;workHref?:string}[];
   externalLinksText?:string;externalLinks?:readonly {label:string;url:string}[];
   purchaseText?:string;purchaseLinks?:readonly {label:string;url:string;priceText?:string}[];
@@ -11,7 +12,7 @@ const escape=(value:string)=>value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 /** Group by the validated URL's platform, never by a user-supplied label. */
 export function renderWebsiteGalleryLinks(gallery: Pick<WebsiteViewerGallery,'purchaseText'|'purchaseLinks'|'externalLinksText'|'externalLinks'>):string {
  const e=escape;
- return ([['Purchase links',gallery.purchaseText?.trim()||'Want more?',gallery.purchaseLinks],['Additional Platform Links',gallery.externalLinksText?.trim()||'Also available on:',gallery.externalLinks]] as const).map(([name,heading,links])=>{
+ return ([['purchase','Purchase links',gallery.purchaseText?.trim()||'Want more?',gallery.purchaseLinks],['additional','Additional Platform Links',gallery.externalLinksText?.trim()||'Also available on:',gallery.externalLinks]] as const).map(([kind,name,heading,links])=>{
   if(!links?.length)return '';
   const groups=new Map<string,{name:string;path?:string;viewBox?:string;links:{label:string;url:string;priceText?:string}[]}>();
   for(const link of links){
@@ -26,7 +27,7 @@ export function renderWebsiteGalleryLinks(gallery: Pick<WebsiteViewerGallery,'pu
    if(group.links.length===1){const link=group.links[0],text=label(link);return `<a class="website-gallery-platform-link" href="${e(link.url)}" target="_blank" rel="noopener noreferrer" aria-label="${e(group.name+': '+text)}">${icon}<span class="website-gallery-link-tooltip">${e(text)}</span></a>`;}
    return `<details class="website-gallery-platform-menu"><summary aria-label="${e(group.name)} · ${group.links.length} links" title="${e(group.name)}">${icon}<svg class="website-gallery-link-chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="2"/></svg></summary><div class="website-gallery-link-options">${group.links.map(link=>`<a href="${e(link.url)}" target="_blank" rel="noopener noreferrer">${e(label(link))}</a>`).join('')}</div></details>`;
   }).join('');
-  return `<div class="website-gallery-link-group" role="group" aria-label="${e(name)}"><p class="website-gallery-link-heading">${e(heading)}</p><div class="website-gallery-link-icons">${buttons}</div></div>`;
+  return `<div class="website-gallery-link-group" data-link-kind="${kind}" role="group" aria-label="${e(name)}"><p class="website-gallery-link-heading">${e(heading)}</p><div class="website-gallery-link-icons">${buttons}</div></div>`;
  }).join('');
 }
 /** Also invalidate saved exports when icon definitions or link rendering changes. */
@@ -34,15 +35,17 @@ export const websiteGalleryLinksFingerprintInput=JSON.stringify(galleryLinkPlatf
 
 export function renderWebsiteGalleryGroup(entries:readonly WebsiteViewerGallery[],selectedId?:string){
  const e=escape,selected=entries.find(g=>g.id===selectedId),count=(n:number)=>`${n} image${n===1?'':'s'}`;
- const tiles=selected?selected.photos.map((photo,index)=>`<a class="website-gallery-tile" href="${e(photo.workHref??selected.href)}" data-gallery-open="${e(selected.id)}" data-photo-index="${index}"><span class="website-gallery-cover"><img src="${e(photo.src)}" alt="${e(photo.alt)}" loading="lazy"><span class="website-gallery-view">View image</span></span><span class="website-gallery-tile-title">${e(photo.title??photo.alt)}</span></a>`).join(''):entries.map(g=>`<article class="website-gallery-teaser"><a class="website-gallery-tile" href="${e(g.href)}" data-gallery-open="${e(g.id)}"><span class="website-gallery-cover">${g.photos[0]?`<img src="${e(g.photos[0].src)}" alt="" loading="lazy">`:'<span class="website-gallery-empty-cover">No preview image</span>'}<span class="website-gallery-count">${count(g.photos.length)}</span><span class="website-gallery-view">▶ View gallery</span></span><span class="website-gallery-tile-title">${e(g.title)}</span></a><p class="website-gallery-tile-count">${count(g.photos.length)}</p>${renderWebsiteGalleryLinks(g)}</article>`).join('');
+ const tiles=selected?selected.photos.map((photo,index)=>`<a class="website-gallery-tile" href="${e(photo.workHref??selected.href)}" data-gallery-open="${e(selected.id)}" data-photo-index="${index}"><span class="website-gallery-cover"><img src="${e(photo.src)}" alt="${e(photo.alt)}" loading="lazy"><span class="website-gallery-view">View image</span></span><span class="website-gallery-tile-title">${e(photo.title??photo.alt)}</span></a>`).join(''):entries.map(g=>`<article class="website-gallery-teaser"><a class="website-gallery-tile" href="${e(g.href)}" data-gallery-open="${e(g.id)}"><span class="website-gallery-cover">${g.cover||g.photos[0]?`<img src="${e((g.cover??g.photos[0]).src)}" alt="${e(g.cover?.alt??'')}" loading="lazy">`:'<span class="website-gallery-empty-cover">No preview image</span>'}<span class="website-gallery-count">${count(g.photos.length)}</span><span class="website-gallery-view">▶ View gallery</span></span><span class="website-gallery-tile-title">${e(g.title)}</span></a><p class="website-gallery-tile-count">${count(g.photos.length)}</p>${renderWebsiteGalleryLinks(g)}</article>`).join('');
  const icon=(content:string)=>`<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${content}</svg>`;
  const playIcon=icon('<path data-icon="play" d="m8 5 11 7-11 7Z" fill="currentColor" stroke="none"/><g data-icon="pause"><path d="M8 5v14M16 5v14" stroke-width="4"/></g>');
  const fullscreenIcon=icon('<path data-icon="expand" d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><path data-icon="contract" d="M3 8h5V3m8 0v5h5M8 21v-5H3m18 0h-5v5"/>');
  const helpIcon=icon('<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 2-2.5 2-2.5 4M12 16h.01"/>');
  const closeIcon=icon('<path d="m6 6 12 12M6 18 18 6"/>');
  const purchase=selected?`<div class="website-gallery-static-purchase">${renderWebsiteGalleryLinks(selected)}</div>`:'';
+ const nonempty=entries.filter(g=>g.photos.length),first=nonempty[0];
+ const endNote=selected&&first&&selected.id===nonempty.at(-1)?.id?`<section class="website-gallery-end-note" aria-label="End of galleries"><p>You’ve reached the end of these galleries.</p><a href="${e(first.href)}">Back to first gallery</a></section>`:'';
  const data=entries.map(g=>`<div data-gallery-entry="${e(g.id)}"><h3 data-gallery-title>${e(g.title)}</h3><div data-gallery-links>${renderWebsiteGalleryLinks(g)}</div>${g.photos.map(p=>`<figure data-gallery-photo${p.title?` data-photo-title="${e(p.title)}"`:""}><img data-gallery-full src="${e(p.src)}" alt="${e(p.alt)}" loading="lazy"><img data-gallery-thumb src="${e(p.thumbnail)}" alt="" loading="lazy"></figure>`).join('')}</div>`).join('');
- return `<section class="website-gallery-group" data-gallery-root><div class="website-gallery-tiles">${tiles||'<p>No images are available in this gallery yet.</p>'}</div>${purchase}<div hidden data-gallery-data>${data}</div><dialog class="website-gallery-viewer" data-gallery-dialog tabindex="-1" aria-label="Gallery viewer"><div class="website-gallery-surface" data-gallery-surface><div class="website-gallery-viewer-header"><div class="website-gallery-heading"><button type="button" data-action="previous-gallery" aria-label="Previous gallery">‹</button><div><h2 data-viewer-title></h2><p><span data-gallery-position></span> · Photo <span data-image-counter></span></p></div><button type="button" data-action="next-gallery"></button></div><div class="website-gallery-controls"><button type="button" class="website-gallery-icon-button" data-action="play" aria-pressed="false" aria-label="Play slideshow" title="Play slideshow">${playIcon}</button><select data-gallery-interval aria-label="Slide duration"><option value="2">2s</option><option value="3">3s</option><option value="4" selected>4s</option><option value="6">6s</option><option value="10">10s</option></select><button type="button" class="website-gallery-icon-button" data-action="fullscreen" aria-pressed="false" aria-label="Full screen" title="Full screen">${fullscreenIcon}</button><div class="website-gallery-help-control"><button type="button" class="website-gallery-icon-button" data-action="help" aria-expanded="false" aria-label="Gallery help" title="Gallery help">${helpIcon}</button><section class="website-gallery-help-panel" data-gallery-help role="region" aria-label="Gallery help" hidden><h3>Using the gallery</h3><p>Click the right side of the photo, scroll, or swipe left for the next image. Click the left side or swipe right to go back.</p><dl><dt>← / →</dt><dd>Previous / next image</dd><dt>↑ / ↓</dt><dd>Previous / next gallery</dd><dt>Space</dt><dd>Play or pause the slideshow when the viewer is focused</dd><dt>F</dt><dd>Enter or exit full screen</dd><dt>Esc</dt><dd>Dismiss help, exit full screen, or close the viewer</dd></dl><p>Choose a duration beside Play to set the slideshow speed. Select a thumbnail to jump to an image.</p><button type="button" data-action="close-help">Close help</button></section></div><button type="button" class="website-gallery-icon-button" data-action="close" aria-label="Close gallery viewer" title="Close gallery viewer">${closeIcon}</button></div></div><div class="website-gallery-progress"><span data-slide-progress></span></div><nav class="website-gallery-purchase" data-purchase-section aria-label="Gallery links" hidden></nav><div class="website-gallery-stage" data-gallery-stage><img data-viewer-image alt=""><button type="button" class="website-gallery-stage-prev" data-action="previous" aria-label="Previous image">‹</button><button type="button" class="website-gallery-stage-next" data-action="next" aria-label="Next image">›</button><button type="button" class="website-gallery-intro" data-action="start" hidden><img data-intro-cover alt=""><span><small>Up next</small><strong data-intro-title></strong><span data-intro-count></span><span class="website-gallery-intro-progress"><span data-intro-progress></span></span><small>Click or press → to start now</small></span></button></div><div class="website-gallery-caption-area"><p class="website-gallery-caption" data-image-caption></p></div><div class="website-gallery-thumbnails" data-gallery-thumbnails role="group" aria-label="Choose an image"></div><p class="website-gallery-announcement" role="status" aria-live="polite" data-viewer-status></p></div></dialog></section>`;
+ return `<section class="website-gallery-group" data-gallery-root><div class="website-gallery-tiles">${tiles||'<p>No images are available in this gallery yet.</p>'}</div>${endNote}${purchase}<div hidden data-gallery-data>${data}</div><dialog class="website-gallery-viewer" data-gallery-dialog tabindex="-1" aria-label="Gallery viewer"><div class="website-gallery-surface" data-gallery-surface><div class="website-gallery-viewer-header"><div class="website-gallery-heading"><button type="button" data-action="previous-gallery" aria-label="Previous gallery">‹</button><div><h2 data-viewer-title></h2><p><span data-gallery-position></span> · Photo <span data-image-counter></span></p></div><button type="button" data-action="next-gallery"></button></div><div class="website-gallery-controls"><button type="button" class="website-gallery-icon-button" data-action="play" aria-pressed="false" aria-label="Play slideshow" title="Play slideshow">${playIcon}</button><select data-gallery-interval aria-label="Slide duration"><option value="2">2s</option><option value="3">3s</option><option value="4" selected>4s</option><option value="6">6s</option><option value="10">10s</option></select><button type="button" class="website-gallery-icon-button" data-action="fullscreen" aria-pressed="false" aria-label="Full screen" title="Full screen">${fullscreenIcon}</button><div class="website-gallery-help-control"><button type="button" class="website-gallery-icon-button" data-action="help" aria-expanded="false" aria-label="Gallery help" title="Gallery help">${helpIcon}</button><section class="website-gallery-help-panel" data-gallery-help role="region" aria-label="Gallery help" hidden><h3>Using the gallery</h3><p>Click the right side of the photo, scroll, or swipe left for the next image. Click the left side or swipe right to go back.</p><dl><dt>← / →</dt><dd>Previous / next image</dd><dt>↑ / ↓</dt><dd>Previous / next gallery</dd><dt>Space</dt><dd>Play or pause the slideshow when the viewer is focused</dd><dt>F</dt><dd>Enter or exit full screen</dd><dt>Esc</dt><dd>Dismiss help, exit full screen, or close the viewer</dd></dl><p>Choose a duration beside Play to set the slideshow speed. Select a thumbnail to jump to an image.</p><button type="button" data-action="close-help">Close help</button></section></div><button type="button" class="website-gallery-icon-button" data-action="close" aria-label="Close gallery viewer" title="Close gallery viewer">${closeIcon}</button></div></div><div class="website-gallery-progress"><span data-slide-progress></span></div><nav class="website-gallery-purchase" data-purchase-section aria-label="Gallery links" hidden></nav><div class="website-gallery-stage" data-gallery-stage><img data-viewer-image alt=""><section class="website-gallery-end" data-gallery-end hidden aria-label="End of galleries"><h3>You’ve reached the end of these galleries.</h3><p>Start again from the first gallery whenever you’re ready.</p><button type="button" data-action="restart">Back to first gallery</button></section><button type="button" class="website-gallery-stage-prev" data-action="previous" aria-label="Previous image">‹</button><button type="button" class="website-gallery-stage-next" data-action="next" aria-label="Next image">›</button><button type="button" class="website-gallery-intro" data-action="start" hidden><img data-intro-cover alt=""><span><small>Up next</small><strong data-intro-title></strong><span data-intro-count></span><span class="website-gallery-intro-progress"><span data-intro-progress></span></span><small>Click or press → to start now</small></span></button></div><div class="website-gallery-caption-area"><p class="website-gallery-caption" data-image-caption></p></div><div class="website-gallery-thumbnails" data-gallery-thumbnails role="group" aria-label="Choose an image"></div><p class="website-gallery-announcement" role="status" aria-live="polite" data-viewer-status></p></div></dialog></section>`;
 }
 
 /** Trusted static source stays identical in server exports and minified browser previews. */
@@ -59,12 +62,12 @@ export const websiteGalleryViewerScript=
 + "            if (entries.some(g => g.id === opener.dataset.galleryOpen))\n"
 + "                opener.setAttribute('aria-haspopup', 'dialog');\n"
 + "        const get = (selector) => dialog.querySelector(selector);\n"
-+ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, opener, overflow = '', lastWheel = 0, pointer;\n"
++ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, ended = false, opener, overflow = '', lastWheel = 0, pointer;\n"
 + "        const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;\n"
 + "        const stop = () => { clearTimeout(timer); timer = undefined; };\n"
 + "        const schedule = () => {\n"
 + "            for(const [selector,enabled,duration] of [['[data-slide-progress]',playing&&!intro,Number(get('[data-gallery-interval]').value)*1000],['[data-intro-progress]',playing&&intro,2500]]){const bar=get(selector);for(const animation of bar.getAnimations())animation.cancel();bar.style.transform='scaleX(0)';if(enabled)bar.animate([{transform:'scaleX(0)'},{transform:'scaleX(1)'}],{duration,fill:'forwards'});}\n"
-+ " stop(); if (playing && dialog.open)\n"
++ " stop(); if (playing && dialog.open && !ended)\n"
 + "            timer = setTimeout(() => { if (intro) {\n"
 + "                intro = false;\n"
 + "                render();\n"
@@ -77,20 +80,23 @@ export const websiteGalleryViewerScript=
 + "            get('[data-gallery-position]').textContent = `Gallery ${gallery + 1} of ${entries.length}`;\n"
 + "            const image = get('[data-viewer-image]');\n"
 + "            image.src = photo.src;\n"
-+ "            image.alt = photo.alt;\n"
++ "            image.alt = photo.alt;image.hidden=ended;\n"
++ "            get('[data-gallery-end]').hidden=!ended;\n"
++ "            get('[data-image-caption]').hidden=ended;\n"
++ "            get('[data-action=\"next\"]').disabled=ended;\n"
 + "            get('[data-image-counter]').textContent = `${index + 1} / ${current.photos.length}`;\n"
 + "            get('[data-image-caption]').textContent = photo.title && photo.title !== photo.alt ? `${photo.title} · ${photo.alt}` : photo.alt;\n"
-+ "            get('[data-viewer-status]').textContent = `${current.title}, image ${index + 1} of ${current.photos.length}`;\n"
++ "            get('[data-viewer-status]').textContent = ended?'You’ve reached the end of these galleries.':`${current.title}, image ${index + 1} of ${current.photos.length}`;\n"
 + "            const play = get('[data-action=\"play\"]');\n"
 + "            play.setAttribute('aria-label',playing ? 'Pause slideshow' : 'Play slideshow'); play.title=play.getAttribute('aria-label');\n"
-+ "            play.setAttribute('aria-pressed', String(playing));\n"
++ "            play.setAttribute('aria-pressed', String(playing));play.disabled=ended;\n"
 + "            const overlay = get('[data-action=\"start\"]');\n"
 + "            overlay.hidden = !intro;\n"
 + "            get('[data-intro-title]').textContent = current.title;\n"
 + "            const strip = get('[data-gallery-thumbnails]'), restoreThumbFocus = strip.contains(document.activeElement);\n"
 + "            strip.replaceChildren();\n"
-+ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.src = p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; render(); }); strip.append(button); });\n"
-+ "            if(entries.length>1){const upcoming=entries[(gallery+1)%entries.length],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.src=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
++ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.src = p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; ended=false; render(); }); strip.append(button); });\n"
++ "            if(gallery<entries.length-1){const upcoming=entries[gallery+1],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.src=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
 + "            get('[data-intro-cover]').src=current.photos[0].thumbnail;get('[data-intro-count]').textContent=`${current.photos.length} photos`;\n"
 + "            const active = strip.children[index];\n"
 + "            if (restoreThumbFocus)\n"
@@ -102,11 +108,13 @@ export const websiteGalleryViewerScript=
 + "            const previous = get('[data-action=\"previous-gallery\"]'), next = get('[data-action=\"next-gallery\"]');\n"
 + "            previous.hidden = next.hidden = entries.length < 2;\n"
 + "            previous.textContent = '‹'; previous.setAttribute('aria-label', `Previous gallery: ${entries[(gallery - 1 + entries.length) % entries.length].title}`);\n"
-+ "            next.textContent = `Next: ${entries[(gallery + 1) % entries.length].title} ›`;\n"
++ "            next.textContent = gallery===entries.length-1?'End of galleries':`Next: ${entries[gallery+1].title} ›`;next.disabled=ended;\n"
 + "            schedule();\n"
 + "        };\n"
-+ "        const switchGallery = (direction, last = false, automatic = false) => { gallery = (gallery + direction + entries.length) % entries.length; index = last ? entries[gallery].photos.length - 1 : 0; intro = automatic && playing && entries.length > 1; render(); };\n"
-+ "        const move = (direction, automatic = false) => { if (intro) {\n"
++ "        const finish=()=>{playing=false;intro=false;ended=true;render();get('[data-action=\"restart\"]').focus({preventScroll:true});};\n"
++ "        const restart=()=>{gallery=0;index=0;playing=false;intro=false;ended=false;render();dialog.focus();};\n"
++ "        const switchGallery = (direction, last = false, automatic = false) => { if(direction>0&&gallery===entries.length-1){finish();return;}ended=false;gallery = (gallery + direction + entries.length) % entries.length; index = last ? entries[gallery].photos.length - 1 : 0; intro = automatic && playing && entries.length > 1; render(); };\n"
++ "        const move = (direction, automatic = false) => { if(ended){if(direction<0){ended=false;render();}return;} if (intro) {\n"
 + "            intro = false;\n"
 + "            render();\n"
 + "            return;\n"
@@ -118,7 +126,7 @@ export const websiteGalleryViewerScript=
 + "            index = next;\n"
 + "            render();\n"
 + "        } };\n"
-+ "        const toggle = () => { playing = !playing; intro = false; render(); };\n"
++ "        const toggle = () => { if(ended)return;playing = !playing; intro = false; render(); };\n"
 + "        const surface=get('[data-gallery-surface]'),fullButton=get('[data-action=\"fullscreen\"]');\n"
 + "        let focused=false,nativeFullscreen=false,fullscreenGeneration=0;\n"
 + "        const setFocused=value=>{focused=value;surface.classList.toggle('is-fullscreen',value);fullButton.setAttribute('aria-label',value?'Exit full screen':'Full screen');fullButton.title=fullButton.getAttribute('aria-label');fullButton.setAttribute('aria-pressed',String(value));if(value)dialog.scrollTop=0;else get('[data-viewer-status]').textContent='';};\n"
@@ -135,7 +143,7 @@ export const websiteGalleryViewerScript=
 + "        const setHelp=(open,restoreFocus=false)=>{helpPanel.hidden=!open;helpButton.setAttribute('aria-expanded',String(open));if(restoreFocus)helpButton.focus();};\n"
 + "        dialog.addEventListener('keydown',event=>{if(!helpPanel.hidden&&event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();setHelp(false,true);}},true);\n"
 + "        dialog.addEventListener('click',event=>{if(!event.target.closest?.('.website-gallery-help-control'))setHelp(false);});\n"
-+ "        const cleanup = () => { setHelp(false);leaveFullscreen();stop(); playing = false; intro = false; document.body.style.overflow = overflow; opener?.focus(); };\n"
++ "        const cleanup = () => { setHelp(false);leaveFullscreen();stop(); playing = false; intro = false; ended=false;document.body.style.overflow = overflow; opener?.focus(); };\n"
 + "        const fitLinkPopup=panel=>{panel.style.marginLeft='0px';const rect=panel.getBoundingClientRect(),container=panel.closest('dialog'),right=container?container.getBoundingClientRect().left+container.clientWidth:document.documentElement.clientWidth;panel.style.marginLeft=`${rect.left<12?12-rect.left:Math.min(0,right-rect.right-12)}px`;};\n"
 + "        for(const type of ['pointerover','focusin'])root.addEventListener(type,event=>{const link=event.target.closest?.('.website-gallery-platform-link');if(link)fitLinkPopup(link.querySelector('.website-gallery-link-tooltip'));});\n"
 + "        root.addEventListener('keydown',event=>{if(event.key!=='Escape')return;const menu=event.target.closest?.('.website-gallery-platform-menu[open]');if(menu){event.preventDefault();event.stopPropagation();menu.open=false;menu.querySelector('summary').focus();}},true);\n"
@@ -143,7 +151,7 @@ export const websiteGalleryViewerScript=
 + "        root.addEventListener('toggle',event=>{const menu=event.target;if(!menu.matches?.('.website-gallery-platform-menu[open]'))return;for(const other of root.querySelectorAll('.website-gallery-platform-menu[open]'))if(other!==menu)other.open=false;fitLinkPopup(menu.querySelector('.website-gallery-link-options'));},true);\n"
 + "        root.addEventListener('click', event => { const target = event.target instanceof Element ? event.target.closest('[data-gallery-open]') : null; if (!target || event instanceof MouseEvent && (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey))\n"
 + "            return; const at = entries.findIndex(g => g.id === target.dataset.galleryOpen); if (at < 0)\n"
-+ "            return; event.preventDefault(); gallery = at; index = Math.max(0, Math.min(Number(target.dataset.photoIndex) || 0, entries[at].photos.length - 1)); playing = false; intro = false; opener = target; overflow = document.body.style.overflow; document.body.style.overflow = 'hidden'; dialog.showModal(); render(); dialog.focus(); });\n"
++ "            return; event.preventDefault(); gallery = at; index = Math.max(0, Math.min(Number(target.dataset.photoIndex) || 0, entries[at].photos.length - 1)); playing = false; intro = false; ended=false;opener = target; overflow = document.body.style.overflow; document.body.style.overflow = 'hidden'; dialog.showModal(); render(); dialog.focus(); });\n"
 + "        dialog.addEventListener('click', event => { const action = event.target instanceof Element ? event.target.closest('[data-action]')?.dataset.action : undefined; switch (action) {\n"
 + "            case 'close':\n"
 + "                leaveFullscreen();\n"
@@ -173,6 +181,9 @@ export const websiteGalleryViewerScript=
 + "            case 'next-gallery':\n"
 + "                switchGallery(1);\n"
 + "                break;\n"
++ "            case 'restart':\n"
++ "                restart();\n"
++ "                break;\n"
 + "            case 'start':\n"
 + "                intro = false;\n"
 + "                render();\n"
@@ -190,12 +201,12 @@ export const websiteGalleryViewerScript=
 + "        else if (key === 'PageDown' || key === 'ArrowDown')\n"
 + "            switchGallery(1);\n"
 + "        else if (key === 'Home') {\n"
-+ "            index = 0;\n"
++ "            ended=false;index = 0;\n"
 + "            intro = false;\n"
 + "            render();\n"
 + "        }\n"
 + "        else if (key === 'End') {\n"
-+ "            index = entries[gallery].photos.length - 1;\n"
++ "            ended=false;index = entries[gallery].photos.length - 1;\n"
 + "            intro = false;\n"
 + "            render();\n"
 + "        }\n"
@@ -233,10 +244,11 @@ export const websiteGalleryViewerScript=
 export const websiteGalleryCss=`
 .template-standard .page-content:has(.website-gallery-group){max-width:none}
 .website-gallery-group{padding-block:1rem}
-.website-gallery-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
-.website-gallery-teaser{min-width:0;text-align:left}
+.website-gallery-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:28px 16px}
+.website-gallery-teaser{min-width:0;text-align:left;box-sizing:border-box;padding:12px;border:1px solid color-mix(in srgb,var(--color-text) 18%,transparent);border-radius:14px}
 .website-gallery-tile{display:flex;flex-direction:column;gap:12px;color:var(--color-text);text-decoration:none}
 .website-gallery-cover{position:relative;display:block;width:100%;aspect-ratio:4/5;border-radius:12px;overflow:hidden;background:color-mix(in srgb,var(--color-muted) 15%,var(--color-canvas))}
+.website-gallery-teaser .website-gallery-cover{aspect-ratio:1/1}
 .website-gallery-cover img{display:block;width:100%;height:100%;object-fit:cover;transition:transform .5s ease}
 .website-gallery-tile:hover img,.website-gallery-tile:focus-visible img{transform:scale(1.04)}
 .website-gallery-tile:focus-visible{outline:3px solid var(--color-focus);outline-offset:4px;border-radius:12px}
@@ -246,24 +258,25 @@ export const websiteGalleryCss=`
 .website-gallery-tile-title{padding:0 2px;font-size:18px;font-weight:800;letter-spacing:-.01em;line-height:1.35}
 .website-gallery-teaser p{margin:2px 2px 0;font-size:14px;color:var(--color-muted)}
 .website-gallery-teaser .website-gallery-availability{margin-top:6px;font-size:13px}
-.website-gallery-link-group{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;min-width:0}
+.website-gallery-link-group{--gallery-link-color:var(--color-action);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;min-width:0}
+.website-gallery-link-group[data-link-kind=additional]{--gallery-link-color:var(--color-muted)}
 .website-gallery-teaser>.website-gallery-link-group{margin-top:12px}
-.website-gallery-group .website-gallery-link-heading{margin:0;font:inherit;font-size:14px;line-height:1.5;color:var(--color-muted);letter-spacing:normal;text-transform:none}
+.website-gallery-group .website-gallery-link-heading{margin:0;font:inherit;font-size:14px;line-height:1.5;color:var(--gallery-link-color);letter-spacing:normal;text-transform:none}
 .website-gallery-link-icons{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-.website-gallery-group .website-gallery-platform-link,.website-gallery-group .website-gallery-platform-menu>summary{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:5px;box-sizing:border-box;min-width:44px;min-height:44px;padding:10px;color:var(--color-action);background:transparent;border:1px solid var(--color-border);border-radius:10px;cursor:pointer;text-decoration:none;list-style:none;line-height:1}
+.website-gallery-group .website-gallery-platform-link,.website-gallery-group .website-gallery-platform-menu>summary{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:5px;box-sizing:border-box;min-width:44px;min-height:44px;padding:10px;color:var(--gallery-link-color);background:transparent;border:1px solid currentColor;border-radius:10px;cursor:pointer;text-decoration:none;list-style:none;line-height:1}
 .website-gallery-platform-menu{position:relative;margin:0;padding:0;border:0}
 .website-gallery-platform-menu>summary::-webkit-details-marker{display:none}
 .website-gallery-link-chevron{transition:transform .15s}.website-gallery-platform-menu[open] .website-gallery-link-chevron{transform:rotate(180deg)}
 .website-gallery-platform-link>svg,.website-gallery-platform-menu>summary>svg{flex:none}
-.website-gallery-platform-link:hover,.website-gallery-platform-menu>summary:hover{background:color-mix(in srgb,var(--color-action) 12%,transparent)}
+.website-gallery-platform-link:hover,.website-gallery-platform-menu>summary:hover{background:color-mix(in srgb,var(--gallery-link-color) 12%,transparent)}
 .website-gallery-platform-link:focus-visible,.website-gallery-platform-menu>summary:focus-visible,.website-gallery-link-options>a:focus-visible{outline:3px solid var(--color-focus);outline-offset:3px}
 .website-gallery-link-tooltip{position:absolute;z-index:25;bottom:calc(100% + 6px);left:0;width:max-content;max-width:min(240px,70vw);padding:7px 10px;border-radius:6px;background:var(--color-surface,var(--color-canvas));color:var(--color-text);border:1px solid var(--color-border);font-family:inherit;font-weight:400;font-size:13px;line-height:1.4;white-space:normal;overflow-wrap:anywhere;pointer-events:none;opacity:0;visibility:hidden;text-transform:none;letter-spacing:normal}
 .website-gallery-platform-link:hover .website-gallery-link-tooltip,.website-gallery-platform-link:focus-visible .website-gallery-link-tooltip{opacity:1;visibility:visible}
 .website-gallery-link-options{position:absolute;z-index:24;left:0;top:calc(100% + 6px);box-sizing:border-box;width:max-content;min-width:180px;max-width:min(280px,calc(100vw - 24px));padding:6px;background:var(--color-surface,var(--color-canvas));color:var(--color-text);border:1px solid var(--color-border);border-radius:10px;box-shadow:0 8px 28px #0005}
 .website-gallery-group .website-gallery-link-options>a{display:block;padding:12px;min-height:44px;box-sizing:border-box;border-radius:5px;font:inherit;font-size:14px;line-height:1.4;color:inherit;text-decoration:none;overflow-wrap:anywhere;letter-spacing:normal;text-transform:none}
-.website-gallery-link-options>a:hover{background:color-mix(in srgb,var(--color-action) 15%,transparent)}
-.website-gallery-viewer .website-gallery-link-heading{color:var(--viewer-muted)}
-.website-gallery-viewer .website-gallery-platform-link,.website-gallery-viewer .website-gallery-platform-menu>summary{color:var(--viewer-text);border-color:#4a4f5a}
+.website-gallery-link-options>a:hover{background:color-mix(in srgb,var(--gallery-link-color) 15%,transparent)}
+.website-gallery-viewer .website-gallery-link-group{--gallery-link-color:color-mix(in srgb,var(--color-action) 50%,var(--viewer-text))}
+.website-gallery-viewer .website-gallery-link-group[data-link-kind=additional]{--gallery-link-color:var(--viewer-muted)}
 .website-gallery-viewer .website-gallery-link-options,.website-gallery-viewer .website-gallery-link-tooltip{background:var(--viewer-panel);color:var(--viewer-text);border-color:#4a4f5a}
 .website-gallery-static-purchase{display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:20px}
 .website-gallery-empty-cover{display:grid;place-items:center;height:100%;color:var(--color-muted)}
@@ -308,6 +321,8 @@ export const websiteGalleryCss=`
 .website-gallery-thumbnails img{display:block;width:100%;height:100%;object-fit:cover}
 .website-gallery-thumbnails .website-gallery-next-tile{display:flex;align-items:center;gap:12px;flex-basis:auto;width:auto;max-width:340px;margin-left:8px;padding-right:16px;border-color:#2a2d35;background:var(--viewer-panel);opacity:1;text-align:left}
 .website-gallery-next-tile img{width:66px;flex-shrink:0}.website-gallery-next-tile span{font-size:14px}
+.website-gallery-end-note{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:1rem;margin-top:1rem;border:1px solid var(--color-border);border-radius:.75rem}.website-gallery-end-note p{margin:0}.website-gallery-end-note a{color:var(--color-action);padding:.65rem 1rem;border:1px solid var(--color-action);border-radius:.5rem;text-decoration:none;font-weight:700}
+.website-gallery-stage .website-gallery-end{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:1.5rem;text-align:center;background:var(--viewer-bg);cursor:default}.website-gallery-end h3{font-size:clamp(1.4rem,3vw,2.4rem);line-height:1.2;margin:0}.website-gallery-end p{margin:0;color:var(--viewer-muted)}.website-gallery-end [data-action=restart]{background:var(--color-action);color:var(--color-canvas);padding:.75rem 1.25rem}
 .website-gallery-stage .website-gallery-intro{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:36px;padding:24px;background:var(--viewer-bg);border-radius:0;z-index:2;text-align:left}
 .website-gallery-intro>img{width:min(30vw,280px);height:min(30vw,280px);object-fit:cover;border-radius:14px}
 .website-gallery-intro>span{display:flex;flex-direction:column;gap:10px;width:min(40vw,300px)}

@@ -20,6 +20,7 @@ export interface StaticWebsiteMedia {
 }
 export interface StaticWebsiteGallery extends WebsiteGallery { href?: string; local: boolean; }
 export interface StaticWebsiteInput {
+  namedGalleryCovers?:Readonly<Record<string,string>>;
   /** Calendar year pinned by the build adapter to keep exports deterministic. */
   copyrightYear?:number;
   creatorIdentities?:readonly {id:string;title:string}[];
@@ -135,7 +136,9 @@ export const renderStaticWebsite = (input: StaticWebsiteInput): RenderedWebsite 
         const ids=(work.publicAssetIds.length?work.publicAssetIds:work.previewAssetIds).filter(assetId=>media.get(assetId)?.mimeType.startsWith('image/'));
         return ids.map(assetId=>{const asset=media.get(assetId)!,thumbnail=media.get(work.previewAssetIds[0])??asset;return {src:asset.src,thumbnail:thumbnail.src,alt:asset.alt||work.title,title:work.title,workHref:work.href?(work.href.startsWith('/')?url(work.href):websiteExternalUrl(work.href)):undefined};});
       });
-      return {id:named.id,title:named.title,href:url(websiteNamedGalleryPath(site,named)),photos,purchaseText:named.purchaseText,purchaseLinks:named.purchaseLinks,externalLinksText:named.externalLinksText,externalLinks:named.externalLinks};
+      const coverId=input.namedGalleryCovers?.[named.id],cover=coverId?media.get(coverId):undefined;
+      if(coverId&&(!cover||!cover.mimeType.startsWith('image/')))throw new WebsiteError('invalid_media','A gallery cover image is unavailable.');
+      return {id:named.id,title:named.title,href:url(websiteNamedGalleryPath(site,named)),photos,...(cover?{cover:{src:cover.src,alt:cover.alt}}:{}),purchaseText:named.purchaseText,purchaseLinks:named.purchaseLinks,externalLinksText:named.externalLinksText,externalLinks:named.externalLinks};
     });
     galleryViewerUsed=true;
     return renderWebsiteGalleryGroup(entries,gallery.kind==='works'?gallery.id:undefined);

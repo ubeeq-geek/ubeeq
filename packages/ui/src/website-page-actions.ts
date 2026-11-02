@@ -24,3 +24,14 @@ export function removeWebsitePage(site:Website,pageId:string,replacementHomeId?:
   websiteRoutes(next);
   return next;
 }
+
+/** Reorder siblings; a main gallery carries its sub-galleries without changing membership or paths. */
+export function moveWebsiteGallery(site:Website,id:string,targetId:string,placement:'before'|'after'='before'):Website {
+  const galleries=site.namedGalleries??[],source=galleries.find(g=>g.id===id),target=galleries.find(g=>g.id===targetId);
+  if(!source||!target||id===targetId||(source.parentId??'')!==(target.parentId??''))return site;
+  const moving=[source,...(!source.parentId?galleries.filter(g=>g.parentId===id):[])],ids=new Set(moving.map(g=>g.id));
+  const remaining=galleries.filter(g=>!ids.has(g.id));
+  const targetIds=new Set([targetId,...(!target.parentId?galleries.filter(g=>g.parentId===targetId).map(g=>g.id):[])]);
+  const at=placement==='before'?remaining.findIndex(g=>g.id===targetId):Math.max(...remaining.map((g,index)=>targetIds.has(g.id)?index:-1))+1;
+  remaining.splice(at,0,...moving);return {...site,namedGalleries:remaining};
+}

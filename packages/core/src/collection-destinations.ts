@@ -175,7 +175,7 @@ export function validateCollectionMapping(
   )
     fail(
       "inbound_authority",
-      "Detach the existing inbound mirror or duplicate this collection as independent.",
+      "Detach the existing inbound mirror before choosing another collection source.",
     );
   if (
     others.some(
@@ -205,7 +205,7 @@ export function assertIndependentCollectionMembership(
   )
     fail(
       "mirror_controlled",
-      "Detach the inbound mirror or duplicate the collection as independent before editing membership.",
+      "Detach the inbound mirror before editing collection membership.",
     );
 }
 /** Pure planning: does not fetch media, create Publications, or mutate either destination. */
