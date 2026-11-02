@@ -12,7 +12,7 @@ const escape=(value:string)=>value.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 /** Group by the validated URL's platform, never by a user-supplied label. */
 export function renderWebsiteGalleryLinks(gallery: Pick<WebsiteViewerGallery,'purchaseText'|'purchaseLinks'|'externalLinksText'|'externalLinks'>):string {
  const e=escape;
- return ([['Purchase links',gallery.purchaseText?.trim()||'Want more?',gallery.purchaseLinks],['Additional Platform Links',gallery.externalLinksText?.trim()||'Also available on:',gallery.externalLinks]] as const).map(([name,heading,links])=>{
+ return ([['purchase','Purchase links',gallery.purchaseText?.trim()||'Want more?',gallery.purchaseLinks],['additional','Additional Platform Links',gallery.externalLinksText?.trim()||'Also available on:',gallery.externalLinks]] as const).map(([kind,name,heading,links])=>{
   if(!links?.length)return '';
   const groups=new Map<string,{name:string;path?:string;viewBox?:string;links:{label:string;url:string;priceText?:string}[]}>();
   for(const link of links){
@@ -27,7 +27,7 @@ export function renderWebsiteGalleryLinks(gallery: Pick<WebsiteViewerGallery,'pu
    if(group.links.length===1){const link=group.links[0],text=label(link);return `<a class="website-gallery-platform-link" href="${e(link.url)}" target="_blank" rel="noopener noreferrer" aria-label="${e(group.name+': '+text)}">${icon}<span class="website-gallery-link-tooltip">${e(text)}</span></a>`;}
    return `<details class="website-gallery-platform-menu"><summary aria-label="${e(group.name)} · ${group.links.length} links" title="${e(group.name)}">${icon}<svg class="website-gallery-link-chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="2"/></svg></summary><div class="website-gallery-link-options">${group.links.map(link=>`<a href="${e(link.url)}" target="_blank" rel="noopener noreferrer">${e(label(link))}</a>`).join('')}</div></details>`;
   }).join('');
-  return `<div class="website-gallery-link-group" role="group" aria-label="${e(name)}"><p class="website-gallery-link-heading">${e(heading)}</p><div class="website-gallery-link-icons">${buttons}</div></div>`;
+  return `<div class="website-gallery-link-group" data-link-kind="${kind}" role="group" aria-label="${e(name)}"><p class="website-gallery-link-heading">${e(heading)}</p><div class="website-gallery-link-icons">${buttons}</div></div>`;
  }).join('');
 }
 /** Also invalidate saved exports when icon definitions or link rendering changes. */
@@ -258,24 +258,25 @@ export const websiteGalleryCss=`
 .website-gallery-tile-title{padding:0 2px;font-size:18px;font-weight:800;letter-spacing:-.01em;line-height:1.35}
 .website-gallery-teaser p{margin:2px 2px 0;font-size:14px;color:var(--color-muted)}
 .website-gallery-teaser .website-gallery-availability{margin-top:6px;font-size:13px}
-.website-gallery-link-group{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;min-width:0}
+.website-gallery-link-group{--gallery-link-color:var(--color-action);display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;min-width:0}
+.website-gallery-link-group[data-link-kind=additional]{--gallery-link-color:var(--color-muted)}
 .website-gallery-teaser>.website-gallery-link-group{margin-top:12px}
-.website-gallery-group .website-gallery-link-heading{margin:0;font:inherit;font-size:14px;line-height:1.5;color:var(--color-muted);letter-spacing:normal;text-transform:none}
+.website-gallery-group .website-gallery-link-heading{margin:0;font:inherit;font-size:14px;line-height:1.5;color:var(--gallery-link-color);letter-spacing:normal;text-transform:none}
 .website-gallery-link-icons{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
-.website-gallery-group .website-gallery-platform-link,.website-gallery-group .website-gallery-platform-menu>summary{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:5px;box-sizing:border-box;min-width:44px;min-height:44px;padding:10px;color:var(--color-action);background:transparent;border:1px solid var(--color-border);border-radius:10px;cursor:pointer;text-decoration:none;list-style:none;line-height:1}
+.website-gallery-group .website-gallery-platform-link,.website-gallery-group .website-gallery-platform-menu>summary{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:5px;box-sizing:border-box;min-width:44px;min-height:44px;padding:10px;color:var(--gallery-link-color);background:transparent;border:1px solid currentColor;border-radius:10px;cursor:pointer;text-decoration:none;list-style:none;line-height:1}
 .website-gallery-platform-menu{position:relative;margin:0;padding:0;border:0}
 .website-gallery-platform-menu>summary::-webkit-details-marker{display:none}
 .website-gallery-link-chevron{transition:transform .15s}.website-gallery-platform-menu[open] .website-gallery-link-chevron{transform:rotate(180deg)}
 .website-gallery-platform-link>svg,.website-gallery-platform-menu>summary>svg{flex:none}
-.website-gallery-platform-link:hover,.website-gallery-platform-menu>summary:hover{background:color-mix(in srgb,var(--color-action) 12%,transparent)}
+.website-gallery-platform-link:hover,.website-gallery-platform-menu>summary:hover{background:color-mix(in srgb,var(--gallery-link-color) 12%,transparent)}
 .website-gallery-platform-link:focus-visible,.website-gallery-platform-menu>summary:focus-visible,.website-gallery-link-options>a:focus-visible{outline:3px solid var(--color-focus);outline-offset:3px}
 .website-gallery-link-tooltip{position:absolute;z-index:25;bottom:calc(100% + 6px);left:0;width:max-content;max-width:min(240px,70vw);padding:7px 10px;border-radius:6px;background:var(--color-surface,var(--color-canvas));color:var(--color-text);border:1px solid var(--color-border);font-family:inherit;font-weight:400;font-size:13px;line-height:1.4;white-space:normal;overflow-wrap:anywhere;pointer-events:none;opacity:0;visibility:hidden;text-transform:none;letter-spacing:normal}
 .website-gallery-platform-link:hover .website-gallery-link-tooltip,.website-gallery-platform-link:focus-visible .website-gallery-link-tooltip{opacity:1;visibility:visible}
 .website-gallery-link-options{position:absolute;z-index:24;left:0;top:calc(100% + 6px);box-sizing:border-box;width:max-content;min-width:180px;max-width:min(280px,calc(100vw - 24px));padding:6px;background:var(--color-surface,var(--color-canvas));color:var(--color-text);border:1px solid var(--color-border);border-radius:10px;box-shadow:0 8px 28px #0005}
 .website-gallery-group .website-gallery-link-options>a{display:block;padding:12px;min-height:44px;box-sizing:border-box;border-radius:5px;font:inherit;font-size:14px;line-height:1.4;color:inherit;text-decoration:none;overflow-wrap:anywhere;letter-spacing:normal;text-transform:none}
-.website-gallery-link-options>a:hover{background:color-mix(in srgb,var(--color-action) 15%,transparent)}
-.website-gallery-viewer .website-gallery-link-heading{color:var(--viewer-muted)}
-.website-gallery-viewer .website-gallery-platform-link,.website-gallery-viewer .website-gallery-platform-menu>summary{color:var(--viewer-text);border-color:#4a4f5a}
+.website-gallery-link-options>a:hover{background:color-mix(in srgb,var(--gallery-link-color) 15%,transparent)}
+.website-gallery-viewer .website-gallery-link-group{--gallery-link-color:color-mix(in srgb,var(--color-action) 50%,var(--viewer-text))}
+.website-gallery-viewer .website-gallery-link-group[data-link-kind=additional]{--gallery-link-color:var(--viewer-muted)}
 .website-gallery-viewer .website-gallery-link-options,.website-gallery-viewer .website-gallery-link-tooltip{background:var(--viewer-panel);color:var(--viewer-text);border-color:#4a4f5a}
 .website-gallery-static-purchase{display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:20px}
 .website-gallery-empty-cover{display:grid;place-items:center;height:100%;color:var(--color-muted)}
