@@ -56,7 +56,7 @@ export interface CommercePorts {
   withStorageLock?<T>(scope: Scope, operation: () => Promise<T>): Promise<T>;
   markVerified(scope: Scope, connectionId: string, merchantId: string, at: string): Promise<void>;
   bindMerchant?(scope: Scope, connectionId: string, merchantId: string): Promise<void>;
-  mail: { send(input: { to: string; subject: string; text: string; idempotencyKey: string }): Promise<void> };
+  mail: { send(input: { to: string; subject: string; text: string; html?: string; idempotencyKey: string }): Promise<void> };
   discord?: CommerceDiscord;
   reconciliation?:{batchSize:number;recentPaymentDays:number};
   discordTokens?: {
