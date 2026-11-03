@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {commerceJavaScript} from '../dist/page.js';
-function fixture({search='',pathname='/commerce',initialToken,fetch=async()=>({ok:true,json:async()=>({})})}={}){
+function fixture({search='',pathname='/commerce',initialToken,schedule=setTimeout,fetch=async()=>({ok:true,json:async()=>({})})}={}){
  const listeners=new Map(),nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
  const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},insertBefore(child,before){this.children.splice(this.children.indexOf(before),0,child);},replaceChildren(...children){this.children=children;},scrollIntoView(){},get lastChild(){return this.children.at(-1);}});
  const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
- vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,setTimeout,clearTimeout});
+ vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,crypto:{randomUUID:()=> 'checkout-request-123'},setTimeout:schedule,clearTimeout});
  return {get,calls,location,listeners};
 }
 test('processing buttons expose busy state, reject duplicate submission and recover after completion',async()=>{
@@ -54,4 +54,25 @@ test('an account signed in from another tab refreshes the buyer identity without
 test('an expired account session does not prevent viewing the public collection',async()=>{
  const f=fixture({initialToken:'expired-session',pathname:'/buy/creator/gallery',fetch:async path=>({ok:path!=='/api/me',json:async()=>path==='/api/me'?{error:{code:'authentication_required'}}:{offers:[]}})});await new Promise(setImmediate);
  assert.equal(f.get('emailSignin').hidden,false);assert.ok(f.calls.some(([path])=>path.startsWith('/api/storefront')));
+});
+
+
+test('prepares a PayPal link on the collection page and polls without navigation or capture',async()=>{
+ const timers=[],offer={id:'offer',slug:'collection',title:'Collection',amountMinor:500,currency:'USD',previews:[],files:[],terms:'Terms',benefits:[]};let ready=false;
+ const f=fixture({pathname:'/buy/creator/collection',initialToken:'buyer-session',schedule:fn=>{timers.push(fn);return timers.length;},fetch:async(path,options)=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path.startsWith('/api/storefront')?{offers:[offer]}:path==='/api/checkouts'?{order:{id:'order'}}:{order:{state:'pending',...(ready?{approvalUrl:'https://www.sandbox.paypal.com/checkoutnow?token=order'}:{})}}})});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary'),purchase=summary.children.find(n=>n.tagName==='BUTTON');
+ await purchase.onclick({currentTarget:purchase,preventDefault(){}});
+ const preparation=summary.children.find(n=>n.className==='commerce-payment-preparation');
+ assert.match(preparation.textContent,/PayPal link will appear below/);assert.equal(purchase.hidden,true);assert.equal(f.location.pathname,'/buy/creator/collection');assert.equal(f.location.href,undefined);
+ ready=true;timers.shift()();await new Promise(setImmediate);
+ const link=preparation.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'Continue to PayPal');assert.match(link.href,/sandbox.paypal.com/);
+ assert.equal(f.calls.filter(([path])=>path==='/api/checkouts').length,1);assert.equal(f.calls.some(([path])=>path.includes('/capture')),false);assert.equal(timers.length,0);
+});
+
+test('the PayPal return page reuses the compact collection media and payment summary layout',async()=>{
+ const f=fixture({pathname:'/commerce/checkout/order',initialToken:'buyer-session',schedule:()=>1,fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path.endsWith('/capture')?{}:{order:{ownerId:'creator',state:'completed',amountMinor:500,currency:'USD'},collection:{title:'Collection',description:'Collection contents.',coverUrl:'/cover',coverAlt:'Cover'}}})});await new Promise(setImmediate);
+ const card=f.get('checkoutState');assert.equal(card.className,'panel commerce-offer');
+ const media=card.children.find(n=>n.className==='commerce-offer-media'),summary=card.children.find(n=>n.className==='commerce-offer-summary');
+ assert.equal(media.children.find(n=>n.tagName==='IMG').src,'/cover');assert.ok(summary.children.some(n=>n.textContent==='Payment'));
+ assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases');assert.equal(f.get('refreshCheckout').hidden,true);
 });
