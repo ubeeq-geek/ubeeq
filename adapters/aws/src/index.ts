@@ -435,3 +435,5 @@ export { createS3PublicDerivativeStore, type PublicDerivativeStore } from './pub
 export { createDynamoPublicDerivativeRepository, publicDerivativePublicationKey, publicDerivativeAssetKey,
   type PublicDerivativePublication, type PublicDerivativeRepository } from './public-derivative-repository.js';
 export * from './website-hosting.js';
+
+export * from './title-polish.js';

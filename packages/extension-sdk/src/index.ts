@@ -109,3 +109,5 @@ export const validateIntegrationConnectorManifest = (manifest: IntegrationConnec
   if (manifest.apiVersion !== EXTENSION_API_VERSION) throw new Error(`Integration connector ${manifest.id} requires unsupported API version ${manifest.apiVersion}`);
   if (new Set(manifest.capabilities).size !== manifest.capabilities.length) throw new Error(`Integration connector ${manifest.id} declares duplicate capabilities`);
 };
+
+export * from './ai.js';
