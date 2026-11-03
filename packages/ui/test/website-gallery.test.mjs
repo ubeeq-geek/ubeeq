@@ -11,7 +11,7 @@ test('gallery covers show counts and native page links, with optional purchase i
  const plain=renderWebsiteGalleryGroup([{...entries[0],photos:[]}]);assert.doesNotMatch(plain,/data-gallery-purchase-text|data-gallery-purchase href/);assert.match(plain,/No preview image/);
 });
 test('work gallery tiles open the selected image and preserve their Work-page fallback',()=>{
- const html=renderWebsiteGalleryGroup(entries,'coast');assert.match(html,/data-photo-index="1"/);assert.match(html,/href="\/portfolio\/galleries\/light\/"/);assert.match(html,/data-gallery-full src="\/portfolio\/assets\/full.jpg"/);
+ const html=renderWebsiteGalleryGroup(entries,'coast');assert.match(html,/data-photo-index="1"/);assert.match(html,/href="\/portfolio\/galleries\/light\/"/);assert.match(html,/data-gallery-full data-src="\/portfolio\/assets\/full.jpg"/);
 });
 test('purchase labels are escaped and unsafe URLs are rejected',()=>{
  const html=renderWebsiteGalleryGroup([{...entries[1],purchaseText:'<script>bad()</script>'}]);assert.doesNotMatch(html,/<script>/);assert.match(html,/&lt;script&gt;/);
@@ -28,7 +28,7 @@ test('large teaser and gallery tiles use the published rendition while viewer th
   const html=renderWebsiteGalleryGroup(entries,selected),tiles=html.split('<div hidden data-gallery-data>')[0];
   assert.match(tiles,/src="\/portfolio\/assets\/full.jpg"/);
   assert.doesNotMatch(tiles,/src="\/portfolio\/assets\/thumb.jpg"/);
-  assert.match(html,/data-gallery-thumb src="\/portfolio\/assets\/thumb.jpg"/);
+  assert.match(html,/data-gallery-thumb data-src="\/portfolio\/assets\/thumb.jpg"/);
  }
 });
 
@@ -94,4 +94,12 @@ test('gallery teasers prefer an explicit cover without adding it to viewer photo
  const html=renderWebsiteGalleryGroup([gallery]),teaser=html.split('<div hidden data-gallery-data>')[0];
  assert.match(teaser,/src="\/assets\/collection-cover.jpg" alt="Collection cover"/);assert.doesNotMatch(teaser,/src="\/portfolio\/assets\/full.jpg"/);assert.match(teaser,/2 images/);
  const selected=renderWebsiteGalleryGroup([gallery],gallery.id).split('<div hidden data-gallery-data>')[0];assert.match(selected,/src="\/portfolio\/assets\/full.jpg"/);assert.doesNotMatch(selected,/src="\/assets\/collection-cover.jpg"/);
+});
+
+
+test('owned galleries support current-image and ZIP downloads without purchase links',()=>{
+ const html=renderWebsiteGalleryGroup([{id:'owned',title:'Purchased collection',href:'/commerce/purchases',photos:[{src:'/image',thumbnail:'/thumb',alt:'Image',downloadAssetId:'image-id'}],downloads:[{label:'Download ZIP',assetId:'zip-id'}]}]);
+ assert.match(html,/data-download-asset="image-id"/);assert.match(html,/data-gallery-download="zip-id"/);assert.match(html,/Download ZIP/);assert.doesNotMatch(html,/Want more\?/);
+ assert.match(websiteGalleryViewerScript,/Download original/);assert.match(websiteGalleryViewerScript,/website-gallery-download/);
+ const safe=renderWebsiteGalleryGroup([{id:'x',title:'Collection',href:'/commerce/purchases',photos:[],downloads:[{label:'<script>bad</script>',assetId:'" onclick="bad'}]}]);assert.doesNotMatch(safe,/<script>|data-gallery-download="" onclick=/);assert.match(safe,/&lt;script&gt;/);
 });

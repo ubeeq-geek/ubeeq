@@ -26,6 +26,9 @@
     "@ubeeq/processing": "^0.1.0",
     "@ubeeq/persistence": "^0.1.0",
     "@ubeeq/core": "^0.1.0",
-    "@ubeeq/media-sharp": "^0.1.0"
+    "@ubeeq/media-sharp": "^0.1.0",
+    "@ubeeq/commerce": "^0.1.0",
+    "@ubeeq/ui": "^0.1.0",
+    "@ubeeq/commerce-runtime": "^0.1.0"
   }
 }

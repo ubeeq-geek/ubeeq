@@ -69,3 +69,14 @@ It listens on `http://127.0.0.1:4100` by default and stores SQLite state plus fi
 
 `node:sqlite` is currently experimental in Node 22; use Node 22.5 or newer for
 this reference implementation. With nvm, run `nvm install 22 && nvm use 22`.
+
+## Creator payments
+
+The optional commerce runtime serves PayPal setup, immutable offers, customer
+checkout/purchases, secure claims, private galleries/downloads and Discord roles.
+It is disabled by default. See
+[creator payments configuration and acceptance](../../packages/integrations/PAYPAL-CREATOR-PAYMENTS.md)
+for required keys, mail relay, callback, storage, worker and provider eligibility
+configuration. `/commerce/creator` manages setup; `/commerce/purchases` is the
+customer access/recovery page. Managed hosts must inject durable commerce/vault
+adapters instead of relying on ephemeral local storage.

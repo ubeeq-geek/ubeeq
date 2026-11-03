@@ -2,8 +2,13 @@
   "name": "@ubeeq/adapter-local",
   "version": "0.1.0",
   "private": false,
-  "publishConfig": { "access": "public" },
-  "files": ["dist", "migrations"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "migrations"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -19,6 +24,7 @@
     "@ubeeq/federation": "^0.1.0",
     "@ubeeq/jobs": "^0.1.0",
     "@ubeeq/persistence": "^0.1.0",
-    "@ubeeq/storage": "^0.1.0"
+    "@ubeeq/storage": "^0.1.0",
+    "@ubeeq/commerce": "^0.1.0"
   }
 }

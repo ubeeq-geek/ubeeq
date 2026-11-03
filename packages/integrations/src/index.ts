@@ -1,4 +1,8 @@
 /** Product-neutral remote integration capabilities. */
+export * from './paypal-client.js';
+export * from './paypal-connections.js';
+export * from './paypal-commerce.js';
+export * from './discord-commerce.js';
 export * from "./ubeeq-compatible.js";
 export * from './youtube-upload.js';
 export * from "./recovery.js";

@@ -4,7 +4,8 @@ import {galleryLinkPlatforms} from './gallery-link-platforms.js';
 export interface WebsiteViewerGallery {
   id:string;title:string;href:string;
   cover?:{src:string;alt:string};
-  photos:readonly {src:string;thumbnail:string;alt:string;title?:string;workHref?:string}[];
+  downloads?:readonly {label:string;assetId:string}[];
+  photos:readonly {src:string;thumbnail:string;alt:string;title?:string;workHref?:string;originalAssetId?:string;downloadAssetId?:string}[];
   externalLinksText?:string;externalLinks?:readonly {label:string;url:string}[];
   purchaseText?:string;purchaseLinks?:readonly {label:string;url:string;priceText?:string}[];
 }
@@ -33,6 +34,7 @@ export function renderWebsiteGalleryLinks(gallery: Pick<WebsiteViewerGallery,'pu
 /** Also invalidate saved exports when icon definitions or link rendering changes. */
 export const websiteGalleryLinksFingerprintInput=JSON.stringify(galleryLinkPlatforms)+renderWebsiteGalleryLinks.toString();
 
+const galleryDownloadButtons=(gallery:WebsiteViewerGallery)=>gallery.downloads?.length?`<div class="website-gallery-downloads" role="group" aria-label="Collection downloads">${gallery.downloads.map(link=>`<button type="button" data-gallery-download="${escape(link.assetId)}">${escape(link.label)}</button>`).join('')}</div>`:'';
 export function renderWebsiteGalleryGroup(entries:readonly WebsiteViewerGallery[],selectedId?:string){
  const e=escape,selected=entries.find(g=>g.id===selectedId),count=(n:number)=>`${n} image${n===1?'':'s'}`;
  const tiles=selected?selected.photos.map((photo,index)=>`<a class="website-gallery-tile" href="${e(photo.workHref??selected.href)}" data-gallery-open="${e(selected.id)}" data-photo-index="${index}"><span class="website-gallery-cover"><img src="${e(photo.src)}" alt="${e(photo.alt)}" loading="lazy"><span class="website-gallery-view">View image</span></span><span class="website-gallery-tile-title">${e(photo.title??photo.alt)}</span></a>`).join(''):entries.map(g=>`<article class="website-gallery-teaser"><a class="website-gallery-tile" href="${e(g.href)}" data-gallery-open="${e(g.id)}"><span class="website-gallery-cover">${g.cover||g.photos[0]?`<img src="${e((g.cover??g.photos[0]).src)}" alt="${e(g.cover?.alt??'')}" loading="lazy">`:'<span class="website-gallery-empty-cover">No preview image</span>'}<span class="website-gallery-count">${count(g.photos.length)}</span><span class="website-gallery-view">▶ View gallery</span></span><span class="website-gallery-tile-title">${e(g.title)}</span></a><p class="website-gallery-tile-count">${count(g.photos.length)}</p>${renderWebsiteGalleryLinks(g)}</article>`).join('');
@@ -44,30 +46,47 @@ export function renderWebsiteGalleryGroup(entries:readonly WebsiteViewerGallery[
  const purchase=selected?`<div class="website-gallery-static-purchase">${renderWebsiteGalleryLinks(selected)}</div>`:'';
  const nonempty=entries.filter(g=>g.photos.length),first=nonempty[0];
  const endNote=selected&&first&&selected.id===nonempty.at(-1)?.id?`<section class="website-gallery-end-note" aria-label="End of galleries"><p>You’ve reached the end of these galleries.</p><a href="${e(first.href)}">Back to first gallery</a></section>`:'';
- const data=entries.map(g=>`<div data-gallery-entry="${e(g.id)}"><h3 data-gallery-title>${e(g.title)}</h3><div data-gallery-links>${renderWebsiteGalleryLinks(g)}</div>${g.photos.map(p=>`<figure data-gallery-photo${p.title?` data-photo-title="${e(p.title)}"`:""}><img data-gallery-full src="${e(p.src)}" alt="${e(p.alt)}" loading="lazy"><img data-gallery-thumb src="${e(p.thumbnail)}" alt="" loading="lazy"></figure>`).join('')}</div>`).join('');
+ const data=entries.map(g=>`<div data-gallery-entry="${e(g.id)}"><h3 data-gallery-title>${e(g.title)}</h3><div data-gallery-links>${renderWebsiteGalleryLinks(g)}${galleryDownloadButtons(g)}</div>${g.photos.map(p=>`<figure data-gallery-photo${p.originalAssetId?` data-original-asset="${e(p.originalAssetId)}"`:""}${p.downloadAssetId?` data-download-asset="${e(p.downloadAssetId)}"`:""}${p.title?` data-photo-title="${e(p.title)}"`:""}><img data-gallery-full data-src="${e(p.src)}" alt="${e(p.alt)}" loading="lazy"><img data-gallery-thumb data-src="${e(p.thumbnail)}" alt="" loading="lazy"></figure>`).join('')}</div>`).join('');
  return `<section class="website-gallery-group" data-gallery-root><div class="website-gallery-tiles">${tiles||'<p>No images are available in this gallery yet.</p>'}</div>${endNote}${purchase}<div hidden data-gallery-data>${data}</div><dialog class="website-gallery-viewer" data-gallery-dialog tabindex="-1" aria-label="Gallery viewer"><div class="website-gallery-surface" data-gallery-surface><div class="website-gallery-viewer-header"><div class="website-gallery-heading"><button type="button" data-action="previous-gallery" aria-label="Previous gallery">‹</button><div><h2 data-viewer-title></h2><p><span data-gallery-position></span> · Photo <span data-image-counter></span></p></div><button type="button" data-action="next-gallery"></button></div><div class="website-gallery-controls"><button type="button" class="website-gallery-icon-button" data-action="play" aria-pressed="false" aria-label="Play slideshow" title="Play slideshow">${playIcon}</button><select data-gallery-interval aria-label="Slide duration"><option value="2">2s</option><option value="3">3s</option><option value="4" selected>4s</option><option value="6">6s</option><option value="10">10s</option></select><button type="button" class="website-gallery-icon-button" data-action="fullscreen" aria-pressed="false" aria-label="Full screen" title="Full screen">${fullscreenIcon}</button><div class="website-gallery-help-control"><button type="button" class="website-gallery-icon-button" data-action="help" aria-expanded="false" aria-label="Gallery help" title="Gallery help">${helpIcon}</button><section class="website-gallery-help-panel" data-gallery-help role="region" aria-label="Gallery help" hidden><h3>Using the gallery</h3><p>Click the right side of the photo, scroll, or swipe left for the next image. Click the left side or swipe right to go back.</p><dl><dt>← / →</dt><dd>Previous / next image</dd><dt>↑ / ↓</dt><dd>Previous / next gallery</dd><dt>Space</dt><dd>Play or pause the slideshow when the viewer is focused</dd><dt>F</dt><dd>Enter or exit full screen</dd><dt>Esc</dt><dd>Dismiss help, exit full screen, or close the viewer</dd></dl><p>Choose a duration beside Play to set the slideshow speed. Select a thumbnail to jump to an image.</p><button type="button" data-action="close-help">Close help</button></section></div><button type="button" class="website-gallery-icon-button" data-action="close" aria-label="Close gallery viewer" title="Close gallery viewer">${closeIcon}</button></div></div><div class="website-gallery-progress"><span data-slide-progress></span></div><nav class="website-gallery-purchase" data-purchase-section aria-label="Gallery links" hidden></nav><div class="website-gallery-stage" data-gallery-stage><img data-viewer-image alt=""><section class="website-gallery-end" data-gallery-end hidden aria-label="End of galleries"><h3>You’ve reached the end of these galleries.</h3><p>Start again from the first gallery whenever you’re ready.</p><button type="button" data-action="restart">Back to first gallery</button></section><button type="button" class="website-gallery-stage-prev" data-action="previous" aria-label="Previous image">‹</button><button type="button" class="website-gallery-stage-next" data-action="next" aria-label="Next image">›</button><button type="button" class="website-gallery-intro" data-action="start" hidden><img data-intro-cover alt=""><span><small>Up next</small><strong data-intro-title></strong><span data-intro-count></span><span class="website-gallery-intro-progress"><span data-intro-progress></span></span><small>Click or press → to start now</small></span></button></div><div class="website-gallery-caption-area"><p class="website-gallery-caption" data-image-caption></p></div><div class="website-gallery-thumbnails" data-gallery-thumbnails role="group" aria-label="Choose an image"></div><p class="website-gallery-announcement" role="status" aria-live="polite" data-viewer-status></p></div></dialog></section>`;
+}
+
+/** Loads thumbnail pages only after the focused image, with at most six requests per batch. */
+export function createGalleryThumbnailLoader(primary:HTMLImageElement,strip:HTMLElement,images:readonly HTMLImageElement[],focusIndex:number,isActive:()=>boolean,onReady?:()=>void){
+ let disposed=false,ready=false,busy=false;const started=new Set<number>(),queued:number[]=[],cleanup:Array<()=>void>=[];
+ const valid=()=>!disposed&&isActive();
+ const visible=()=>{if(!ready||!valid())return;const left=strip.scrollLeft,right=left+strip.clientWidth;for(let i=0;i<images.length;i++){const tile=images[i].parentElement;if(tile&&tile.offsetLeft+tile.offsetWidth>left&&tile.offsetLeft<right)enqueue(i);}pump();};
+ const enqueue=(index:number)=>{const page=Math.floor(index/6)*6;if(!queued.includes(page)&&images.slice(page,page+6).some((_,i)=>!started.has(page+i)))queued.push(page);};
+ const pump=()=>{if(!ready||busy||!valid())return;let page:number|undefined;while(queued.length){const candidate=queued.shift()!;if(images.slice(candidate,candidate+6).some((_,i)=>!started.has(candidate+i))){page=candidate;break;}}if(page===undefined)return;
+  const pending=images.slice(page,page+6).map((image,i)=>({image,index:page!+i})).filter(item=>!started.has(item.index));busy=true;let remaining=pending.length;
+  for(const {image,index}of pending){started.add(index);let settled=false;const done=()=>{if(settled)return;settled=true;image.removeEventListener('load',done);image.removeEventListener('error',done);if(--remaining===0){busy=false;if(valid())visible();}};image.addEventListener('load',done);image.addEventListener('error',done);cleanup.push(()=>{image.removeEventListener('load',done);image.removeEventListener('error',done);});image.loading='eager';image.fetchPriority='low';if(image.getAttribute('src')!==image.dataset.thumbnailSrc)image.src=image.dataset.thumbnailSrc!;if(image.complete)done();}
+ };
+ const loaded=()=>{if(!valid()||!primary.complete||primary.naturalWidth===0||primary.currentSrc&&primary.currentSrc!==primary.src)return;if(!ready){ready=true;onReady?.();enqueue(focusIndex);}pump();visible();};
+ primary.addEventListener('load',loaded);strip.addEventListener('scroll',visible,{passive:true});loaded();
+ return {focus(index:number){ready=false;focusIndex=index;queued.length=0;loaded();},dispose(){disposed=true;primary.removeEventListener('load',loaded);strip.removeEventListener('scroll',visible);for(const remove of cleanup)remove();}};
 }
 
 /** Trusted static source stays identical in server exports and minified browser previews. */
 export const websiteGalleryViewerScript=
 "(function websiteGalleryViewerRuntime() {\n"
++ "    const createThumbnailLoader="+createGalleryThumbnailLoader.toString()+";\n"
 + "    for (const [rootIndex,root] of Array.from(document.querySelectorAll('[data-gallery-root]')).entries()) {\n"
 + "        const dialog = root.querySelector('[data-gallery-dialog]');\n"
 + "        if (!dialog || typeof dialog.showModal !== 'function')\n"
 + "            continue;\n"
-+ "        const entries = Array.from(root.querySelectorAll('[data-gallery-entry]')).map(node => ({ id: node.dataset.galleryEntry, title: node.querySelector('[data-gallery-title]')?.textContent ?? 'Gallery', linkGroups: node.querySelector('[data-gallery-links]'), photos: Array.from(node.querySelectorAll('[data-gallery-photo]')).map(figure => { const full = figure.querySelector('[data-gallery-full]'), thumb = figure.querySelector('[data-gallery-thumb]'); return { src: full.getAttribute('src'), thumbnail: thumb.getAttribute('src'), alt: full.alt, title: figure.dataset.photoTitle }; }) })).filter(g => g.photos.length);\n"
++ "        const entries = Array.from(root.querySelectorAll('[data-gallery-entry]')).map(node => ({ id: node.dataset.galleryEntry, title: node.querySelector('[data-gallery-title]')?.textContent ?? 'Gallery', linkGroups: node.querySelector('[data-gallery-links]'), photos: Array.from(node.querySelectorAll('[data-gallery-photo]')).map(figure => { const full = figure.querySelector('[data-gallery-full]'), thumb = figure.querySelector('[data-gallery-thumb]'); return { src: full.getAttribute('data-src')??full.getAttribute('src'), thumbnail: thumb.getAttribute('data-src')??thumb.getAttribute('src'), alt: full.alt, title: figure.dataset.photoTitle, downloadAssetId: figure.dataset.downloadAsset,originalAssetId:figure.dataset.originalAsset }; }) })).filter(g => g.photos.length);\n"
 + "        if (!entries.length)\n"
 + "            continue;\n"
 + "        for (const opener of root.querySelectorAll('[data-gallery-open]'))\n"
 + "            if (entries.some(g => g.id === opener.dataset.galleryOpen))\n"
 + "                opener.setAttribute('aria-haspopup', 'dialog');\n"
 + "        const get = (selector) => dialog.querySelector(selector);\n"
-+ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, ended = false, opener, overflow = '', lastWheel = 0, pointer;\n"
++ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, ended = false, opener, overflow = '', lastWheel = 0, pointer, thumbnailLoader, thumbnailGallery=-1;\n"
 + "        const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;\n"
 + "        const stop = () => { clearTimeout(timer); timer = undefined; };\n"
 + "        const schedule = () => {\n"
-+ "            for(const [selector,enabled,duration] of [['[data-slide-progress]',playing&&!intro,Number(get('[data-gallery-interval]').value)*1000],['[data-intro-progress]',playing&&intro,2500]]){const bar=get(selector);for(const animation of bar.getAnimations())animation.cancel();bar.style.transform='scaleX(0)';if(enabled)bar.animate([{transform:'scaleX(0)'},{transform:'scaleX(1)'}],{duration,fill:'forwards'});}\n"
-+ " stop(); if (playing && dialog.open && !ended)\n"
++ "            const imageReady=get('[data-viewer-image]').complete&&get('[data-viewer-image]').naturalWidth>0;\n"
++ "            for(const [selector,enabled,duration] of [['[data-slide-progress]',playing&&imageReady&&!intro,Number(get('[data-gallery-interval]').value)*1000],['[data-intro-progress]',playing&&imageReady&&intro,2500]]){const bar=get(selector);for(const animation of bar.getAnimations())animation.cancel();bar.style.transform='scaleX(0)';if(enabled)bar.animate([{transform:'scaleX(0)'},{transform:'scaleX(1)'}],{duration,fill:'forwards'});}\n"
++ " stop(); if (playing && dialog.open && !ended && imageReady)\n"
 + "            timer = setTimeout(() => { if (intro) {\n"
 + "                intro = false;\n"
 + "                render();\n"
@@ -79,7 +98,7 @@ export const websiteGalleryViewerScript=
 + "            get('[data-viewer-title]').textContent = current.title;\n"
 + "            get('[data-gallery-position]').textContent = `Gallery ${gallery + 1} of ${entries.length}`;\n"
 + "            const image = get('[data-viewer-image]');\n"
-+ "            image.src = photo.src;\n"
++ "            image.fetchPriority='high';image.loading='eager';if(image.getAttribute('src')!==photo.src)image.src = photo.src;\n"
 + "            image.alt = photo.alt;image.hidden=ended;\n"
 + "            get('[data-gallery-end]').hidden=!ended;\n"
 + "            get('[data-image-caption]').hidden=ended;\n"
@@ -94,21 +113,25 @@ export const websiteGalleryViewerScript=
 + "            overlay.hidden = !intro;\n"
 + "            get('[data-intro-title]').textContent = current.title;\n"
 + "            const strip = get('[data-gallery-thumbnails]'), restoreThumbFocus = strip.contains(document.activeElement);\n"
-+ "            strip.replaceChildren();\n"
-+ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.src = p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; ended=false; render(); }); strip.append(button); });\n"
-+ "            if(gallery<entries.length-1){const upcoming=entries[gallery+1],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.src=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
-+ "            get('[data-intro-cover]').src=current.photos[0].thumbnail;get('[data-intro-count]').textContent=`${current.photos.length} photos`;\n"
++ "            const buildStrip=thumbnailGallery!==gallery;if(buildStrip){thumbnailLoader?.dispose();strip.replaceChildren();thumbnailGallery=gallery;\n"
++ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.dataset.thumbnailSrc=p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; ended=false; render(); }); strip.append(button); });\n"
++ "            if(gallery<entries.length-1){const upcoming=entries[gallery+1],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.dataset.thumbnailSrc=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
++ "            }else current.photos.forEach((_,i)=>strip.children[i].setAttribute('aria-pressed',String(i===index)));\n"
++ "            get('[data-intro-cover]').removeAttribute('src');get('[data-intro-count]').textContent=`${current.photos.length} photos`;\n"
 + "            const active = strip.children[index];\n"
 + "            if (restoreThumbFocus)\n"
 + "                active.focus({ preventScroll: true });\n"
 + "            strip.scrollTo?.({ left: active.offsetLeft - strip.clientWidth / 2 + active.clientWidth / 2, behavior: reduced ? 'instant' : 'smooth' });\n"
 + "            const section = get('[data-purchase-section]');\n"
-+ "            section.hidden = !current.linkGroups?.children.length;\n"
++ "            section.hidden = !current.linkGroups?.children.length && !photo.downloadAssetId && !photo.originalAssetId;\n"
 + "            if(linksGallery!==gallery){section.replaceChildren(...Array.from(current.linkGroups?.children??[],node=>node.cloneNode(true)));linksGallery=gallery;}\n"
++ "            let download=section.querySelector('[data-current-photo-download]');if(!download){download=document.createElement('button');download.type='button';download.dataset.currentPhotoDownload='true';download.textContent='Download original';section.append(download);}download.hidden=!photo.downloadAssetId||intro||ended;if(photo.downloadAssetId)download.dataset.galleryDownload=photo.downloadAssetId;\n"
++ "            let original=section.querySelector('[data-current-photo-original]');if(!original){original=document.createElement('button');original.type='button';original.dataset.currentPhotoOriginal='true';original.textContent='View original';section.append(original);}original.hidden=!photo.originalAssetId||intro||ended;if(photo.originalAssetId)original.dataset.galleryOriginal=photo.originalAssetId;\n"
 + "            const previous = get('[data-action=\"previous-gallery\"]'), next = get('[data-action=\"next-gallery\"]');\n"
 + "            previous.hidden = next.hidden = entries.length < 2;\n"
 + "            previous.textContent = '‹'; previous.setAttribute('aria-label', `Previous gallery: ${entries[(gallery - 1 + entries.length) % entries.length].title}`);\n"
 + "            next.textContent = gallery===entries.length-1?'End of galleries':`Next: ${entries[gallery+1].title} ›`;next.disabled=ended;\n"
++ "            if(buildStrip)thumbnailLoader=createThumbnailLoader(image,strip,Array.from(strip.querySelectorAll('img[data-thumbnail-src]')),index,()=>dialog.open&&thumbnailGallery===gallery,()=>{if(intro)get('[data-intro-cover]').src=entries[gallery].photos[0].thumbnail;schedule();});else thumbnailLoader.focus(index);\n"
 + "            schedule();\n"
 + "        };\n"
 + "        const finish=()=>{playing=false;intro=false;ended=true;render();get('[data-action=\"restart\"]').focus({preventScroll:true});};\n"
@@ -149,6 +172,8 @@ export const websiteGalleryViewerScript=
 + "        root.addEventListener('keydown',event=>{if(event.key!=='Escape')return;const menu=event.target.closest?.('.website-gallery-platform-menu[open]');if(menu){event.preventDefault();event.stopPropagation();menu.open=false;menu.querySelector('summary').focus();}},true);\n"
 + "        document.addEventListener('click',event=>{for(const menu of root.querySelectorAll('.website-gallery-platform-menu[open]'))if(!menu.contains(event.target))menu.open=false;});\n"
 + "        root.addEventListener('toggle',event=>{const menu=event.target;if(!menu.matches?.('.website-gallery-platform-menu[open]'))return;for(const other of root.querySelectorAll('.website-gallery-platform-menu[open]'))if(other!==menu)other.open=false;fitLinkPopup(menu.querySelector('.website-gallery-link-options'));},true);\n"
++ "        root.addEventListener('click',event=>{const button=event.target instanceof Element?event.target.closest('[data-gallery-original]'):undefined;if(button){event.preventDefault();root.dispatchEvent(new CustomEvent('website-gallery-original',{bubbles:true,detail:{assetId:button.dataset.galleryOriginal,button}}));}});\n"
++ "        root.addEventListener('click',event=>{const button=event.target instanceof Element?event.target.closest('[data-gallery-download]'):undefined;if(button){event.preventDefault();root.dispatchEvent(new CustomEvent('website-gallery-download',{bubbles:true,detail:{assetId:button.dataset.galleryDownload,button}}));}});\n"
 + "        root.addEventListener('click', event => { const target = event.target instanceof Element ? event.target.closest('[data-gallery-open]') : null; if (!target || event instanceof MouseEvent && (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey))\n"
 + "            return; const at = entries.findIndex(g => g.id === target.dataset.galleryOpen); if (at < 0)\n"
 + "            return; event.preventDefault(); gallery = at; index = Math.max(0, Math.min(Number(target.dataset.photoIndex) || 0, entries[at].photos.length - 1)); playing = false; intro = false; ended=false;opener = target; overflow = document.body.style.overflow; document.body.style.overflow = 'hidden'; dialog.showModal(); render(); dialog.focus(); });\n"
@@ -278,6 +303,7 @@ export const websiteGalleryCss=`
 .website-gallery-viewer .website-gallery-link-group{--gallery-link-color:color-mix(in srgb,var(--color-action) 50%,var(--viewer-text))}
 .website-gallery-viewer .website-gallery-link-group[data-link-kind=additional]{--gallery-link-color:var(--viewer-muted)}
 .website-gallery-viewer .website-gallery-link-options,.website-gallery-viewer .website-gallery-link-tooltip{background:var(--viewer-panel);color:var(--viewer-text);border-color:#4a4f5a}
+.website-gallery-downloads{display:flex;flex-wrap:wrap;gap:12px}.website-gallery-purchase>[data-current-photo-download]{margin:0}
 .website-gallery-static-purchase{display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:20px}
 .website-gallery-empty-cover{display:grid;place-items:center;height:100%;color:var(--color-muted)}
 .website-gallery-viewer{--viewer-bg:#0e0f12;--viewer-panel:#1b1d22;--viewer-border:#23262d;--viewer-text:#f3f4f6;--viewer-muted:#9aa0ab;box-sizing:border-box;width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;margin:0;padding:0;border:0;background:var(--viewer-bg);color:var(--viewer-text);font:inherit;overflow:auto;text-align:left}
@@ -309,17 +335,17 @@ export const websiteGalleryCss=`
 .website-gallery-progress{height:3px;background:var(--viewer-panel)}
 .website-gallery-progress>span,.website-gallery-intro-progress>span{display:block;width:100%;height:100%;transform:scaleX(0);transform-origin:left;background:var(--color-action)}
 .website-gallery-viewer .website-gallery-purchase{letter-spacing:normal;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px 28px;padding:10px 24px;background:#15171b;border-bottom:1px solid var(--viewer-border)}
-.website-gallery-stage{position:relative;display:flex;align-items:center;justify-content:center;box-sizing:border-box;flex:1 1 0;min-height:120px;padding:12px 96px 8px;touch-action:pan-y pinch-zoom;cursor:e-resize}
+.website-gallery-stage{position:relative;display:flex;align-items:center;justify-content:center;box-sizing:border-box;flex:1 1 0;min-height:120px;padding:6px 96px 2px;touch-action:pan-y pinch-zoom;cursor:e-resize}
 .website-gallery-stage>img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;box-shadow:0 20px 60px #0008}
 .website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{position:absolute;top:50%;transform:translateY(-50%);width:52px;height:52px;min-height:0;padding:0;border:1px solid #ffffff2e;border-radius:50%;background:#ffffff1a;color:#fff;font-size:28px}
 .website-gallery-stage-prev{left:24px}.website-gallery-stage-next{right:24px}
-.website-gallery-caption-area{padding:2px 24px 4px}
-.website-gallery-caption{margin:0;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
-.website-gallery-thumbnails{position:relative;display:flex;gap:8px;overflow-x:auto;padding:4px 24px 8px}
-.website-gallery-thumbnails button{flex:0 0 104px;width:104px;height:70px;min-height:0;margin:0;padding:0;border:2px solid transparent;border-radius:8px;overflow:hidden;opacity:.55;background:none}
-.website-gallery-thumbnails button[aria-pressed=true]{opacity:1;border-color:var(--color-action)}
+.website-gallery-caption-area{padding:0 24px 2px}
+.website-gallery-viewer .website-gallery-caption{margin:0;text-align:center;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
+.website-gallery-thumbnails{position:relative;display:flex;gap:6px;overflow-x:auto;padding:2px 24px 8px}
+.website-gallery-viewer .website-gallery-thumbnails button{box-sizing:border-box;flex:0 0 130px;width:130px;height:88px;min-height:0;margin:0;padding:0;border:1px solid transparent;border-radius:8px;overflow:hidden;opacity:.55;background:none}
+.website-gallery-viewer .website-gallery-thumbnails button[aria-pressed=true]{opacity:1;border-color:var(--color-action)}
 .website-gallery-thumbnails img{display:block;width:100%;height:100%;object-fit:cover}
-.website-gallery-thumbnails .website-gallery-next-tile{display:flex;align-items:center;gap:12px;flex-basis:auto;width:auto;max-width:340px;margin-left:8px;padding-right:16px;border-color:#2a2d35;background:var(--viewer-panel);opacity:1;text-align:left}
+.website-gallery-viewer .website-gallery-thumbnails .website-gallery-next-tile{display:flex;align-items:center;gap:12px;flex-basis:auto;width:auto;max-width:340px;margin-left:8px;padding-right:16px;border-color:#2a2d35;background:var(--viewer-panel);opacity:1;text-align:left}
 .website-gallery-next-tile img{width:66px;flex-shrink:0}.website-gallery-next-tile span{font-size:14px}
 .website-gallery-end-note{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:1rem;margin-top:1rem;border:1px solid var(--color-border);border-radius:.75rem}.website-gallery-end-note p{margin:0}.website-gallery-end-note a{color:var(--color-action);padding:.65rem 1rem;border:1px solid var(--color-action);border-radius:.5rem;text-decoration:none;font-weight:700}
 .website-gallery-stage .website-gallery-end{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:1.5rem;text-align:center;background:var(--viewer-bg);cursor:default}.website-gallery-end h3{font-size:clamp(1.4rem,3vw,2.4rem);line-height:1.2;margin:0}.website-gallery-end p{margin:0;color:var(--viewer-muted)}.website-gallery-end [data-action=restart]{background:var(--color-action);color:var(--color-canvas);padding:.75rem 1.25rem}
@@ -339,6 +365,6 @@ export const websiteGalleryCss=`
 .website-gallery-surface.is-fullscreen :is(.website-gallery-purchase,.website-gallery-caption-area,.website-gallery-thumbnails){display:none}
 @media(max-width:1000px){.website-gallery-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:480px){.website-gallery-tiles{grid-template-columns:minmax(0,1fr)}}
-@media(max-width:600px){.website-gallery-viewer-header{padding:12px;gap:10px}.website-gallery-heading{flex-basis:100%}.website-gallery-controls{width:100%;justify-content:flex-end;gap:16px}.website-gallery-controls select{padding-inline:10px}.website-gallery-stage{padding:8px 12px 4px}.website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{width:40px;height:40px;background:#0e0f12b8}.website-gallery-stage-prev{left:8px}.website-gallery-stage-next{right:8px}.website-gallery-purchase{padding:12px}.website-gallery-caption-area{padding:2px 12px 4px}.website-gallery-thumbnails{padding:4px 12px 8px}.website-gallery-stage .website-gallery-intro{gap:18px}.website-gallery-surface.is-fullscreen .website-gallery-stage{height:auto;padding:6px 12px}}
+@media(max-width:600px){.website-gallery-viewer-header{padding:12px;gap:10px}.website-gallery-heading{flex-basis:100%}.website-gallery-controls{width:100%;justify-content:flex-end;gap:16px}.website-gallery-controls select{padding-inline:10px}.website-gallery-stage{padding:4px 12px 2px}.website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{width:40px;height:40px;background:#0e0f12b8}.website-gallery-stage-prev{left:8px}.website-gallery-stage-next{right:8px}.website-gallery-purchase{padding:12px}.website-gallery-caption-area{padding:0 12px 2px}.website-gallery-thumbnails{padding:2px 12px 8px}.website-gallery-stage .website-gallery-intro{gap:18px}.website-gallery-surface.is-fullscreen .website-gallery-stage{height:auto;padding:6px 12px}}
 @media(prefers-reduced-motion:reduce){.website-gallery-cover img{transition:none}.website-gallery-tile:hover img{transform:none}}
 `;

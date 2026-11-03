@@ -1,4 +1,5 @@
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
+export { SqliteCommerceStore } from './commerce.js';
 export { SqliteWebsiteStore } from './websites.js';
 export * from './website-hosting.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
@@ -312,6 +313,11 @@ export class LocalCredentialVault implements CredentialVault {
     const decipher = createDecipheriv("aes-256-gcm", this.key, row.iv); decipher.setAuthTag(Buffer.from(row.auth_tag)); return Buffer.concat([decipher.update(row.ciphertext), decipher.final()]);
   }
   async revoke(input: { cellId: string; reference: string }): Promise<void> { const prefix = `local-vault:${input.cellId}:`; if (input.reference.startsWith(prefix) && input.cellId === this.local.configuration.cellId) this.local.database.prepare("UPDATE ubeeq_credentials SET revoked_at = ? WHERE id = ? AND cell_id = ?").run(now(), input.reference.slice(prefix.length), input.cellId); }
+  async pruneCommerceOrphans(referenced: readonly string[], createdBefore: string): Promise<void> {
+    const rows=this.local.database.prepare("SELECT id FROM ubeeq_credentials WHERE cell_id=? AND owner_id LIKE 'paypal-commerce:%' AND revoked_at IS NULL AND created_at<?").all(this.local.configuration.cellId,createdBefore) as {id:string}[];
+    const keep=new Set(referenced);
+    for(const row of rows){const reference=`local-vault:${this.local.configuration.cellId}:${row.id}`;if(!keep.has(reference))await this.revoke({cellId:this.local.configuration.cellId,reference});}
+  }
 }
 
 /** Local Ed25519 signing is a portable reference; hosted instances may resolve keys from a managed provider. */
