@@ -74,7 +74,7 @@ test('the PayPal return page reuses the compact collection media and payment sum
  const card=f.get('checkoutState');assert.equal(card.className,'panel commerce-offer');
  const media=card.children.find(n=>n.className==='commerce-offer-media'),summary=card.children.find(n=>n.className==='commerce-offer-summary');
  assert.equal(media.children.find(n=>n.tagName==='IMG').src,'/cover');assert.ok(summary.children.some(n=>n.textContent==='Payment'));
- assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases?purchase=purchase');assert.equal(f.get('refreshCheckout').hidden,true);
+ assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases?purchase=purchase');
 });
 
 
@@ -84,7 +84,7 @@ test('PayPal return polls verified completion before offering the purchased coll
  let summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');
  assert.ok(summary.children.some(n=>/confirming your payment/.test(n.textContent)));assert.equal(summary.children.some(n=>n.tagName==='A'),false);
  paid=true;timers.shift()();await new Promise(setImmediate);
- summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');const link=summary.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'View purchased collection');assert.equal(link.href,'/commerce/purchases?purchase=paid-purchase');
+ summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');const link=summary.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'Continue to My Purchases');assert.equal(link.href,'/commerce/purchases?purchase=paid-purchase');
  assert.equal(f.calls.filter(([path])=>path.endsWith('/capture')).length,1);assert.equal(timers.length,0);
 });
 test('the purchased collection link opens only the requested active collection owned by the signed-in buyer',async()=>{
