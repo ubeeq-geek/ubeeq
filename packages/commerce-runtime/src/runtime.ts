@@ -247,7 +247,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (download && method === 'POST') { send(response, await service.authorizeDownload(subjectId, download[1])); return true; }
       if (path === '/api/checkouts' && method === 'POST') { const b = await parseBody(request); send(response, { order: await service.checkout(subjectId, required(b.offerVersionId), required(request.headers['idempotency-key'])) }, 202); return true; }
       const order = path.match(/^\/api\/checkouts\/([^/]+)(\/capture)?$/);
-      if (order && method === 'GET' && !order[2]) { const result=await service.order(subjectId, order[1]);const offer=await store.transaction(tx=>tx.get('offer',result.order.offerVersionId));send(response,{...result,collection:offer?await deps.publicOfferCollection?.(offer):undefined}); return true; }
+      if (order && method === 'GET' && !order[2]) { const result=await service.order(subjectId, order[1]);const offer=await store.transaction(tx=>tx.get('offer',result.order.offerVersionId));send(response,{...result,purchasePageUrl:offer?'/buy/'+encodeURIComponent(offer.ownerId)+'/'+encodeURIComponent(offer.slug)+'?environment='+offer.environment:undefined,collection:offer?await deps.publicOfferCollection?.(offer):undefined}); return true; }
       if (order && method === 'POST' && order[2]) { send(response, await service.capture(subjectId, order[1]), 202); return true; }
       if (path === '/api/connections/paypal') {
         const a = await actor(), paypalActor = { deploymentId: deps.deploymentId, ownerId: a.ownerId, actorId: subjectId };

@@ -414,3 +414,14 @@ test('email continuation context shows the public collection title without consu
  f.advance(900001);
  await assert.rejects(f.service.emailLoginContext(general.searchParams.get('id'),general.searchParams.get('token')),{code:'invalid_sign_in_link'});
 });
+
+
+test('checkout confirmation exposes a collection link only for verified active gallery access',async t=>{
+ const f=await fixture(t);await f.verify();const offer=await f.offer(await f.asset()),order=await f.checkout(offer);
+ assert.equal((await f.service.order('buyer',order.id)).collectionPurchaseId,undefined);
+ await f.service.reconcile(scope,'connection',[f.evidence(order)]);
+ const confirmed=await f.service.order('buyer',order.id);assert.equal(confirmed.collectionPurchaseId,confirmed.purchases[0].id);
+ await assert.rejects(f.service.order('other',order.id),{code:'checkout_not_found'});
+ await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'refunded',refundedMinor:1000})]);
+ assert.equal((await f.service.order('buyer',order.id)).collectionPurchaseId,undefined);
+});

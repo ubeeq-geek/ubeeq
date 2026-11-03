@@ -388,7 +388,9 @@ export class CommerceService {
   async order(subjectId: string, id: string) {
     return this.store.transaction(tx => { const c = this.customer(tx, subjectId), order = tx.get('checkout', id);
       if (!order || order.customerId !== c.id) throw new CommerceError('checkout_not_found', 404);
-      return { order, payments: tx.list('payment').filter(p => p.checkoutId === id), purchases: tx.list('purchase').filter(p => p.customerId === c.id && tx.get('payment', p.paymentId)?.checkoutId === id) }; });
+      const purchases=tx.list('purchase').filter(p=>p.customerId===c.id&&tx.get('payment',p.paymentId)?.checkoutId===id);
+      const collectionPurchaseId=purchases.find(p=>p.state==='active'&&tx.list('entitlement').some(g=>g.customerId===c.id&&g.purchaseId===p.id&&g.state==='active'&&g.benefit.type==='gallery'&&g.startsAt<=this.now()&&(!g.endsAt||g.endsAt>this.now())))?.id;
+      return { order, payments: tx.list('payment').filter(p => p.checkoutId === id), purchases, ...(collectionPurchaseId?{collectionPurchaseId}:{}) }; });
   }
   async cancelSubscription(subjectId:string,id:string){
     const {order}=await this.order(subjectId,id);if(!order.billing||!order.providerOrderId||!this.ports.provider.cancelSubscription)throw new CommerceError('subscription_unavailable',409);

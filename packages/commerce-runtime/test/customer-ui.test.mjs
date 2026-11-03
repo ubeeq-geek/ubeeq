@@ -70,9 +70,27 @@ test('prepares a PayPal link on the collection page and polls without navigation
 });
 
 test('the PayPal return page reuses the compact collection media and payment summary layout',async()=>{
- const f=fixture({pathname:'/commerce/checkout/order',initialToken:'buyer-session',schedule:()=>1,fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path.endsWith('/capture')?{}:{order:{ownerId:'creator',state:'completed',amountMinor:500,currency:'USD'},collection:{title:'Collection',description:'Collection contents.',coverUrl:'/cover',coverAlt:'Cover'}}})});await new Promise(setImmediate);
+ const f=fixture({pathname:'/commerce/checkout/order',initialToken:'buyer-session',schedule:()=>1,fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path.endsWith('/capture')?{}:{order:{ownerId:'creator',state:'completed',amountMinor:500,currency:'USD'},purchases:[{id:'purchase',state:'active'}],collectionPurchaseId:'purchase',collection:{title:'Collection',description:'Collection contents.',coverUrl:'/cover',coverAlt:'Cover'}}})});await new Promise(setImmediate);
  const card=f.get('checkoutState');assert.equal(card.className,'panel commerce-offer');
  const media=card.children.find(n=>n.className==='commerce-offer-media'),summary=card.children.find(n=>n.className==='commerce-offer-summary');
  assert.equal(media.children.find(n=>n.tagName==='IMG').src,'/cover');assert.ok(summary.children.some(n=>n.textContent==='Payment'));
- assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases');assert.equal(f.get('refreshCheckout').hidden,true);
+ assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases?purchase=purchase');assert.equal(f.get('refreshCheckout').hidden,true);
+});
+
+
+test('PayPal return polls verified completion before offering the purchased collection, with no second PayPal approval link',async()=>{
+ const timers=[];let paid=false;
+ const f=fixture({pathname:'/commerce/checkout/order',search:'?token=paypal-token&PayerID=payer',initialToken:'buyer',schedule:fn=>{timers.push(fn);return timers.length;},fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path.endsWith('/capture')?{}:{order:{state:paid?'completed':'pending',amountMinor:500,currency:'USD',approvalUrl:'https://www.sandbox.paypal.com/approve'},purchases:paid?[{id:'paid-purchase',state:'active'}]:[],...(paid?{collectionPurchaseId:'paid-purchase'}:{})}})});await new Promise(setImmediate);
+ let summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');
+ assert.ok(summary.children.some(n=>/confirming your payment/.test(n.textContent)));assert.equal(summary.children.some(n=>n.tagName==='A'),false);
+ paid=true;timers.shift()();await new Promise(setImmediate);
+ summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');const link=summary.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'View purchased collection');assert.equal(link.href,'/commerce/purchases?purchase=paid-purchase');
+ assert.equal(f.calls.filter(([path])=>path.endsWith('/capture')).length,1);assert.equal(timers.length,0);
+});
+test('the purchased collection link opens only the requested active collection owned by the signed-in buyer',async()=>{
+ const purchase={id:'paid-purchase',ownerId:'creator',state:'active',offer:{title:'Collection',supportEmail:'help@example.test'},payment:{state:'completed'},entitlements:[{state:'active',benefit:{type:'gallery'},assetIds:[]}],packages:[],discord:[]};
+ const f=fixture({pathname:'/commerce/purchases',search:'?purchase=paid-purchase',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[purchase]}:path.startsWith('/api/me/gallery')?{html:'<div>Purchased collection viewer</div>'}:{entitlements:[]}})});await new Promise(setImmediate);
+ assert.ok(f.calls.some(([path])=>path==='/api/me/gallery?purchase=paid-purchase'));assert.match(f.get('gallery').innerHTML,/Purchased collection viewer/);
+ const other=fixture({pathname:'/commerce/purchases',search:'?purchase=someone-else',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[purchase]}:{entitlements:[]}})});await new Promise(setImmediate);
+ assert.equal(other.calls.some(([path])=>path.startsWith('/api/me/gallery')),false);assert.match(other.get('notice').textContent,/not available from this account/);
 });
