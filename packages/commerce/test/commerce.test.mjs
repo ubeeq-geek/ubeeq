@@ -392,7 +392,7 @@ test('host Ever provisioning happens only after valid email proof and retains ex
 });
 
 test('local native account email and password hash are encrypted at rest and survive restart',async t=>{
- const f=await fixture(t),now=new Date().toISOString(),record={...scope,id:'member',ownerId:'eversally-members',createdAt:now,updatedAt:now,userId:'ever-user',email:'private-member@example.test',commerceSubjectId:'buyer',provider:'local',passwordHash:'salt:private-hash',passwordSetupRequired:false};await f.store.transaction(tx=>tx.insert('memberAccount',record));
+ const f=await fixture(t),now=new Date().toISOString(),record={...scope,id:'member',ownerId:'host-members',createdAt:now,updatedAt:now,userId:'ever-user',email:'private-member@example.test',commerceSubjectId:'buyer',provider:'local',passwordHash:'salt:private-hash',passwordSetupRequired:false};await f.store.transaction(tx=>tx.insert('memberAccount',record));
  const {DatabaseSync}=await import('node:sqlite'),raw=new DatabaseSync(f.path),payload=raw.prepare('SELECT payload FROM commerce_records WHERE deployment=? AND kind=? AND id=?').get('deployment','memberAccount','member').payload;raw.close();assert.ok(payload.includes('encryptedMemberAccount'));assert.equal(payload.includes(record.email),false);assert.equal(payload.includes(record.passwordHash),false);f.restart();assert.deepEqual(await f.store.transaction(tx=>tx.get('memberAccount','member')),record);
 });
 
