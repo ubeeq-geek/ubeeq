@@ -12,7 +12,7 @@ ${websiteGalleryCss}
 <form id="recovery"><h3>Recovery email</h3><p id="verifiedEmails"></p><label>Email to verify<input name="email" type="email" required></label><button>Send verification link</button></form></section>
 <section id="store"><h2>Storefront</h2><form id="findStore"><label>Creator reference<input name="owner" required></label><label>Environment<select name="environment"><option value="live">Live</option><option value="sandbox">Sandbox</option></select></label><button>View storefront</button></form><div id="creatorIdentity"></div><div id="offers" class="grid"></div></section>
 <section id="checkout" hidden><h2>Purchase status</h2><div id="checkoutState" class="panel"></div></section>
-<section id="purchases" hidden><h2>My purchases</h2><button id="refreshPurchases">Refresh purchases</button><button id="recoverClaims" class="secondary">Recover unclaimed purchases</button><button id="connectDiscord" class="secondary">Connect Discord</button><div id="purchaseList"></div><div id="manualAccess"></div><div id="gallery"></div></section>
+<section id="purchases" hidden><h2>My purchases</h2><button id="refreshPurchases">Refresh purchases</button><div id="purchaseList"></div><div id="manualAccess"></div><div id="gallery"></div></section>
 <section id="proof" hidden><h2 id="proofTitle">Recover purchase access</h2><p id="proofDescription">Use your secure email link to continue.</p><button id="redeemProof">Continue</button></section>
 <section id="discordCallback" hidden><h2>Connect Discord</h2><p>Customer access is optional. Creators can verify a server and map existing roles below.</p><button id="finishDiscord">Complete customer connection</button><form id="guild" hidden><label>Server<select name="guildId" id="guildSelect" required></select></label><fieldset><legend>Existing roles the bot can manage</legend><div id="guildRoles"></div></fieldset><label>Server invite URL<input name="inviteUrl" type="url" required></label><button>Verify creator server</button></form></section>
 <section id="creator" hidden><h2>Connections → Payments → PayPal</h2><p>Create a Business REST app in the <a href="https://developer.paypal.com/dashboard/applications" target="_blank" rel="noopener noreferrer">PayPal Developer Dashboard</a>. Submit the app credentials here. Your PayPal login password is never needed.</p>
@@ -154,12 +154,11 @@ async function purchases(){
  const result=await api('/api/me/purchases'),list=$('purchaseList');list.replaceChildren();list.className='commerce-purchase-grid';
  for(const purchase of result.purchases)list.append(purchaseTeaser(purchase));
  for(const gift of result.gifts||[])list.append(purchaseTeaser(gift,true));
- if(!result.purchases.length&&!(result.gifts||[]).length)list.append(el('p','You haven’t made any purchases with this account yet. Open a creator’s collection to get started. If you have already paid, use Recover unclaimed purchases to recover access.'));
+ if(!result.purchases.length&&!(result.gifts||[]).length)list.append(el('p','You haven’t made any purchases with this account yet. Open a creator’s collection to get started.'));
  const access=await api('/api/me/access');$('manualAccess').replaceChildren();for(const grant of access.entitlements.filter(g=>g.source==='manual'&&!g.giftId)){const node=el('article');node.append(el('h3','Manual access'),el('p',grant.reason));for(const id of grant.assetIds)node.append(button('Download',async()=>downloadPurchasedFile(id)));$('manualAccess').append(node);}
  const selected=params.get('purchase')||params.get('gift');if(selected){const gift=params.has('gift'),record=(gift?result.gifts||[]:result.purchases).find(p=>p.id===selected&&p.state!=='revoked'&&activeGrants(p).some(g=>g.benefit?.type==='gallery'));if(record)await openPurchasedCollection(record,gift);else notice('This collection is not available from this account. Check your purchases or contact the creator.',true);}
 }
-$('refreshPurchases').onclick=guard(purchases);$('recoverClaims').onclick=guard(async()=>{await api('/api/me/purchase-claims/resend','POST',{});notice('Recovery links queued for eligible unclaimed purchases matching your verified emails.');});
-$('connectDiscord').onclick=guard(async()=>{sessionStorage.setItem('ubeeq.commerce.discordMode','customer');location.href=(await api('/api/discord/authorize','POST',{})).authorizationUrl;});
+$('refreshPurchases').onclick=guard(purchases);
 $('redeemProof').onclick=guard(async()=>{
  const email=location.pathname.endsWith('verify-email'),login=location.pathname.endsWith('sign-in');
  const result=await api(login?'/api/auth/email/redeem':email?'/api/me/email/verify':'/api/purchase-claims','POST',{id:params.get('id'),token:params.get('token')});

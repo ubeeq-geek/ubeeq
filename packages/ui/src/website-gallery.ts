@@ -335,17 +335,17 @@ export const websiteGalleryCss=`
 .website-gallery-progress{height:3px;background:var(--viewer-panel)}
 .website-gallery-progress>span,.website-gallery-intro-progress>span{display:block;width:100%;height:100%;transform:scaleX(0);transform-origin:left;background:var(--color-action)}
 .website-gallery-viewer .website-gallery-purchase{letter-spacing:normal;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:12px 28px;padding:10px 24px;background:#15171b;border-bottom:1px solid var(--viewer-border)}
-.website-gallery-stage{position:relative;display:flex;align-items:center;justify-content:center;box-sizing:border-box;flex:1 1 0;min-height:120px;padding:12px 96px 8px;touch-action:pan-y pinch-zoom;cursor:e-resize}
+.website-gallery-stage{position:relative;display:flex;align-items:center;justify-content:center;box-sizing:border-box;flex:1 1 0;min-height:120px;padding:6px 96px 2px;touch-action:pan-y pinch-zoom;cursor:e-resize}
 .website-gallery-stage>img{display:block;width:auto;height:auto;max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;box-shadow:0 20px 60px #0008}
 .website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{position:absolute;top:50%;transform:translateY(-50%);width:52px;height:52px;min-height:0;padding:0;border:1px solid #ffffff2e;border-radius:50%;background:#ffffff1a;color:#fff;font-size:28px}
 .website-gallery-stage-prev{left:24px}.website-gallery-stage-next{right:24px}
-.website-gallery-caption-area{padding:2px 24px 4px}
-.website-gallery-caption{margin:0;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
-.website-gallery-thumbnails{position:relative;display:flex;gap:8px;overflow-x:auto;padding:4px 24px 8px}
-.website-gallery-thumbnails button{flex:0 0 104px;width:104px;height:70px;min-height:0;margin:0;padding:0;border:2px solid transparent;border-radius:8px;overflow:hidden;opacity:.55;background:none}
-.website-gallery-thumbnails button[aria-pressed=true]{opacity:1;border-color:var(--color-action)}
+.website-gallery-caption-area{padding:0 24px 2px}
+.website-gallery-viewer .website-gallery-caption{margin:0;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
+.website-gallery-thumbnails{position:relative;display:flex;gap:6px;overflow-x:auto;padding:2px 24px 8px}
+.website-gallery-viewer .website-gallery-thumbnails button{box-sizing:border-box;flex:0 0 130px;width:130px;height:88px;min-height:0;margin:0;padding:0;border:1px solid transparent;border-radius:8px;overflow:hidden;opacity:.55;background:none}
+.website-gallery-viewer .website-gallery-thumbnails button[aria-pressed=true]{opacity:1;border-color:var(--color-action)}
 .website-gallery-thumbnails img{display:block;width:100%;height:100%;object-fit:cover}
-.website-gallery-thumbnails .website-gallery-next-tile{display:flex;align-items:center;gap:12px;flex-basis:auto;width:auto;max-width:340px;margin-left:8px;padding-right:16px;border-color:#2a2d35;background:var(--viewer-panel);opacity:1;text-align:left}
+.website-gallery-viewer .website-gallery-thumbnails .website-gallery-next-tile{display:flex;align-items:center;gap:12px;flex-basis:auto;width:auto;max-width:340px;margin-left:8px;padding-right:16px;border-color:#2a2d35;background:var(--viewer-panel);opacity:1;text-align:left}
 .website-gallery-next-tile img{width:66px;flex-shrink:0}.website-gallery-next-tile span{font-size:14px}
 .website-gallery-end-note{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;padding:1rem;margin-top:1rem;border:1px solid var(--color-border);border-radius:.75rem}.website-gallery-end-note p{margin:0}.website-gallery-end-note a{color:var(--color-action);padding:.65rem 1rem;border:1px solid var(--color-action);border-radius:.5rem;text-decoration:none;font-weight:700}
 .website-gallery-stage .website-gallery-end{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;padding:1.5rem;text-align:center;background:var(--viewer-bg);cursor:default}.website-gallery-end h3{font-size:clamp(1.4rem,3vw,2.4rem);line-height:1.2;margin:0}.website-gallery-end p{margin:0;color:var(--viewer-muted)}.website-gallery-end [data-action=restart]{background:var(--color-action);color:var(--color-canvas);padding:.75rem 1.25rem}
@@ -365,6 +365,6 @@ export const websiteGalleryCss=`
 .website-gallery-surface.is-fullscreen :is(.website-gallery-purchase,.website-gallery-caption-area,.website-gallery-thumbnails){display:none}
 @media(max-width:1000px){.website-gallery-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:480px){.website-gallery-tiles{grid-template-columns:minmax(0,1fr)}}
-@media(max-width:600px){.website-gallery-viewer-header{padding:12px;gap:10px}.website-gallery-heading{flex-basis:100%}.website-gallery-controls{width:100%;justify-content:flex-end;gap:16px}.website-gallery-controls select{padding-inline:10px}.website-gallery-stage{padding:8px 12px 4px}.website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{width:40px;height:40px;background:#0e0f12b8}.website-gallery-stage-prev{left:8px}.website-gallery-stage-next{right:8px}.website-gallery-purchase{padding:12px}.website-gallery-caption-area{padding:2px 12px 4px}.website-gallery-thumbnails{padding:4px 12px 8px}.website-gallery-stage .website-gallery-intro{gap:18px}.website-gallery-surface.is-fullscreen .website-gallery-stage{height:auto;padding:6px 12px}}
+@media(max-width:600px){.website-gallery-viewer-header{padding:12px;gap:10px}.website-gallery-heading{flex-basis:100%}.website-gallery-controls{width:100%;justify-content:flex-end;gap:16px}.website-gallery-controls select{padding-inline:10px}.website-gallery-stage{padding:4px 12px 2px}.website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{width:40px;height:40px;background:#0e0f12b8}.website-gallery-stage-prev{left:8px}.website-gallery-stage-next{right:8px}.website-gallery-purchase{padding:12px}.website-gallery-caption-area{padding:0 12px 2px}.website-gallery-thumbnails{padding:2px 12px 8px}.website-gallery-stage .website-gallery-intro{gap:18px}.website-gallery-surface.is-fullscreen .website-gallery-stage{height:auto;padding:6px 12px}}
 @media(prefers-reduced-motion:reduce){.website-gallery-cover img{transition:none}.website-gallery-tile:hover img{transform:none}}
 `;
