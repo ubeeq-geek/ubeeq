@@ -227,18 +227,24 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/me/purchase-claims/resend' && method === 'POST') { send(response, await service.recoverClaims(subjectId), 202); return true; }
       if (path === '/api/me/discord/retry' && method === 'POST') { send(response, await service.retryCustomerDiscord(subjectId),202);return true; }
       const cancelSubscription=path.match(/^\/api\/me\/subscriptions\/([^/]+)\/cancel$/);if(cancelSubscription&&method==='POST'){send(response,await service.cancelSubscription(subjectId,cancelSubscription[1]));return true;}
-      if (path === '/api/me/purchases' && method === 'GET') { send(response, { purchases: await service.purchases(subjectId),gifts:await service.gifts(subjectId) }); return true; }
+      if (path === '/api/me/purchases' && method === 'GET') {
+        const decorate=async<T extends {offer?:Offer;contentOffer?:Offer}>(purchase:T)=>({...purchase,collection:purchase.offer?await deps.publicOfferCollection?.(purchase.offer):undefined,files:await store.transaction(tx=>(purchase.contentOffer??purchase.offer)?.files.map(id=>({id,label:tx.get('asset',id)?.label??'Unavailable file'}))??[])});
+        send(response, { purchases: await Promise.all((await service.purchases(subjectId)).map(decorate)),gifts:await Promise.all((await service.gifts(subjectId)).map(decorate)) }); return true;
+      }
       if (path === '/api/me/access' && method === 'GET') { send(response, await service.myAccess(subjectId)); return true; }
       if (path === '/api/me/gallery' && method === 'GET') {
         const purchase = url.searchParams.has('gift')?(await service.gifts(subjectId)).find(g=>g.id===url.searchParams.get('gift')):(await service.purchases(subjectId)).find(p => p.id === url.searchParams.get('purchase'));
         if (!purchase?.offer) throw new CommerceError('purchase_not_found', 404);
         if(!purchase.entitlements.some(g=>g.benefit.type==='gallery'&&g.state==='active'&&(!g.endsAt||g.endsAt>new Date().toISOString())))throw new CommerceError('gallery_access_required',403);
-        const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string }[] = [];
+        const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string;downloadAssetId?:string }[] = [];
+        const active=purchase.entitlements.filter(g=>g.state==='active'&&g.startsAt<=new Date().toISOString()&&(!g.endsAt||g.endsAt>new Date().toISOString()));
         for (const id of (purchase.contentOffer??purchase.offer).files) {
           const asset = access.assets.find(a => a.id === id); if (!asset?.contentType.startsWith('image/') || asset.state !== 'available') continue;
-          const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url, thumbnail: authorized.url, title: asset.label, alt: asset.label });
+          const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url, thumbnail: authorized.url, title: asset.label, alt: asset.label,...(active.some(g=>g.benefit.type==='download'&&g.assetIds.includes(id))?{downloadAssetId:id}:{}) });
         }
-        send(response, { html: renderWebsiteGalleryGroup([{ id: purchase.id, title: (purchase.contentOffer??purchase.offer).title, href: '/commerce/purchases', photos }], purchase.id), refreshAfterSeconds: 240 }); return true;
+        const downloads=[...new Set(active.filter(g=>g.benefit.type==='package').flatMap(g=>g.assetIds))].filter(id=>access.assets.some(a=>a.id===id&&a.state==='available')).map(assetId=>({assetId,label:'Download ZIP'}));
+        const collection=await deps.publicOfferCollection?.(purchase.offer);
+        send(response, { html: renderWebsiteGalleryGroup([{ id: purchase.id, title: (purchase.contentOffer??purchase.offer).title, href: '/commerce/purchases', ...(collection?.coverUrl?{cover:{src:collection.coverUrl,alt:collection.coverAlt??collection.title}}:{}), photos,downloads }]), refreshAfterSeconds: 240 }); return true;
       }
       if (path === '/api/me/email' && method === 'POST') { const b = await parseBody(request); send(response, await service.beginEmailVerification(subjectId, required(b.email)), 202); return true; }
       if (path === '/api/me/email/verify' && method === 'POST') { const b = await parseBody(request); send(response, await service.verifyEmail(subjectId, required(b.id), required(b.token))); return true; }

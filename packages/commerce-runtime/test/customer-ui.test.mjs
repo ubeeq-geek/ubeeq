@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import {commerceJavaScript} from '../dist/page.js';
 function fixture({search='',pathname='/commerce',initialToken,schedule=setTimeout,fetch=async()=>({ok:true,json:async()=>({})})}={}){
  const listeners=new Map(),nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
- const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},insertBefore(child,before){this.children.splice(this.children.indexOf(before),0,child);},replaceChildren(...children){this.children=children;},scrollIntoView(){},get lastChild(){return this.children.at(-1);}});
+ const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},insertBefore(child,before){this.children.splice(this.children.indexOf(before),0,child);},replaceChildren(...children){this.children=children;},scrollIntoView(){},click(){this.clicked=true;},get lastChild(){return this.children.at(-1);}});
  const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
  vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,crypto:{randomUUID:()=> 'checkout-request-123'},setTimeout:schedule,clearTimeout});
  return {get,calls,location,listeners};
@@ -74,7 +74,7 @@ test('the PayPal return page reuses the compact collection media and payment sum
  const card=f.get('checkoutState');assert.equal(card.className,'panel commerce-offer');
  const media=card.children.find(n=>n.className==='commerce-offer-media'),summary=card.children.find(n=>n.className==='commerce-offer-summary');
  assert.equal(media.children.find(n=>n.tagName==='IMG').src,'/cover');assert.ok(summary.children.some(n=>n.textContent==='Payment'));
- assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases?purchase=purchase');
+ assert.equal(summary.children.find(n=>n.tagName==='A').href,'/commerce/purchases');
 });
 
 
@@ -84,7 +84,7 @@ test('PayPal return polls verified completion before offering the purchased coll
  let summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');
  assert.ok(summary.children.some(n=>/confirming your payment/.test(n.textContent)));assert.equal(summary.children.some(n=>n.tagName==='A'),false);
  paid=true;timers.shift()();await new Promise(setImmediate);
- summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');const link=summary.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'Continue to My Purchases');assert.equal(link.href,'/commerce/purchases?purchase=paid-purchase');
+ summary=f.get('checkoutState').children.find(n=>n.className==='commerce-offer-summary');const link=summary.children.find(n=>n.tagName==='A');assert.equal(link.textContent,'Continue to My Purchases');assert.equal(link.href,'/commerce/purchases');
  assert.equal(f.calls.filter(([path])=>path.endsWith('/capture')).length,1);assert.equal(timers.length,0);
 });
 test('the purchased collection link opens only the requested active collection owned by the signed-in buyer',async()=>{
@@ -93,4 +93,20 @@ test('the purchased collection link opens only the requested active collection o
  assert.ok(f.calls.some(([path])=>path==='/api/me/gallery?purchase=paid-purchase'));assert.match(f.get('gallery').innerHTML,/Purchased collection viewer/);
  const other=fixture({pathname:'/commerce/purchases',search:'?purchase=someone-else',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[purchase]}:{entitlements:[]}})});await new Promise(setImmediate);
  assert.equal(other.calls.some(([path])=>path.startsWith('/api/me/gallery')),false);assert.match(other.get('notice').textContent,/not available from this account/);
+});
+
+
+test('purchases are collection teasers rather than a wall of file buttons',async()=>{
+ const purchase={id:'paid-purchase',ownerId:'creator',createdAt:'2026-11-01T12:00:00Z',state:'active',offer:{title:'Collection',files:Array.from({length:50},(_,i)=>'image-'+i),supportEmail:'help@example.test'},collection:{coverUrl:'/collection-cover',coverAlt:'Collection cover'},payment:{state:'completed'},entitlements:[{state:'active',benefit:{type:'gallery'},assetIds:[]},...Array.from({length:50},(_,i)=>({state:'active',benefit:{type:'download'},assetIds:['image-'+i]}))],packages:[],discord:[]};
+ const f=fixture({pathname:'/commerce/purchases',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[purchase]}:{entitlements:[]}})});await new Promise(setImmediate);
+ const list=f.get('purchaseList'),card=list.children[0];assert.equal(list.className,'commerce-purchase-grid');assert.match(card.className,/website-gallery-teaser/);
+ const descendants=node=>[node,...node.children.flatMap(descendants)],all=descendants(card);
+ assert.equal(all.find(n=>n.tagName==='IMG').src,'/collection-cover');assert.equal(all.some(n=>n.textContent==='Download file'),false);assert.ok(all.some(n=>n.textContent==='View gallery'));assert.ok(all.some(n=>n.textContent==='Purchase details'));
+});
+
+test('viewer downloads request fresh authorization for the selected asset and release the busy control',async()=>{
+ const f=fixture({initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:{url:'https://commerce.test/api/private-assets/second?token=short-lived'}})});await new Promise(setImmediate);
+ const control={disabled:false,attrs:{},setAttribute(key,value){this.attrs[key]=value;},removeAttribute(key){delete this.attrs[key];}};
+ f.listeners.get('website-gallery-download')({detail:{assetId:'second-image',button:control}});assert.equal(control.disabled,true);await new Promise(setImmediate);
+ const request=f.calls.find(([path])=>path==='/api/downloads/second-image/authorize');assert.equal(request[1].method,'POST');assert.equal(request[1].headers.authorization,'Bearer buyer');assert.equal(control.disabled,false);assert.equal(control.attrs['aria-busy'],undefined);
 });
