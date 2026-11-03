@@ -1,0 +1,25 @@
+{
+  "name": "@ubeeq/browser-extension",
+  "version": "0.1.0",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "src/server.cjs",
+    "src/server.d.ts"
+  ],
+  "main": "src/server.cjs",
+  "types": "src/server.d.ts",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && node test/service.test.mjs && node test/browser.test.mjs",
+    "test:chromium": "node scripts/smoke-chromium.mjs",
+    "test:panel": "node scripts/smoke-panel.mjs",
+    "test:premium-form": "node scripts/smoke-premium-form.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -53,6 +53,7 @@ remain as backward-compatible aliases.
 - `@ubeeq/core` — neutral domain entities and lifecycle contracts.
 - `@ubeeq/auth` — authenticated-subject and authorization contracts.
 - `@ubeeq/billing` — append-only usage and credit-reservation ledger primitives.
+- `@ubeeq/browser-extension` — experimental cross-browser pairing and public-source import shell; see [scope and qualification](packages/browser-extension/README.md).
 - `@ubeeq/extension-sdk` — versioned extension manifests and product-policy interfaces.
 - `@ubeeq/ui` — unbranded UI token, accessible-action, and localization contracts.
 - `@ubeeq/integrations` — capability vocabulary, operation gates, and executable connector conformance runner.
