@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {commerceJavaScript} from '../dist/page.js';
-function fixture({search='',pathname='/commerce',initialToken,schedule=setTimeout,fetch=async()=>({ok:true,json:async()=>({})})}={}){
+function fixture({search='',pathname='/commerce',initialToken,schedule=setTimeout,open=()=>undefined,fetch=async()=>({ok:true,json:async()=>({})})}={}){
  const listeners=new Map(),nodes=new Map(),calls=[],location={search,pathname},values=new Map(initialToken?[['ubeeq.commerce.session',initialToken]]:[]);
  const node=(tag='div')=>({tagName:tag.toUpperCase(),children:[],attributes:{},hidden:false,disabled:false,textContent:'',elements:new Proxy({email:{focus(){this.focused=true;}}},{get:(target,key)=>target[key]??(target[key]={value:''})}),setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];},append(...children){this.children.push(...children);},insertBefore(child,before){this.children.splice(this.children.indexOf(before),0,child);},replaceChildren(...children){this.children=children;},scrollIntoView(){},click(){this.clicked=true;},get lastChild(){return this.children.at(-1);}});
  const get=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};
- vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,crypto:{randomUUID:()=> 'checkout-request-123'},setTimeout:schedule,clearTimeout});
+ vm.runInNewContext(commerceJavaScript,{document:{getElementById:get,createElement:node,querySelectorAll:()=>[]},window:{open,dispatchEvent(){},addEventListener:(type,callback)=>listeners.set(type,callback)},sessionStorage:{getItem:key=>values.get(key)??null,setItem:(key,value)=>values.set(key,value)},localStorage:{getItem:()=>null},location,history:{replaceState(_state,_title,path){const url=new URL(path,'https://commerce.test');location.pathname=url.pathname;location.search=url.search;}},URLSearchParams,CustomEvent:class{},FormData:class{*[Symbol.iterator](){yield ['email','buyer@example.test'];}},fetch:async(...args)=>{calls.push(args);return fetch(...args);},Intl,BigInt,Date,crypto:{randomUUID:()=> 'checkout-request-123'},setTimeout:schedule,clearTimeout});
  return {get,calls,location,listeners};
 }
 test('processing buttons expose busy state, reject duplicate submission and recover after completion',async()=>{
@@ -109,4 +109,12 @@ test('viewer downloads request fresh authorization for the selected asset and re
  const control={disabled:false,attrs:{},setAttribute(key,value){this.attrs[key]=value;},removeAttribute(key){delete this.attrs[key];}};
  f.listeners.get('website-gallery-download')({detail:{assetId:'second-image',button:control}});assert.equal(control.disabled,true);await new Promise(setImmediate);
  const request=f.calls.find(([path])=>path==='/api/downloads/second-image/authorize');assert.equal(request[1].method,'POST');assert.equal(request[1].headers.authorization,'Bearer buyer');assert.equal(control.disabled,false);assert.equal(control.attrs['aria-busy'],undefined);
+});
+
+test('View original authorizes the full file only after an explicit original-view action',async()=>{
+ const navigations=[],tab={opener:{},location:{replace:url=>navigations.push(url)},close(){}};
+ const f=fixture({initialToken:'buyer',open:()=>tab,fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:{url:'https://commerce.test/api/private-assets/original?token=fresh'}})});await new Promise(setImmediate);
+ assert.equal(f.calls.some(([path])=>path.includes('/authorize')),false);
+ f.listeners.get('website-gallery-original')({detail:{assetId:'original'}});await new Promise(setImmediate);
+ assert.equal(tab.opener,null);assert.equal(f.calls.find(([path])=>path==='/api/downloads/original/authorize')[1].method,'POST');assert.equal(navigations[0],'https://commerce.test/api/private-assets/original?token=fresh');assert.doesNotMatch(navigations[0],/rendition=/);
 });

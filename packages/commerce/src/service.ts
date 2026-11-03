@@ -616,6 +616,7 @@ export class CommerceService {
     if(this.ports.assets.verify)await this.ports.assets.verify(asset);
     return asset;
   }
+  async galleryAsset(assetId:string,token:string){const asset=await this.downloadAsset(assetId,token);if(!asset.contentType.startsWith('image/'))throw new CommerceError('content_unavailable',409);return asset;}
   async openDownload(assetId:string,token:string){
     const asset=await this.downloadAsset(assetId,token),ports=this.ports.assets;
     if(!ports.open)throw new CommerceError('stream_unavailable',503);

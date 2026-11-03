@@ -40,6 +40,7 @@ export interface CommerceRuntimeConfiguration {
   reconciliationBatchSize?:number;
   recentPaymentDays?:number;
   assertOfferEligible?:CommercePorts['assertOfferEligible'];
+  galleryImage?:(asset:PrivateAsset,size:'display'|'thumbnail')=>Promise<{bytes:Uint8Array;contentType:string}>;
   prepareCollectionContents?:CommercePorts['prepareCollectionContents'];
   mail: CommercePorts['mail'];
   discord?: DiscordCommerceConfiguration;
@@ -207,6 +208,8 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       }
       const privateAsset = path.match(/^\/api\/private-assets\/([^/]+)$/), preview = path.match(/^\/api\/previews\/([^/]+)$/);
       if (method === 'GET' && (privateAsset || preview)) {
+        const rendition=url.searchParams.get('rendition');
+        if(privateAsset&&rendition){if(!['display','thumbnail'].includes(rendition)||!config.galleryImage)throw new CommerceError('invalid_image_rendition',400);const token=required(url.searchParams.get('token')),asset=await service.galleryAsset(privateAsset[1],token);if(!await deps.contentAvailable(asset.ownerId,asset.id))throw new CommerceError('content_unavailable',409);const image=await config.galleryImage(asset,rendition as 'display'|'thumbnail');await service.galleryAsset(privateAsset[1],token);if(!await deps.contentAvailable(asset.ownerId,asset.id))throw new CommerceError('content_unavailable',409);response.setHeader('content-type',image.contentType);response.setHeader('content-length',image.bytes.length);response.setHeader('content-security-policy',"default-src 'none'; sandbox");response.setHeader('content-disposition','inline');response.end(Buffer.from(image.bytes));return true;}
         const streaming=!!privateAsset&&!!service.ports.assets.open;
         const result = privateAsset ? streaming?await service.openDownload(privateAsset[1],required(url.searchParams.get('token'))):await service.download(privateAsset[1], required(url.searchParams.get('token'))) : await service.preview(preview![1]);
         response.setHeader('content-type', result.asset.contentType); response.setHeader('content-length', result.asset.byteLength);
@@ -236,11 +239,11 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
         const purchase = url.searchParams.has('gift')?(await service.gifts(subjectId)).find(g=>g.id===url.searchParams.get('gift')):(await service.purchases(subjectId)).find(p => p.id === url.searchParams.get('purchase'));
         if (!purchase?.offer) throw new CommerceError('purchase_not_found', 404);
         if(!purchase.entitlements.some(g=>g.benefit.type==='gallery'&&g.state==='active'&&(!g.endsAt||g.endsAt>new Date().toISOString())))throw new CommerceError('gallery_access_required',403);
-        const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string;downloadAssetId?:string }[] = [];
+        const access = await service.myAccess(subjectId), photos: { src: string; thumbnail: string; title: string; alt: string;originalAssetId?:string;downloadAssetId?:string }[] = [];
         const active=purchase.entitlements.filter(g=>g.state==='active'&&g.startsAt<=new Date().toISOString()&&(!g.endsAt||g.endsAt>new Date().toISOString()));
         for (const id of (purchase.contentOffer??purchase.offer).files) {
           const asset = access.assets.find(a => a.id === id); if (!asset?.contentType.startsWith('image/') || asset.state !== 'available') continue;
-          const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url, thumbnail: authorized.url, title: asset.label, alt: asset.label,...(active.some(g=>g.benefit.type==='download'&&g.assetIds.includes(id))?{downloadAssetId:id}:{}) });
+          const authorized = await service.authorizeDownload(subjectId, id); photos.push({ src: authorized.url+(config.galleryImage?'&rendition=display':''), thumbnail: authorized.url+(config.galleryImage?'&rendition=thumbnail':''),...(config.galleryImage?{originalAssetId:id}:{}), title: asset.label, alt: asset.label,...(active.some(g=>g.benefit.type==='download'&&g.assetIds.includes(id))?{downloadAssetId:id}:{}) });
         }
         const downloads=[...new Set(active.filter(g=>g.benefit.type==='package').flatMap(g=>g.assetIds))].filter(id=>access.assets.some(a=>a.id===id&&a.state==='available')).map(assetId=>({assetId,label:'Download ZIP'}));
         const collection=await deps.publicOfferCollection?.(purchase.offer);

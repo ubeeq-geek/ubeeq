@@ -100,6 +100,6 @@ test('gallery teasers prefer an explicit cover without adding it to viewer photo
 test('owned galleries support current-image and ZIP downloads without purchase links',()=>{
  const html=renderWebsiteGalleryGroup([{id:'owned',title:'Purchased collection',href:'/commerce/purchases',photos:[{src:'/image',thumbnail:'/thumb',alt:'Image',downloadAssetId:'image-id'}],downloads:[{label:'Download ZIP',assetId:'zip-id'}]}]);
  assert.match(html,/data-download-asset="image-id"/);assert.match(html,/data-gallery-download="zip-id"/);assert.match(html,/Download ZIP/);assert.doesNotMatch(html,/Want more\?/);
- assert.match(websiteGalleryViewerScript,/Download image/);assert.match(websiteGalleryViewerScript,/website-gallery-download/);
+ assert.match(websiteGalleryViewerScript,/Download original/);assert.match(websiteGalleryViewerScript,/website-gallery-download/);
  const safe=renderWebsiteGalleryGroup([{id:'x',title:'Collection',href:'/commerce/purchases',photos:[],downloads:[{label:'<script>bad</script>',assetId:'" onclick="bad'}]}]);assert.doesNotMatch(safe,/<script>|data-gallery-download="" onclick=/);assert.match(safe,/&lt;script&gt;/);
 });

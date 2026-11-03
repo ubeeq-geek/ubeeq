@@ -6,6 +6,7 @@ function fixture(count=24,index=0){
  class Image extends EventTarget{
   complete=false;naturalWidth=0;currentSrc='';dataset={};_src='';
   set src(value){this._src=value;this.complete=false;requests.push(value);}get src(){return this._src;}
+  getAttribute(name){return name==='src'?this._src:null;}
   finish(success=true){this.complete=true;this.naturalWidth=success?100:0;this.currentSrc=this.src;this.dispatchEvent(new Event(success?'load':'error'));}
  }
  const primary=new Image();primary._src='focused-image';const strip=new EventTarget();strip.scrollLeft=Math.floor(index/6)*600;strip.clientWidth=600;
@@ -39,4 +40,9 @@ test('hidden gallery data does not put full images or thumbnails on the browser 
  const html=renderWebsiteGalleryGroup([{id:'test',title:'Gallery',href:'/gallery',photos:[{src:'/full-image',thumbnail:'/small-thumbnail',alt:'Image'}]}]);
  const metadata=html.slice(html.indexOf('<div hidden data-gallery-data>'),html.indexOf('<dialog'));
  assert.match(metadata,/data-gallery-full data-src="\/full-image"/);assert.match(metadata,/data-gallery-thumb data-src="\/small-thumbnail"/);assert.doesNotMatch(metadata,/\ssrc=/);
+});
+
+test('moving the focus preserves the thumbnail cache and reuses the strip loader',()=>{
+ const f=fixture(),loader=f.loader();f.primary.finish();f.images.slice(0,6).forEach(i=>i.finish());assert.equal(f.requests.length,6);
+ f.primary._src='second-focus';f.primary.complete=false;f.primary.currentSrc='focused-image';loader.focus(1);assert.equal(f.requests.length,6);f.primary.finish();assert.equal(f.requests.length,6);loader.dispose();
 });
