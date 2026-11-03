@@ -46,25 +46,41 @@ export function renderWebsiteGalleryGroup(entries:readonly WebsiteViewerGallery[
  const purchase=selected?`<div class="website-gallery-static-purchase">${renderWebsiteGalleryLinks(selected)}</div>`:'';
  const nonempty=entries.filter(g=>g.photos.length),first=nonempty[0];
  const endNote=selected&&first&&selected.id===nonempty.at(-1)?.id?`<section class="website-gallery-end-note" aria-label="End of galleries"><p>You’ve reached the end of these galleries.</p><a href="${e(first.href)}">Back to first gallery</a></section>`:'';
- const data=entries.map(g=>`<div data-gallery-entry="${e(g.id)}"><h3 data-gallery-title>${e(g.title)}</h3><div data-gallery-links>${renderWebsiteGalleryLinks(g)}${galleryDownloadButtons(g)}</div>${g.photos.map(p=>`<figure data-gallery-photo${p.downloadAssetId?` data-download-asset="${e(p.downloadAssetId)}"`:""}${p.title?` data-photo-title="${e(p.title)}"`:""}><img data-gallery-full src="${e(p.src)}" alt="${e(p.alt)}" loading="lazy"><img data-gallery-thumb src="${e(p.thumbnail)}" alt="" loading="lazy"></figure>`).join('')}</div>`).join('');
+ const data=entries.map(g=>`<div data-gallery-entry="${e(g.id)}"><h3 data-gallery-title>${e(g.title)}</h3><div data-gallery-links>${renderWebsiteGalleryLinks(g)}${galleryDownloadButtons(g)}</div>${g.photos.map(p=>`<figure data-gallery-photo${p.downloadAssetId?` data-download-asset="${e(p.downloadAssetId)}"`:""}${p.title?` data-photo-title="${e(p.title)}"`:""}><img data-gallery-full data-src="${e(p.src)}" alt="${e(p.alt)}" loading="lazy"><img data-gallery-thumb data-src="${e(p.thumbnail)}" alt="" loading="lazy"></figure>`).join('')}</div>`).join('');
  return `<section class="website-gallery-group" data-gallery-root><div class="website-gallery-tiles">${tiles||'<p>No images are available in this gallery yet.</p>'}</div>${endNote}${purchase}<div hidden data-gallery-data>${data}</div><dialog class="website-gallery-viewer" data-gallery-dialog tabindex="-1" aria-label="Gallery viewer"><div class="website-gallery-surface" data-gallery-surface><div class="website-gallery-viewer-header"><div class="website-gallery-heading"><button type="button" data-action="previous-gallery" aria-label="Previous gallery">‹</button><div><h2 data-viewer-title></h2><p><span data-gallery-position></span> · Photo <span data-image-counter></span></p></div><button type="button" data-action="next-gallery"></button></div><div class="website-gallery-controls"><button type="button" class="website-gallery-icon-button" data-action="play" aria-pressed="false" aria-label="Play slideshow" title="Play slideshow">${playIcon}</button><select data-gallery-interval aria-label="Slide duration"><option value="2">2s</option><option value="3">3s</option><option value="4" selected>4s</option><option value="6">6s</option><option value="10">10s</option></select><button type="button" class="website-gallery-icon-button" data-action="fullscreen" aria-pressed="false" aria-label="Full screen" title="Full screen">${fullscreenIcon}</button><div class="website-gallery-help-control"><button type="button" class="website-gallery-icon-button" data-action="help" aria-expanded="false" aria-label="Gallery help" title="Gallery help">${helpIcon}</button><section class="website-gallery-help-panel" data-gallery-help role="region" aria-label="Gallery help" hidden><h3>Using the gallery</h3><p>Click the right side of the photo, scroll, or swipe left for the next image. Click the left side or swipe right to go back.</p><dl><dt>← / →</dt><dd>Previous / next image</dd><dt>↑ / ↓</dt><dd>Previous / next gallery</dd><dt>Space</dt><dd>Play or pause the slideshow when the viewer is focused</dd><dt>F</dt><dd>Enter or exit full screen</dd><dt>Esc</dt><dd>Dismiss help, exit full screen, or close the viewer</dd></dl><p>Choose a duration beside Play to set the slideshow speed. Select a thumbnail to jump to an image.</p><button type="button" data-action="close-help">Close help</button></section></div><button type="button" class="website-gallery-icon-button" data-action="close" aria-label="Close gallery viewer" title="Close gallery viewer">${closeIcon}</button></div></div><div class="website-gallery-progress"><span data-slide-progress></span></div><nav class="website-gallery-purchase" data-purchase-section aria-label="Gallery links" hidden></nav><div class="website-gallery-stage" data-gallery-stage><img data-viewer-image alt=""><section class="website-gallery-end" data-gallery-end hidden aria-label="End of galleries"><h3>You’ve reached the end of these galleries.</h3><p>Start again from the first gallery whenever you’re ready.</p><button type="button" data-action="restart">Back to first gallery</button></section><button type="button" class="website-gallery-stage-prev" data-action="previous" aria-label="Previous image">‹</button><button type="button" class="website-gallery-stage-next" data-action="next" aria-label="Next image">›</button><button type="button" class="website-gallery-intro" data-action="start" hidden><img data-intro-cover alt=""><span><small>Up next</small><strong data-intro-title></strong><span data-intro-count></span><span class="website-gallery-intro-progress"><span data-intro-progress></span></span><small>Click or press → to start now</small></span></button></div><div class="website-gallery-caption-area"><p class="website-gallery-caption" data-image-caption></p></div><div class="website-gallery-thumbnails" data-gallery-thumbnails role="group" aria-label="Choose an image"></div><p class="website-gallery-announcement" role="status" aria-live="polite" data-viewer-status></p></div></dialog></section>`;
+}
+
+/** Loads thumbnail pages only after the focused image, with at most six requests per batch. */
+export function createGalleryThumbnailLoader(primary:HTMLImageElement,strip:HTMLElement,images:readonly HTMLImageElement[],focusIndex:number,isActive:()=>boolean,onReady?:()=>void){
+ let disposed=false,ready=false,busy=false;const started=new Set<number>(),queued:number[]=[],cleanup:Array<()=>void>=[];
+ const valid=()=>!disposed&&isActive();
+ const visible=()=>{if(!ready||!valid())return;const left=strip.scrollLeft,right=left+strip.clientWidth;for(let i=0;i<images.length;i++){const tile=images[i].parentElement;if(tile&&tile.offsetLeft+tile.offsetWidth>left&&tile.offsetLeft<right)enqueue(i);}pump();};
+ const enqueue=(index:number)=>{const page=Math.floor(index/6)*6;if(!queued.includes(page)&&images.slice(page,page+6).some((_,i)=>!started.has(page+i)))queued.push(page);};
+ const pump=()=>{if(!ready||busy||!valid())return;let page:number|undefined;while(queued.length){const candidate=queued.shift()!;if(images.slice(candidate,candidate+6).some((_,i)=>!started.has(candidate+i))){page=candidate;break;}}if(page===undefined)return;
+  const pending=images.slice(page,page+6).map((image,i)=>({image,index:page!+i})).filter(item=>!started.has(item.index));busy=true;let remaining=pending.length;
+  for(const {image,index}of pending){started.add(index);let settled=false;const done=()=>{if(settled)return;settled=true;image.removeEventListener('load',done);image.removeEventListener('error',done);if(--remaining===0){busy=false;if(valid())visible();}};image.addEventListener('load',done);image.addEventListener('error',done);cleanup.push(()=>{image.removeEventListener('load',done);image.removeEventListener('error',done);});image.loading='eager';image.fetchPriority='low';image.src=image.dataset.thumbnailSrc!;if(image.complete)done();}
+ };
+ const loaded=()=>{if(!valid()||!primary.complete||primary.naturalWidth===0||primary.currentSrc&&primary.currentSrc!==primary.src)return;if(!ready){ready=true;onReady?.();enqueue(focusIndex);}pump();visible();};
+ primary.addEventListener('load',loaded);strip.addEventListener('scroll',visible,{passive:true});loaded();
+ return {dispose(){disposed=true;primary.removeEventListener('load',loaded);strip.removeEventListener('scroll',visible);for(const remove of cleanup)remove();}};
 }
 
 /** Trusted static source stays identical in server exports and minified browser previews. */
 export const websiteGalleryViewerScript=
 "(function websiteGalleryViewerRuntime() {\n"
++ "    const createThumbnailLoader="+createGalleryThumbnailLoader.toString()+";\n"
 + "    for (const [rootIndex,root] of Array.from(document.querySelectorAll('[data-gallery-root]')).entries()) {\n"
 + "        const dialog = root.querySelector('[data-gallery-dialog]');\n"
 + "        if (!dialog || typeof dialog.showModal !== 'function')\n"
 + "            continue;\n"
-+ "        const entries = Array.from(root.querySelectorAll('[data-gallery-entry]')).map(node => ({ id: node.dataset.galleryEntry, title: node.querySelector('[data-gallery-title]')?.textContent ?? 'Gallery', linkGroups: node.querySelector('[data-gallery-links]'), photos: Array.from(node.querySelectorAll('[data-gallery-photo]')).map(figure => { const full = figure.querySelector('[data-gallery-full]'), thumb = figure.querySelector('[data-gallery-thumb]'); return { src: full.getAttribute('src'), thumbnail: thumb.getAttribute('src'), alt: full.alt, title: figure.dataset.photoTitle, downloadAssetId: figure.dataset.downloadAsset }; }) })).filter(g => g.photos.length);\n"
++ "        const entries = Array.from(root.querySelectorAll('[data-gallery-entry]')).map(node => ({ id: node.dataset.galleryEntry, title: node.querySelector('[data-gallery-title]')?.textContent ?? 'Gallery', linkGroups: node.querySelector('[data-gallery-links]'), photos: Array.from(node.querySelectorAll('[data-gallery-photo]')).map(figure => { const full = figure.querySelector('[data-gallery-full]'), thumb = figure.querySelector('[data-gallery-thumb]'); return { src: full.getAttribute('data-src')??full.getAttribute('src'), thumbnail: thumb.getAttribute('data-src')??thumb.getAttribute('src'), alt: full.alt, title: figure.dataset.photoTitle, downloadAssetId: figure.dataset.downloadAsset }; }) })).filter(g => g.photos.length);\n"
 + "        if (!entries.length)\n"
 + "            continue;\n"
 + "        for (const opener of root.querySelectorAll('[data-gallery-open]'))\n"
 + "            if (entries.some(g => g.id === opener.dataset.galleryOpen))\n"
 + "                opener.setAttribute('aria-haspopup', 'dialog');\n"
 + "        const get = (selector) => dialog.querySelector(selector);\n"
-+ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, ended = false, opener, overflow = '', lastWheel = 0, pointer;\n"
++ "        let linksGallery = -1, gallery = 0, index = 0, playing = false, timer, intro = false, ended = false, opener, overflow = '', lastWheel = 0, pointer, thumbnailLoader, renderVersion=0;\n"
 + "        const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;\n"
 + "        const stop = () => { clearTimeout(timer); timer = undefined; };\n"
 + "        const schedule = () => {\n"
@@ -77,11 +93,11 @@ export const websiteGalleryViewerScript=
 + "            else\n"
 + "                move(1, true); }, intro ? 2500 : Number(get('[data-gallery-interval]').value) * 1000); };\n"
 + "        const render = () => {\n"
-+ "            const current = entries[gallery], photo = current.photos[index];\n"
++ "            thumbnailLoader?.dispose();const version=++renderVersion;const current = entries[gallery], photo = current.photos[index];\n"
 + "            get('[data-viewer-title]').textContent = current.title;\n"
 + "            get('[data-gallery-position]').textContent = `Gallery ${gallery + 1} of ${entries.length}`;\n"
 + "            const image = get('[data-viewer-image]');\n"
-+ "            image.src = photo.src;\n"
++ "            image.fetchPriority='high';image.loading='eager';if(image.getAttribute('src')!==photo.src)image.src = photo.src;\n"
 + "            image.alt = photo.alt;image.hidden=ended;\n"
 + "            get('[data-gallery-end]').hidden=!ended;\n"
 + "            get('[data-image-caption]').hidden=ended;\n"
@@ -97,9 +113,9 @@ export const websiteGalleryViewerScript=
 + "            get('[data-intro-title]').textContent = current.title;\n"
 + "            const strip = get('[data-gallery-thumbnails]'), restoreThumbFocus = strip.contains(document.activeElement);\n"
 + "            strip.replaceChildren();\n"
-+ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.src = p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; ended=false; render(); }); strip.append(button); });\n"
-+ "            if(gallery<entries.length-1){const upcoming=entries[gallery+1],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.src=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
-+ "            get('[data-intro-cover]').src=current.photos[0].thumbnail;get('[data-intro-count]').textContent=`${current.photos.length} photos`;\n"
++ "            current.photos.forEach((p, i) => { const button = document.createElement('button'), thumb = document.createElement('img'); button.type = 'button'; button.setAttribute('aria-label', `Image ${i + 1}: ${p.alt}`); button.setAttribute('aria-pressed', String(i === index)); thumb.dataset.thumbnailSrc=p.thumbnail; thumb.alt = ''; thumb.loading = 'lazy'; button.append(thumb); button.addEventListener('click', () => { index = i; intro = false; ended=false; render(); }); strip.append(button); });\n"
++ "            if(gallery<entries.length-1){const upcoming=entries[gallery+1],tile=document.createElement('button'),cover=document.createElement('img'),label=document.createElement('span');tile.type='button';tile.className='website-gallery-next-tile';tile.dataset.action='next-gallery';tile.setAttribute('aria-label',`Next gallery: ${upcoming.title}`);cover.dataset.thumbnailSrc=upcoming.photos[0].thumbnail;cover.alt='';label.textContent=`Next gallery · ${upcoming.title} →`;tile.append(cover,label);strip.append(tile);}\n"
++ "            get('[data-intro-cover]').removeAttribute('src');get('[data-intro-count]').textContent=`${current.photos.length} photos`;\n"
 + "            const active = strip.children[index];\n"
 + "            if (restoreThumbFocus)\n"
 + "                active.focus({ preventScroll: true });\n"
@@ -112,6 +128,7 @@ export const websiteGalleryViewerScript=
 + "            previous.hidden = next.hidden = entries.length < 2;\n"
 + "            previous.textContent = '‹'; previous.setAttribute('aria-label', `Previous gallery: ${entries[(gallery - 1 + entries.length) % entries.length].title}`);\n"
 + "            next.textContent = gallery===entries.length-1?'End of galleries':`Next: ${entries[gallery+1].title} ›`;next.disabled=ended;\n"
++ "            thumbnailLoader=createThumbnailLoader(image,strip,Array.from(strip.querySelectorAll('img[data-thumbnail-src]')),index,()=>dialog.open&&version===renderVersion,()=>{if(intro)get('[data-intro-cover]').src=current.photos[0].thumbnail;});\n"
 + "            schedule();\n"
 + "        };\n"
 + "        const finish=()=>{playing=false;intro=false;ended=true;render();get('[data-action=\"restart\"]').focus({preventScroll:true});};\n"
