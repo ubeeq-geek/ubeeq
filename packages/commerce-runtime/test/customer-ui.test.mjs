@@ -165,3 +165,21 @@ test('the same signed-in account refreshes ownership after access changes in ano
  owns=true;f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:'buyer'}});await new Promise(setImmediate);
  assert.ok(f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary').children.some(n=>n.textContent==='View collection'));
 });
+
+test('Volume storefront displays the server discount and submits the displayed amount for revalidation',async()=>{
+ const offer={...ownedOffer,collectionRoots:['volume'],collection:{type:'volume'},amountMinor:2000,benefits:[{type:'gallery',resourceId:'volume'},{type:'gallery',resourceId:'collection'}]},quote={offerVersionId:offer.id,currency:'USD',amountMinor:1600,ownershipDiscount:{percent:20,collectionIds:['collection'],baseAmountMinor:2000,discountMinor:400}};
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken:'buyer',schedule:()=>1,fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[ownedRecord()]}:path==='/api/checkouts/quote'?quote:path.startsWith('/api/storefront')?{offers:[offer]}:path==='/api/checkouts'?{order:{id:'order'}}:{order:{state:'pending'}}})});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.equal(summary.children.find(n=>n.tagName==='DEL').textContent,'$20.00');assert.equal(summary.children.find(n=>n.className==='commerce-price').textContent,'$16.00');assert.match(summary.children.find(n=>n.className==='commerce-discount').textContent,/20%.*1 included collection/);
+ const purchase=summary.children.find(n=>n.textContent==='Purchase with PayPal');await purchase.onclick({currentTarget:purchase,preventDefault(){}});const command=f.calls.find(([path])=>path==='/api/checkouts');assert.deepEqual(JSON.parse(command[1].body),{offerVersionId:offer.id,expectedAmountMinor:1600});
+ const before=f.calls.filter(([path])=>path.startsWith('/api/storefront')).length;f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:'buyer'}});await new Promise(setImmediate);assert.equal(f.calls.filter(([path])=>path.startsWith('/api/storefront')).length,before);
+});
+test('failed Volume quote disables payment and gives a price retry',async()=>{
+ const offer={...ownedOffer,collectionRoots:['volume'],collection:{type:'volume'}};
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken:'buyer',fetch:async path=>{if(path==='/api/checkouts/quote')throw Error('offline');return {ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[]}:{offers:[offer]}};}});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.equal(summary.children.find(n=>n.textContent==='Purchase with PayPal').disabled,true);assert.ok(summary.children.find(n=>n.className==='commerce-payment-preparation').children.some(n=>n.textContent==='Retry price check'));assert.equal(f.calls.some(([path])=>path==='/api/checkouts'),false);
+});
+test('a changed price requires an explicit refresh before another checkout attempt',async()=>{
+ const offer={...ownedOffer,collectionRoots:['volume'],collection:{type:'volume'}};
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken:'buyer',fetch:async path=>({ok:path!=='/api/checkouts',json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:[]}:path==='/api/checkouts/quote'?{offerVersionId:offer.id,currency:'USD',amountMinor:400}:path==='/api/checkouts'?{error:{code:'checkout_price_changed'}}:{offers:[offer]}})});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary'),purchase=summary.children.find(n=>n.textContent==='Purchase with PayPal');await purchase.onclick({currentTarget:purchase,preventDefault(){}});assert.ok(summary.children.find(n=>n.className==='commerce-payment-preparation').children.some(n=>n.textContent==='Refresh price'));assert.equal(f.calls.filter(([path])=>path==='/api/checkouts').length,1);
+});

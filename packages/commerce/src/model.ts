@@ -12,6 +12,7 @@ export interface Offer extends RecordBase {
   published: boolean; external?: { url: string; mappingId: string; validatedAt?: string; evidenceId?: string };
 }
 export interface Checkout extends RecordBase {
+  ownershipDiscount?: {percent:20|25;collectionIds:string[];baseAmountMinor:number;discountMinor:number};
   billing?: 'month' | 'year'; subscriptionState?: string;
   customerId: string; offerVersionId: string; connectionId: string; merchantId: string;
   currency: string; amountMinor: number; reference: string; idempotencyKey: string;

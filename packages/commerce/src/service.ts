@@ -46,6 +46,8 @@ export interface CommerceDiscord {
 export interface PreparedCollectionContents {revision:string;collectionRoots:string[];galleryIds:string[];title:string;description:string;assets:Array<Omit<PrivateAsset,keyof RecordBase>>;}
 export interface CommercePorts {
   prepareCollectionContents?(offer:Offer):Promise<PreparedCollectionContents|undefined>;
+  /** Trusted host identifies distinct included collections of an eligible one-time Volume. */
+  volumeDiscountCollections?(offer:Offer):Promise<readonly string[]>;
 
   store: CommerceStore; provider: CommerceProvider; assets: CommerceAssets;
   publicBaseUrl: string; tokenKey: string; now?: () => Date;
@@ -360,7 +362,24 @@ export class CommerceService {
       if(published&&tx.list('offer').some(o=>o.offerId===offer.offerId&&same(o,offer)&&o.version>offer.version))throw new CommerceError('offer_version_superseded',409);
       offer.published = published; tx.put('offer', offer);if(!published)for(const version of tx.list('offer').filter(v=>same(v,offer)&&v.offerId===offer.offerId&&(v.financialOfferVersionId??v.id)===(offer.financialOfferVersionId??offer.id))){version.published=false;tx.put('offer',version);} this.audit(tx, offer, actor.subjectId, 'offer.visibility', offerId); });
   }
-  async checkout(subjectId: string, offerVersionId: string, idempotencyKey: string) {
+  private ownershipPrice(tx:CommerceTransaction,customer:Customer,offer:Offer,included:readonly string[]){
+    const ids=new Set(included),owned=new Set<string>();
+    const records=[...tx.list('purchase').filter(p=>p.customerId===customer.id&&p.state==='active'),...tx.list('gift').filter(g=>g.customerId===customer.id&&g.state==='claimed'&&!g.months)];
+    if(!offer.billing&&!offer.external&&ids.size)for(const record of records){
+      const source=tx.get('offer',record.offerVersionId);if(!same(record,offer)||!source||source.billing||source.durationSeconds)continue;
+      for(const grant of tx.list('entitlement'))if(grant.customerId===customer.id&&same(grant,offer)&&('paymentId' in record?grant.purchaseId===record.id:grant.giftId===record.id)&&isActive(grant,this.now())&&!grant.endsAt&&grant.benefit.type==='gallery'&&ids.has(grant.benefit.resourceId))owned.add(grant.benefit.resourceId);
+    }
+    const percent=owned.size>=2?25:owned.size===1?20:undefined;
+    const amountMinor=percent?Math.max(1,Number((BigInt(offer.amountMinor)*BigInt(100-percent)+50n)/100n)):offer.amountMinor;
+    return {offerVersionId:offer.id,currency:offer.currency,amountMinor,...(percent?{ownershipDiscount:{percent:percent as 20|25,collectionIds:[...owned].sort(),baseAmountMinor:offer.amountMinor,discountMinor:offer.amountMinor-amountMinor}}:{})};
+  }
+  private async discountCollections(offer:Offer){return !offer.billing&&!offer.external?await this.ports.volumeDiscountCollections?.(offer)??[]:[];}
+  async quote(subjectId:string,offerVersionId:string){
+    const offer=await this.store.transaction(tx=>tx.get('offer',offerVersionId));if(!offer?.published)throw new CommerceError('offer_not_found',404);
+    await this.ports.assertEligible(offer);await this.ports.assertOfferEligible?.(offer,offer);const included=await this.discountCollections(offer);
+    return this.store.transaction(tx=>{const current=tx.get('offer',offer.id);if(!current?.published)throw new CommerceError('offer_unavailable',409);const customer=this.customer(tx,subjectId);this.claimGifts(tx,customer);return this.ownershipPrice(tx,customer,current,included);});
+  }
+  async checkout(subjectId: string, offerVersionId: string, idempotencyKey: string, expectedAmountMinor?:number) {
     if (!/^[A-Za-z0-9_-]{8,200}$/.test(idempotencyKey)) throw new CommerceError('invalid_idempotency_key');
     const prior=await this.store.transaction(tx=>{const customer=this.customer(tx,subjectId),order=tx.get('checkout',key('checkout',customer.id,idempotencyKey));if(order&&order.offerVersionId!==offerVersionId)throw new CommerceError('idempotency_conflict',409);return order;});
     if(prior)return prior;
@@ -371,14 +390,18 @@ export class CommerceService {
     await this.ports.assertEligible(offer); const connection = await this.ports.connection(offer.ownerId, offer.environment,offer.connectionId);
     if (connection.id !== offer.connectionId) throw new CommerceError('offer_connection_requires_republish', 409);
     await this.rateLimit(subjectId, 'checkout', 30, 3600);
+    if(expectedAmountMinor!==undefined&&(!Number.isSafeInteger(expectedAmountMinor)||expectedAmountMinor<=0))throw new CommerceError('invalid_expected_price');
+    const included=await this.discountCollections(offer);
     return this.store.transaction(tx => {
       const customer = this.customer(tx, subjectId);
       if (!customer.verifiedEmails.length) throw new CommerceError('verified_recovery_email_required', 403);
       const id = key('checkout', customer.id, idempotencyKey), prior = tx.get('checkout', id);
       if (prior) { if (prior.offerVersionId !== offerVersionId) throw new CommerceError('idempotency_conflict', 409); return prior; }
       const current = tx.get('offer', offer.id); if (!current?.published) throw new CommerceError('offer_unavailable', 409);
+      this.claimGifts(tx,customer);const quoted=this.ownershipPrice(tx,customer,current,included);
+      if(expectedAmountMinor!==undefined&&quoted.amountMinor!==expectedAmountMinor)throw new CommerceError('checkout_price_changed',409);
       const order: Checkout = { ...this.base(offer, id), customerId: customer.id, offerVersionId: offer.id, ...(offer.billing?{billing:offer.billing}:{}), connectionId: connection.id,
-        merchantId: connection.merchantId ?? offer.merchantId, currency: offer.currency, amountMinor: offer.amountMinor, reference: randomUUID(), idempotencyKey,
+        merchantId: connection.merchantId ?? offer.merchantId, currency: offer.currency, amountMinor: quoted.amountMinor,...(quoted.ownershipDiscount?{ownershipDiscount:quoted.ownershipDiscount}:{}), reference: randomUUID(), idempotencyKey,
         captureRequestId: randomUUID(), state: 'creating' };
       tx.insert('checkout', order, [key('checkout-idempotency', customer.id, idempotencyKey), key('order-reference', order.reference)]);
       this.queue(tx, order, 'create_order', order.id, order.id); return order;

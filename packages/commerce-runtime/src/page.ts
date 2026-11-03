@@ -27,7 +27,7 @@ ${websiteGalleryCss}
 export const commerceJavaScript = String.raw`'use strict';
 (() => {
 const $ = id => document.getElementById(id);let params = new URLSearchParams(location.search);
-let token = sessionStorage.getItem('ubeeq.commerce.session') || localStorage.getItem('ubeeq.reference.token') || '', historyData, orderId, pendingTimer, setupSession, setupOwner, storefrontRequest=0;
+let token = sessionStorage.getItem('ubeeq.commerce.session') || localStorage.getItem('ubeeq.reference.token') || '', historyData, orderId, pendingTimer, setupSession, setupOwner, storefrontRequest=0, storefrontCheckout=false;
 const notice = (text, error=false) => { $('notice').textContent=text; $('notice').className=error?'status error':'status';$('notice').setAttribute('role',error?'alert':'status');$('notice').setAttribute('aria-live',error?'assertive':'polite'); };
 const friendly = value => String(value || '').replaceAll('_',' ');
 const api = async (path, method='GET', body, idempotency) => { const managedOwner=params.get('owner')||setupOwner;if(managedOwner&&(location.pathname.startsWith('/commerce/creator')||location.pathname.endsWith('/discord-callback'))&&/^\/api\/(connections|offers|commerce|discord)/.test(path))path+=(path.includes('?')?'&':'?')+'owner='+encodeURIComponent(managedOwner);const result=await fetch(path,{method,headers:{...(token?{authorization:'Bearer '+token}:{}),...(body===undefined?{}:{'content-type':'application/json'}),...(idempotency?{'idempotency-key':idempotency}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})}); const data=await result.json();if(!result.ok)throw Error(friendly(data.error?.code || data.error || 'request_failed'));return data; };
@@ -41,7 +41,7 @@ const price = offer => new Intl.NumberFormat(undefined,{style:'currency',currenc
 function amount(value,currency){const exponent=['JPY','HUF','TWD'].includes(currency)?0:2;if(!/^\d+(\.\d+)?$/.test(value))throw Error('Enter an exact price');const [whole,part='']=value.split('.');if(part.length>exponent)throw Error('Too many decimal places');const result=BigInt(whole)*10n**BigInt(exponent)+BigInt(part.padEnd(exponent,'0')||'0');if(result>BigInt(Number.MAX_SAFE_INTEGER))throw Error('Price is too large');return Number(result);}
 const initialSigninHidden=$('signin').hidden;
 async function profile(){const credential=token;if(!credential){$('signin').hidden=initialSigninHidden;$('emailSignin').hidden=false;$('verifiedEmails').textContent='';return;}try{const customer=await api('/api/me');if(token!==credential)return;$('signin').hidden=true;$('emailSignin').hidden=true;$('verifiedEmails').textContent=customer.verifiedEmails.length?'Verified recovery email: '+customer.verifiedEmails.join(', '):'Verify a recovery email before checkout.';}catch(error){if(token!==credential)return;$('signin').hidden=initialSigninHidden;$('emailSignin').hidden=false;throw error;}}
-window.addEventListener('ubeeq:commerce-session-changed',event=>{const previous=token;token=typeof event.detail?.token==='string'?event.detail.token:'';if(token!==previous)$('offers').replaceChildren();void profile().then(()=>{if(location.pathname==='/commerce'||location.pathname.startsWith('/buy/'))return currentPage();}).catch(error=>notice(error.message,true));});
+window.addEventListener('ubeeq:commerce-session-changed',event=>{const previous=token;token=typeof event.detail?.token==='string'?event.detail.token:'';if(token!==previous){storefrontCheckout=false;$('offers').replaceChildren();}void profile().then(()=>{if(!storefrontCheckout&&(location.pathname==='/commerce'||location.pathname.startsWith('/buy/')))return currentPage();}).catch(error=>notice(error.message,true));});
 function signInReturnPath(){const path=location.pathname,query=new URLSearchParams();if(path==='/commerce'||path.startsWith('/buy/')){for(const key of path==='/commerce'?['owner','environment']:['environment'])if(params.has(key))query.set(key,params.get(key));return path+(query.size?'?'+query:'');}if(path==='/commerce/purchases'){const key=params.has('gift')?'gift':'purchase',id=params.get(key);return path+(id?'?'+key+'='+encodeURIComponent(id):'');}if(path.startsWith('/commerce/checkout/'))return path;return '/commerce/purchases';}
 $('emailSignin').onsubmit=guard(async()=>{await api('/api/auth/email','POST',{...form('emailSignin'),returnPath:signInReturnPath()});notice('If eligible, a sign-in link will arrive shortly. It expires in 15 minutes.');});
 $('signin').onsubmit=guard(async()=>{const result=await api('/v1/auth/sign-in','POST',form('signin'));token=result.token;sessionStorage.setItem('ubeeq.commerce.session',token);await profile();notice('Signed in.');await currentPage();});
@@ -62,19 +62,29 @@ async function prepareInlinePayment(id,node){
 async function storefront(owner,environment,slug){
  window.dispatchEvent(new CustomEvent('ubeeq:commerce-media-scope',{detail:{ownerId:owner}}));
  const request=++storefrontRequest,credential=token;
- const [result,ownership]=await Promise.all([api('/api/storefront?owner='+encodeURIComponent(owner)+'&environment='+environment),credential?api('/api/me/purchases').catch(()=>null):Promise.resolve({purchases:[],gifts:[]})]);
+ const ownership=credential?await api('/api/me/purchases').catch(()=>null):{purchases:[],gifts:[]};
+ if(request!==storefrontRequest||credential!==token)return;
+ const result=await api('/api/storefront?owner='+encodeURIComponent(owner)+'&environment='+environment);
  if(request!==storefrontRequest||credential!==token)return;
  const records=ownership?[...(ownership.purchases||[]).map(record=>({record,gift:false})),...(ownership.gifts||[]).map(record=>({record,gift:true}))]:[];
  $('offers').replaceChildren();$('creatorIdentity').replaceChildren();
  if(result.creator){$('creatorIdentity').append(el('h3',result.creator.displayName));if(result.creator.bio)$('creatorIdentity').append(el('p',result.creator.bio));}
  for(const offer of result.offers.filter(o=>!slug||o.slug===slug)){
+  const roots=offer.collectionRoots?.length?offer.collectionRoots:offer.benefits.filter(b=>b.type==='gallery').map(b=>b.resourceId);
+  const owned=roots.length?records.find(({record,gift})=>record.ownerId===owner&&record.environment===environment&&(gift?record.state==='claimed':record.state==='active')&&roots.every(id=>activeGrants(record).some(g=>g.benefit?.type==='gallery'&&g.benefit.resourceId===id))):undefined;
+  const volume=!offer.billing&&!offer.external&&offer.collection?.type==='volume';let quoted,priceFailed=false;
+  if(volume&&credential&&ownership&&!owned){try{quoted=await api('/api/checkouts/quote','POST',{offerVersionId:offer.id});}catch{priceFailed=true;}}
+  if(request!==storefrontRequest||credential!==token)return;
+
   const article=el('article',undefined,'commerce-offer');
   const media=el('div',undefined,'commerce-offer-media'),summary=el('div',undefined,'commerce-offer-summary');
   collectionCover(media,offer.collection);
   for(const id of offer.previews){const image=el('img');image.className='preview';image.src='/api/previews/'+id;image.alt=offer.title+' preview';media.append(image);}
   summary.append(el('p',offer.billing?'Subscription':'One-time purchase','muted'),el('h3',offer.title));
   const description=offer.collection?.description??offer.description;if(description)media.append(el('p',description,'commerce-collection-description'));
-  summary.append(el('p',price(offer),'commerce-price'),el('p',offer.billing?'Access for each verified paid '+offer.billing:offer.durationSeconds?'Access for '+Math.floor(offer.durationSeconds/86400)+' days':'Ongoing collection access','muted'));
+  if(quoted?.ownershipDiscount){summary.append(el('del',price(offer),'commerce-original-price'));summary.append(el('p',quoted.ownershipDiscount.percent+'% ownership discount · '+quoted.ownershipDiscount.collectionIds.length+' included collection'+(quoted.ownershipDiscount.collectionIds.length===1?'':'s')+' already owned','commerce-discount'));}
+  summary.append(el('p',price(quoted?{...offer,...quoted}:offer),'commerce-price'),el('p',offer.billing?'Access for each verified paid '+offer.billing:offer.durationSeconds?'Access for '+Math.floor(offer.durationSeconds/86400)+' days':'Ongoing collection access','muted'));
+  if(volume&&!owned)summary.append(el('p','Own 1 included collection for 20% off, or 2 or more for 25% off. Ongoing purchases and gifts qualify.','muted'));
   const benefits=el('ul',undefined,'commerce-benefits');
   if(offer.benefits.some(b=>b.type==='gallery'))benefits.append(el('li','Collection viewing included'));
   if(offer.benefits.some(b=>b.type==='download'))benefits.append(el('li','Individual downloads included'));
@@ -85,16 +95,15 @@ async function storefront(owner,environment,slug){
   const paymentPreparation=el('div',undefined,'commerce-payment-preparation');paymentPreparation.setAttribute('role','status');paymentPreparation.setAttribute('aria-live','polite');let checkoutRequestId;
   const purchaseButton=button(offer.billing?'Subscribe with PayPal':'Purchase with PayPal',async()=>{
    if(!token){notice('Sign in with your email to continue to checkout.');$('identity').scrollIntoView({behavior:'smooth'});$('emailSignin').elements.email.focus();return;}
-   paymentPreparation.textContent='Your PayPal link will appear below as soon as it’s ready.';checkoutRequestId??=crypto.randomUUID();
-   try{const result=await api('/api/checkouts','POST',{offerVersionId:offer.id},checkoutRequestId);purchaseButton.hidden=true;await prepareInlinePayment(result.order.id,paymentPreparation);}catch{paymentPreparation.replaceChildren(el('p','Your PayPal link could not be prepared. Please try again.','error'));}
+   paymentPreparation.textContent='Your PayPal link will appear below as soon as it’s ready.';checkoutRequestId??=crypto.randomUUID();storefrontCheckout=true;
+   try{const result=await api('/api/checkouts','POST',{offerVersionId:offer.id,...(quoted?{expectedAmountMinor:quoted.amountMinor}:{})},checkoutRequestId);purchaseButton.hidden=true;await prepareInlinePayment(result.order.id,paymentPreparation);}catch(error){storefrontCheckout=false;if(error.message==='checkout price changed'){checkoutRequestId=undefined;paymentPreparation.replaceChildren(el('p','Your price changed. Refresh the price before continuing.','error'),button('Refresh price',()=>storefront(owner,environment,slug)));}else paymentPreparation.replaceChildren(el('p','Your PayPal link could not be prepared. Please try again.','error'));}
   });
-  const roots=offer.collectionRoots?.length?offer.collectionRoots:offer.benefits.filter(b=>b.type==='gallery').map(b=>b.resourceId);
-  const owned=roots.length?records.find(({record,gift})=>record.ownerId===owner&&record.environment===environment&&(gift?record.state==='claimed':record.state==='active')&&roots.every(id=>activeGrants(record).some(g=>g.benefit?.type==='gallery'&&g.benefit.resourceId===id))):undefined;
   if(owned){const link=el('a','View collection','commerce-primary'),message=owned.gift?'Gift access active':owned.record.offer?.billing?'Access included with your subscription':'You own this collection.';link.href='/commerce/purchases?'+(owned.gift?'gift':'purchase')+'='+encodeURIComponent(owned.record.id);summary.insertBefore(el('p',message,'commerce-owned-status'),benefits);summary.insertBefore(link,benefits);}
-  else{purchaseButton.className='commerce-primary';purchaseButton.disabled=offer.availableForCheckout===false||!ownership;summary.insertBefore(purchaseButton,benefits);summary.insertBefore(paymentPreparation,benefits);if(!ownership){paymentPreparation.append(el('p','Your existing access could not be checked. Please retry before purchasing.','error'),button('Retry access check',()=>storefront(owner,environment,slug)));}}
+  else{purchaseButton.className='commerce-primary';purchaseButton.disabled=offer.availableForCheckout===false||!ownership||priceFailed;summary.insertBefore(purchaseButton,benefits);summary.insertBefore(paymentPreparation,benefits);if(!ownership){paymentPreparation.append(el('p','Your existing access could not be checked. Please retry before purchasing.','error'),button('Retry access check',()=>storefront(owner,environment,slug)));}}
 
+  if(priceFailed)paymentPreparation.append(el('p','Your Volume price could not be checked. Please retry before purchasing.','error'),button('Retry price check',()=>storefront(owner,environment,slug)));
   if(offer.availableForCheckout===false)summary.append(el('p','Purchases are temporarily unavailable. Contact the creator for help.'));
-  if(offer.external&&!owned&&ownership){const link=el('a',offer.external.automatic?'PayPal link purchase':'External purchase — manual fulfillment');link.href=offer.external.url;link.rel='noopener noreferrer';summary.append(link);}
+  if(offer.external&&!owned&&ownership&&!priceFailed){const link=el('a',offer.external.automatic?'PayPal link purchase':'External purchase — manual fulfillment');link.href=offer.external.url;link.rel='noopener noreferrer';summary.append(link);}
   const support=el('a','Contact creator support');support.href='mailto:'+offer.supportEmail;const supportRow=el('p',undefined,'commerce-support');supportRow.append(support);summary.append(supportRow);if(media.children.length)article.append(media);else article.className+=' commerce-offer-no-media';article.append(summary);$('offers').append(article);
  }
 }
@@ -106,7 +115,7 @@ async function checkout(){
  node.className='panel commerce-offer';node.replaceChildren();
  window.dispatchEvent(new CustomEvent('ubeeq:commerce-media-scope',{detail:{ownerId:result.order.ownerId}}));
  if(result.collection){collectionCover(media,result.collection);if(result.collection.description)media.append(el('p',result.collection.description,'commerce-collection-description'));}
- summary.append(el('p','Payment','muted'),el('h3',result.collection?.title||'Your payment'),el('p',price(result.order),'commerce-price'));
+ summary.append(el('p','Payment','muted'),el('h3',result.collection?.title||'Your payment'),el('p',price(result.order),'commerce-price'));if(result.order.ownershipDiscount)summary.append(el('p',result.order.ownershipDiscount.percent+'% Volume ownership discount applied','commerce-discount'));
  if(result.order.environment==='sandbox')summary.append(el('p','Sandbox test payment','muted'));
  if(media.children.length)node.append(media);else node.className+=' commerce-offer-no-media';node.append(summary);
  const status=state=>window.dispatchEvent(new CustomEvent('ubeeq:commerce-checkout-state',{detail:{state}}));
