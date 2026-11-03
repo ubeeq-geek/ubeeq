@@ -340,7 +340,7 @@ export const websiteGalleryCss=`
 .website-gallery-stage .website-gallery-stage-prev,.website-gallery-stage .website-gallery-stage-next{position:absolute;top:50%;transform:translateY(-50%);width:52px;height:52px;min-height:0;padding:0;border:1px solid #ffffff2e;border-radius:50%;background:#ffffff1a;color:#fff;font-size:28px}
 .website-gallery-stage-prev{left:24px}.website-gallery-stage-next{right:24px}
 .website-gallery-caption-area{padding:0 24px 2px}
-.website-gallery-viewer .website-gallery-caption{margin:0;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
+.website-gallery-viewer .website-gallery-caption{margin:0;text-align:center;font-size:12px;line-height:1.4;font-weight:600;max-width:none}
 .website-gallery-thumbnails{position:relative;display:flex;gap:6px;overflow-x:auto;padding:2px 24px 8px}
 .website-gallery-viewer .website-gallery-thumbnails button{box-sizing:border-box;flex:0 0 130px;width:130px;height:88px;min-height:0;margin:0;padding:0;border:1px solid transparent;border-radius:8px;overflow:hidden;opacity:.55;background:none}
 .website-gallery-viewer .website-gallery-thumbnails button[aria-pressed=true]{opacity:1;border-color:var(--color-action)}
