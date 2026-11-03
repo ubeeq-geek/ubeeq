@@ -118,3 +118,50 @@ test('View original authorizes the full file only after an explicit original-vie
  f.listeners.get('website-gallery-original')({detail:{assetId:'original'}});await new Promise(setImmediate);
  assert.equal(tab.opener,null);assert.equal(f.calls.find(([path])=>path==='/api/downloads/original/authorize')[1].method,'POST');assert.equal(navigations[0],'https://commerce.test/api/private-assets/original?token=fresh');assert.doesNotMatch(navigations[0],/rendition=/);
 });
+
+const ownedOffer={id:'offer-new',slug:'collection',offerId:'offer-family',ownerId:'creator',environment:'sandbox',collectionRoots:['collection'],title:'Collection',amountMinor:500,currency:'USD',previews:[],files:['file'],terms:'Terms',benefits:[{type:'gallery',resourceId:'collection'}]};
+function ownedRecord(overrides={}){return {id:'purchase-owned',ownerId:'creator',environment:'sandbox',state:'active',offer:{...ownedOffer,id:'offer-old'},entitlements:[{state:'active',startsAt:'2020-01-01T00:00:00Z',benefit:{type:'gallery',resourceId:'collection'}}],...overrides};}
+async function ownershipFixture({records={purchases:[ownedRecord()]},offer=ownedOffer,failAccess=false,initialToken='buyer'}={}){
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken,fetch:async path=>{if(failAccess&&path==='/api/me/purchases')throw Error('offline');return {ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?records:{offers:[offer]}};}});await new Promise(setImmediate);return f;
+}
+test('a signed-in owner sees current collection access across offer versions instead of another checkout',async()=>{
+ const f=await ownershipFixture(),summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');
+ assert.equal(summary.children.some(n=>n.textContent==='Purchase with PayPal'),false);
+ assert.ok(summary.children.some(n=>n.textContent==='You own this collection.'));
+ const link=summary.children.find(n=>n.textContent==='View collection');assert.equal(link.href,'/commerce/purchases?purchase=purchase-owned');
+ assert.equal(f.calls.some(([path])=>path==='/api/checkouts'),false);
+});
+for(const [kind,record,message,query] of [
+ ['subscription',ownedRecord({offer:{...ownedOffer,billing:'month'}}),'Access included with your subscription','purchase'],
+ ['gift',ownedRecord({id:'gift-owned',state:'claimed'}),'Gift access active','gift']
+])test(`active ${kind} access opens the existing collection`,async()=>{
+ const f=await ownershipFixture({records:kind==='gift'?{purchases:[],gifts:[record]}:{purchases:[record]}}),summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');
+ assert.ok(summary.children.some(n=>n.textContent===message));assert.equal(summary.children.find(n=>n.textContent==='View collection').href,'/commerce/purchases?'+query+'='+record.id);
+});
+test('refunded, expired, future, foreign creator/environment and incomplete Volume access do not count as ownership',async()=>{
+ for(const record of [ownedRecord({state:'revoked'}),ownedRecord({ownerId:'other'}),ownedRecord({environment:'live'}),ownedRecord({entitlements:[{state:'revoked',benefit:{type:'gallery',resourceId:'collection'}}]}),ownedRecord({entitlements:[{state:'active',endsAt:'2020-01-01T00:00:00Z',benefit:{type:'gallery',resourceId:'collection'}}]}),ownedRecord({entitlements:[{state:'active',startsAt:'2999-01-01T00:00:00Z',benefit:{type:'gallery',resourceId:'collection'}}]})]){
+  const f=await ownershipFixture({records:{purchases:[record]}}),summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.ok(summary.children.some(n=>n.textContent==='Purchase with PayPal'));assert.equal(summary.children.some(n=>n.textContent==='View collection'),false);
+ }
+ const f=await ownershipFixture({offer:{...ownedOffer,collectionRoots:['volume'],benefits:[{type:'gallery',resourceId:'volume'},{type:'gallery',resourceId:'collection'}]}}),summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.ok(summary.children.some(n=>n.textContent==='Purchase with PayPal'));
+});
+test('an unavailable ownership lookup blocks another payment and offers retry',async()=>{
+ const f=await ownershipFixture({failAccess:true}),summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.equal(summary.children.find(n=>n.textContent==='Purchase with PayPal').disabled,true);assert.equal(f.calls.some(([path])=>path==='/api/checkouts'),false);assert.ok(summary.children.find(n=>n.className==='commerce-payment-preparation').children.some(n=>n.textContent==='Retry access check'));
+});
+test('anonymous storefronts do not request private purchase history',async()=>{
+ const f=await ownershipFixture({initialToken:''});assert.equal(f.calls.some(([path])=>path==='/api/me/purchases'),false);
+});
+test('account changes refresh storefront ownership and discard the previous account result',async()=>{
+ const f=await ownershipFixture();f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:''}});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.ok(summary.children.some(n=>n.textContent==='Purchase with PayPal'));assert.equal(summary.children.some(n=>n.textContent==='View collection'),false);
+});
+test('a delayed ownership response cannot restore a previous account after sign-out',async()=>{
+ let finish;const pending=new Promise(resolve=>{finish=resolve;});
+ const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?pending:{offers:[ownedOffer]}})});await new Promise(setImmediate);
+ f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:''}});await new Promise(setImmediate);finish({purchases:[ownedRecord()]});await new Promise(setImmediate);
+ const summary=f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary');assert.ok(summary.children.some(n=>n.textContent==='Purchase with PayPal'));assert.equal(summary.children.some(n=>n.textContent==='View collection'),false);
+});
+test('the same signed-in account refreshes ownership after access changes in another tab',async()=>{
+ let owns=false;const f=fixture({pathname:'/buy/creator/collection',search:'?environment=sandbox',initialToken:'buyer',fetch:async path=>({ok:true,json:async()=>path==='/api/me'?{verifiedEmails:['buyer@example.test']}:path==='/api/me/purchases'?{purchases:owns?[ownedRecord()]:[]}:{offers:[ownedOffer]}})});await new Promise(setImmediate);
+ owns=true;f.listeners.get('ubeeq:commerce-session-changed')({detail:{token:'buyer'}});await new Promise(setImmediate);
+ assert.ok(f.get('offers').children[0].children.find(n=>n.className==='commerce-offer-summary').children.some(n=>n.textContent==='View collection'));
+});
