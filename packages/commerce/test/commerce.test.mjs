@@ -425,3 +425,47 @@ test('checkout confirmation exposes a collection link only for verified active g
  await f.service.reconcile(scope,'connection',[f.evidence(order,{status:'refunded',refundedMinor:1000})]);
  assert.equal((await f.service.order('buyer',order.id)).collectionPurchaseId,undefined);
 });
+
+async function discountedVolume(t){
+ const f=await fixture(t);await f.verify();const file=await f.asset();
+ const first=await f.offer(file,{slug:'first',benefits:[{type:'gallery',resourceId:'first'}]}),second=await f.offer(file,{slug:'second',benefits:[{type:'gallery',resourceId:'second'}]}),volume=await f.offer(file,{slug:'volume',amountMinor:2000,collectionRoots:['volume'],benefits:[{type:'gallery',resourceId:'volume'},{type:'gallery',resourceId:'first'},{type:'gallery',resourceId:'second'}]});
+ f.ports.volumeDiscountCollections=async offer=>offer.id===volume.id?['first','first','second']:[];
+ const gift=async(offer,id,extra={})=>f.service.giftOffer(actor,{offerVersionId:offer.id,recipientEmail:'buyer@example.test',requestId:'gift-'+id,...extra});
+ return Object.assign(f,{first,second,volume,gift});
+}
+test('Volume checkout applies 20% for an ongoing purchase and pins the verified discounted amount',async t=>{
+ const f=await discountedVolume(t),firstOrder=await f.checkout(f.first,'buyer','buy-first');await f.service.reconcile(scope,'connection',[f.evidence(firstOrder)]);
+ const quote=await f.service.quote('buyer',f.volume.id);assert.equal(quote.amountMinor,1600);assert.deepEqual(quote.ownershipDiscount,{percent:20,collectionIds:['first'],baseAmountMinor:2000,discountMinor:400});
+ let submitted;const create=f.provider.createOrder;f.provider.createOrder=async order=>{submitted=order;return create(order);};
+ const order=await f.service.checkout('buyer',f.volume.id,'buy-volume',1600);await f.drain();assert.equal(submitted.amountMinor,1600);assert.deepEqual(order.ownershipDiscount,quote.ownershipDiscount);
+ const prepared=(await f.service.order('buyer',order.id)).order;await f.service.reconcile(scope,'connection',[f.evidence(prepared,{captureId:'VOLUME-CAPTURE',paidMinor:1600})]);assert.equal((await f.service.purchases('buyer')).filter(p=>p.offer.id===f.volume.id&&p.state==='active').length,1);
+ const prior=(await f.service.purchases('buyer')).find(p=>p.offer.id===f.first.id);await f.service.revoke(actor,prior.entitlements[0].id,'Removed first collection');
+ assert.equal((await f.service.checkout('buyer',f.volume.id,'buy-volume',2000)).amountMinor,1600);
+ f.restart();assert.equal((await f.service.order('buyer',order.id)).order.ownershipDiscount.percent,20);
+});
+test('ongoing gifts qualify, duplicate ownership counts once and two distinct collections cap the discount at 25%',async t=>{
+ const f=await discountedVolume(t);assert.equal((await f.service.quote('buyer',f.volume.id)).amountMinor,2000);
+ await f.gift(f.first,'first');let quote=await f.service.quote('buyer',f.volume.id);assert.equal(quote.ownershipDiscount.percent,20);assert.equal(quote.ownershipDiscount.collectionIds.length,1);
+ await f.gift(f.first,'duplicate');quote=await f.service.quote('buyer',f.volume.id);assert.equal(quote.ownershipDiscount.percent,20);
+ await f.gift(f.second,'second');quote=await f.service.quote('buyer',f.volume.id);assert.equal(quote.ownershipDiscount.percent,25);assert.equal(quote.amountMinor,1500);assert.deepEqual(quote.ownershipDiscount.collectionIds,['first','second']);
+});
+test('checkout rechecks revoked ownership, rejects a stale displayed price and ignores customer discount claims',async t=>{
+ const f=await discountedVolume(t),gift=await f.gift(f.first,'first');assert.equal((await f.service.quote('buyer',f.volume.id)).amountMinor,1600);await f.service.revokeGift(actor,gift.id,'Gift revoked');
+ await assert.rejects(f.service.checkout('buyer',f.volume.id,'stale-price',1600),{code:'checkout_price_changed'});
+ assert.equal((await f.store.transaction(tx=>tx.list('checkout'))).length,0);
+ assert.equal((await f.service.checkout('buyer',f.volume.id,'no-discount')).amountMinor,2000);
+});
+test('only current ongoing ownership for this customer, creator and environment qualifies',async t=>{
+ const f=await discountedVolume(t);await f.gift(f.first,'first');await f.service.quote('buyer',f.volume.id);const customer=await f.service.customerProfile('buyer');
+ const original=await f.store.transaction(tx=>tx.list('entitlement').find(g=>g.customerId===customer.id));
+ for(const change of [{environment:'live'},{ownerId:'other'},{customerId:'other'},{state:'revoked'},{endsAt:'2030-01-01T00:00:00Z'},{startsAt:'2030-01-01T00:00:00Z'},{endsAt:'2020-01-01T00:00:00Z'}]){
+  await f.store.transaction(tx=>{tx.remove('entitlement',original.id);tx.insert('entitlement',{...original,...change});});assert.equal((await f.service.quote('buyer',f.volume.id)).ownershipDiscount,undefined);
+ }
+ await f.store.transaction(tx=>{tx.remove('entitlement',original.id);tx.insert('entitlement',original);const gift=tx.list('gift')[0];tx.put('gift',{...gift,months:1});});assert.equal((await f.service.quote('buyer',f.volume.id)).ownershipDiscount,undefined);
+});
+test('discount rounding is exact for minor currency units and a different capture amount grants no access',async t=>{
+ const f=await discountedVolume(t);await f.gift(f.first,'first');
+ await f.store.transaction(tx=>{const offer=tx.get('offer',f.volume.id);tx.put('offer',{...offer,amountMinor:11,currency:'JPY'});});const quote=await f.service.quote('buyer',f.volume.id);assert.equal(quote.amountMinor,9);assert.equal(quote.ownershipDiscount.discountMinor,2);
+ const order=await f.checkout({...f.volume,currency:'JPY'});await f.service.reconcile(scope,'connection',[f.evidence(order,{currency:'JPY',paidMinor:11})]);assert.equal((await f.service.purchases('buyer')).filter(p=>p.offer.id===f.volume.id).length,0);
+ await f.store.transaction(tx=>{const offer=tx.get('offer',f.volume.id);tx.put('offer',{...offer,amountMinor:Number.MAX_SAFE_INTEGER});});const large=await f.service.quote('buyer',f.volume.id);assert.equal(large.amountMinor,Number((BigInt(Number.MAX_SAFE_INTEGER)*80n+50n)/100n));
+});

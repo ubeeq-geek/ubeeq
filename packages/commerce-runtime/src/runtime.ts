@@ -43,6 +43,7 @@ export interface CommerceRuntimeConfiguration {
   assertOfferEligible?:CommercePorts['assertOfferEligible'];
   galleryImage?:(asset:PrivateAsset,size:'display'|'thumbnail')=>Promise<{bytes:Uint8Array;contentType:string}>;
   prepareCollectionContents?:CommercePorts['prepareCollectionContents'];
+  volumeDiscountCollections?:CommercePorts['volumeDiscountCollections'];
   mail: CommercePorts['mail'];
   discord?: DiscordCommerceConfiguration;
   fetch?: PayPalFetch;
@@ -52,7 +53,7 @@ export interface CommerceRuntimeDependencies {
   subject(request: IncomingMessage): Promise<string>;
   customerSubject?(request:IncomingMessage):Promise<string>;
   creator(subjectId: string, ownerId?:string): Promise<{ id: string; homeCellId: string }>;
-  publicOfferCollection?(offer:Pick<Offer,'id'|'ownerId'|'collectionRoots'|'benefits'|'description'|'published'>):Promise<{title:string;description?:string;coverUrl?:string;coverAlt?:string}|undefined>;
+  publicOfferCollection?(offer:Pick<Offer,'id'|'ownerId'|'collectionRoots'|'benefits'|'description'|'published'>):Promise<{title:string;type?:string;description?:string;coverUrl?:string;coverAlt?:string}|undefined>;
   publicCreator?(ownerId:string):Promise<{displayName:string;handle?:string;bio?:string}|undefined>;
   contentAvailable(ownerId: string, assetId: string): Promise<boolean>;
   pruneCredentials?(referenced: string[], createdBefore: string): Promise<void>;
@@ -120,7 +121,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
     try { return (await deps.storage.get(object)).body; } catch { throw new CommerceError('content_unavailable', 409); }
   };
   const service = new CommerceService({ store, provider, publicBaseUrl: baseUrl, tokenKey: config.tokenKey, authorizeCreator: authorize, assertEligible: eligible,
-    prepareCollectionContents:config.prepareCollectionContents,
+    prepareCollectionContents:config.prepareCollectionContents,volumeDiscountCollections:config.volumeDiscountCollections,
     assertOfferEligible:async(scope,offer)=>{if(!await deps.contentAvailable(scope.ownerId,'')||!(await Promise.all(offer.files.map(id=>deps.contentAvailable(scope.ownerId,id)))).every(Boolean))throw new CommerceError('offer_not_eligible',403);await config.assertOfferEligible?.(scope,offer);},
     reconciliation:{batchSize:config.reconciliationBatchSize??100,recentPaymentDays:config.recentPaymentDays??30},
     withConnectionLock: (scope, operation) => store.withLock(scope, operation),
@@ -255,7 +256,8 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/purchase-claims' && method === 'POST') { const b = await parseBody(request); send(response, await service.redeemClaim(subjectId, required(b.id), required(b.token))); return true; }
       const download = path.match(/^\/api\/downloads\/([^/]+)\/authorize$/);
       if (download && method === 'POST') { send(response, await service.authorizeDownload(subjectId, download[1])); return true; }
-      if (path === '/api/checkouts' && method === 'POST') { const b = await parseBody(request); send(response, { order: await service.checkout(subjectId, required(b.offerVersionId), required(request.headers['idempotency-key'])) }, 202); return true; }
+      if(path==='/api/checkouts/quote'&&method==='POST'){const b=await parseBody(request);send(response,await service.quote(subjectId,required(b.offerVersionId)));return true;}
+      if (path === '/api/checkouts' && method === 'POST') { const b = await parseBody(request); send(response, { order: await service.checkout(subjectId, required(b.offerVersionId), required(request.headers['idempotency-key']),b.expectedAmountMinor) }, 202); return true; }
       const order = path.match(/^\/api\/checkouts\/([^/]+)(\/capture)?$/);
       if (order && method === 'GET' && !order[2]) { const result=await service.order(subjectId, order[1]);const offer=await store.transaction(tx=>tx.get('offer',result.order.offerVersionId));send(response,{...result,purchasePageUrl:offer?'/buy/'+encodeURIComponent(offer.ownerId)+'/'+encodeURIComponent(offer.slug)+'?environment='+offer.environment:undefined,collection:offer?await deps.publicOfferCollection?.(offer):undefined}); return true; }
       if (order && method === 'POST' && order[2]) { send(response, await service.capture(subjectId, order[1]), 202); return true; }
