@@ -57,26 +57,27 @@ async function storefront(owner,environment,slug){
  if(result.creator){$('creatorIdentity').append(el('h3',result.creator.displayName));if(result.creator.bio)$('creatorIdentity').append(el('p',result.creator.bio));}
  for(const offer of result.offers.filter(o=>!slug||o.slug===slug)){
   const article=el('article',undefined,'commerce-offer');
-  collectionCover(article,offer.collection);
-  for(const id of offer.previews){const image=el('img');image.className='preview';image.src='/api/previews/'+id;image.alt=offer.title+' preview';article.append(image);}
-  article.append(el('p',offer.billing?'Subscription':'One-time purchase','muted'),el('h3',offer.title));
-  const description=offer.collection?.description??offer.description;if(description)article.append(el('p',description,'commerce-collection-description'));
-  article.append(el('p',price(offer),'commerce-price'),el('p',offer.billing?'Access for each verified paid '+offer.billing:offer.durationSeconds?'Access for '+Math.floor(offer.durationSeconds/86400)+' days':'Ongoing collection access','muted'));
+  const media=el('div',undefined,'commerce-offer-media'),summary=el('div',undefined,'commerce-offer-summary');
+  collectionCover(media,offer.collection);
+  for(const id of offer.previews){const image=el('img');image.className='preview';image.src='/api/previews/'+id;image.alt=offer.title+' preview';media.append(image);}
+  summary.append(el('p',offer.billing?'Subscription':'One-time purchase','muted'),el('h3',offer.title));
+  const description=offer.collection?.description??offer.description;if(description)media.append(el('p',description,'commerce-collection-description'));
+  summary.append(el('p',price(offer),'commerce-price'),el('p',offer.billing?'Access for each verified paid '+offer.billing:offer.durationSeconds?'Access for '+Math.floor(offer.durationSeconds/86400)+' days':'Ongoing collection access','muted'));
   const benefits=el('ul',undefined,'commerce-benefits');
   if(offer.benefits.some(b=>b.type==='gallery'))benefits.append(el('li','Collection viewing included'));
   if(offer.benefits.some(b=>b.type==='download'))benefits.append(el('li','Individual downloads included'));
   if(offer.benefits.some(b=>b.type==='package'))benefits.append(el('li','ZIP download included'));
-  article.append(benefits);
-  if(offer.includedFiles?.length){const contents=el('details'),included=el('ul');for(const file of offer.includedFiles)included.append(el('li',file.label));contents.append(el('summary','Included content ('+offer.includedFiles.length+')'),included);article.append(contents);}
-  const terms=el('details');terms.append(el('summary','Purchase and refund terms'),el('p',offer.terms));article.append(terms);
+  summary.append(benefits);
+  if(offer.includedFiles?.length){const contents=el('details'),included=el('ul');for(const file of offer.includedFiles)included.append(el('li',file.label));contents.append(el('summary','Included content ('+offer.includedFiles.length+')'),included);summary.append(contents);}
+  const terms=el('details');terms.append(el('summary','Purchase and refund terms'),el('p',offer.terms));summary.append(terms);
   const purchaseButton=button(offer.billing?'Subscribe with PayPal':'Purchase with PayPal',async()=>{
    if(!token){notice('Sign in with your email to continue to checkout.');$('identity').scrollIntoView({behavior:'smooth'});$('emailSignin').elements.email.focus();return;}
    const result=await api('/api/checkouts','POST',{offerVersionId:offer.id},crypto.randomUUID());location.href='/commerce/checkout/'+result.order.id;
   });
-  purchaseButton.className='commerce-primary';purchaseButton.disabled=offer.availableForCheckout===false;article.append(purchaseButton);
-  if(offer.availableForCheckout===false)article.append(el('p','Purchases are temporarily unavailable. Contact the creator for help.'));
-  if(offer.external){const link=el('a',offer.external.automatic?'PayPal link purchase':'External purchase — manual fulfillment');link.href=offer.external.url;link.rel='noopener noreferrer';article.append(link);}
-  const support=el('a','Contact creator support');support.href='mailto:'+offer.supportEmail;const supportRow=el('p',undefined,'commerce-support');supportRow.append(support);article.append(supportRow);$('offers').append(article);
+  purchaseButton.className='commerce-primary';purchaseButton.disabled=offer.availableForCheckout===false;summary.insertBefore(purchaseButton,benefits);
+  if(offer.availableForCheckout===false)summary.append(el('p','Purchases are temporarily unavailable. Contact the creator for help.'));
+  if(offer.external){const link=el('a',offer.external.automatic?'PayPal link purchase':'External purchase — manual fulfillment');link.href=offer.external.url;link.rel='noopener noreferrer';summary.append(link);}
+  const support=el('a','Contact creator support');support.href='mailto:'+offer.supportEmail;const supportRow=el('p',undefined,'commerce-support');supportRow.append(support);summary.append(supportRow);if(media.children.length)article.append(media);else article.className+=' commerce-offer-no-media';article.append(summary);$('offers').append(article);
  }
 }
 $('findStore').onsubmit=guard(async()=>{const f=form('findStore');await storefront(f.owner,f.environment);history.replaceState({},'', '/commerce?owner='+encodeURIComponent(f.owner)+'&environment='+f.environment);});
