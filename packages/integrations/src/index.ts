@@ -346,3 +346,4 @@ export * from "./historical-posts.js";
 export * from './website-hosting-connections.js';
 
 export * from './website-hosting-hostinger.js';
+export * from './collection-release-completion.js';

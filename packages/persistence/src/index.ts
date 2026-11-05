@@ -212,3 +212,4 @@ export const verifyCellScopedRepositoryContract = async (harness: { repository: 
   }
 };
 export * from './publication-copies.js';
+export * from './collection-announcements.js';

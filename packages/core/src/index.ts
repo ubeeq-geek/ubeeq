@@ -351,3 +351,9 @@ export * from './collection-destinations.js';
 export * from './collection-publications.js';
 
 export * from "./website-redirect-history.js";
+export * from "./announcement-orchestration.js";
+export * from "./collection-release-readiness.js";
+export * from "./collection-releases.js";
+export * from "./collection-announcement-preferences.js";
+export * from "./announcement-plan-scheduler.js";
+export * from "./announcement-plans.js";
