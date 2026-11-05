@@ -90,3 +90,11 @@ test('a legacy upsert paused in product validation cannot overwrite a newly allo
   await assert.rejects(write, PublicationCopyConflict);
   assert.equal((await store.getPublication('tenant', 'p')).copy.slotId, 'p');
 });
+
+test('old preparation/operation helpers cannot dispatch while ignoring new image settings', async () => {
+  const store = await setup(), p = { ...draft('p'), imageSelection: { schemaVersion: 1, variant: { mode: 'override', value: 'share' },
+    watermark: { mode: 'inherit' }, context: { mode: 'inherit' } }, configurationRevision: 1 };
+  await createPublicationCopy(store, p);
+  await assert.rejects(approvePublicationOperation(store, p, { kind: 'CREATE', sourceRevision: 1, now: 'approve' }), /common reviewed/);
+  await assert.rejects(store.upsertPublication({ ...p, imageSelection: undefined, configurationRevision: undefined }), /own revision-checked/);
+});
