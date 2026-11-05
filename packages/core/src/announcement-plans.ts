@@ -101,11 +101,15 @@ export function evaluateAnnouncementPlan(input: {
   return advance(p, { gateState: p.materialization?.state === "materialized" ? "active" : "ready_to_prepare", holds: [], releaseReadyAt, schedule, authorizationRevision }, input.now);
 }
 /** Reserve once using a deterministic identity; a crash resumes creation with this same ID. */
-export function reserveAnnouncementMaterialization(plan: AnnouncementPlan, expectedRevision: number, now: string): AnnouncementPlan {
+export function reserveAnnouncementMaterialization(plan: AnnouncementPlan, expectedRevision: number, now: string, announcementId = `announcement:${plan.planId}`): AnnouncementPlan {
   assertAnnouncementPlanRevision(plan, expectedRevision);
-  if (plan.materialization) return structuredClone(plan);
+  assertAnnouncementId(announcementId);
+  if (plan.materialization) {
+    if(plan.materialization.announcementId!==announcementId)throw new AnnouncementOrchestrationError('GENERATION_CONFLICT','Materialization already reserved another announcement identity.');
+    return structuredClone(plan);
+  }
   if (plan.gateState !== "ready_to_prepare") throw new AnnouncementOrchestrationError("PUBLICATION_PENDING", "Resolve this plan's publication and parent dependencies before preparing content.");
-  return advance(plan, { materialization: { announcementId: `announcement:${plan.planId}`, state: "reserved" } }, now);
+  return advance(plan, { materialization: { announcementId, state: "reserved" } }, now);
 }
 /** The host atomically creates/locates the authoring record and commits this materialized state. */
 export function completeAnnouncementMaterialization(plan: AnnouncementPlan, expectedRevision: number, announcementId: string, now: string): AnnouncementPlan {

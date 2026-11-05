@@ -10,10 +10,11 @@ import { validateAnnouncementTiming, validateAnnouncementLatePolicy } from "./an
 export const ANNOUNCEMENT_TEMPLATE_VARIABLES = ["collection.title", "collection.description", "creator.name", "release.kind", "release.newWorkCount", "release.totalPublishedWorkCount", "release.publishedAt", "primaryLink.url", "primaryLink.label"] as const;
 export type AnnouncementTemplateVariable = typeof ANNOUNCEMENT_TEMPLATE_VARIABLES[number];
 export type AnnouncementTemplateValues = Partial<Record<AnnouncementTemplateVariable, string | number>>;
+export interface AnnouncementTemplateBlock extends ContentBlock {alt?:string;question?:string;items?:readonly string[];answers?:readonly string[];}
 export interface AnnouncementTemplate {
-  blocks: readonly ContentBlock[];
+  blocks: readonly AnnouncementTemplateBlock[];
   /** Keys identify complete destination bindings, never provider names alone. */
-  destinationOverrides?: Readonly<Record<string, readonly ContentBlock[]>>;
+  destinationOverrides?: Readonly<Record<string, readonly AnnouncementTemplateBlock[]>>;
 }
 export interface AnnouncementDestinationSelection {
   binding: AnnouncementDestinationBinding;
@@ -69,7 +70,8 @@ export interface EffectiveCollectionAnnouncementPreferences {
   contributingRevisions: { creator: number; collection?: number; release?: number };
   inheritance: Record<"initial" | "additions", Partial<Record<keyof CollectionAnnouncementTriggerPreferences, "creator" | "collection" | "release">>>;
 }
-const templateFields = ["text", "title", "label", "caption", "quote", "author", "url"] as const;
+const templateFields = ["text", "title", "label", "caption", "quote", "author", "url","alt","question"] as const;
+const templateArrayFields=['items','answers'] as const;
 const allowedVariables = new Set<string>(ANNOUNCEMENT_TEMPLATE_VARIABLES);
 function variables(text: string): string[] {
   const found: string[] = [];
@@ -81,15 +83,16 @@ function variables(text: string): string[] {
     throw new AnnouncementOrchestrationError("INVALID_INPUT", "Use fixed {{variable.name}} substitutions without expressions.");
   return found;
 }
-function validateTemplateBlocks(blocks: readonly ContentBlock[]): void {
+function validateTemplateBlocks(blocks: readonly AnnouncementTemplateBlock[]): void {
   validateContentBlocks(blocks);
-  const visit = (items: readonly ContentBlock[], depth: number) => {
+  const visit = (items: readonly AnnouncementTemplateBlock[], depth: number) => {
     if (depth > 16) throw new AnnouncementOrchestrationError("INVALID_INPUT", "Announcement templates are nested too deeply.");
     for (const b of items) {
       // Opaque data/HTML cannot be interpolated. Keep templates in explicitly typed fields.
       for (const [key, value] of Object.entries(b)) {
         if (key === "children") continue;
-        if (templateFields.includes(key as typeof templateFields[number]) && typeof value === "string") variables(value);
+        if(templateArrayFields.includes(key as typeof templateArrayFields[number])&&Array.isArray(value)&&value.every(v=>typeof v==='string'))value.forEach(variables);
+        else if (templateFields.includes(key as typeof templateFields[number]) && typeof value === "string") variables(value);
         else if (/\{\{|\}\}/.test(JSON.stringify(value) ?? "")) throw new AnnouncementOrchestrationError("INVALID_INPUT", "Template variables may only appear in typed text or link fields.");
       }
       if (b.url !== undefined && b.url !== "{{primaryLink.url}}" && (!isDurableAnnouncementUrl(b.url) || variables(b.url).length))
@@ -112,7 +115,7 @@ export function renderAnnouncementTemplate(input: {
   destinationKey?: string;
   /** Shared counts are forbidden when primary destination scopes differ. */
   sharedCountsAvailable?: boolean;
-}): ContentBlock[] {
+}): AnnouncementTemplateBlock[] {
   validateAnnouncementTemplate(input.template);
   const blocks = input.destinationKey && input.template.destinationOverrides?.[input.destinationKey] || input.template.blocks;
   const replace = (text: string): string => {
@@ -130,15 +133,19 @@ export function renderAnnouncementTemplate(input: {
       return String(value);
     });
   };
-  const visit = (items: readonly ContentBlock[]): ContentBlock[] => items.map(original => {
+  const visit = (items: readonly AnnouncementTemplateBlock[]): AnnouncementTemplateBlock[] => items.map(original => {
     const b = structuredClone(original);
     for (const field of templateFields) if (typeof b[field] === "string") b[field] = replace(b[field]!);
+    for(const field of templateArrayFields)if(b[field])b[field]=b[field]!.map(replace);
     if (b.url !== undefined && !isDurableAnnouncementUrl(b.url))
       throw new AnnouncementOrchestrationError("LINK_NOT_READY", "Resolve a durable, credential-free content link before preparing this announcement.");
     if (b.children) b.children = visit(b.children);
     return b;
   });
   return visit(blocks);
+}
+export function renderAnnouncementTemplateText(text:string,values:AnnouncementTemplateValues):string {
+  return renderAnnouncementTemplate({template:{blocks:[{id:'template-text' as ContentBlock['id'],type:'paragraph',text}]},values})[0].text!;
 }
 function validateDestinations(destinations: readonly AnnouncementDestinationSelection[], active: boolean): void {
   const keys = destinations.map(d => announcementDestinationKey(d.binding));
@@ -151,8 +158,9 @@ function validateMedia(media: AnnouncementMediaSelection): void {
   if (media.mode === "managed_previews") {
     if (!media.assets.length || media.assets.length > 50 || new Set(media.assets.map(a => a.assetId)).size !== media.assets.length)
       throw new AnnouncementOrchestrationError("INVALID_INPUT", "Select a bounded set of distinct managed preview assets.");
-    media.assets.forEach(a => assertAnnouncementId(a.assetId));
+    media.assets.forEach(a => {assertAnnouncementId(a.assetId);variables(a.altText);if(a.caption!==undefined)variables(a.caption);});
   }
+  if(media.mode==='cover'){variables(media.altText);if(media.caption!==undefined)variables(media.caption);}
 }
 export function validateCollectionAnnouncementPreferences(settings: CollectionAnnouncementPreferences): void {
   if (settings.schemaVersion !== 1) throw new AnnouncementOrchestrationError("INVALID_INPUT", "Unsupported announcement preferences version.");

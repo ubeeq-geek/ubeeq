@@ -228,3 +228,15 @@ test('logical identities include account, target and post type, and exclude repl
   assert.notEqual(id, announcementPlanKey(scope, 'release', 'additions'));
   assert.notEqual(announcementDestinationStepKey(id, target), announcementDestinationStepKey(id, { ...target, postType: 'status' }));
 });
+test('typed list items and image descriptions interpolate without evaluating arbitrary document data',()=>{
+ const template={blocks:[{id:'list',type:'paragraph',items:['{{collection.title}}','{{release.newWorkCount}} new works'],alt:'Cover for {{collection.title}}'}]};
+ const result=renderAnnouncementTemplate({template,values:{'collection.title':'Stories','release.newWorkCount':2}});
+ assert.deepEqual(result[0].items,['Stories','2 new works']);assert.equal(result[0].alt,'Cover for Stories');
+ assert.throws(()=>validateAnnouncementTemplate({blocks:[{id:'bad',type:'paragraph',items:['{{unknown}}']}]}),/Unknown/);
+});
+test('product-constrained authoring identifiers are reserved deterministically and cannot change on recovery',()=>{
+ const p=plan(),reserved=reserveAnnouncementMaterialization(p,p.revision,now,'bounded-authoring-id');
+ assert.equal(reserved.materialization.announcementId,'bounded-authoring-id');
+ assert.deepEqual(reserveAnnouncementMaterialization(reserved,reserved.revision,now,'bounded-authoring-id'),reserved);
+ assert.throws(()=>reserveAnnouncementMaterialization(reserved,reserved.revision,now,'other-authoring-id'),{code:'GENERATION_CONFLICT'});
+});
