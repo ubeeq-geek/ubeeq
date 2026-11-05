@@ -53,7 +53,11 @@ export function publicationImageCanonicalJson(value: unknown): string {
     if (item === null || typeof item === 'string' || typeof item === 'boolean') return item;
     if (typeof item === 'number' && Number.isFinite(item)) return item;
     if (Array.isArray(item)) return item.map(visit);
-    if (object(item) && (Object.getPrototypeOf(item) === Object.prototype || Object.getPrototypeOf(item) === null)) {
+    const prototype = object(item) ? Object.getPrototypeOf(item) : undefined;
+    // structuredClone/VM/browser boundaries can have a different realm's Object.prototype.
+    const plain = object(item) && (prototype === null || Object.getPrototypeOf(prototype) === null
+      && Object.hasOwn(prototype, 'constructor') && prototype.constructor?.name === 'Object');
+    if (plain) {
       return Object.fromEntries(Object.keys(item).sort().filter(key => item[key] !== undefined).map(key => [key, visit(item[key])]));
     }
     throw new PublicationImageError('invalid_request', 'Image settings must contain finite JSON values.');

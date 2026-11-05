@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {runInNewContext} from 'node:vm';
 import { inheritedPublicationImageSelection, resolvePublicationImageSelection, validatePublicationImageSelection,
   publicationImageFingerprint, comparePublicationImage } from '../dist/index.js';
 
@@ -100,6 +101,12 @@ test('safe read projection, tenant boundaries and strict settings validation', a
   for (const bad of [null, {}, { ...override('original'), url: 'https://example.com' }, { ...override('original'), variant: { mode: 'inherit', value: 'original' } },
     { ...override('original'), context: { mode: 'collection', collectionId: '  ' } }, override('unknown')]) assert.throws(() => validatePublicationImageSelection(bad, validateWatermark));
   assert.throws(() => validatePublicationImageSelection(override('share', 'x'.repeat(101)), validateWatermark), /Invalid watermark/);
+});
+
+test('finite JSON settings remain valid across structured-clone and VM realms', () => {
+  const value = runInNewContext(`({schemaVersion:1,variant:{mode:'override',value:'share'},watermark:{mode:'override',value:{text:'Volume'}},context:{mode:'inherit'}})`);
+  assert.deepEqual(validatePublicationImageSelection(value, validateWatermark), override('share', 'Volume'));
+  assert.throws(() => validatePublicationImageSelection({ ...override('share'), watermark: { mode: 'override', value: new Date() } }, value => value), /finite JSON/);
 });
 
 test('drift distinguishes unknown, source, variant, recipe and watermark; keep expires only for relevant changes', async () => {
