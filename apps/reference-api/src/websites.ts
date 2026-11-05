@@ -18,6 +18,13 @@ export const handleWebsiteRequest = async (input: {
     if(method==='PUT') { const b=await input.body(),doc=b.document as WebsiteDocument; if(doc?.id!==parts[1]) throw new WebsiteError('invalid_document','Document ID must match the route.'); return {document:await service.saveDocument(actor,doc,Number(b.expectedRevision))}; }
   }
   if(parts[0]==='builds' && parts[1]) {
+    if(method==='GET'&&parts[2]==='preview-manifest')return service.previewManifest(actor,parts[1]);
+    if(method==='POST'&&parts[2]==='preview-files'){
+      const body=await input.body(),known=body.knownChecksums;
+      if(known!==undefined&&(!known||typeof known!=='object'||Array.isArray(known)))throw new WebsiteError('invalid_path','Invalid preview checksums.');
+      const result=await service.previewFiles(actor,parts[1],body.paths as string[],known as Record<string,string>|undefined);
+      return {digest:result.digest,files:result.files.map(file=>({path:file.path,checksum:file.checksum,...(file.bytes?{base64:Buffer.from(file.bytes).toString('base64')}:{})}))};
+    }
     if(method==='GET' && parts[2]==='preview-site'){const archive=await service.previewArchive(actor,parts[1]);response.setHeader('content-type','application/zip');response.end(archive.bytes);return;}
     if(method==='GET' && parts[2]==='pages') return {pages:await service.previewPages(actor,parts[1])};
     if(method==='GET' && parts.length===2) return {build:await service.build(actor,parts[1])};
@@ -47,6 +54,6 @@ export const handleWebsiteRequest = async (input: {
   }
   if(method==='GET' && parts.length===1) return {website:await service.get(actor,parts[0])};
   if(method==='POST' && parts[1]==='builds') { const b=await input.body(); return {build:await service.requestBuild(actor,parts[0],Number(b.expectedRevision),String(b.idempotencyKey??''))}; }
-  if(method==='GET' && parts[1]==='builds') return {builds:await service.builds(actor,parts[0])};
+  if(method==='GET' && parts[1]==='builds') return {builds:await service.builds(actor,parts[0],url.searchParams.has('previewRevision')?Number(url.searchParams.get('previewRevision')):undefined)};
   throw new WebsiteError('website_route_not_found','Website operation was not found.');
 };

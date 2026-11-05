@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { WebsiteService, buildWebsiteArtifact, websiteDigest, normalizeWebsiteDocument } from '../dist/index.js';
+import { WebsiteService, buildWebsiteArtifact, createWebsiteZip, websiteDigest, normalizeWebsiteDocument } from '../dist/index.js';
 import { websiteRoutes, websitePath, resolveWebsiteGallery, parseContentBlocks } from '@ubeeq/core';
 import { STATIC_BLOCK_SUPPORT } from '@ubeeq/ui';
 import { SqliteWebsiteStore } from '../../../adapters/local/dist/index.js';
@@ -328,4 +328,47 @@ test('build document freshness checks use bounded concurrency and detect changed
  let active=0,peak=0;const read=h.store.getDocument.bind(h.store);
  h.store.getDocument=async(workspace,id)=>{if(!id.startsWith('parallel-'))return read(workspace,id);peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return {id,revision:id==='parallel-11'?2:1};};
  assert.equal((await h.service.build(h.actor,base.id)).stale,true);assert.equal(peak,5);assert.equal(active,0);
+});
+
+test('1000-image previews retrieve only selected immutable files, reauthorize conditional hits and reject corrupt bytes',async t=>{
+ const h=await harness();t.after(()=>h.store.close());
+ const requested=await h.service.requestBuild(h.actor,h.snapshot.website.id,1,'large-preview');
+ const source=h.snapshot,first=source.assets[0];
+ source.assets=[first,...Array.from({length:999},(_,index)=>{const bytes=Buffer.from('distinct approved rendition '+index);return {...first,id:'image-'+index,bytes,checksum:websiteDigest(bytes)};})];
+ source.galleries[0].publicAssetIds=source.assets.map(asset=>asset.id);
+ const artifact=buildWebsiteArtifact(source,{...limits,maxAssets:2000});assert.ok(artifact.files.size>1000);
+ await h.store.putArtifact(h.actor.workspaceId,artifact.digest,artifact.zip,artifact.files);
+ await h.store.saveBuild({...requested,revision:2,state:'ready',artifactDigest:artifact.digest,dependencies:artifact.dependencies},1);
+ h.store.getArtifact=async()=>assert.fail('Preview must not load the full archive');
+ const read=h.store.getArtifactFile.bind(h.store),reads=[];
+ h.store.getArtifactFile=async(...args)=>{reads.push(args[2]);return read(...args);};
+ const manifest=await h.service.previewManifest(h.actor,requested.id);assert.equal(Object.keys(manifest.files).length,artifact.files.size);assert.equal(reads.length,0);
+ const last=source.assets.at(-1),path='assets/'+last.checksum+'.png';
+ const batch=await h.service.previewFiles(h.actor,requested.id,['index.html',path]);assert.deepEqual(reads,['index.html',path]);assert.deepEqual(Buffer.from(batch.files[1].bytes),last.bytes);
+ reads.length=0;
+ const hit=await h.service.previewFiles(h.actor,requested.id,[path],{[path]:last.checksum});assert.equal(hit.files[0].bytes,undefined);assert.equal(reads.length,0);
+ h.setEligible(false);await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path],{[path]:last.checksum}),{code:'dependency_restricted'});h.setEligible(true);
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,['../private']),{code:'invalid_path'});
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,['missing.jpg']),{code:'file_not_found'});
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,Array(9).fill(path)),{code:'invalid_path'});
+ h.store.getArtifactFile=async()=>new Uint8Array([0]);
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path]),{code:'artifact_unavailable'});
+ h.store.getArtifactFile=async(...args)=>{const bytes=await read(...args);h.setAllowed(false);return bytes;};
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path]),{code:'release_restricted'});h.setAllowed(true);
+ h.setActive(false);await assert.rejects(h.service.previewManifest(h.actor,requested.id),{code:'authorization_denied'});
+});
+
+test('optimized ZIP CRC remains compatible with the standard CRC-32 check vector',()=>{
+ const bytes=Buffer.from('123456789'),zip=Buffer.from(createWebsiteZip(new Map([['index.html',bytes]])));
+ assert.equal(zip.readUInt32LE(14),0xcbf43926);
+});
+
+test('1000 individually published images fit the expanded reference page and file budgets',()=>{
+ const snapshot=fixture(),base=snapshot.assets[0],common=snapshot.galleries[0];
+ snapshot.assets=Array.from({length:1000},(_,index)=>{const bytes=Buffer.from('image '+index);return {...base,id:'image-'+index,bytes,checksum:websiteDigest(bytes)};});
+ snapshot.galleries=snapshot.assets.map((asset,index)=>({...common,publicationId:'publication-'+index,workId:'work-'+index,title:'Work '+index,slug:'work-'+index,premium:false,previewAssetIds:[asset.id],publicAssetIds:[asset.id]}));
+ snapshot.website.galleryPublicationIds=snapshot.galleries.map(gallery=>gallery.publicationId);
+ snapshot.documents=snapshot.documents.map(document=>({...document,blocks:[{id:'gallery-list',type:'gallery_list',data:{pageSize:100}}]}));
+ const artifact=buildWebsiteArtifact(snapshot,{maxPages:2000,maxAssets:2000,maxBytes:256*1024*1024});
+ assert.ok(artifact.report.pages>1000);assert.ok(artifact.files.size<5000);assert.equal(artifact.report.media,1000);
 });

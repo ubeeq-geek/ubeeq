@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, lstat, readFile, realpath, rename, rm, open, readdir } from 'node:fs/promises';
+import { mkdir, lstat, readFile, realpath, rename, rm, open, readdir, link } from 'node:fs/promises';
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { WebsiteError, websiteFrameAncestors, websiteExternalUrl, type HostingCapabilities, type HostingDeploymentContext, type HostingOutcome, type WebsiteHostingAdapter, type WebsiteHostingTarget } from '@ubeeq/core';
@@ -38,8 +38,9 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
   async prepare(context:HostingDeploymentContext){const artifact=context.artifact;if(!artifact)throw new WebsiteError('artifact_unavailable','A pinned artifact is required.');const site=await this.site(context.target),releaseId=artifact.digest,releaseRoot=join(site,'releases',releaseId),stage=join(site,'.staging-'+randomUUID());
     const releases=join(site,'releases'),assets=join(site,'assets');for(const dir of [releases,assets]){const st=await exists(dir);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Release/asset storage cannot be a symlink.');await mkdir(dir,{recursive:true,mode:0o750});}
     if(await exists(releaseRoot)){for(const [file,bytes] of artifact.files){const destination=await this.safeParent(releaseRoot,file);if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('release_drift','An immutable release has changed.');}return {releaseId};}
-    await mkdir(stage,{mode:0o750});try{for(const [file,bytes] of artifact.files){const destination=await this.safeParent(stage,file);await writeSynced(destination,bytes);
-        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}else{try{await writeSynced(asset,bytes);}catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST'||hash(await readFile(asset))!==hash(bytes))throw error;}}}}
+    await mkdir(stage,{mode:0o750});try{for(const [file,bytes] of artifact.files){const destination=await this.safeParent(stage,file);
+        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}else{try{await writeSynced(asset,bytes);}catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST'||hash(await readFile(asset))!==hash(bytes))throw error;}}await link(asset,destination);}
+        else await writeSynced(destination,bytes);}
       await syncTree(stage);await syncDirectory(assets);await rename(stage,releaseRoot);await syncDirectory(releases);return {releaseId};
     }catch(error){await rm(stage,{recursive:true,force:true});throw error;}
   }

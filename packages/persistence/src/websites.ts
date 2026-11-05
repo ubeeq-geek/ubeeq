@@ -3,6 +3,10 @@ export interface WebsiteImageRecord {
   id:string;workspaceId:string;revision:number;title:string;mimeType:'image/webp';
   checksum:string;sizeBytes:number;width:number;height:number;
 }
+export interface WebsiteArtifactManifest {
+  digest:string;
+  files:Readonly<Record<string,{checksum:string;byteLength:number}>>;
+}
 
 export interface WebsiteBuildRecord {
   id: string; workspaceId: string; websiteId: string; websiteRevision: number;
@@ -34,5 +38,8 @@ export interface WebsiteStore {
   listBuilds(workspaceId: string, websiteId: string): Promise<readonly WebsiteBuildRecord[]>;
   putArtifact(workspaceId: string, digest: string, zip: Uint8Array, files: ReadonlyMap<string, Uint8Array>): Promise<void>;
   getArtifact(workspaceId: string, digest: string): Promise<{ zip: Uint8Array; files: ReadonlyMap<string, Uint8Array> } | undefined>;
+  /** Optional immutable blob access: preview reads do not materialize the archive or unrelated media. */
+  getArtifactManifest?(workspaceId:string,digest:string):Promise<WebsiteArtifactManifest|undefined>;
+  getArtifactFile?(workspaceId:string,digest:string,path:string):Promise<Uint8Array|undefined>;
   removeArtifact(workspaceId: string, digest: string): Promise<void>;
 }

@@ -50,11 +50,13 @@ Create a creator using the existing authentication/profile flow. Then:
    current authority, resolves sources, evaluates policy, renders and packages.
 5. `GET /v1/websites/builds/:id` returns private state, dependencies, warnings,
    staleness, diagnostics code and output-validation report.
-6. `GET /v1/websites/builds/:id/preview?inline=1` returns a self-contained HTML
-   preview. Display it in an iframe with an **empty sandbox attribute**. The
-   normal authenticated file interface is `preview?file=index.html` (or another
-   artifact-relative file). Preview responses are private/no-store, sandboxed
-   and have no execution or authenticated editor-session access.
+6. The shared client reads `GET /v1/websites/builds/:id/preview-manifest`, then
+   `POST /v1/websites/builds/:id/preview-files` with `{paths, knownChecksums?}`.
+   The trusted preview shell loads pages and visible media on demand in an
+   opaque-origin sandbox. Every file batch rechecks current authority and policy.
+   The legacy `preview?inline=1` interface returns inert self-contained HTML for
+   an iframe with an **empty sandbox attribute**; `preview?file=index.html`
+   remains available. All API responses are private/no-store.
 7. `GET /v1/websites/builds/:id/export` downloads the exact ZIP after current
    owner/manager export authorization, policy, eligibility and digest checks.
    A new draft does not change bytes in a previous candidate. Invalidated,
@@ -66,11 +68,73 @@ Other reads: `GET /v1/websites`, `/v1/websites/catalogue`, `/v1/websites/:id/bui
 
 The workspace comes from the authenticated session, never a request-selected
 principal. Credentials do not appear in snapshots or public files. The default
-reference limits are 200 output HTML pages (including generated pages and 404),
-500 supplied assets, separate 50 MiB source-projection/output budgets and seven-day download retention. The store's
+reference limits are 2,000 output HTML pages (including generated pages and 404),
+2,000 supplied assets, separate 256 MiB source-projection/output budgets and seven-day download retention. The store's
 `removeArtifact` hook supports deployment-owned cleanup; expiration rejects
 access even before physical cleanup. A background garbage collector is not
 installed by this change.
+
+## Large private previews
+
+The manifest contains artifact-relative paths, sizes and SHA-256 checksums, never
+public media URLs or credentials. File batches contain at most eight paths and
+32 MiB. The editor keeps its bearer provider and serves requests over the existing
+same-origin cross-tab channel; keep the editor open while browsing a preview.
+Only the selected page, home page, stylesheet and trusted viewer are loaded when
+opening. An intersection observer requests visible images; gallery full images
+and thumbnail batches are requested when used. Binary blobs are cloned into the
+opaque iframe, which creates and revokes its own blob URLs. The iframe receives no
+bearer token or same-origin access, and its script connections remain disabled. The exact gallery script
+is pinned by the authenticated manifest, so editor minification cannot change the
+viewer selected for an immutable artifact.
+
+The editor's byte cache is limited to 64 MiB, scoped to its client credential and
+keyed by content checksum. Reopening a preview or editing text can reuse images
+across build IDs. Conditional cache hits still make authenticated batch requests
+and recheck membership, identity, expiry, invalidation, policy and eligibility
+before and after storage IO. They return checksums without retransmitting cached
+bytes. A new document/catalogue revision makes a build stale; it does not rewrite
+or silently replace an already-open preview or an approved publication snapshot.
+
+The reference resolver indexes Works, assets, publications and holds once per
+source projection and checks each Work once. Projections are reused only while
+SQLite `data_version` **and** connection `total_changes()` are unchanged. This
+detects changes made by the separate worker/API process as well as local writes,
+without a TTL for revoked permissions. Other database compositions must supply an
+equivalent authoritative revision mechanism or retain request-scoped reads. The
+catalogue revision includes ready-asset membership, source revisions/checksums
+and live publications, so adding an image invalidates reuse even if the Work
+revision is unchanged.
+
+Clean 1600-pixel JPEGs are prepared during image processing and cached by
+workspace, asset ID, source checksum and recipe version. Existing sources are
+filled on demand; both paths share in-flight work and a two-decoder limit. An
+optional prewarm failure leaves the normal snapshot resolver responsible for
+reporting/retrying that rendition.
+
+`SqliteWebsiteStore` stores media once in workspace-scoped checksum blobs.
+Artifacts have a file index and a retained exact ZIP; frozen publish snapshots
+reference the same blobs. File preview reads never load the ZIP or other media.
+Existing ZIP/base64 artifacts migrate on first indexed access, and old snapshots
+remain readable. Removing artifacts or cleaning expired unaccepted reviews
+collects bounded batches of orphaned blobs while preserving references from
+retained artifacts and frozen snapshots. Products still own aggregate retention
+and the scheduling of cleanup; active/rollback releases must remain protected.
+
+After `npm run build`, run:
+
+```sh
+npm run benchmark:website-preview -- 1000 40
+npm run test:website-preview-browser
+```
+
+The benchmark uses 1,000 synthetic already-processed 40 KiB payloads and measures
+build/storage, manifest retrieval, initial files and conditional image reads. It
+does not measure original-image decoding, catalogue IO, network transfer or
+provider publishing. The Chromium smoke uses 1,000 distinct valid JPEGs and a
+minified editor bundle to check lazy images, page navigation, the gallery viewer,
+cache reuse and a hold arriving after the preview opens. Neither check contacts a
+hosting provider.
 
 ## React integration
 

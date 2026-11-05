@@ -1,5 +1,5 @@
 import { WebsiteError, membershipAllows, websiteRoutes, websiteHistoricalRedirects, type Website, type WebsiteDocument, type WebsiteDependency, type WorkspaceMembership, type WebsiteReleaseDecision, type WebsiteCapabilities } from '@ubeeq/core';
-import type { WebsiteBuildRecord, WebsiteStore } from '@ubeeq/persistence';
+import type { WebsiteBuildRecord, WebsiteStore, WebsiteArtifactManifest } from '@ubeeq/persistence';
 import { buildWebsiteArtifact, validateWebsiteSnapshotBudget, createWebsiteZip, normalizeWebsiteDocument, websiteDigest, websiteFingerprint, type WebsiteSnapshot } from './website-artifact.js';
 import { parse, serialize, type DefaultTreeAdapterMap } from 'parse5';
 
@@ -237,6 +237,48 @@ export class WebsiteService {
   async previewArchive(actor:WebsiteActor,buildId:string) {
     const {build,artifact}=await this.artifact(actor,buildId,'preview');
     return {digest:build.artifactDigest!,bytes:artifact.zip};
+  }
+  private async previewAccess(actor:WebsiteActor,buildId:string){
+    const build=await this.build(actor,buildId);
+    if(build.state!=='ready'||!build.artifactDigest||build.invalidated)throw new WebsiteError('artifact_unavailable','A ready, eligible immutable artifact is required.');
+    if(Date.parse(build.expiresAt)<=this.now().getTime())throw new WebsiteError('artifact_expired','Build artifact retention has expired.');
+    if(!await this.ports.creatorIdentityAllowed(actor,build.creatorIdentityId))throw new WebsiteError('foreign_reference','Publishing identity is no longer available.');
+    await this.decision(actor,'preview',build.websiteId,build.dependencies);
+    if(!await this.ports.dependenciesEligible(actor,build.dependencies))throw new WebsiteError('dependency_restricted','This preview is no longer eligible.');
+    return build;
+  }
+  private async previewIndex(actor:WebsiteActor,buildId:string,build:WebsiteBuildRecord):Promise<WebsiteArtifactManifest>{
+    if(this.ports.store.getArtifactManifest&&this.ports.store.getArtifactFile){
+      const manifest=await this.ports.store.getArtifactManifest(actor.workspaceId,build.artifactDigest!);
+      if(!manifest||manifest.digest!==build.artifactDigest)throw new WebsiteError('artifact_unavailable','Preview files are unavailable.');
+      return manifest;
+    }
+    const {artifact}=await this.artifact(actor,buildId,'preview');
+    return {digest:build.artifactDigest!,files:Object.fromEntries([...artifact.files].map(([path,bytes])=>[path,{checksum:websiteDigest(bytes),byteLength:bytes.length}]))};
+  }
+  /** No archive or media bytes are loaded by stores with immutable file access. */
+  async previewManifest(actor:WebsiteActor,buildId:string){
+    const build=await this.previewAccess(actor,buildId),manifest=await this.previewIndex(actor,buildId,build);
+    const current=await this.previewAccess(actor,buildId);if(current.artifactDigest!==manifest.digest)throw new WebsiteError('artifact_unavailable','Preview changed during retrieval.');
+    return manifest;
+  }
+  /** Small authorized batches amortize policy checks while preserving revocation checks after IO. */
+  async previewFiles(actor:WebsiteActor,buildId:string,paths:readonly string[],knownChecksums:Readonly<Record<string,string>>={}){
+    if(!Array.isArray(paths)||!paths.length||paths.length>8||new Set(paths).size!==paths.length||paths.some(path=>typeof path!=='string'||path.length>2000||path.startsWith('/')||path.includes('\\')||path.split('/').some(part=>!part||part==='.'||part==='..')))throw new WebsiteError('invalid_path','Select 1–8 distinct safe preview files.');
+    const build=await this.previewAccess(actor,buildId),manifest=await this.previewIndex(actor,buildId,build);
+    let size=0;for(const path of paths){const entry=Object.hasOwn(manifest.files,path)?manifest.files[path]:undefined;if(!entry)throw new WebsiteError('file_not_found','Preview file was not found.');size+=entry.byteLength;}
+    if(size>32*1024*1024)throw new WebsiteError('quota_exceeded','Preview file batch exceeds its byte budget.');
+    const fallback=this.ports.store.getArtifactFile?undefined:(await this.artifact(actor,buildId,'preview')).artifact.files;
+    const files=await mapWebsiteChecks(paths,async path=>{
+      const entry=manifest.files[path];
+      // This is an authenticated conditional read, not cached permission to release bytes.
+      if(Object.hasOwn(knownChecksums,path)&&knownChecksums[path]===entry.checksum)return {path,checksum:entry.checksum,bytes:undefined};
+      const bytes=fallback?fallback.get(path):await this.ports.store.getArtifactFile!(actor.workspaceId,build.artifactDigest!,path);
+      if(!bytes||bytes.length!==entry.byteLength||websiteDigest(bytes)!==entry.checksum)throw new WebsiteError('artifact_unavailable','Preview file is missing or corrupt.');
+      return {path,checksum:entry.checksum,bytes};
+    });
+    const current=await this.previewAccess(actor,buildId);if(current.artifactDigest!==manifest.digest)throw new WebsiteError('artifact_unavailable','Preview changed during retrieval.');
+    return {digest:manifest.digest,files};
   }
   async preview(actor: WebsiteActor, buildId: string, file: string) {
     const {artifact}=await this.artifact(actor,buildId,'preview');

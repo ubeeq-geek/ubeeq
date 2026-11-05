@@ -2,7 +2,7 @@ import { hash as blake3 } from 'blake3-wasm';
 import { createHash } from 'node:crypto';
 import { extname } from 'node:path';
 import { WebsiteError, type HostingCapabilities, type HostingDeploymentContext, type HostingOutcome, type HostingConnection, type HostingDomain, type WebsiteHostingAdapter, type WebsiteHostingTarget } from '@ubeeq/core';
-import { HostingHttp, hostingJson, hostingMime, hostingPath, hostingRedirectFiles, type HostingFetch, type HostingPublicProbe } from './website-hosting-http.js';
+import { HostingHttp, hostingJson, hostingMime, hostingPath, hostingRedirectFiles, uploadWebsiteFiles, type HostingFetch, type HostingPublicProbe } from './website-hosting-http.js';
 
 export const cloudflarePagesAttemptTag=(context:HostingDeploymentContext)=>'Ubeeq attempt '+createHash('sha256').update(context.attemptId).digest('hex');
 export const cloudflarePagesAssetHash=(path:string,bytes:Uint8Array)=>blake3(Buffer.from(bytes).toString('base64')+extname(path).slice(1)).toString('hex').slice(0,32);
@@ -24,8 +24,9 @@ export class CloudflarePagesWebsiteHostingAdapter implements WebsiteHostingAdapt
     for(const [path,bytes] of artifact.files){if(path==='_redirects'||path==='_headers')continue;manifest['/'+path]=cloudflarePagesAssetHash(path,bytes);}
     const missing=await this.result('/client/v4/pages/assets/check-missing',session.jwt,{method:'POST',...hostingJson({hashes:Object.values(manifest)})});
     if(!Array.isArray(missing)||missing.length>artifact.files.size)throw new WebsiteError('provider_invalid_response','Invalid Pages missing-asset response.');
-    // Sequential bounded batches; an upload session token never leaves the fixed API origin.
-    for(const digest of missing){const item=[...artifact.files].find(([p])=>manifest['/'+p]===digest);if(!item)throw new WebsiteError('provider_invalid_response','Unknown asset hash requested.');await this.result('/client/v4/pages/assets/upload',session.jwt,{method:'POST',...hostingJson([{key:digest,value:Buffer.from(item[1]).toString('base64'),metadata:{contentType:hostingMime(item[0])},base64:true}])});}
+    const byDigest=new Map([...artifact.files].filter(([path])=>Object.hasOwn(manifest,'/'+path)).map(([path,bytes])=>[manifest['/'+path],{path,bytes}]));
+    const uploads=[...new Set(missing)].map(digest=>{const file=byDigest.get(digest as string);if(!file)throw new WebsiteError('provider_invalid_response','Unknown asset hash requested.');return {digest,file};});
+    await uploadWebsiteFiles(uploads,async({digest,file})=>{await c.beforeUpload?.();await this.result('/client/v4/pages/assets/upload',session.jwt,{method:'POST',...hostingJson([{key:digest,value:Buffer.from(file.bytes).toString('base64'),metadata:{contentType:hostingMime(file.path)},base64:true}])});});
     await this.result('/client/v4/pages/assets/upsert-hashes',session.jwt,{method:'POST',...hostingJson({hashes:Object.values(manifest)})});
     return {data:{manifest:JSON.stringify(manifest)}};
   }
