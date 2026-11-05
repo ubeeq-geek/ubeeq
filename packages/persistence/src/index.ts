@@ -132,7 +132,7 @@ export interface CollectionRecord extends RevisionedRecord, CellOwnedRecord { in
 export interface WorkMembershipRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; collectionId: string; workId: string; position: number; }
 export interface PublicationIntentRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; workId: string; destination: string; idempotencyKey: string; }
 export interface PublicationRecord extends RevisionedRecord, CellOwnedRecord, PublicationImageConfiguration {
-  instanceId: string; workId: string; destination: string; status: "draft" | "queued" | "live" | "removed" | "failed"; remoteId?: string;
+  instanceId: string; workId: string; destination: string; status: "draft" | "scheduled" | "queued" | "live" | "removed" | "failed"; remoteId?: string;
   lastConfirmedImage?: PublicationImageDeliveryEvidence;
   /** Disconnected provenance; never an active remote binding or delivery pointer. */
   restoredPublicationHistory?: { sourcePublicationId: string; remoteId?: string; image?: PublicationImageDeliveryEvidence; copy?: import('@ubeeq/core').PublicationCopyIdentity };

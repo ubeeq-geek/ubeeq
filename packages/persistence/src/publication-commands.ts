@@ -409,7 +409,7 @@ export class PublicationCommandService {
         state: input.result === 'confirmed' ? 'CONFIRMED' : input.result === 'failed' ? 'FAILED' : 'AMBIGUOUS',
         blockedCode: input.result === 'uncertain' ? 'publication_reconciliation_required' : undefined,
         ...(remoteId ? { remoteId, confirmedImage } : {}) } }, { transaction });
-      if (confirmedImage) await this.repositories.publications.update(p!.id, p!.revision, { remoteId, lastConfirmedImage: confirmedImage, status: 'live' }, { transaction });
+      if (confirmedImage) await this.repositories.publications.update(p!.id, p!.revision, { remoteId, lastConfirmedImage: confirmedImage, status: op.snapshot.desiredStatus }, { transaction });
       await this.audit(work, p!.id, `publication.${input.result}`, evidence, transaction);
       return { quarantined: false, record };
     });

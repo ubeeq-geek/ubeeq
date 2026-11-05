@@ -10,7 +10,7 @@ export const preparation = id => ({ ...scope, publicationId: id, requestId: id, 
   destination: 'deviantart', connectionId: 'connection', account, targetKey: id, intent: { access: 'premium', full: true } });
 export const binding = remoteId => ({ providerNamespace: 'deviantart.com', objectType: 'deviation', ownershipBoundary: 'global', remoteId });
 export const makePolicy = repositories => {
-  const state = { metadata: {}, principal: 'principal', failPreparation: false, authorize: true, sourceChecksum: sha('source'), collections: [], defaultVariant: 'reduced' };
+  const state = { metadata: {}, principal: 'principal', failPreparation: false, authorize: true, sourceChecksum: sha('source'), collections: [], defaultVariant: 'reduced', desiredStatus: 'live' };
   const validateWatermark = value => {
     if (!value || typeof value.text !== 'string' || value.text.length > 100) throw new PublicationImageError('invalid_request', 'Invalid watermark.');
     return { text: value.text };
@@ -41,7 +41,7 @@ export const makePolicy = repositories => {
         file: { fileReference: `private-file-${r.variant}`, checksum: sha(r.imageFingerprint + state.sourceChecksum), sizeBytes: 1000, mimeType: 'image/jpeg', width: 1000, height: 800 },
         variant: r.variant, imageChoice: 'saved', recipeFingerprint: sha(r.variant),
         ...(!r.watermarkDormant ? { watermark: r.watermark, watermarkFingerprint: await publicationImageFingerprint(r.watermark) } : {}),
-        targets: [{ id: p.currentTargetKey, access: 'premium' }], desiredStatus: 'live' };
+        targets: [{ id: p.currentTargetKey, access: 'premium' }], desiredStatus: state.desiredStatus };
     },
     async verifyRemoteResult(op, b) {
       if (op.snapshot.account.remoteAccountId !== state.principal) throw new PublicationImageError('publication_identity_conflict', 'Principal changed.');

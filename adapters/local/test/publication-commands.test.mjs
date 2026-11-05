@@ -250,3 +250,12 @@ test('an explicitly reviewed context save can correct an unresolved restore mark
   assert.equal(saved.publication.unresolvedImageContext, undefined); assert.equal(saved.publication.configurationRevision, 2);
   assert.equal((await f.service.reviewImage(scope, 'p')).snapshot.variant, 'original');
 });
+
+test('confirmed draft and scheduled deliveries preserve the approved target lifecycle', async t => {
+  const f = await fixture(t);
+  for (const desiredStatus of ['draft', 'scheduled']) {
+    await f.prepare(desiredStatus); f.state.desiredStatus = desiredStatus;
+    await f.result(await f.dispatch(await f.approve(desiredStatus)), `remote-${desiredStatus}`);
+    assert.equal((await f.service.get(scope, desiredStatus)).status, desiredStatus);
+  }
+});
