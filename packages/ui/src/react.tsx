@@ -496,3 +496,4 @@ export function BlockEditor({
     </div>
   );
 }
+export { CollectionSlideshowPanel, type CollectionSlideshowPanelProps } from './collection-slideshow-panel.js';

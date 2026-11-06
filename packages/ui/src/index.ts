@@ -89,3 +89,4 @@ export { createProfileLinkEditor, type ProfileLinkValue } from './profile-link-e
 export * from './website-gallery.js';
 
 export * from './media-embed.js';
+export * from './collection-slideshow-client.js';
