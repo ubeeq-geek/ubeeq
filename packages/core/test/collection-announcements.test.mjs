@@ -21,6 +21,25 @@ const observation = (r, overrides = {}) => ({ releaseId: 'release', ...r, observ
 const ready = (requirements, observations, overrides = {}) => evaluateCollectionReleaseReadiness({ releaseId: 'release', requirements, observations, rule: { mode: 'all_required' }, now, ...overrides });
 const baseline = () => ({ ...scope, schemaVersion: 1, revision: 1, initialized: true, releasedWorkIds: [], evidence: [], reservations: [] });
 
+test('primary exposure consumes initial identity while late optional results retain their reservation and evidence', () => {
+  const a = requirement('one'), optional = requirement('optional', { workId: 'one', target: { ...target, targetId: 'optional-gallery' } });
+  let b = reserveCollectionRelease({ baseline: baseline(), expectedRevision: 1, releaseId: 'release', requestedWorkIds: ['one'] }).baseline;
+  b = recordCollectionReleaseExposure({ baseline: b, expectedRevision: b.revision, releaseId: 'release', requirements: [a, optional], observations: [observation(a)], now });
+  assert.equal(b.initialReleaseId, 'release');
+  assert.equal(b.initialClaimReleaseId, undefined);
+  assert.equal(b.reservations.length, 1);
+  const next = reserveCollectionRelease({ baseline: b, expectedRevision: b.revision, releaseId: 'later', requestedWorkIds: ['two'] });
+  assert.equal(next.reservation.kind, 'additions');
+  b = recordCollectionReleaseExposure({ baseline: next.baseline, expectedRevision: next.baseline.revision, releaseId: 'release', requirements: [a, optional], observations: [observation(a), observation(optional)], now });
+  assert.equal(b.evidence.length, 2);
+  b = finishCollectionReleaseReservation(b, b.revision, 'release');
+  const copy = requirement('another-copy', { workId: 'one', target: { ...target, targetId: 'another-gallery' } });
+  assert.equal(reserveCollectionRelease({ baseline: b, expectedRevision: b.revision, releaseId: 'copy', requestedWorkIds: ['one'] }).state, 'noop');
+  b = recordCollectionReleaseExposure({ baseline: b, expectedRevision: b.revision, releaseId: 'copy', requirements: [copy], observations: [observation(copy, { releaseId: 'copy' })], now });
+  assert.equal(b.evidence.length, 3);
+  assert.deepEqual(b.releasedWorkIds, ['one']);
+});
+
 test('exact content publication and placement evidence is required; submission and job success are insufficient', () => {
   const r = requirement();
   assert.equal(ready([r], []).ready, false);
@@ -151,6 +170,22 @@ test('credential-bearing primary links fail rather than being silently rewritten
 const plan = (overrides = {}) => createAnnouncementPlan({ ...scope, planId: 'plan', origin: 'manual', actorId: 'actor', kind: 'ad_hoc', authorizationRevision: 1, behaviour: 'automatic', latePolicy: { mode: 'hold', maximumLatenessMs: 86400000 }, now, ...overrides });
 const step = (id = 'one', overrides = {}) => ({ logicalStepId: id, destinationKey: key, generation: 1, contentRevision: 'content-1', dueAt: now, state: 'pending', deliveryId: `delivery-${id}`, ...overrides });
 const active = (overrides = {}) => { let p = plan(overrides); p = reserveAnnouncementMaterialization(p, p.revision, now); return completeAnnouncementMaterialization(p, p.revision, p.materialization.announcementId, now); };
+test('withdrawn confirmed content requires review for initial and follow-up plans, while an authored waiting draft can remain unresolved', () => {
+  const r=requirement(), readiness=ready([r],[observation(r)]);
+  for(const kind of ['initial','follow_up']){
+    let p=plan({releaseId:'release',kind,...(kind==='follow_up'?{parentPlanId:'parent'}:{})});
+    p=evaluateAnnouncementPlan({plan:p,expectedRevision:p.revision,featureEnabled:true,readiness,schedule:{state:'due',dueAt:now,holds:[]},now});
+    assert.equal(p.releaseReadyAt,now);
+    p=evaluateAnnouncementPlan({plan:p,expectedRevision:p.revision,featureEnabled:true,readiness:ready([r],[]),now});
+    assert.equal(p.gateState,'held');assert.equal(p.holds[0].code,'SOURCE_CHANGED');
+    p=evaluateAnnouncementPlan({plan:p,expectedRevision:p.revision,featureEnabled:true,readiness,schedule:{state:'due',dueAt:now,holds:[]},now});
+    assert.equal(p.gateState,'held');
+    p=evaluateAnnouncementPlan({plan:p,expectedRevision:p.revision,featureEnabled:true,readiness,schedule:{state:'due',dueAt:now,holds:[]},reviewedAuthorizationRevision:p.authorizationRevision+1,now});
+    assert.equal(p.gateState,'ready_to_prepare');
+  }
+  const authored={...plan({releaseId:'release'}),materialization:{state:'materialized',announcementId:'manual-author'}};
+  assert.equal(evaluateAnnouncementPlan({plan:authored,expectedRevision:authored.revision,featureEnabled:true,readiness:ready([r],[]),now}).gateState,'waiting_publication');
+});
 test('materialization resumes the same reserved ID and exposes only one logical row after durable creation', () => {
   let p = plan();
   assert.equal(announcementLogicalRow(p).announcementId, undefined);

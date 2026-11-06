@@ -59,7 +59,7 @@ Reconcile historical live content before setting a baseline's `initialized` flag
 Unknown evidence must never initialize an empty baseline that treats historical
 content as new. `reserveCollectionRelease` returns a pure proposal:
 
-- An initial claim serializes subsequent releases until it finishes.
+- An unexposed initial claim serializes subsequent releases until confirmed exposure or cancellation.
 - Overlapping addition scopes wait rather than silently dropping reserved works.
 - Repeated claims retain the original reserved scope.
 - Zero new works yields a no-op.
@@ -70,6 +70,9 @@ monotonic baseline as soon as any exact result proves exposure, regardless of
 announcement status. `finishCollectionReleaseReservation` frees reservations
 when publication terminates, retaining all confirmed exposure. Cancelling an
 unexposed initial claim permits the next release to classify as initial.
+Keep outstanding result reservations after primary-only readiness so late optional
+destinations can still add evidence. Recording a different copy or destination of
+an already released Work updates evidence without claiming new content.
 
 ## Preferences and content
 

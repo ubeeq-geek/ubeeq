@@ -85,7 +85,9 @@ export function evaluateAnnouncementPlan(input: {
   const reviewCodes = new Set(["SOURCE_CHANGED", "DESTINATION_UNAVAILABLE", "RULES_CHANGED", "PERMISSION_CHANGED", "SCHEDULE_EXPIRED"]);
   if (p.gateState === "held" && input.reviewedAuthorizationRevision === undefined) holds.push(...p.holds.filter(h => reviewCodes.has(h.code) && h.requiresReview !== false));
   if (holds.length) return advance(p, { gateState: "held", holds, authorizationRevision }, input.now);
-  if (p.kind !== "follow_up" && p.releaseId && !input.readiness?.ready) {
+  if (p.releaseId && !input.readiness?.ready) {
+    if (p.releaseReadyAt)
+      return advance(p, { gateState: "held", holds: [{ code: "SOURCE_CHANGED", requiresReview: true, message: "Previously confirmed collection content or its required links are unavailable. Review the remaining copies before resuming." }], authorizationRevision }, input.now);
     const publicationHolds = input.readiness?.holds ?? [{ code: "PUBLICATION_PENDING" as const, message: "Wait for authoritative publication evidence." }];
     return advance(p, { gateState: publicationHolds.some(h => h.code !== "PUBLICATION_PENDING") ? "held" : "waiting_publication", holds: publicationHolds, authorizationRevision }, input.now);
   }

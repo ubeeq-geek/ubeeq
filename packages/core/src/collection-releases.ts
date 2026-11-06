@@ -100,13 +100,14 @@ export function recordCollectionReleaseExposure(input: {
   const b = input.baseline;
   assertBaseline(b, input.expectedRevision);
   const reservation = b.reservations.find(r => r.releaseId === input.releaseId);
-  if (!reservation) throw new AnnouncementOrchestrationError("GENERATION_CONFLICT", "Reserve this release before recording exposure.");
+  if (!reservation && input.requirements.some(r => !b.releasedWorkIds.includes(r.workId)))
+    throw new AnnouncementOrchestrationError("GENERATION_CONFLICT", "Reserve this release before recording new exposure.");
   const evaluated = evaluateCollectionReleaseReadiness({ ...input, rule: { mode: "all_required" } });
   const confirmed = new Set(evaluated.confirmedResultIds);
   const released = new Set(b.releasedWorkIds), evidence = new Map(b.evidence.map(e => [JSON.stringify([e.workId, e.destinationKey, e.contentRevision]), e]));
   let changed = false;
   for (const r of input.requirements) {
-    if (!confirmed.has(r.resultId) || !reservation.workIds.includes(r.workId)) continue;
+    if (!confirmed.has(r.resultId) || !b.releasedWorkIds.includes(r.workId) && !reservation?.workIds.includes(r.workId)) continue;
     const o = input.observations.find(o => o.releaseId === input.releaseId && o.resultId === r.resultId)!;
     const e: CollectionReleasedWorkEvidence = { workId: r.workId, destinationKey: announcementDestinationKey(r.target), contentRevision: r.contentRevision, evidenceReference: o.evidence!.reference };
     const key = JSON.stringify([e.workId, e.destinationKey, e.contentRevision]);
@@ -115,7 +116,8 @@ export function recordCollectionReleaseExposure(input: {
   }
   if (!changed) return structuredClone(b);
   return { ...structuredClone(b), revision: b.revision + 1, releasedWorkIds: [...released], evidence: [...evidence.values()],
-    initialReleaseId: b.initialReleaseId ?? (released.size ? input.releaseId : undefined) };
+    initialReleaseId: b.initialReleaseId ?? (released.size ? input.releaseId : undefined),
+    initialClaimReleaseId: released.size && b.initialClaimReleaseId === input.releaseId ? undefined : b.initialClaimReleaseId };
 }
 /** Publication termination frees unexposed claims. Confirmed exposure is monotonic, including after cancellation. */
 export function finishCollectionReleaseReservation(b: CollectionReleaseBaseline, expectedRevision: number, releaseId: string): CollectionReleaseBaseline {
