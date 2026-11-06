@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/server.mjs",
     "test": "npm run build && node --test test/*.test.mjs",
-    "build": "esbuild src/websites.tsx --bundle --platform=browser --outfile=dist/websites.js --minify --jsx=automatic",
+    "build": "esbuild src/websites.tsx src/collections.tsx --bundle --platform=browser --outdir=dist --minify --jsx=automatic",
     "prestart": "npm run build"
   },
   "dependencies": {

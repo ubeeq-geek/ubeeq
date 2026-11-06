@@ -2,6 +2,11 @@
 
 The reference API is a neutral, local-first implementation of the creator profile, Work, Asset, Collection, upload, publication, delivery, and export flow.
 
+The optional [collection slideshow renderer](../../docs/collection-slideshow-videos.md)
+adds durable private MP4 exports. Configure `UBEEQ_FFMPEG_PATH` and
+`UBEEQ_FFPROBE_PATH` in the API and worker environments to enable the controls at
+`/collections`.
+
 `PublicationService` in `@ubeeq/api` owns the canonical publication mechanism.
 Consumers supply an authenticated Work-authorization callback and an explicit
 publication-admission callback; there is no default allow policy. The reference

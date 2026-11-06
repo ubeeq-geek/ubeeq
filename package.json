@@ -35,7 +35,8 @@
     "test:machine-compact": "node scripts/smoke-machine-compact.mjs",
     "test:machine-scalable": "node scripts/smoke-machine-scalable.mjs",
     "test:kubernetes-scalable": "node scripts/validate-kubernetes-scalable.mjs",
-    "test:commerce-browser": "node scripts/smoke-commerce-browser.mjs"
+    "test:commerce-browser": "node scripts/smoke-commerce-browser.mjs",
+    "test:slideshow-browser": "node scripts/smoke-slideshow-browser.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

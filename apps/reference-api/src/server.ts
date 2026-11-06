@@ -21,6 +21,10 @@ import { repositoryItems, type Page, type PageRequest } from "@ubeeq/persistence
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
+import type { SlideshowRenderer } from '@ubeeq/processing';
+import { FfmpegSlideshowRenderer } from '@ubeeq/media-ffmpeg';
+import { SlideshowError } from '@ubeeq/core';
+import { ReferenceCollectionSlideshows } from './slideshows.js';
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
@@ -73,6 +77,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   federationPolicy?: FederationPolicy;
   federationVerifier?: FederationSignatureVerifier;
   mediaProcessor?: MediaProcessor;
+  /** Opt-in: deployments supply native tools or another implementation. */
+  slideshowRenderer?: SlideshowRenderer;
   adapters?: ReferenceAdapterSet;
   regionalControlPlane?: RegionalControlPlane;
   /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
@@ -102,6 +108,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
     operator: environment.UBEEQ_CELL_OPERATOR ?? "self-hosted",
     credentialEncryptionKey: environment.UBEEQ_CREDENTIAL_ENCRYPTION_KEY,
     commerce: referenceCommerceConfigurationFromEnvironment(environment),
+    ...(environment.UBEEQ_FFMPEG_PATH && environment.UBEEQ_FFPROBE_PATH ? { slideshowRenderer: new FfmpegSlideshowRenderer({ ffmpegPath: environment.UBEEQ_FFMPEG_PATH, ffprobePath: environment.UBEEQ_FFPROBE_PATH }) } : {}),
     nativeWebsiteProfiles:environment.UBEEQ_WEBSITE_HOSTING_ROOT&&environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE?[{id:'local',root:environment.UBEEQ_WEBSITE_HOSTING_ROOT,publicUrlTemplate:environment.UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE,persistent:true,writerMode:'single'}]:[],
   };
 };
@@ -329,8 +336,12 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     pruneCredentials: localAdapters&&!configuration.commerce.vault ? (references,cutoff)=>localAdapters.credentials.pruneCommerceOrphans(references,cutoff) : undefined
   }) : undefined;
   let lastWebsitePolicyScan=0;
+  const slideshows = new ReferenceCollectionSlideshows({ repositories, storage: adapters.storage, jobs: adapters.jobs, cellId,
+    renderer: configuration.slideshowRenderer, writable: requireCreatorWritable, admit: ids => requireClearAdmission('slideshow', ids) });
   let commerceTurn=true;
   const runNextJob = async (workerId: string) => {
+    const slideshow = await slideshows.runNextJob(workerId);
+    if (slideshow) return slideshow;
     if (commerce && commerceTurn) { commerceTurn=false; const job = await commerce.runNextJob(workerId); if (job) return job; }
     commerceTurn=true;
     // Recover policy changes from authoritative hold records, even if the process crashed after the hold committed.
@@ -529,6 +540,35 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
       if (method === "POST" && url.pathname === "/v1/creators") { const identity = await session(request); const body = await parseBody(request); const creator = await repositories.creators.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, handle: requireString(body.handle, "handle"), displayName: requireString(body.displayName, "displayName"), subjectId: identity.subject.id }); return json(response, 201, { creator, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/creators/me") { const identity = await session(request); return json(response, 200, { creator: await creatorFor(identity.subject.id), requestId }, requestId); }
+      if (method === 'GET' && url.pathname === '/v1/collections') {
+        const identity = await session(request), creator = await creatorFor(identity.subject.id);
+        requireHomeCell({ cellId }, creator);
+        response.setHeader('cache-control', 'private, no-store');
+        return json(response, 200, { ...await slideshows.catalogue(creator), requestId }, requestId);
+      }
+      const collectionExportMatch = /^\/v1\/collections\/([^/]+)\/(works|slideshows)(?:\/([^/]+)(?:\/(content))?)?$/.exec(url.pathname);
+      if (collectionExportMatch) {
+        const identity = await session(request), creator = await creatorFor(identity.subject.id);
+        requireHomeCell({ cellId }, creator);
+        const [, encodedCollectionId, kind, encodedRenditionId, content] = collectionExportMatch;
+        const collectionId = decodeURIComponent(encodedCollectionId), renditionId = encodedRenditionId ? decodeURIComponent(encodedRenditionId) : undefined;
+        response.setHeader('cache-control', 'private, no-store');
+        if (kind === 'works' && method === 'PUT' && !renditionId) {
+          const body = await parseBody(request);
+          return json(response, 200, { ...await slideshows.replaceWorks(creator, collectionId, body.workIds, body.expectedRevision), requestId }, requestId);
+        }
+        if (kind === 'slideshows') {
+          if (method === 'POST' && !renditionId) return json(response, 202, { ...await slideshows.request(creator, collectionId, await parseBody(request)), requestId }, requestId);
+          if (method === 'GET' && !renditionId) return json(response, 200, { ...await slideshows.list(creator, collectionId), requestId }, requestId);
+          if (method === 'GET' && renditionId && !content) return json(response, 200, { rendition: await slideshows.status(creator, collectionId, renditionId), requestId }, requestId);
+          if (method === 'GET' && renditionId && content) {
+            const body = await slideshows.download(creator, collectionId, renditionId);
+            response.writeHead(200, { 'content-type': 'video/mp4', 'content-length': body.byteLength, 'content-disposition': 'attachment; filename="collection-slideshow.mp4"', 'x-content-type-options': 'nosniff' });
+            response.end(Buffer.from(body)); return;
+          }
+        }
+        throw new HttpError(404, 'not_found', 'Route was not found');
+      }
       if (method === "POST" && url.pathname === "/v1/works") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator); const body = await parseBody(request); const work = await repositories.works.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, title: requireString(body.title, "title"), status: "draft" }); return json(response, 201, { work, requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/collections") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator); const body = await parseBody(request); const collection = await repositories.collections.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, title: requireString(body.title, "title"), visibility: body.visibility === "public" || body.visibility === "unlisted" ? body.visibility : "private" }); return json(response, 201, { collection, requestId }, requestId); }
 
@@ -635,7 +675,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         try {
           const completed = await repositories.transaction(async (transaction) => {
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
-            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
+            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, slideshowPending: _slideshowPending, slideshowJobId: _slideshowJobId, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; slideshowPending?: unknown; slideshowJobId?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
             for (const publication of manifest.publications) await repositories.publications.create({ ...publication, instanceId: creator.instanceId, ...dataHomeOf(creator), status: "draft" }, { transaction, idempotencyKey: `import:${importId}:publication:${publication.id}` });
             for (const intent of manifest.publicationIntents) await repositories.publicationIntents.create({ ...intent, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:intent:${intent.id}` });
@@ -662,6 +702,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if (error instanceof SlideshowError) return json(response, error.code.endsWith('not_found') ? 404 : error.code === 'slideshow_unavailable' ? 503 : error.code === 'invalid_slideshow' ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof WebsiteError) return json(response, error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof PublicationRequestError) return json(response, ['invalid_request', 'invalid_idempotency_key'].includes(error.code) ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);

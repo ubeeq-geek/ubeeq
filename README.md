@@ -6,6 +6,8 @@ Hosted products consume Ubeeq through versioned packages and extension contracts
 
 Native website export and its integration boundaries are documented in [Native static websites](docs/native-static-websites.md). The local reference web app exposes the shared editor at `/websites`.
 
+Optional [collection slideshow videos](docs/collection-slideshow-videos.md) provide private MP4 exports with adjustable timing, transitions and music. The reference controls are at `/collections`; hosts must explicitly enable a renderer.
+
 ## Local development
 
 The reference instance runs entirely on the local machine: SQLite state,

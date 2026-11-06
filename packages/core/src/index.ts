@@ -351,3 +351,4 @@ export * from './collection-destinations.js';
 export * from './collection-publications.js';
 
 export * from "./website-redirect-history.js";
+export * from './slideshow.js';
