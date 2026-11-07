@@ -5,12 +5,13 @@ const latePolicy = { mode: 'hold', maximumLatenessMs: 86400000 };
 const now = '2026-11-05T12:00:00.000Z';
 const timeZone = 'America/Winnipeg';
 test('civil time resolution rejects DST gaps and demands an explicit repeated-hour occurrence', () => {
-  assert.throws(() => resolveAnnouncementCivilTime({ timeZone, localDateTime: '2026-03-08T02:30:00' }), /does not exist/);
-  assert.throws(() => resolveAnnouncementCivilTime({ timeZone, localDateTime: '2026-11-01T01:30:00' }), { code: 'REVIEW_REQUIRED' });
-  const earlier = resolveAnnouncementCivilTime({ timeZone, localDateTime: '2026-11-01T01:30:00', occurrence: 'earlier' });
-  const later = resolveAnnouncementCivilTime({ timeZone, localDateTime: '2026-11-01T01:30:00', occurrence: 'later' });
-  assert.equal(earlier.instant, '2026-11-01T06:30:00.000Z'); assert.equal(earlier.offsetMinutes, -300);
-  assert.equal(later.instant, '2026-11-01T07:30:00.000Z'); assert.equal(later.offsetMinutes, -360);
+  // Historical transitions keep gap/fold coverage independent of future zone-rule updates.
+  assert.throws(() => resolveAnnouncementCivilTime({ timeZone, localDateTime: '2024-03-10T02:30:00' }), /does not exist/);
+  assert.throws(() => resolveAnnouncementCivilTime({ timeZone, localDateTime: '2024-11-03T01:30:00' }), { code: 'REVIEW_REQUIRED' });
+  const earlier = resolveAnnouncementCivilTime({ timeZone, localDateTime: '2024-11-03T01:30:00', occurrence: 'earlier' });
+  const later = resolveAnnouncementCivilTime({ timeZone, localDateTime: '2024-11-03T01:30:00', occurrence: 'later' });
+  assert.equal(earlier.instant, '2024-11-03T06:30:00.000Z'); assert.equal(earlier.offsetMinutes, -300);
+  assert.equal(later.instant, '2024-11-03T07:30:00.000Z'); assert.equal(later.offsetMinutes, -360);
   assert.deepEqual(resolveAnnouncementCivilTime({ timeZone, localDateTime: later.localDateTime, offsetMinutes: -360 }), later);
   assert.throws(() => resolveAnnouncementCivilTime({ timeZone, localDateTime: later.localDateTime, offsetMinutes: 0 }));
   assert.throws(() => resolveAnnouncementCivilTime({ timeZone: 'invalid', localDateTime: later.localDateTime }));
