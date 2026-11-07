@@ -1,4 +1,4 @@
-import { assertPublicationConfigurationRevision, assertPublicationCopyIdentity, PublicationImageError, validatePublicationImageSelection,
+import { assertPublicationConfigurationRevision, assertPublicationCopyIdentity, inheritedPublicationImageSelection, PublicationImageError, validatePublicationImageSelection,
   validatePublicationImageReviewSnapshot } from '@ubeeq/core';
 import { publicationIdentityHash } from './publication-copies.js';
 import type { ManagedPublicationRecord, PublicationDeliveryRecord } from './publication-commands.js';
@@ -11,8 +11,8 @@ export function assertManagedPublicationWrite(previous: ManagedPublicationRecord
     return value as Record<string, unknown>;
   });
   if (!previous) return;
-  const before = publicationIdentityHash([previous.imageSelection, previous.unresolvedImageContext]);
-  const after = publicationIdentityHash([next.imageSelection, next.unresolvedImageContext]);
+  const before = publicationIdentityHash([previous.imageSelection ?? inheritedPublicationImageSelection(), previous.unresolvedImageContext]);
+  const after = publicationIdentityHash([next.imageSelection ?? inheritedPublicationImageSelection(), next.unresolvedImageContext]);
   if (before !== after ? next.configurationRevision !== (previous.configurationRevision ?? 0) + 1
     : (next.configurationRevision ?? 0) !== (previous.configurationRevision ?? 0)) throw new PublicationImageError('publication_revision_conflict', 'Image configuration must advance its independent revision exactly once.');
   if (previous.copy && publicationIdentityHash(previous.copy) !== publicationIdentityHash(next.copy)) throw new PublicationImageError('publication_identity_conflict', 'Legacy copy identity is immutable.');

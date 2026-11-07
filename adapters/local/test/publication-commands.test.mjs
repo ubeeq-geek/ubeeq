@@ -38,6 +38,41 @@ const fixture = async t => {
 };
 const rows = async repository => { const output = []; for await (const row of repositoryItems(request => repository.list(request))) output.push(row); return output; };
 
+test('operational adoption preserves a published identity and reserves its remote object before delivery',async t=>{
+ const f=await fixture(t);f.policy.validateLegacyAdaptation=async()=>{};
+ const existing=await f.repositories.publications.create({id:'existing',...dataHome,instanceId:scope.instanceId,creatorId:scope.creatorId,workId:scope.workId,destination:'deviantart',status:'live',remoteId:'existing-remote'});
+ const input={...scope,publicationId:existing.id,requestId:'adopt',expectedPublicationRevision:existing.revision,expectedWorkRevision:1,connectionId:'connection',account,targetKey:'regular',intent:{access:'regular'},remoteBinding:binding('existing-remote')};
+ const adopted=await f.service.adoptOperationalPublication(input);
+ assert.equal(adopted.id,existing.id);assert.equal(adopted.createdAt,existing.createdAt);assert.equal(adopted.configurationRevision,0);
+ assert.deepEqual(adopted.imageSelection.variant,{mode:'inherit'});assert.deepEqual(adopted.remoteBinding,binding('existing-remote'));
+ assert.equal((await f.service.adoptOperationalPublication(input)).id,existing.id);
+ const other=await f.repositories.publications.create({...existing,id:'duplicate'});
+ await assert.rejects(f.service.adoptOperationalPublication({...input,publicationId:other.id,requestId:'duplicate',targetKey:'other',expectedPublicationRevision:other.revision}),{code:'publication_identity_conflict'});
+ assert.equal((await rows(f.repositories.operations)).length,0);assert.equal((await rows(f.repositories.outbox)).length,0);
+});
+
+test('publishing a reviewed existing draft allows only its explicitly approved live object type',async t=>{
+ const f=await fixture(t);await f.prepare('draft');f.state.desiredStatus='draft';
+ const draftBinding={...binding('stash:123'),objectType:'stash'},first=await f.dispatch(await f.approve('draft'));
+ await f.service.recordResult({...scope,publicationId:'draft',operationId:first.id,workerId:'worker',fencingGeneration:first.operation.fencingGeneration,result:'confirmed',binding:draftBinding});
+ f.state.desiredStatus='live';const original=f.policy.review.bind(f.policy);
+ f.policy.review=async(...args)=>({...await original(...args),remoteTransition:{kind:'publish-draft',resultObjectType:'deviation'}});
+ const publish=await f.dispatch(await f.approve('draft','publish-existing','UPDATE'));
+ await f.result(publish,'published-draft');
+ const saved=await f.service.get(scope,'draft');assert.equal(saved.remoteId,'published-draft');assert.equal(saved.status,'live');
+ assert.equal((await rows(f.repositories.claims)).filter(c=>c.kind==='remote').length,2);
+});
+
+test('explicit target moves retain historical reservations and reject moves during an unresolved delivery',async t=>{
+ const f=await fixture(t);await f.prepare('original-target');f.policy.validateLegacyAdaptation=async()=>{};
+ const p=await f.service.get(scope,'original-target'),input={...scope,publicationId:p.id,requestId:'move',expectedPublicationRevision:p.revision,targetKey:'new-target',intent:{access:'premium'}};
+ await f.service.retargetOperationalPublication(input);assert.equal((await f.service.retargetOperationalPublication(input)).currentTargetKey,'new-target');
+ await assert.rejects(f.service.prepare({...preparation('replacement-id'),requestId:'historical-reuse',targetKey:'original-target'}),{code:'publication_identity_conflict'});
+ const pending=await f.approve(p.id),current=await f.service.get(scope,p.id);
+ await assert.rejects(f.service.retargetOperationalPublication({...input,requestId:'busy-move',expectedPublicationRevision:current.revision,targetKey:'third-target'}),{code:'publication_busy'});
+ assert.equal((await rows(f.repositories.claims)).filter(c=>c.kind==='target').length,2);
+});
+
 test('three settings survive SQLite restart; config edits preserve sibling bytes, metadata and copy IDs', async t => {
   const f = await fixture(t);
   for (const id of ['preview', 'collection', 'volume']) await f.prepare(id);

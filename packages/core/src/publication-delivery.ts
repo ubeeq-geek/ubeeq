@@ -19,6 +19,9 @@ export interface PublicationImageReviewSnapshot {
   account: PublicationAccountIdentity;
   /** Required for UPDATE; absent for CREATE. The worker uses this exact object identity. */
   remoteBinding?: PublicationImageRemoteBinding;
+  /** Explicit approval to publish this existing draft into its provider's live object.
+   * Ordinary UPDATE operations retain their exact remote identity. */
+  remoteTransition?: {kind:'publish-draft';resultObjectType:string};
   metadata: Readonly<Record<string, unknown>>;
   metadataFingerprint: string;
   dependencyFingerprint: string;
@@ -65,6 +68,9 @@ export function validatePublicationImageReviewSnapshot(value: PublicationImageRe
     || value.remoteBinding !== undefined && (!value.remoteBinding
       || ![value.remoteBinding.providerNamespace, value.remoteBinding.objectType, value.remoteBinding.ownershipBoundary, value.remoteBinding.remoteId].every(isPublicationIdentifier)
       || value.remoteBinding.providerNamespace !== value.account?.providerNamespace || value.remoteBinding.remoteId.startsWith('pending:'))
+    || value.remoteTransition !== undefined && (value.remoteTransition.kind !== 'publish-draft' || !value.remoteBinding
+      || value.desiredStatus !== 'live' || !isPublicationIdentifier(value.remoteTransition.resultObjectType)
+      || value.remoteTransition.resultObjectType === value.remoteBinding.objectType)
     || !Array.isArray(value.targets) || value.targets.length > 100 || value.targets.some(t => !isPublicationIdentifier(t.id) || !isPublicationIdentifier(t.access))
     || new Set(value.targets.map(t => t.id)).size !== value.targets.length
     || !['draft', 'live', 'scheduled'].includes(value.desiredStatus)

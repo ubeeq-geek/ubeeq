@@ -63,6 +63,8 @@ export interface PublicationCommandPolicy {
   verifyFinalFailure?(operation: PublicationDeliveryOperation, evidence: { code: string; providerRequestId?: string }, transaction: PersistenceTransaction): Promise<void>;
   /** Product compatibility rows/intents/assets must join this transaction. No provider calls. */
   commitPreparation?(work: WorkRecord, publication: ManagedPublicationRecord, intent: Readonly<Record<string, unknown>>, transaction: PersistenceTransaction): Promise<void>;
+  /** Updates existing compatibility intent without allocating another preparation. */
+  commitTargetMove?(work:WorkRecord,publication:ManagedPublicationRecord,intent:Readonly<Record<string,unknown>>,transaction:PersistenceTransaction):Promise<void>;
   /** Must guard the original command/slot/remote claims, compatibility rows and all legacy jobs.
    * Missing capability, any dispatched/ambiguous operation or inconsistent projection blocks adaptation.
    */
@@ -124,6 +126,47 @@ export class PublicationCommandService {
 
   async get(scope: PublicationCommandScope, publicationId: string): Promise<ManagedPublicationRecord> {
     return this.transaction(async transaction => structuredClone((await this.load(scope, publicationId, 'read', transaction)).publication!));
+  }
+
+  /** Transactional adoption of an ordinary operational Publication. Preserves its
+   * identity, saved image settings and provider evidence; never adapts a generic copy. */
+  async adoptOperationalPublication(input: PublicationCommandScope & {publicationId:string;requestId:string;expectedPublicationRevision:number;expectedWorkRevision:number;
+    connectionId:string;account:PublicationAccountIdentity;targetKey:string;intent:Readonly<Record<string,unknown>>;remoteBinding?:PublicationRemoteBinding}) {
+    input=structuredClone(input);validRequest(input.requestId);
+    if(![input.connectionId,input.targetKey,input.account?.providerNamespace,input.account?.remoteAccountId].every(isPublicationIdentifier))fail('invalid_request','Verified operational target information is required.');
+    const receiptId=key('operational-adoption',[input.instanceId,input.creatorId,input.requestId]),fingerprint=publicationIdentityHash(input);
+    return this.transaction(async transaction=>{
+      const {work,publication:p}=await this.load(input,input.publicationId,'prepare',transaction);
+      const receipt=await this.repositories.claims.get(receiptId,{transaction});
+      if(receipt){if(receipt.fingerprint!==fingerprint)fail('idempotency_conflict','Operational adoption settings changed.');await this.assertManaged(p!,transaction);return p!;}
+      if(p!.copy)fail('publication_reconciliation_required','A generic copy requires the explicit legacy adaptation command.');
+      if(p!.revision!==input.expectedPublicationRevision||work.revision!==input.expectedWorkRevision)fail('publication_revision_conflict','Publication or source changed before adoption.');
+      if(p!.activeOperationId)fail('publication_busy','Resolve the active operation before adopting this target.');
+      if(p!.preparationVersion===1){
+        if(p!.connectionId!==input.connectionId||publicationIdentityHash(p!.account)!==publicationIdentityHash(input.account)||p!.currentTargetKey!==input.targetKey)fail('publication_identity_conflict','An operational target must be moved through explicit review.');
+        return p!;
+      }
+      if(!this.policy.validateLegacyAdaptation)fail('publication_reconciliation_required','Operational adoption requires complete legacy inventory.');
+      await this.policy.validateLegacyAdaptation(work,p!,transaction);await this.guardWork(work,transaction);
+      const targetId=key('target',[identity(input),p!.destination,input.account,input.targetKey]),target=await this.repositories.claims.get(targetId,{transaction});
+      if(target&&target.publicationId!==p!.id)fail('publication_identity_conflict','The operational target is reserved by another Publication.');
+      const remote=input.remoteBinding;
+      if(p!.remoteId&&(!remote||remote.remoteId!==p!.remoteId||remote.providerNamespace!==input.account.providerNamespace||![remote.objectType,remote.ownershipBoundary,remote.remoteId].every(isPublicationIdentifier)))fail('publication_identity_conflict','Existing remote publications require their complete original binding.');
+      if(!p!.remoteId&&remote)fail('publication_identity_conflict','An unbound Publication cannot acquire a remote identity during adoption.');
+      const remoteKey=remote?key('remote',[input.instanceId,remote]):undefined,remoteClaim=remoteKey?await this.repositories.claims.get(remoteKey,{transaction}):undefined;
+      if(remoteClaim&&remoteClaim.publicationId!==p!.id)fail('publication_identity_conflict','Another Publication already claims this provider object.');
+      const next=await this.repositories.publications.update(p!.id,p!.revision,{creatorId:work.creatorId,connectionId:input.connectionId,account:input.account,currentTargetKey:input.targetKey,preparationVersion:1,
+        ...(remote?{remoteBinding:remote}:{}),
+        ...(p!.imageSelection===undefined?{imageSelection:inheritedPublicationImageSelection(),configurationRevision:p!.configurationRevision??0}:{})},{transaction});
+      await this.policy.validateSelection(work,next,next.imageSelection??inheritedPublicationImageSelection(),transaction);
+      await this.policy.commitPreparation?.(work,next,input.intent,transaction);
+      if(!target)await this.repositories.claims.create({...this.claim(work,p!.id,targetId,'target',publicationIdentityHash(input.intent)),targetKey:input.targetKey},{transaction});
+      if(remoteKey&&!remoteClaim)await this.repositories.claims.create(this.claim(work,p!.id,remoteKey,'remote',publicationIdentityHash(remote)),{transaction});
+      const identityId=key('publication-identity',[input.instanceId,p!.id]);
+      if(!await this.repositories.claims.get(identityId,{transaction}))await this.repositories.claims.create(this.claim(work,p!.id,identityId,'identity',publicationIdentityHash([identity(input),p!.id])),{transaction});
+      await this.repositories.claims.create(this.claim(work,p!.id,receiptId,'preparation',fingerprint),{transaction});
+      await this.audit(work,p!.id,'publication.operational-adopted',{receiptId,targetId},transaction);return next;
+    });
   }
 
   async prepare(input: PublicationCommandScope & { publicationId: string; requestId: string; expectedWorkRevision: number;
@@ -201,6 +244,28 @@ export class PublicationCommandService {
       await this.repositories.claims.create({ ...this.claim(work, p!.id, receiptId, 'configuration', fingerprint), configurationRevision: appliedRevision }, { transaction });
       await this.audit(work, p!.id, 'publication.image-configured', { receiptId, configurationRevision: appliedRevision }, transaction);
       return { publication, appliedRevision, replayed: false };
+    });
+  }
+
+  /** Explicit target moves keep historical claims so old derived IDs cannot recreate uploads. */
+  async retargetOperationalPublication(input:PublicationCommandScope&{publicationId:string;requestId:string;expectedPublicationRevision:number;targetKey:string;intent:Readonly<Record<string,unknown>>}){
+    input=structuredClone(input);validRequest(input.requestId);if(!isPublicationIdentifier(input.targetKey))fail('invalid_request','Choose a verified Publication target.');
+    return this.transaction(async transaction=>{
+      const {work,publication:p}=await this.load(input,input.publicationId,'prepare',transaction);await this.assertManaged(p!,transaction);
+      const id=key('target-move',[input.instanceId,input.creatorId,input.requestId]),fingerprint=publicationIdentityHash(input),receipt=await this.repositories.claims.get(id,{transaction});
+      if(receipt){if(receipt.fingerprint!==fingerprint)fail('idempotency_conflict','This target-move request has different choices.');return p!;}
+      if(p!.copy)fail('publication_reconciliation_required','Retargeting a generic copy requires a new explicit adaptation review.');
+      if(p!.revision!==input.expectedPublicationRevision)fail('publication_revision_conflict','The Publication target changed. Reload before moving it.');
+      if(p!.activeOperationId){const active=await this.repositories.operations.get(p!.activeOperationId,{transaction});if(!active||!['CONFIRMED','FAILED','CANCELLED'].includes(active.operation.state))fail('publication_busy','Resolve the current delivery before moving its target.');}
+      if(!this.policy.validateLegacyAdaptation)fail('publication_reconciliation_required','Target moves require current product inventory.');
+      await this.policy.validateLegacyAdaptation(work,p!,transaction);await this.guardWork(work,transaction);
+      const targetId=key('target',[identity(input),p!.destination,p!.account,input.targetKey]),target=await this.repositories.claims.get(targetId,{transaction});
+      if(target&&target.publicationId!==p!.id)fail('publication_identity_conflict','Another Publication reserves this target.');
+      const next=await this.repositories.publications.update(p!.id,p!.revision,{currentTargetKey:input.targetKey},{transaction});
+      await this.policy.commitTargetMove?.(work,next,input.intent,transaction);
+      if(!target)await this.repositories.claims.create({...this.claim(work,p!.id,targetId,'target',publicationIdentityHash(input.intent)),targetKey:input.targetKey},{transaction});
+      await this.repositories.claims.create(this.claim(work,p!.id,id,'preparation',fingerprint),{transaction});
+      await this.audit(work,p!.id,'publication.target-moved',{from:p!.currentTargetKey,to:input.targetKey,receiptId:id},transaction);return next;
     });
   }
 
@@ -335,6 +400,17 @@ export class PublicationCommandService {
     return saved;
   }
 
+  /** Product-authorized cancellation never changes an already-dispatched operation. */
+  async cancelPrepared(input:PublicationCommandScope&{publicationId:string;operationId:string}){
+    return this.transaction(async transaction=>{
+      const {work,publication:p}=await this.load(input,input.publicationId,'reconcile',transaction),saved=await this.loadOperation(input,p!,transaction);
+      if(saved.operation.state!=='PREPARED')return saved;
+      const record=await this.repositories.operations.update(saved.id,saved.revision,{operation:{...saved.operation,state:'CANCELLED'}},{transaction}),outbox=await this.repositories.outbox.get(saved.id,{transaction});
+      if(outbox)await this.repositories.outbox.update(outbox.id,outbox.revision,{state:'paused'},{transaction});
+      await this.audit(work,p!.id,'publication.cancelled-before-dispatch',{operationId:saved.id},transaction);return record;
+    });
+  }
+
   /** Acquiring reconciliation authority never authorizes another upload. */
   async beginReconciliation(input: PublicationCommandScope & { publicationId: string; operationId: string; workerId: string; leaseSeconds: number }) {
     if (!isPublicationIdentifier(input.workerId) || !Number.isSafeInteger(input.leaseSeconds) || input.leaseSeconds < 1 || input.leaseSeconds > 3600) fail('invalid_request', 'Invalid reconciliation lease.');
@@ -397,9 +473,15 @@ export class PublicationCommandService {
         remoteBinding = binding;
         const remoteKey = key('remote', [input.instanceId, binding]);
         const claimed = await this.repositories.claims.get(remoteKey, { transaction });
-        if (op.kind === 'UPDATE' && publicationIdentityHash(op.snapshot.remoteBinding) !== publicationIdentityHash(binding)
+        const transition=op.kind==='UPDATE'&&op.snapshot.remoteTransition?.kind==='publish-draft'
+          &&binding.objectType===op.snapshot.remoteTransition.resultObjectType
+          &&binding.providerNamespace===op.snapshot.remoteBinding?.providerNamespace
+          &&binding.ownershipBoundary===op.snapshot.remoteBinding?.ownershipBoundary
+          &&p!.remoteId===op.snapshot.remoteBinding?.remoteId
+          &&(!p!.remoteBinding||publicationIdentityHash(p!.remoteBinding)===publicationIdentityHash(op.snapshot.remoteBinding));
+        if (!transition&&(op.kind === 'UPDATE' && publicationIdentityHash(op.snapshot.remoteBinding) !== publicationIdentityHash(binding)
           || p!.remoteBinding && publicationIdentityHash(p!.remoteBinding) !== publicationIdentityHash(binding)
-          || p!.remoteId && p!.remoteId !== binding.remoteId || claimed && claimed.publicationId !== p!.id) {
+          || p!.remoteId && p!.remoteId !== binding.remoteId) || claimed && claimed.publicationId !== p!.id) {
           if (op.blockedCode === 'publication_identity_conflict') return { quarantined: true, record: saved, identityConflict: true };
           const record = await this.repositories.operations.update(saved.id, saved.revision, { operation: { ...op, state: 'AMBIGUOUS', blockedCode: 'publication_identity_conflict' } }, { transaction });
           await this.audit(work, p!.id, 'publication.identity-conflict', evidence, transaction);
