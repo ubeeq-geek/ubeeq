@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { portablePublicationImageRecord, restorePublicationImageRecord, validatePortablePublicationImage } from './publication-images.js';
+export * from './publication-images.js';
 export * from './website-artifact.js';
 export * from './website-service.js';
 export * from './website-publishing.js';
@@ -51,7 +53,7 @@ export const stableJson = (value: unknown): string => JSON.stringify(canonicaliz
 export const exportChecksum = (manifest: Omit<CreatorExportManifest, "checksum">): string => createHash("sha256").update(stableJson(manifest)).digest("hex");
 
 export const createCreatorExport = (input: Omit<CreatorExportManifest, "schemaVersion" | "checksum" | "secretsExcluded" | "exclusions">): CreatorExportManifest => {
-  const manifest = { ...input, schemaVersion: CREATOR_EXPORT_SCHEMA_VERSION, secretsExcluded: true as const, exclusions: ["credentials", "secrets", "transient_worker_leases", "live_queue_state", "provider_runtime_state", "original_object_bytes"] as const };
+  const manifest = { ...input, publications: input.publications.map(portablePublicationImageRecord), schemaVersion: CREATOR_EXPORT_SCHEMA_VERSION, secretsExcluded: true as const, exclusions: ["credentials", "secrets", "transient_worker_leases", "live_queue_state", "provider_runtime_state", "original_object_bytes"] as const };
   return { ...manifest, checksum: exportChecksum(manifest) };
 };
 
@@ -78,6 +80,7 @@ export const validateCreatorExport = (value: unknown): CreatorExportManifest => 
   if (!manifest.creator?.id || arrays.some((items) => !Array.isArray(items))) throw new Error("Export manifest is missing required creator content arrays.");
   if (!manifest.creator.homeCellId || !manifest.creator.dataHomeRegion || !manifest.creator.dataHomeAssignedAt || Number.isNaN(Date.parse(manifest.creator.dataHomeAssignedAt)) || !Number.isSafeInteger(manifest.creator.routingRevision)) throw new Error("Export creator is missing data-home information.");
   if (manifest.secretsExcluded !== true || containsSecret(manifest)) throw new Error("Export manifests must exclude credentials and secrets.");
+  for (const publication of manifest.publications) validatePortablePublicationImage(publication);
   const requiredExclusions = ["credentials", "secrets", "transient_worker_leases", "live_queue_state", "provider_runtime_state", "original_object_bytes"];
   if (manifest.exclusions.length !== requiredExclusions.length || requiredExclusions.some((item, index) => manifest.exclusions[index] !== item)) throw new Error("Export manifest exclusions are incomplete or reordered.");
   const { checksum: _checksum, ...unsigned } = manifest;
@@ -154,8 +157,9 @@ export const remapCreatorExportForImport = (
   const works = sourceManifest.works.map((item) => ({ ...item, id: map(idMap.works, item.id), creatorId: input.targetCreatorId }));
   const assets = sourceManifest.assets.map((item) => ({ ...item, id: map(idMap.assets, item.id), creatorId: input.targetCreatorId, workId: item.workId ? map(idMap.works, item.workId) : undefined }));
   const collections = sourceManifest.collections.map((item) => ({ ...item, id: map(idMap.collections, item.id), creatorId: input.targetCreatorId }));
-  const publications = sourceManifest.publications.map((item) => ({ ...item, id: map(idMap.publications, item.id), workId: map(idMap.works, item.workId) }));
-  const publicationIntents = sourceManifest.publicationIntents.map((item) => ({ ...item, id: map(idMap.publicationIntents, item.id), workId: map(idMap.works, item.workId) }));
+  const publications = sourceManifest.publications.map((item) => restorePublicationImageRecord(item, idMap));
+  const publicationIntents = sourceManifest.publicationIntents.map((item) => ({ ...item, id: map(idMap.publicationIntents, item.id), workId: map(idMap.works, item.workId),
+    idempotencyKey: `restored:${input.targetCreatorId}:${map(idMap.publicationIntents, item.id)}` }));
   const processing = sourceManifest.processing.map((item) => ({ ...item, id: map(idMap.processing, item.id), assetId: map(idMap.assets, item.assetId) }));
   const moderationEvidence = sourceManifest.moderationEvidence.map((item) => ({ ...item, id: map(idMap.moderationEvidence, item.id), subjectId: map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) }));
   const moderationHolds = sourceManifest.moderationHolds.map((item) => ({ ...item, id: map(idMap.moderationHolds, item.id), subjectId: map({ [sourceManifest.creator.id]: input.targetCreatorId, ...idMap.works, ...idMap.assets }, item.subjectId) }));

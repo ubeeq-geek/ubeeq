@@ -4,14 +4,26 @@ import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, type Trans
 import type { PersistenceTransaction } from '@ubeeq/persistence';
 import { OptimisticConcurrencyError } from '@ubeeq/persistence';
 
-type Dynamo = Pick<DynamoDBDocumentClient, 'send'> & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void };
+type Dynamo = Pick<DynamoDBDocumentClient, 'send'> & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
 type State = { id: string; active: boolean; failed: boolean; writes: NonNullable<TransactWriteCommandInput['TransactItems']>; overlay: Map<string, Record<string, any> | undefined> };
 const keyOf = (table: string | undefined, key: Record<string, any>) => JSON.stringify([table, key.pk, key.sk]);
 
 /** Atomic repository write batches. Reads are not a serializable snapshot. */
 export const createTransactionalDynamo = (base: Dynamo) => {
   const context = new AsyncLocalStorage<State>();
-  const client: Dynamo = { failTransaction: () => {
+  const client: Dynamo = { checkRevision: (table, key, expectedRevision) => {
+    const state = context.getStore();
+    if (!state?.active) throw new Error('Revision guards require an active transaction.');
+    const identity = keyOf(table, key);
+    if (state.overlay.has(identity) || state.writes.some(write => write.ConditionCheck && keyOf(write.ConditionCheck.TableName, write.ConditionCheck.Key!) === identity)) {
+      state.failed = true;
+      throw new Error('A transaction must guard or write each item once.');
+    }
+    if (state.writes.length >= 100) { state.failed = true; throw new Error('A repository transaction supports at most 100 distinct writes.'); }
+    state.writes.push({ ConditionCheck: { TableName: table, Key: key, ConditionExpression: 'attribute_exists(pk) AND #revision = :revision',
+      ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } } });
+  }, failTransaction: () => {
     const state = context.getStore();
     if (state?.active) state.failed = true;
   }, assertTransaction: transaction => {
@@ -34,6 +46,7 @@ export const createTransactionalDynamo = (base: Dynamo) => {
       const input = command.input;
       const item = command instanceof PutCommand ? command.input.Item! : undefined;
       const key = keyOf(input.TableName, item || (command as DeleteCommand).input.Key!);
+      if (state.writes.some(write => write.ConditionCheck && keyOf(write.ConditionCheck.TableName, write.ConditionCheck.Key!) === key)) throw new Error('A transaction cannot write a guarded item.');
       if (state.overlay.has(key)) throw new Error('A repository transaction cannot write the same item twice.');
       if (state.writes.length >= 100) throw new Error('A repository transaction supports at most 100 distinct writes.');
       const { ReturnValues: _returnValues, ReturnConsumedCapacity: _capacity, ReturnItemCollectionMetrics: _metrics, ...write } = input;
@@ -64,11 +77,11 @@ export const createTransactionalDynamo = (base: Dynamo) => {
             if (failure.name === 'TransactionCanceledException' && reasons?.length === state.writes.length &&
               reasons.every(reason => reason.Code === 'None' || reason.Code === 'ConditionalCheckFailed')) {
               const index = reasons.findIndex((reason, position) => reason.Code === 'ConditionalCheckFailed' &&
-                typeof (state.writes[position].Put || state.writes[position].Delete)?.ExpressionAttributeValues?.[':revision'] === 'number');
+                typeof (state.writes[position].Put || state.writes[position].Delete || state.writes[position].ConditionCheck)?.ExpressionAttributeValues?.[':revision'] === 'number');
               if (index >= 0) {
                 const write = state.writes[index];
-                const key = write.Put?.Item?.pk || write.Delete?.Key?.pk;
-                const revision = (write.Put || write.Delete)!.ExpressionAttributeValues![':revision'];
+                const key = write.Put?.Item?.pk || write.Delete?.Key?.pk || write.ConditionCheck?.Key?.pk;
+                const revision = (write.Put || write.Delete || write.ConditionCheck)!.ExpressionAttributeValues![':revision'];
                 if (typeof key === 'string') throw new OptimisticConcurrencyError(key.slice(key.indexOf('#') + 1), revision);
               }
             }

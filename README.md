@@ -73,6 +73,10 @@ remain as backward-compatible aliases.
 
 ## Extension compatibility
 
+Publication image contracts, durable commands, shared controls and consumer
+integration requirements are documented in
+[`docs/publication-images.md`](docs/publication-images.md).
+
 Extensions declare an API version and the contracts they implement. `@ubeeq/api` validates manifests at startup and fails clearly if a required extension is missing or incompatible. See [`packages/extension-sdk`](packages/extension-sdk) for the initial contracts.
 
 The SDK also defines platform-neutral integration capabilities, such as metadata import, work publication, activity synchronization, and remote deletion. A product decides whether and how a compatible connector is offered.

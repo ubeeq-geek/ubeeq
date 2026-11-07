@@ -1,4 +1,5 @@
 /** Provider-neutral durable persistence contracts. Provider implementations belong in adapter packages. */
+import type { PublicationImageConfiguration, PublicationImageDeliveryEvidence } from '@ubeeq/core';
 export * from "./creator-content.js";
 export * from './websites.js';
 export * from './website-hosting.js';
@@ -69,6 +70,8 @@ export interface TransactionRunner {
  * Updates must reject stale revisions with OptimisticConcurrencyError.
  */
 export interface RevisionedRepository<T extends RevisionedRecord> {
+  /** Commit-time read guard. Required by publication commands; never emulate with an unguarded read. */
+  checkRevision?(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void>;
   create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { transaction?: PersistenceTransaction; idempotencyKey?: string }): Promise<T>;
   get(id: string, options?: { transaction?: PersistenceTransaction }): Promise<T | undefined>;
   list(request: PageRequest, options?: { transaction?: PersistenceTransaction }): Promise<Page<T>>;
@@ -92,6 +95,12 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   }
   async get(id: string, options?: Parameters<RevisionedRepository<T>["get"]>[1]): Promise<T | undefined> {
     return this.local(await this.repository.get(id, options));
+  }
+  async checkRevision(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void> {
+    const record = await this.get(id, options);
+    if (!record) throw new CellOwnershipError(this.cellId);
+    if (!this.repository.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
+    await this.repository.checkRevision(id, expectedRevision, options);
   }
   async list(request: PageRequest, options?: Parameters<RevisionedRepository<T>["list"]>[1]): Promise<Page<T>> {
     const limit = Math.max(1, request.limit); const items: T[] = []; let cursor = request.cursor;
@@ -122,7 +131,12 @@ export interface AssetRecord extends RevisionedRecord, CellOwnedRecord { instanc
 export interface CollectionRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; visibility: "private" | "unlisted" | "public"; }
 export interface WorkMembershipRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; collectionId: string; workId: string; position: number; }
 export interface PublicationIntentRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; workId: string; destination: string; idempotencyKey: string; }
-export interface PublicationRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; workId: string; destination: string; status: "draft" | "queued" | "live" | "removed" | "failed"; remoteId?: string; }
+export interface PublicationRecord extends RevisionedRecord, CellOwnedRecord, PublicationImageConfiguration {
+  instanceId: string; workId: string; destination: string; status: "draft" | "scheduled" | "queued" | "live" | "removed" | "failed"; remoteId?: string;
+  lastConfirmedImage?: PublicationImageDeliveryEvidence;
+  /** Disconnected provenance; never an active remote binding or delivery pointer. */
+  restoredPublicationHistory?: { sourcePublicationId: string; remoteId?: string; image?: PublicationImageDeliveryEvidence; copy?: import('@ubeeq/core').PublicationCopyIdentity };
+}
 export interface ReconciliationSnapshotRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; publicationId: string; cursor?: string; snapshot: Readonly<Record<string, unknown>>; }
 export interface ModerationEvidenceRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; subjectType: string; subjectId: string; source: string; payload: Readonly<Record<string, unknown>>; }
 export interface ModerationHoldRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; subjectType: string; subjectId: string; state: "active" | "released"; reason?: string; }
@@ -213,3 +227,6 @@ export const verifyCellScopedRepositoryContract = async (harness: { repository: 
 };
 export * from './publication-copies.js';
 export * from './collection-announcements.js';
+export * from './publication-commands.js';
+export * from './publication-inventory.js';
+export * from './publication-record-guards.js';

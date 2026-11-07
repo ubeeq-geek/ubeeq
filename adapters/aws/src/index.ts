@@ -11,6 +11,8 @@ import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdent
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import type { PublicationCommandRepositories } from '@ubeeq/persistence';
+import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
@@ -27,7 +29,8 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
 export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
-type Dynamo = Pick<DynamoDBDocumentClient, "send"> & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void };
+type Dynamo = Pick<DynamoDBDocumentClient, "send"> & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
 const now = () => new Date().toISOString();
 const pk = (repository: string, id: string) => `${repository}#${id}`;
 /** AWS's standard document client rejects undefined attributes; absence is the portable representation. */
@@ -39,22 +42,84 @@ const withoutUndefined = <T>(value: T): T => {
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {}
+  private guard(previous: T | undefined, next: T) {
+    try {
+      if (this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
+      if (this.repository === 'publicationOperations') assertPublicationDeliveryWrite(previous as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord, next as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord);
+    } catch (error) { this.dynamo.failTransaction?.(); throw error; }
+  }
   private assertTransaction(options?: { transaction?: { id: string } }): void {
     if (!options?.transaction) return;
     if (!this.dynamo.assertTransaction) throw new Error('This repository has no transaction coordinator.');
     this.dynamo.assertTransaction(options.transaction);
   }
-  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const timestamp = now(); const value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, value.id), sk: "record", repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) }, ConditionExpression: "attribute_not_exists(pk)" })); return value; } catch (error) { const existing = options?.idempotencyKey && (error as { name?: string }).name === "ConditionalCheckFailedException" ? await this.get(value.id) : undefined; if (existing) return existing; throw error; } }
+  async checkRevision(id: string, expectedRevision: number, options: { transaction: { id: string } }): Promise<void> {
+    this.assertTransaction(options);
+    if (!this.dynamo.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
+    this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
+  }
+  async create(record: Omit<T, 'revision' | 'createdAt' | 'updatedAt'>, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> {
+    this.assertTransaction(options);
+    const timestamp = now(), value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T;
+    this.guard(undefined, value);
+    try {
+      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+        Item: { pk: pk(this.repository, value.id), sk: 'record', repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) },
+        ConditionExpression: 'attribute_not_exists(pk)' }));
+      return value;
+    } catch (error) {
+      const existing = options?.idempotencyKey && (error as { name?: string }).name === 'ConditionalCheckFailedException' ? await this.get(value.id) : undefined;
+      if (existing) return existing;
+      throw error;
+    }
+  }
   async get(id: string, options?: { transaction?: { id: string } }): Promise<T | undefined> { this.assertTransaction(options); const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConsistentRead: true })); return response.Item?.value as T | undefined; }
   /** Records are queried through the explicit repository/id index, never a filtered scan. */
   async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: (response.Items ?? []).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
-  async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>, options?: { transaction?: { id: string } }): Promise<T> { this.assertTransaction(options); const current = await this.get(id); if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); } const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T; try { await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName, Item: { pk: pk(this.repository, id), sk: "record", repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) }, ConditionExpression: "attribute_exists(pk) AND #revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); return value; } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
+  async update(id: string, expectedRevision: number, change: Partial<Omit<T, 'id' | 'revision' | 'createdAt' | 'updatedAt'>>, options?: { transaction?: { id: string } }): Promise<T> {
+    this.assertTransaction(options);
+    const current = await this.get(id);
+    if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); }
+    const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T;
+    this.guard(current, value);
+    try {
+      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+        Item: { pk: pk(this.repository, id), sk: 'record', repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) },
+        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } }));
+      return value;
+    } catch (error) {
+      if ((error as { name?: string }).name === 'ConditionalCheckFailedException') throw new OptimisticConcurrencyError(id, expectedRevision);
+      throw error;
+    }
+  }
   async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
 }
 
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
-export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => { const { client: dynamo, transaction } = createTransactionalDynamo(base); return ({ transaction, creators: cellRepository(dynamo, config, "creators"), works: cellRepository(dynamo, config, "works"), assets: cellRepository(dynamo, config, "assets"), collections: cellRepository(dynamo, config, "collections"), workMemberships: cellRepository(dynamo, config, "workMemberships"), publicationIntents: cellRepository(dynamo, config, "publicationIntents"), publications: cellRepository(dynamo, config, "publications"), reconciliationSnapshots: cellRepository(dynamo, config, "reconciliationSnapshots"), moderationEvidence: cellRepository(dynamo, config, "moderationEvidence"), moderationHolds: cellRepository(dynamo, config, "moderationHolds"), reviewCases: cellRepository(dynamo, config, "reviewCases"), auditEvents: cellRepository(dynamo, config, "auditEvents"), usageEvents: cellRepository(dynamo, config, "usageEvents"), creditLots: cellRepository(dynamo, config, "creditLots"), creditReservations: cellRepository(dynamo, config, "creditReservations"), balances: cellRepository(dynamo, config, "balances"), integrationAccounts: cellRepository(dynamo, config, "integrationAccounts"), syncCursors: cellRepository(dynamo, config, "syncCursors"), integrationJobs: cellRepository(dynamo, config, "integrationJobs"), exportManifests: cellRepository(dynamo, config, "exportManifests"), importCheckpoints: cellRepository(dynamo, config, "importCheckpoints"), federationActors: repository(dynamo, config, "federationActors"), remotePublicationReferences: repository(dynamo, config, "remotePublicationReferences") }); };
+export const createDynamoPublicationCommandRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): PublicationCommandRepositories & UbeeqRepositories => {
+  const { client: dynamo, transaction } = createTransactionalDynamo(base);
+  return { ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
+    claims: cellRepository(dynamo, config, 'publicationClaims'), operations: cellRepository(dynamo, config, 'publicationOperations'),
+    outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') };
+};
+const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction,
+  creators: cellRepository(dynamo, config, 'creators'), works: cellRepository(dynamo, config, 'works'), assets: cellRepository(dynamo, config, 'assets'),
+  collections: cellRepository(dynamo, config, 'collections'), workMemberships: cellRepository(dynamo, config, 'workMemberships'),
+  publicationIntents: cellRepository(dynamo, config, 'publicationIntents'), publications: cellRepository(dynamo, config, 'publications'),
+  reconciliationSnapshots: cellRepository(dynamo, config, 'reconciliationSnapshots'), moderationEvidence: cellRepository(dynamo, config, 'moderationEvidence'),
+  moderationHolds: cellRepository(dynamo, config, 'moderationHolds'), reviewCases: cellRepository(dynamo, config, 'reviewCases'),
+  auditEvents: cellRepository(dynamo, config, 'auditEvents'), usageEvents: cellRepository(dynamo, config, 'usageEvents'),
+  creditLots: cellRepository(dynamo, config, 'creditLots'), creditReservations: cellRepository(dynamo, config, 'creditReservations'), balances: cellRepository(dynamo, config, 'balances'),
+  integrationAccounts: cellRepository(dynamo, config, 'integrationAccounts'), syncCursors: cellRepository(dynamo, config, 'syncCursors'),
+  integrationJobs: cellRepository(dynamo, config, 'integrationJobs'), exportManifests: cellRepository(dynamo, config, 'exportManifests'),
+  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), federationActors: repository(dynamo, config, 'federationActors'),
+  remotePublicationReferences: repository(dynamo, config, 'remotePublicationReferences')
+});
+export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
+  const { client, transaction } = createTransactionalDynamo(base);
+  return dynamoRepositories(client, transaction, config);
+};
 
 /**
  * Optional managed-edge control plane.  Its table is deliberately distinct

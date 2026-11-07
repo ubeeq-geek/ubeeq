@@ -202,6 +202,9 @@ export interface PublicationReconciliationField {
 }
 
 export interface Publication extends CellOwned {
+  imageSelection?: import('./publication-image.js').PublicationImageSelection;
+  unresolvedImageContext?: { sourceCollectionId: string };
+  configurationRevision?: number;
   copy?: import("./publication-copy.js").PublicationCopyIdentity;
   activeOperationId?: EntityId;
   /** CAS revision for copy-aware operations; legacy records have no revision. */
@@ -341,6 +344,8 @@ export * from './creator-source-files.js';
 export * from './shared-viewing.js';
 
 export * from "./publication-copy.js";
+export * from './publication-image.js';
+export * from './publication-delivery.js';
 
 export * from "./historical-announcements.js";
 

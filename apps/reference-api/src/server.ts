@@ -19,7 +19,7 @@ import type { JobQueue } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
 import { repositoryItems, type Page, type PageRequest } from "@ubeeq/persistence";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
-import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, validateCreatorExport } from "@ubeeq/portability";
+import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, validateCreatorExport, restorePublicationImageRecord } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
@@ -637,8 +637,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
             for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
-            for (const publication of manifest.publications) await repositories.publications.create({ ...publication, instanceId: creator.instanceId, ...dataHomeOf(creator), status: "draft" }, { transaction, idempotencyKey: `import:${importId}:publication:${publication.id}` });
-            for (const intent of manifest.publicationIntents) await repositories.publicationIntents.create({ ...intent, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:intent:${intent.id}` });
+            const publicationRestoreMaps = { publications: Object.fromEntries(manifest.publications.map(p => [p.id, p.id])),
+              works: Object.fromEntries(manifest.works.map(w => [w.id, w.id])), assets: Object.fromEntries(manifest.assets.map(a => [a.id, a.id])),
+              collections: Object.fromEntries(manifest.collections.map(c => [c.id, c.id])) };
+            for (const publication of manifest.publications) await repositories.publications.create({ ...restorePublicationImageRecord(publication, publicationRestoreMaps),
+              instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:publication:${publication.id}` });
+            for (const intent of manifest.publicationIntents) await repositories.publicationIntents.create({ ...intent, instanceId: creator.instanceId, ...dataHomeOf(creator),
+              idempotencyKey: `restored:${importId}:${intent.id}` }, { transaction, idempotencyKey: `import:${importId}:intent:${intent.id}` });
             for (const evidence of manifest.moderationEvidence) await repositories.moderationEvidence.create({ ...evidence, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:evidence:${evidence.id}` });
             for (const hold of manifest.moderationHolds) await repositories.moderationHolds.create({ ...hold, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:hold:${hold.id}` });
             for (const reviewCase of manifest.reviewCases) await repositories.reviewCases.create({ ...reviewCase, instanceId: creator.instanceId, ...dataHomeOf(creator) }, { transaction, idempotencyKey: `import:${importId}:review:${reviewCase.id}` });
