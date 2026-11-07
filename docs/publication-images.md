@@ -121,7 +121,12 @@ UPDATE snapshots must include the verified `remoteBinding` (provider namespace,
 object type, ownership boundary and remote ID). CREATE snapshots must omit it.
 Reviews and dispatch bind that identity; workers must use the snapshot binding,
 never reload a different remote target after approval. Confirmed results retain the
-full binding on the Publication and may not change an UPDATE's approved namespace.
+full binding on the Publication and may not change an ordinary UPDATE's approved namespace.
+The explicit `remoteTransition: {kind: 'publish-draft', resultObjectType}` exception
+approves publication of the retained draft. Product policy must verify the actual
+draft-to-live receipt and resulting binding. The original provider namespace,
+ownership boundary and currently bound source object must still match; both old and
+new remote claims remain reserved. Never use this exception for replacement by a new upload.
 
 `recordResult` requires worker identity and fencing generation. It records the old
 snapshot's actual outcome while retaining newer desired settings. Remote claim,
@@ -139,6 +144,8 @@ required; never delete/recreate implicitly or lose preserved discussions.
 The current fenced reconciler may close AMBIGUOUS as FAILED only after
 `verifyFinalFailure` accepts definitive evidence that the attempted write failed.
 That closure permits a fresh review and approval; stale workers remain quarantined.
+`cancelPrepared` pauses an undispatched operation and its outbox under product
+authorization. It never changes a dispatched operation or claims to undo a remote write.
 
 ## Shared controls
 
@@ -171,6 +178,14 @@ slot/remote claims, compatibility projections and all legacy jobs. Dispatched,
 ambiguous or inconsistent drafts stay blocked. Missing inventory capability fails
 closed. Reserved targets conflict instead of merging. An immutable adaptation receipt
 and validated versioned execution-policy marker enable the common reviewer/writer.
+
+`adoptOperationalPublication` transactionally adopts an ordinary existing Publication
+after the same product inventory checks, retaining IDs, configuration and provider
+history. Existing remote objects require their complete binding and an exclusive
+remote claim. `retargetOperationalPublication` moves an ordinary target under current
+authorization and revision checks while retaining historical reservations; it rejects
+unresolved deliveries and generic-copy retargeting. Its optional `commitTargetMove`
+hook updates existing compatibility rows instead of allocating another preparation.
 
 `inventoryPublicationCommands` is a read-only authorized-Creator inventory grouped by
 Work using durable status, bindings and markers. It reports operational/legacy records,
