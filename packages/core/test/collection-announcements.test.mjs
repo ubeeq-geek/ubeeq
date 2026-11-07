@@ -275,3 +275,15 @@ test('product-constrained authoring identifiers are reserved deterministically a
  assert.deepEqual(reserveAnnouncementMaterialization(reserved,reserved.revision,now,'bounded-authoring-id'),reserved);
  assert.throws(()=>reserveAnnouncementMaterialization(reserved,reserved.revision,now,'other-authoring-id'),{code:'GENERATION_CONFLICT'});
 });
+
+test('an unrepresented required link is held for review instead of crashing release reconciliation', () => {
+  const r=requirement();
+  const result=ready([r],[observation(r)],{links:[{label:'Native collection',destinationKey:'native',resultIds:[]}]});
+  assert.equal(result.ready,false);
+  assert.deepEqual(result.holds.map(h=>h.code),['LINK_NOT_READY']);
+});
+test('follow-up template overrides must name a selected follow-up destination', () => {
+  const settings=defaultCollectionAnnouncementPreferences('Etc/UTC');
+  settings.initial.followUp={enabled:false,template:{blocks:[],destinationOverrides:{misspelled:[]}},destinations:[],media:{mode:'none'},timing:{mode:'delay_after_parent',timeZone:'Etc/UTC',durationMs:1000,anchor:{mode:'corresponding_destination'}},latePolicy:{mode:'hold',maximumLatenessMs:86400000}};
+  assert.throws(()=>resolveCollectionAnnouncementPreferences({creator:{revision:1,settings}}),/selected.*destination/);
+});

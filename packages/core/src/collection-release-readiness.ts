@@ -130,9 +130,11 @@ export function evaluateCollectionReleaseReadiness(input: {
   }
   const requiredIds = new Set(selected.map(r => r.resultId));
   for (const link of input.links ?? []) {
-    if (!link.label?.trim() || !link.resultIds.length || new Set(link.resultIds).size !== link.resultIds.length)
+    if (!link.label?.trim() || new Set(link.resultIds).size !== link.resultIds.length)
       throw new AnnouncementOrchestrationError("INVALID_INPUT", "Each content link requires a label and an exact publication scope.");
-    let available = true;
+    // A configured destination may be absent from this frozen release scope.
+    // Keep its link blocked and visible instead of failing the reconciliation sweep.
+    let available = link.resultIds.length > 0;
     for (const id of link.resultIds) {
       const r = requirements.get(id), o = observations.get(id);
       if (!r || announcementDestinationKey(r.target) !== link.destinationKey || !confirmed.has(id) || !isDurableAnnouncementUrl(o?.evidence?.durableUrl)) available = false;

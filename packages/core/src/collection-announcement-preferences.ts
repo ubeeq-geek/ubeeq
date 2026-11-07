@@ -181,6 +181,9 @@ export function validateCollectionAnnouncementPreferences(settings: CollectionAn
     if (f) {
       validateAnnouncementTemplate(f.template); validateDestinations(f.destinations, f.enabled); validateMedia(f.media);
       validateAnnouncementTiming(f.timing); validateAnnouncementLatePolicy(f.latePolicy);
+      const followUpKeys = f.destinations.map(d => announcementDestinationKey(d.binding));
+      for (const key of Object.keys(f.template.destinationOverrides ?? {})) if (!followUpKeys.includes(key))
+        throw new AnnouncementOrchestrationError("INVALID_INPUT", "Follow-up template overrides must identify a selected follow-up destination.");
       const anchor = f.timing.anchor;
       if (!["corresponding_destination", "first_successful_initial_delivery", "parent_destination"].includes(anchor.mode)
         || (f.enabled && anchor.mode === "corresponding_destination" && f.destinations.some(d => !destinationKeys.includes(announcementDestinationKey(d.binding))))
