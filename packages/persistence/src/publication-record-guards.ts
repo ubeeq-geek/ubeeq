@@ -29,6 +29,7 @@ export function assertPublicationDeliveryWrite(previous: PublicationDeliveryReco
   const op = next.operation;
   validatePublicationImageReviewSnapshot(op?.snapshot);
   if (op.schemaVersion !== 1 || op.operationId !== next.id || op.publicationId !== op.snapshot.publicationId
+    || !['CREATE', 'UPDATE'].includes(op.kind) || (op.kind === 'UPDATE' ? !op.snapshot.remoteBinding : Boolean(op.snapshot.remoteBinding))
     || op.snapshot.workId !== next.workId || !Number.isSafeInteger(op.fencingGeneration) || op.fencingGeneration < 0
     || publicationIdentityHash(op.snapshot) !== op.reviewFingerprint) throw new PublicationImageError('publication_review_stale', 'Invalid immutable operation snapshot.');
   if (!previous) {
@@ -39,7 +40,7 @@ export function assertPublicationDeliveryWrite(previous: PublicationDeliveryReco
   const immutable = (record: PublicationDeliveryRecord) => [record.instanceId, record.creatorId, record.workId, record.operation.operationId,
     record.operation.publicationId, record.operation.schemaVersion, record.operation.kind, record.operation.snapshot, record.operation.reviewFingerprint];
   if (publicationIdentityHash(immutable(previous)) !== publicationIdentityHash(immutable(next))) throw new PublicationImageError('publication_review_stale', 'Approved operation inputs are immutable.');
-  const transitions: Record<string, readonly string[]> = { PREPARED: ['IN_FLIGHT', 'CANCELLED'], IN_FLIGHT: ['CONFIRMED', 'FAILED', 'AMBIGUOUS'], AMBIGUOUS: ['CONFIRMED', 'AMBIGUOUS'] };
+  const transitions: Record<string, readonly string[]> = { PREPARED: ['IN_FLIGHT', 'CANCELLED'], IN_FLIGHT: ['CONFIRMED', 'FAILED', 'AMBIGUOUS'], AMBIGUOUS: ['CONFIRMED', 'FAILED', 'AMBIGUOUS'] };
   if (!transitions[before.state]?.includes(op.state) || op.fencingGeneration < before.fencingGeneration || op.fencingGeneration > before.fencingGeneration + 1
     || before.dispatchedAt && before.dispatchedAt !== op.dispatchedAt
     || (op.fencingGeneration !== before.fencingGeneration ? !['IN_FLIGHT', 'AMBIGUOUS'].includes(op.state)

@@ -18,6 +18,7 @@ export interface ManagedPublicationRecord extends PublicationRecord {
   preparationVersion?: 1;
   activeOperationId?: string;
   lastConfirmedImage?: PublicationImageDeliveryEvidence;
+  remoteBinding?: PublicationRemoteBinding;
 }
 export interface PublicationCommandClaim extends RevisionedRecord, CellOwnedRecord {
   instanceId: string; creatorId: string; workId: string; publicationId: string;
@@ -248,7 +249,9 @@ export class PublicationCommandService {
     validatePublicationImageReviewSnapshot(snapshot);
     if (snapshot.publicationId !== p.id || snapshot.workId !== work.id || snapshot.workRevision !== work.revision
       || snapshot.configurationRevision !== (p.configurationRevision ?? 0) || snapshot.connectionId !== p.connectionId
-      || publicationIdentityHash(snapshot.account) !== publicationIdentityHash(p.account)) fail('publication_review_stale', 'Review identity or configuration changed.');
+      || publicationIdentityHash(snapshot.account) !== publicationIdentityHash(p.account)
+      || snapshot.remoteBinding?.remoteId !== p.remoteId
+      || p.remoteBinding && publicationIdentityHash(snapshot.remoteBinding) !== publicationIdentityHash(p.remoteBinding)) fail('publication_review_stale', 'Review identity or configuration changed.');
     return { snapshot, fingerprint: await publicationImageFingerprint(snapshot) };
   }
 
@@ -304,7 +307,8 @@ export class PublicationCommandService {
       if (saved.operation.state !== 'PREPARED') fail(saved.operation.dispatchedAt ? 'publication_reconciliation_required' : 'publication_busy', 'This operation cannot start another provider request.');
       const current = await this.review(work, p!, transaction, saved.operation.snapshot);
       await this.guardWork(work, transaction);
-      if (current.fingerprint !== saved.operation.reviewFingerprint) {
+      if (current.fingerprint !== saved.operation.reviewFingerprint
+        || (saved.operation.kind === 'CREATE' ? Boolean(p!.remoteId || current.snapshot.remoteBinding) : !current.snapshot.remoteBinding)) {
         const paused = await this.repositories.operations.update(saved.id, saved.revision, { operation: { ...saved.operation, state: 'CANCELLED', blockedCode: 'publication_review_stale' } }, { transaction });
         const outbox = await this.repositories.outbox.get(saved.id, { transaction });
         if (!outbox) fail('publication_reconciliation_required', 'Accepted operation has no outbox record.');
@@ -375,7 +379,6 @@ export class PublicationCommandService {
         fail('publication_reconciliation_required', 'The operation already has a final outcome.');
       }
       if (op.state === 'AMBIGUOUS' && input.result === 'uncertain') return { quarantined: false, record: saved };
-      if (op.state === 'AMBIGUOUS' && input.result === 'failed') fail('publication_reconciliation_required', 'An uncertain provider write requires verified reconciliation.');
       if (input.result === 'failed') {
         if (!this.policy.verifyFinalFailure || !input.failureEvidence || !isPublicationIdentifier(input.failureEvidence.code)
           || input.failureEvidence.providerRequestId !== undefined && !isPublicationIdentifier(input.failureEvidence.providerRequestId)) {
@@ -385,14 +388,18 @@ export class PublicationCommandService {
       }
       let confirmedImage: PublicationImageDeliveryEvidence | undefined;
       let remoteId: string | undefined;
+      let remoteBinding: PublicationRemoteBinding | undefined;
       if (input.result === 'confirmed') {
         const binding = await this.policy.verifyRemoteResult(structuredClone(op), input.binding!, transaction);
         if (binding.providerNamespace !== op.snapshot.account.providerNamespace || ![binding.objectType, binding.ownershipBoundary, binding.remoteId].every(isPublicationIdentifier)
           || binding.remoteId.startsWith('pending:')) fail('publication_identity_conflict', 'Verified result does not match this Publication.');
         remoteId = binding.remoteId;
+        remoteBinding = binding;
         const remoteKey = key('remote', [input.instanceId, binding]);
         const claimed = await this.repositories.claims.get(remoteKey, { transaction });
-        if (p!.remoteId && p!.remoteId !== binding.remoteId || claimed && claimed.publicationId !== p!.id) {
+        if (op.kind === 'UPDATE' && publicationIdentityHash(op.snapshot.remoteBinding) !== publicationIdentityHash(binding)
+          || p!.remoteBinding && publicationIdentityHash(p!.remoteBinding) !== publicationIdentityHash(binding)
+          || p!.remoteId && p!.remoteId !== binding.remoteId || claimed && claimed.publicationId !== p!.id) {
           if (op.blockedCode === 'publication_identity_conflict') return { quarantined: true, record: saved, identityConflict: true };
           const record = await this.repositories.operations.update(saved.id, saved.revision, { operation: { ...op, state: 'AMBIGUOUS', blockedCode: 'publication_identity_conflict' } }, { transaction });
           await this.audit(work, p!.id, 'publication.identity-conflict', evidence, transaction);
@@ -409,7 +416,7 @@ export class PublicationCommandService {
         state: input.result === 'confirmed' ? 'CONFIRMED' : input.result === 'failed' ? 'FAILED' : 'AMBIGUOUS',
         blockedCode: input.result === 'uncertain' ? 'publication_reconciliation_required' : undefined,
         ...(remoteId ? { remoteId, confirmedImage } : {}) } }, { transaction });
-      if (confirmedImage) await this.repositories.publications.update(p!.id, p!.revision, { remoteId, lastConfirmedImage: confirmedImage, status: op.snapshot.desiredStatus }, { transaction });
+      if (confirmedImage) await this.repositories.publications.update(p!.id, p!.revision, { remoteId, remoteBinding, lastConfirmedImage: confirmedImage, status: op.snapshot.desiredStatus }, { transaction });
       await this.audit(work, p!.id, `publication.${input.result}`, evidence, transaction);
       return { quarantined: false, record };
     });

@@ -127,7 +127,8 @@ test('queue outage recovers the same accepted operation after restart; duplicate
   assert.equal(attempts.filter(r => r.status === 'fulfilled').length, 1);
   const dispatched = attempts.find(r => r.status === 'fulfilled').value;
   await f.result(dispatched, 'remote'); f.restart();
-  const replay = await f.approve('p'); assert.equal(replay.id, accepted.id);
+  const replay = await f.service.approve({ ...scope, publicationId: 'p', requestId: 'approve-p', kind: 'CREATE',
+    expectedReviewFingerprint: accepted.operation.reviewFingerprint }); assert.equal(replay.id, accepted.id);
   await assert.rejects(f.dispatch(accepted), { code: 'publication_reconciliation_required' });
 });
 
@@ -258,4 +259,54 @@ test('confirmed draft and scheduled deliveries preserve the approved target life
     await f.result(await f.dispatch(await f.approve(desiredStatus)), `remote-${desiredStatus}`);
     assert.equal((await f.service.get(scope, desiredStatus)).status, desiredStatus);
   }
+});
+
+test('verified absence after uncertain delivery permits fresh approval, while stale and unverified failures remain blocked', async t => {
+  const f = await fixture(t); await f.prepare('p');
+  const dispatched = await f.dispatch(await f.approve('p'));
+  await f.result(dispatched, undefined, 'uncertain'); f.advance(11);
+  const reconciled = await f.service.beginReconciliation({ ...scope, publicationId: 'p', operationId: dispatched.id, workerId: 'reconciler', leaseSeconds: 10 });
+  const result = { ...scope, publicationId: 'p', operationId: dispatched.id, workerId: 'reconciler',
+    fencingGeneration: reconciled.operation.fencingGeneration, result: 'failed', failureEvidence: { code: 'verified-not-created' } };
+  await assert.rejects(f.service.recordResult(result), { code: 'publication_reconciliation_required' });
+  let verified = 0;
+  f.policy.verifyFinalFailure = async (op, evidence) => {
+    verified++; assert.equal(op.state, 'AMBIGUOUS'); assert.equal(evidence.code, 'verified-not-created');
+  };
+  assert.equal((await f.service.recordResult({ ...result, workerId: 'worker', fencingGeneration: 1 })).quarantined, true);
+  assert.equal(verified, 0);
+  assert.equal((await f.service.recordResult(result)).record.operation.state, 'FAILED');
+  assert.equal(verified, 1); f.restart();
+  const fresh = await f.approve('p', 'fresh-after-reconciliation');
+  assert.notEqual(fresh.id, dispatched.id); assert.equal(fresh.operation.state, 'PREPARED');
+});
+
+test('UPDATE approval binds the full remote identity and a changed target cannot dispatch', async t => {
+  const f = await fixture(t); await f.prepare('p');
+  let p = await f.service.get(scope, 'p');
+  await f.repositories.publications.update(p.id, p.revision, { remoteId: 'reviewed', remoteBinding: binding('reviewed') });
+  const accepted = await f.approve('p', 'update', 'UPDATE');
+  assert.deepEqual(accepted.operation.snapshot.remoteBinding, binding('reviewed'));
+  p = await f.service.get(scope, 'p');
+  await f.repositories.publications.update(p.id, p.revision, { remoteId: 'other', remoteBinding: binding('other') });
+  const cancelled = await f.dispatch(accepted);
+  assert.equal(cancelled.operation.state, 'CANCELLED'); assert.equal(cancelled.operation.dispatchedAt, undefined);
+  assert.deepEqual(cancelled.operation.snapshot.remoteBinding, binding('reviewed'));
+});
+
+test('CREATE approval cannot dispatch after a remote binding appears', async t => {
+  const f = await fixture(t); await f.prepare('p'); const accepted = await f.approve('p');
+  const p = await f.service.get(scope, 'p');
+  await f.repositories.publications.update(p.id, p.revision, { remoteId: 'observed', remoteBinding: binding('observed') });
+  assert.equal((await f.dispatch(accepted)).operation.state, 'CANCELLED');
+});
+
+test('an UPDATE result cannot change the approved object namespace even with the same remote ID', async t => {
+  const f = await fixture(t); await f.prepare('p');
+  const p = await f.service.get(scope, 'p');
+  await f.repositories.publications.update(p.id, p.revision, { remoteId: 'reviewed', remoteBinding: binding('reviewed') });
+  const dispatched = await f.dispatch(await f.approve('p', 'update', 'UPDATE'));
+  await assert.rejects(f.service.recordResult({ ...scope, publicationId: 'p', operationId: dispatched.id, workerId: 'worker', fencingGeneration: 1,
+    result: 'confirmed', binding: { ...binding('reviewed'), objectType: 'other-object' } }), { code: 'publication_identity_conflict' });
+  assert.deepEqual((await f.service.get(scope, 'p')).remoteBinding, binding('reviewed'));
 });

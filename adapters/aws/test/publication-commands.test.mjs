@@ -96,3 +96,14 @@ test('a publication configuration race at dispatch commit prevents old-image aut
   assert.equal(paused.operation.state, 'CANCELLED'); assert.equal(paused.operation.dispatchedAt, undefined);
   assert.equal(f.rows.get(`publicationOutbox#${accepted.id}`).value.state, 'paused');
 });
+
+test('a remote binding race at hosted dispatch commit invalidates the approved CREATE', async () => {
+  const f = await fixture(); await f.service.prepare(preparation('p')); const accepted = await approve(f, 'p');
+  f.beforeCommit(() => {
+    const row = f.rows.get('publications#p'); f.rows.set('publications#p', { ...row, revision: row.revision + 1,
+      value: { ...row.value, revision: row.revision + 1, remoteId: 'observed', remoteBinding: binding('observed') } });
+  });
+  const cancelled = await dispatch(f, accepted);
+  assert.equal(cancelled.operation.state, 'CANCELLED'); assert.equal(cancelled.operation.dispatchedAt, undefined);
+  assert.equal(f.rows.get(`publicationOutbox#${accepted.id}`).value.state, 'paused');
+});

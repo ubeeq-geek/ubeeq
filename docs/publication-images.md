@@ -117,6 +117,11 @@ check `record.operation.state === 'IN_FLIGHT'` before sending**. Changed review 
 a cancelled operation needing review; unavailable files/context/policy fail closed.
 Duplicate dispatch cannot begin again. Send precisely approved bytes, metadata,
 principal, access and targets. Sibling setting edits do not invalidate this operation.
+UPDATE snapshots must include the verified `remoteBinding` (provider namespace,
+object type, ownership boundary and remote ID). CREATE snapshots must omit it.
+Reviews and dispatch bind that identity; workers must use the snapshot binding,
+never reload a different remote target after approval. Confirmed results retain the
+full binding on the Publication and may not change an UPDATE's approved namespace.
 
 `recordResult` requires worker identity and fencing generation. It records the old
 snapshot's actual outcome while retaining newer desired settings. Remote claim,
@@ -131,6 +136,9 @@ An expired lease after dispatch or lost provider response requires read-back.
 Uncertain writes cannot be called failed without evidence. No remote exactly-once
 guarantee is claimed. Existing provider replacement capability/read-back remains
 required; never delete/recreate implicitly or lose preserved discussions.
+The current fenced reconciler may close AMBIGUOUS as FAILED only after
+`verifyFinalFailure` accepts definitive evidence that the attempted write failed.
+That closure permits a fresh review and approval; stale workers remain quarantined.
 
 ## Shared controls
 

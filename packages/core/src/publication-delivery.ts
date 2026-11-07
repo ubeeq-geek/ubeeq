@@ -1,6 +1,13 @@
 import type { PublicationAccountIdentity, PublicationOperation } from './publication-copy.js';
 import { isPublicationIdentifier, PUBLICATION_IMAGE_VARIANTS, PublicationImageError, publicationImageCanonicalJson, type PublicationImageDeliveryEvidence, type PublicationImageVariant, type PublicationWatermarkSettings } from './publication-image.js';
 
+export interface PublicationImageRemoteBinding {
+  providerNamespace: string;
+  objectType: string;
+  ownershipBoundary: string;
+  remoteId: string;
+}
+
 /** Server-created approval. fileReference is private and must never enter a general read model or export. */
 export interface PublicationImageReviewSnapshot {
   schemaVersion: 1;
@@ -10,6 +17,8 @@ export interface PublicationImageReviewSnapshot {
   workRevision: number;
   connectionId: string;
   account: PublicationAccountIdentity;
+  /** Required for UPDATE; absent for CREATE. The worker uses this exact object identity. */
+  remoteBinding?: PublicationImageRemoteBinding;
   metadata: Readonly<Record<string, unknown>>;
   metadataFingerprint: string;
   dependencyFingerprint: string;
@@ -53,6 +62,9 @@ export function validatePublicationImageReviewSnapshot(value: PublicationImageRe
     || typeof value.file?.mimeType !== 'string' || !/^image\/[a-z0-9.+-]+$/.test(value.file.mimeType)
     || !PUBLICATION_IMAGE_VARIANTS.includes(value.variant) || !['saved', 'operation'].includes(value.imageChoice)
     || value.collectionId !== undefined && !isPublicationIdentifier(value.collectionId)
+    || value.remoteBinding !== undefined && (!value.remoteBinding
+      || ![value.remoteBinding.providerNamespace, value.remoteBinding.objectType, value.remoteBinding.ownershipBoundary, value.remoteBinding.remoteId].every(isPublicationIdentifier)
+      || value.remoteBinding.providerNamespace !== value.account?.providerNamespace || value.remoteBinding.remoteId.startsWith('pending:'))
     || !Array.isArray(value.targets) || value.targets.length > 100 || value.targets.some(t => !isPublicationIdentifier(t.id) || !isPublicationIdentifier(t.access))
     || new Set(value.targets.map(t => t.id)).size !== value.targets.length
     || !['draft', 'live', 'scheduled'].includes(value.desiredStatus)

@@ -35,7 +35,7 @@ export const makePolicy = repositories => {
       await this.validateSelection(work, p, p.imageSelection ?? inheritedPublicationImageSelection());
       const r = await resolve(work, p), metadata = { title: state.metadata[p.id] ?? p.id };
       return { schemaVersion: 1, publicationId: p.id, workId: work.id, configurationRevision: p.configurationRevision ?? 0,
-        workRevision: work.revision, connectionId: p.connectionId, account: p.account, metadata,
+        workRevision: work.revision, connectionId: p.connectionId, account: p.account, ...(p.remoteId ? { remoteBinding: p.remoteBinding ?? binding(p.remoteId) } : {}), metadata,
         metadataFingerprint: await publicationImageFingerprint(metadata), dependencyFingerprint: r.dependencyFingerprint, imageFingerprint: r.imageFingerprint,
         source: { assetId: 'asset', checksum: state.sourceChecksum },
         file: { fileReference: `private-file-${r.variant}`, checksum: sha(r.imageFingerprint + state.sourceChecksum), sizeBytes: 1000, mimeType: 'image/jpeg', width: 1000, height: 800 },
