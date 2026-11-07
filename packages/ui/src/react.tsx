@@ -496,3 +496,5 @@ export function BlockEditor({
     </div>
   );
 }
+export { PublicationImageControls, selectPublicationImageModel } from './publication-image-controls.js';
+export type { PublicationImageReadModel, PublicationImageControlsProps } from './publication-image-controls.js';

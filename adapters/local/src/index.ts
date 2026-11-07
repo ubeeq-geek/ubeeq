@@ -21,6 +21,8 @@ import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
 import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import type { PublicationCommandRepositories } from '@ubeeq/persistence';
+import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
@@ -83,6 +85,14 @@ export class LocalSqliteDatabase {
   }
 
   /** Atomic synchronous work must not yield while holding SQLite's write lock. */
+  assertTransaction(transaction: PersistenceTransaction): void {
+    const context = this.transactionContext.getStore();
+    if (!context?.active || context !== this.owner || context.id !== transaction.id) throw new Error('Transaction handle is not active on this repository context.');
+  }
+  failTransaction(): void {
+    const context = this.transactionContext.getStore();
+    if (context?.active) context.rollbackOnly = true;
+  }
   transactionSync<T>(operation: () => T): T {
     const inherited = this.transactionContext.getStore();
     if (inherited) {
@@ -128,6 +138,12 @@ export class LocalSqliteDatabase {
 
 class SqliteRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
+  private guard(previous: T | undefined, next: T) {
+    try {
+      if (this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
+      if (this.repository === 'publicationOperations') assertPublicationDeliveryWrite(previous as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord, next as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord);
+    } catch (error) { this.local.failTransaction(); throw error; }
+  }
 
   private write(operation: () => { changes: number }): { changes: number } {
     try { return operation(); }
@@ -161,6 +177,7 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
       if (existing) throw new Error(`Record ${record.id} already exists.`);
       const timestamp = now();
       const value = this.retainHandleHistory({ ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T);
+      this.guard(undefined, value);
       this.write(() => this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp));
       if (options?.idempotencyKey) this.local.database.prepare("INSERT INTO ubeeq_idempotency (repository, idempotency_key, record_id, created_at) VALUES (?, ?, ?, ?)").run(this.repository, options.idempotencyKey, value.id, timestamp);
       return value;
@@ -169,6 +186,12 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
 
   async get(id: string): Promise<T | undefined> {
     return this.read(id);
+  }
+  async checkRevision(id: string, expectedRevision: number, _options: { transaction: PersistenceTransaction }): Promise<void> {
+    this.local.assertTransaction(_options.transaction);
+    // The transaction owns BEGIN IMMEDIATE; this read stays guarded until commit.
+    const current = this.read(id);
+    if (!current || current.revision !== expectedRevision) { this.local.failTransaction(); throw new OptimisticConcurrencyError(id, expectedRevision); }
   }
 
   private read(id: string): T | undefined {
@@ -187,8 +210,9 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
 
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> {
     const current = await this.get(id);
-    if (!current || current.revision !== expectedRevision) throw new OptimisticConcurrencyError(id, expectedRevision);
+    if (!current || current.revision !== expectedRevision) { this.local.failTransaction(); throw new OptimisticConcurrencyError(id, expectedRevision); }
     const value = this.retainHandleHistory({ ...current, ...change, revision: current.revision + 1, updatedAt: now() } as T, current);
+    this.guard(current, value);
     const result = this.write(() => this.local.database.prepare("UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?").run(value.revision, json(value), value.updatedAt, this.repository, id, expectedRevision));
     if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
     return value;
@@ -202,6 +226,13 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
 
 const repository = <T extends RevisionedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new SqliteRevisionedRepository<T>(local, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(local, name), local.configuration.cellId);
+
+/** Shares the authoritative publications/works buckets and SQLite transaction with the ordinary repositories. */
+export const createLocalPublicationCommandRepositories = (local: LocalSqliteDatabase): PublicationCommandRepositories & UbeeqRepositories => ({
+  ...createLocalRepositories(local), publications: cellRepository(local, 'publications'),
+  claims: cellRepository(local, 'publicationClaims'), operations: cellRepository(local, 'publicationOperations'),
+  outbox: cellRepository(local, 'publicationOutbox'), auditEvents: cellRepository(local, 'auditEvents')
+});
 
 /** Durable local composition. It is intentionally a generic JSON-record adapter, not an in-memory default. */
 export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqRepositories => ({
