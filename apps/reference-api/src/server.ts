@@ -9,6 +9,7 @@ import { createHostingPublicProbe } from '@ubeeq/integrations';
 import { NativeWebsiteHostingAdapter, type NativeWebsiteHostingProfile } from '@ubeeq/adapter-local';
 import { WebsitePublishingService } from '@ubeeq/portability';
 import { handleWebsiteRequest } from './websites.js';
+import {createWebsiteSourceReader,mapWebsiteSources} from './website-sources.js';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { PublicationService, PublicationRequestError } from '@ubeeq/api';
@@ -81,6 +82,7 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Optional host-composed deterministic activity interface; no LLM service. */
   /** Trusted product composition may supply catalogue/rendition and policy ports. */
   websiteService?: WebsiteService;
+  websitePreviewMaxFileBytes?:number;
   websitePublishing?: WebsitePublishingService;
   nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
   /** Explicit outbound policy is required before any external hosting connection is enabled. */
@@ -96,6 +98,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
     databasePath: environment.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`,
     dataDirectory,
     publicBaseUrl: environment.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`,
+    websitePreviewMaxFileBytes:environment.UBEEQ_WEBSITE_PREVIEW_MAX_FILE_BYTES===undefined?undefined:Number(environment.UBEEQ_WEBSITE_PREVIEW_MAX_FILE_BYTES),
     instanceId: environment.UBEEQ_INSTANCE_ID,
     cellId: environment.UBEEQ_CELL_ID ?? "local-single-cell",
     region: environment.UBEEQ_CELL_REGION ?? "local",
@@ -206,8 +209,33 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     return { work, assets, publications };
   };
   const websiteStore = localAdapters && !configuration.websiteService ? new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`) : undefined;
+  const websiteLimits={apiVersion:'1' as const,export:true,maxPages:2000,maxAssets:2000,maxBytes:256*1024*1024,deploymentAdapters:[]};
+  const websiteSources=createWebsiteSourceReader(repositories,localAdapters?()=>JSON.stringify([
+    localAdapters.database.database.prepare('PRAGMA data_version').get(),localAdapters.database.database.prepare('SELECT total_changes() AS changes').get()
+  ]):undefined);
+  const renditionFlights=new Map<string,Promise<{bytes:Uint8Array;width:number;height:number}>>();
+  const renditionWaiters:Array<()=>void>=[];let activeRenditions=0;
+  const websiteRendition=(asset:AssetRecord,sourceBytes?:Uint8Array)=>{
+    const recipe=`website-jpeg-1600-v1:${asset.id}:${asset.checksum}`,key=asset.creatorId+':'+recipe,existing=renditionFlights.get(key);if(existing)return existing;
+    const value=(async()=>{
+      const cached=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(cached)return cached;
+      if(activeRenditions>=2)await new Promise<void>(resolve=>renditionWaiters.push(resolve));else activeRenditions++;
+      try{
+        // Another worker/process may have populated the persistent cache while this operation waited.
+        const ready=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(ready)return ready;
+        let bytes=sourceBytes;
+        if(!bytes){const location=(asset as AssetRecord&{storage?:{bucket:string;key:string;versionId?:string;scope?:string}}).storage;if(!location||location.scope!=='public')throw new WebsiteError('media_not_public','Public storage rendition was not found.');bytes=(await adapters.storage.get(location)).body;}
+        if(bytes.length>50*1024*1024||websiteDigest(bytes)!==asset.checksum)throw new WebsiteError('invalid_media','Image source is oversized or changed.');
+        const {createCropSourcePreview}=await import('@ubeeq/media-sharp');
+        const result=await createCropSourcePreview(bytes,{maxPreviewEdge:1600,maxOutputBytes:10*1024*1024}),clean={bytes:result.body,width:result.width,height:result.height};
+        await websiteStore!.putPublicRendition(asset.creatorId,recipe,clean);return clean;
+      }finally{const next=renditionWaiters.shift();if(next)next();else activeRenditions--;}
+    })();
+    renditionFlights.set(key,value);void value.finally(()=>renditionFlights.delete(key)).catch(()=>{});return value;
+  };
   const websites = configuration.websiteService ?? (websiteStore ? new WebsiteService({
     store: websiteStore,
+    previewMaxFileBytes:configuration.websitePreviewMaxFileBytes,
     creatorIdentityAllowed: async (actor, identityId) => identityId === actor.workspaceId,
     membership: async actor => {
       const creator = await repositories.creators.get(actor.workspaceId);
@@ -215,7 +243,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       await requireCreatorWritable(creator);
       return { workspaceId: actor.workspaceId, userId: actor.actorId, role: 'owner', status: 'active' };
     },
-    capabilities: async () => ({ apiVersion: '1', export: true, maxPages: 200, maxAssets: 500, maxBytes: 50 * 1024 * 1024, deploymentAdapters: [] }),
+    capabilities: async () => websiteLimits,
     resolveSnapshot: async (actor, website) => {
       const documents = [];
       let documentBytes=0;
@@ -223,19 +251,20 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const document = await websiteStore!.getDocument(actor.workspaceId, id);
         if (!document) throw new WebsiteError('missing_document', 'Page document was not found.');
         documentBytes+=Buffer.byteLength(JSON.stringify(document));
-        if(documentBytes>50*1024*1024) throw new WebsiteError('quota_exceeded','Website source documents exceed the build byte budget.');
+        if(documentBytes>websiteLimits.maxBytes) throw new WebsiteError('quota_exceeded','Website source documents exceed the build byte budget.');
         documents.push(document);
       }
       const galleries: WebsiteGallery[] = [], assets: WebsitePublicAsset[] = [], dependencies: WebsiteDependency[] = [{ kind: 'policy', id: 'reference-public-release', revision: '1' }];
-      const needed = new Set<string>([website.theme.settings.logoAssetId, website.theme.settings.faviconAssetId, ...website.pages.filter(p => p.state === 'ready').map(p => p.socialAssetId)].filter((id): id is string => Boolean(id)));
+      const catalogue=await websiteSources(actor.workspaceId);
+      const needed = new Set<string>([website.theme.settings.logoAssetId, website.theme.settings.faviconAssetId, ...website.pages.filter(p => p.state === 'ready').flatMap(p => [p.socialAssetId,p.coverAssetId,p.backgroundAssetId])].filter((id): id is string => Boolean(id)));
       for (const document of documents) {
         const pending = [...document.blocks];
         while (pending.length) { const block = pending.pop()!; if (block.assetId || block.fileId) needed.add(block.fileId ?? block.assetId!); if (block.children) pending.push(...block.children); }
       }
       for (const publicationId of website.galleryPublicationIds) {
-        const publication = await repositories.publications.get(publicationId);
+        const publication = catalogue.publications.get(publicationId);
         if (!publication || publication.status !== 'live' || publication.destination !== 'local') throw new WebsiteError('publication_not_public', 'The reference website selects live local public publications. Connected/premium sources require their product snapshot adapter.');
-        const current = await currentPublicWork(publication.workId);
+        const current = catalogue.current(publication.workId);
         if (current.work.creatorId !== actor.workspaceId || !current.publications.some(p => p.id === publicationId)) throw new WebsiteError('foreign_reference', 'Selected publication is outside this personal workspace.');
         // The reference public API defines its local presentation as all current ready assets.
         // Product adapters with multiple presentations must supply their narrower exact selection.
@@ -244,34 +273,23 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         galleries.push({ publicationId, workId: current.work.id, workspaceId: actor.workspaceId, revision: publication.revision,
           title: current.work.title, slug: normalizeContentSlug(current.work.title, { fallback: 'gallery' }),
           tags: [], collectionIds: [], date: current.work.updatedAt, premium: false, previewAssetIds: ids.slice(0, 1), publicAssetIds: ids });
-        dependencies.push({kind:'catalogue',id:current.work.id,revision:String(current.work.revision)});
+        if(!dependencies.some(dependency=>dependency.kind==='catalogue'&&dependency.id===current.work.id))dependencies.push({kind:'catalogue',id:current.work.id,revision:catalogue.revision(current.work.id)});
       }
-      if (needed.size > 500) throw new WebsiteError('quota_exceeded', 'Too many public media references.');
+      if (needed.size > websiteLimits.maxAssets) throw new WebsiteError('quota_exceeded', 'Too many public media references.');
       let totalBytes = 0;
-      for (const id of needed) {
-        const asset = await repositories.assets.get(id);
+      const resolved=await mapWebsiteSources([...needed],async id=>{
+        const asset = catalogue.assets.get(id);
         if (!asset || !asset.workId || asset.creatorId !== actor.workspaceId || asset.status !== 'ready') throw new WebsiteError('media_not_public', 'Media must belong to a current public local presentation.');
-        const current = await currentPublicWork(asset.workId);
-        if (!current.publications.some(p => p.destination === 'local') || !current.assets.some(a => a.id === id)) throw new WebsiteError('media_not_public', 'Media is not in an eligible public local publication.');
+        const current = catalogue.current(asset.workId);
+        if (!current.publications.some(p => p.destination === 'local')) throw new WebsiteError('media_not_public', 'Media is not in an eligible public local publication.');
         if (!asset.mimeType.startsWith('image/')) throw new WebsiteError('public_rendition_adapter_required', 'The reference website adapter supports clean image renditions. Other public media requires an approved rendition adapter.');
-        const recipe = `website-jpeg-1600-v1:${id}:${asset.checksum}`;
-        let clean: { bytes: Uint8Array; width: number; height: number } | undefined = await websiteStore!.getPublicRendition(actor.workspaceId, recipe);
-        if (!clean) {
-          const location = (asset as AssetRecord & { storage?: { bucket: string; key: string; versionId?: string; scope?: string } }).storage;
-          if (!location || location.scope !== 'public') throw new WebsiteError('media_not_public', 'Public storage rendition was not found.');
-          const source = await adapters.storage.get(location);
-          if (source.body.length > 50 * 1024 * 1024 || websiteDigest(source.body) !== asset.checksum) throw new WebsiteError('invalid_media', 'Image source is oversized or changed.');
-          const { createCropSourcePreview } = await import('@ubeeq/media-sharp');
-          const result = await createCropSourcePreview(source.body, { maxPreviewEdge: 1600, maxOutputBytes: 10 * 1024 * 1024 });
-          clean = { bytes: result.body, width: result.width, height: result.height };
-          await websiteStore!.putPublicRendition(actor.workspaceId, recipe, clean);
-        }
+        const clean=await websiteRendition(asset);
         totalBytes += clean.bytes.length;
-        if (totalBytes > 50 * 1024 * 1024) throw new WebsiteError('quota_exceeded', 'Bundled media exceeds the website byte budget.');
-        assets.push({ id, workspaceId: actor.workspaceId, revision: asset.revision, checksum: websiteDigest(clean.bytes), mimeType: 'image/jpeg', bytes: clean.bytes,
-          alt: current.work.title, width: clean.width, height: clean.height, approvedPublic: true, metadataStripped: true });
-        dependencies.push({kind:'catalogue',id:current.work.id,revision:String(current.work.revision)});
-      }
+        if (totalBytes > websiteLimits.maxBytes) throw new WebsiteError('quota_exceeded', 'Bundled media exceeds the website byte budget.');
+        return {asset:{ id, workspaceId: actor.workspaceId, revision: asset.revision, checksum: websiteDigest(clean.bytes), mimeType: 'image/jpeg', bytes: clean.bytes,
+          alt: current.work.title, width: clean.width, height: clean.height, approvedPublic: true, metadataStripped: true },work:current.work};
+      });
+      for(const result of resolved){assets.push(result.asset);if(!dependencies.some(dependency=>dependency.kind==='catalogue'&&dependency.id===result.work.id))dependencies.push({kind:'catalogue',id:result.work.id,revision:catalogue.revision(result.work.id)});}
       return { apiVersion: '1', website, documents, galleries, mappings: [], assets, dependencies };
     },
     evaluateRelease: async ({ actor, dependencies }) => {
@@ -282,14 +300,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     dependenciesEligible: async (actor, dependencies) => {
       try { await requireClearAdmission('Website eligibility', [actor.workspaceId, ...dependencies.map(d => d.id)]); }
       catch (error) { if (error instanceof AdmissionBlockedError) return false; throw error; }
-      for (const dep of dependencies) {
-        if (dep.kind === 'document' && !await websiteStore!.getDocument(actor.workspaceId, dep.id)) return false;
-        if (dep.kind === 'publication') { const publication = await repositories.publications.get(dep.id); if (!publication || publication.status !== 'live' || publication.destination !== 'local') return false; try { const current = await currentPublicWork(publication.workId); if (current.work.creatorId !== actor.workspaceId) return false; } catch { return false; } }
-        if (dep.kind === 'asset') { const asset = await repositories.assets.get(dep.id); if (!asset?.workId || asset.creatorId !== actor.workspaceId || asset.status !== 'ready' || !dep.revision.startsWith(`${asset.revision}:`)) return false; try { await currentPublicWork(asset.workId); } catch { return false; } }
-        if (dep.kind === 'catalogue') { try { const current = await currentPublicWork(dep.id); if (current.work.creatorId !== actor.workspaceId) return false; } catch { return false; } }
-      }
-      return true;
+      for(const dep of dependencies)if(dep.kind==='document'&&!await websiteStore!.getDocument(actor.workspaceId,dep.id))return false;
+      return (await websiteSources(actor.workspaceId)).eligible(dependencies);
     },
+    dependenciesCurrent:async(actor,dependencies)=>(await websiteSources(actor.workspaceId)).eligible(dependencies,true),
     enqueue: async payload => { await adapters.jobs.enqueue({ cellId, type: 'website.build', payload, idempotencyKey: payload.idempotencyKey, maxAttempts: 3 }); },
     audit: async event => { await audit({ action: event.action, actorId: event.actor.actorId, subjectId: event.websiteId, payload: { buildId: event.buildId, artifactDigest: event.artifactDigest, result: event.result } }); }
   }) : undefined);
@@ -392,6 +406,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         await repositories.auditEvents.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), action: "asset.processing_completed", subjectId: processing.id, payload: { jobId: lease.job.id, sourceVersionId: processing.objectVersion } }, { transaction });
         return ready;
       });
+      // Prepare reusable, metadata-clean website bytes before Preview is requested.
+      // A failed optional prewarm is retried by the normal snapshot resolver.
+      if(websiteStore&&processed.mimeType.startsWith('image/'))try{await websiteRendition(processed,source.body);}catch{await audit({action:'website.rendition_deferred',subjectId:processed.id});}
       await adapters.jobs.complete({ id: lease.job.id, leaseToken: lease.leaseToken });
       return { job: await adapters.jobs.get(lease.job.id), asset: processed };
     } catch (error) {
@@ -433,12 +450,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         }
         if(method==='GET' && url.pathname==='/v1/websites/catalogue' && websiteStore) {
           const publications=[];
-          for await(const publication of repositoryItems(request=>repositories.publications.list(request))) {
+          const sources=await websiteSources(creator.id);
+          for(const publication of sources.publications.values()) {
             if(publication.destination!=='local' || publication.status!=='live') continue;
-            const work=await repositories.works.get(publication.workId);
+            const work=sources.works.get(publication.workId);
             if(!work || work.creatorId!==creator.id) continue;
-            try { const current=await currentPublicWork(work.id); publications.push({id:publication.id,title:work.title,assets:current.assets.filter(a=>a.mimeType.startsWith('image/')).map(a=>({id:a.id,label:work.title}))}); }
-            catch(error) { if(error instanceof HttpError || error instanceof AdmissionBlockedError) continue; throw error; }
+            try { const current=sources.current(work.id); publications.push({id:publication.id,title:work.title,assets:current.assets.filter(a=>a.mimeType.startsWith('image/')).map(a=>({id:a.id,label:work.title}))}); }
+            catch(error) { if(error instanceof WebsiteError) continue; throw error; }
           }
           return json(response,200,{publications,requestId},requestId);
         }
@@ -448,7 +466,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           return json(response,method==='POST'?202:200,{...result,requestId},requestId);
         }
         const result = await handleWebsiteRequest({ service: websites, actor: { actorId: identity.subject.id, workspaceId: creator.id }, request, response, url, body: () => parseBody(request) });
-        if (!response.writableEnded) return json(response, method === 'POST' ? 202 : 200, { ...result as object, requestId }, requestId);
+        if (!response.writableEnded) return json(response, method === 'POST'&&!url.pathname.endsWith('/preview-files') ? 202 : 200, { ...result as object, requestId }, requestId);
         return;
       }
 
@@ -667,7 +685,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
-      if (error instanceof WebsiteError) return json(response, error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
+      if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof PublicationRequestError) return json(response, ['invalid_request', 'invalid_idempotency_key'].includes(error.code) ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof UniqueConstraintError && error.constraint.name === 'creator_current_handle') {

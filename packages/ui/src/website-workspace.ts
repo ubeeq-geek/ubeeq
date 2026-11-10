@@ -1,7 +1,8 @@
 import {saveWebsitePreviewDrafts} from './website-preview-drafts.js';
 import {attachWebsiteDragScroll} from './website-drag-scroll.js';
 import {moveWebsiteGallery,removeWebsitePage} from './website-page-actions.js';
-import {readWebsitePreviewArchive,websitePreviewHtml,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
+import {readWebsitePreviewArchive,websitePreviewHtml,websitePreviewEmbeds,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
+import {createWebsitePreviewFileBroker,validateWebsitePreviewManifest,type WebsitePreviewManifest,type WebsitePreviewFiles,type WebsitePreviewSource} from './website-preview-files.js';
 import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteCatalogueOption {workId?:string;id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
 export interface WebsiteMediaOption {id:string;title:string;source?:string;}
@@ -32,6 +33,8 @@ export interface WebsiteWorkspaceClient {
   requestBuild(revision: number, key: string): Promise<{ id: string; state: string }>;
   builds?(previewRevision?:number): Promise<readonly {id:string;state:string;websiteRevision:number;stale?:boolean}[]>;
   previewSite?(id:string):Promise<Blob>;
+  previewManifest?(id:string):Promise<WebsitePreviewManifest>;
+  previewFiles?(id:string,paths:readonly string[],progress?:()=>void):Promise<WebsitePreviewFiles>;
   previewPages?(id:string): Promise<readonly string[]>;
   build(id: string): Promise<{ id: string; state: string; errorCode?: string; warnings: readonly string[]; stale?: boolean }>;
   export(id: string): Promise<Blob>;
@@ -41,7 +44,7 @@ export interface WebsiteWorkspaceClient {
   preview(id: string,file?:string): Promise<string>;
 }
 export interface WebsiteWorkspaceOptions { hostingSetupUrl?:string; hostingDestinationSetupUrl?:(target:WebsiteHostingTarget)=>string; initialHostingTargetId?:string; hostingPlatformIcons?:Readonly<Partial<Record<string,{path:string;viewBox?:string}>>>; initialTab?:'Settings'|'Pages'|'Layout'|'Appearance'|'Galleries'|'Publishing'; studioName?:string; onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
-type PreviewClient=Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'>;
+type PreviewClient=Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'|'previewManifest'|'previewFiles'>;
 const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(message:string)=>void=()=>{},closed:()=>boolean=()=>false,fallback=false)=>{
     const saved=await client.get(),selected=saved.pages.find(p=>p.id===(pageId??saved.homePageId)),page=fallback&&selected?.state!=='ready'?saved.pages.find(p=>p.id===saved.homePageId):selected;
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
@@ -63,23 +66,36 @@ const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(
       }
     }
     const route=websiteRoutes(saved).get(page.id);if(!route)throw new Error('This page is unavailable in the saved website.');
-    if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
     progress('Loading your preview…');
-    const files=await readWebsitePreviewArchive(await client.previewSite(buildId));
-
     const initial=route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html';
-    return {saved,buildId,files,initial};
+    let source:WebsitePreviewSource|undefined,files:Record<string,string>;
+    if(client.previewManifest&&client.previewFiles&&typeof BroadcastChannel!=='undefined'){
+      const manifest=validateWebsitePreviewManifest(await client.previewManifest(buildId));
+      const paths=[...new Set(['index.html',initial,'assets/theme.css','assets/gallery-viewer.js'].filter(path=>Object.hasOwn(manifest.files,path)))];
+      const loaded=await client.previewFiles(buildId,paths);if(loaded.digest!==manifest.digest||paths.some(path=>typeof loaded.files[path]!=='string'))throw new Error('Invalid website preview response.');
+      files=loaded.files;source={buildId,manifest,channel:websitePreviewKey(saved)+':requests'};
+    }else{
+      if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
+      files=await readWebsitePreviewArchive(await client.previewSite(buildId));
+    }
+    return {saved,buildId,files,initial,source};
 };
-const previewProviders=new Map<string,{channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string}>();
-const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient)=>{
+const previewProviders=new Map<string,{channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string;broker:ReturnType<typeof createWebsitePreviewFileBroker>}>();
+const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient,source?:WebsitePreviewSource)=>{
   if(typeof window==='undefined'||typeof BroadcastChannel==='undefined')return;
   const key=websitePreviewKey(saved),previous=previewProviders.get(key);
-  if(previous){previous.client=client;previous.sourceUrl=sourceUrl;return;}
-  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID()};
+  if(previous){previous.client=client;previous.sourceUrl=sourceUrl;if(source)previous.broker.register(source.buildId,source.manifest);return;}
+  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID(),broker:createWebsitePreviewFileBroker((buildId,paths,progress)=>previewProviders.get(key)!.client.previewFiles!(buildId,paths,progress))};
+  if(source)provider.broker.register(source.buildId,source.manifest);
   const offers=new Map<string,{replyTo:string;pageId?:string;path?:string;expires:number}>();
   const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
   provider.channel.onmessage=async event=>{
     const data=event.data;if(typeof data?.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))return;
+    if(data.type==='file-request'){
+      if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.files:[a-f0-9-]{36}$/.test(data.replyTo)||typeof data.buildId!=='string'||typeof data.path!=='string'||data.path.length>2000)return;
+      try{const base64=await provider.broker.request(data.buildId,data.path,()=>send(data.replyTo,data.requestId,'file-progress',{path:data.path}));send(data.replyTo,data.requestId,'file',{path:data.path,base64,embeds:data.path.endsWith('.html')?websitePreviewEmbeds(base64):[]});}
+      catch(error){send(data.replyTo,data.requestId,'file-error',{message:error instanceof Error?error.message:'The preview file could not be loaded.'});}return;
+    }
     if(data.type==='refresh-request'){
       if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.refresh:[a-f0-9-]{36}$/.test(data.replyTo)||data.pageId!==undefined&&(typeof data.pageId!=='string'||data.pageId.length>200)||data.path!==undefined&&(typeof data.path!=='string'||data.path.length>2000))return;
       for(const [id,offer]of offers)if(offer.expires<Date.now())offers.delete(id);
@@ -94,8 +110,10 @@ const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClie
       const result=await prepareWebsitePreview(provider.client,offer.pageId,message=>reply('progress',{message}),undefined,true);
       if(websitePreviewKey(result.saved)!==key)throw Error('This website is no longer available in the editor.');
       const nextContext=makePreviewContext(result.saved,provider.sourceUrl,offer.replyTo);
-      const initial=!offer.pageId&&offer.path?.endsWith('.html')&&Object.hasOwn(result.files,offer.path)?offer.path:result.initial;
-      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext));notifyWebsitePreviewSaved(result.saved);reply('ready',{id});
+      if(result.source)provider.broker.register(result.buildId,result.source.manifest);
+      const initial=!offer.pageId&&offer.path?.endsWith('.html')&&Object.hasOwn(result.source?.manifest.files??result.files,offer.path)?offer.path:result.initial;
+      if(result.source&&!Object.hasOwn(result.files,initial)){const loaded=await provider.client.previewFiles!(result.buildId,[initial]);if(loaded.digest!==result.source.manifest.digest)throw new Error('Preview changed during retrieval.');Object.assign(result.files,loaded.files);}
+      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext,result.source));notifyWebsitePreviewSaved(result.saved);reply('ready',{id});
     }catch(error){reply('error',{message:error instanceof Error?error.message:'The latest preview could not be prepared. Try again.'});}
   };
   previewProviders.set(key,provider);
@@ -110,10 +128,10 @@ export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourc
   popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
   const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
   try{
-    const {saved,buildId,files,initial}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed);
-    registerPreviewProvider(saved,sourceUrl,client);
+    const {saved,buildId,files,initial,source}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed);
+    registerPreviewProvider(saved,sourceUrl,client,source);
     const context=previewPath?makePreviewContext(saved,sourceUrl):undefined;
-    const html=websitePreviewHtml(files,initial,context);notifyWebsitePreviewSaved(saved);
+    const html=websitePreviewHtml(files,initial,context,source);notifyWebsitePreviewSaved(saved);
     if(popup.closed)return buildId;
     if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
     return buildId;
