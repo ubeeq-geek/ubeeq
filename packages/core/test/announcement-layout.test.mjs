@@ -43,3 +43,20 @@ test('series and event labels remain separate from creator and platform names', 
 test('related collections with the same platform target retain distinct source identities', () => {
   assert.notEqual(announcementLinkSourceKey({ kind: 'publication', destinationKey: 'native' }), announcementLinkSourceKey({ kind: 'publication', destinationKey: 'native', collectionId: 'related' }));
 });
+
+
+test('expanded groups allocate deterministic IDs without colliding with headings or authored nested blocks', () => {
+ const url={kind:'url',url:'https://example.test/gallery'};
+ const template={blocks:[
+  group([{id:'heading',label:'Gallery',source:url},{id:'heading-2',label:'Second',source:url}]),
+  {id:'wrapper',type:'paragraph',children:[{id:'previews-heading',type:'paragraph',text:'Authored block'},{id:'previews-heading-2',type:'paragraph',text:'Another authored block'}]},
+  {id:'previews-heading-3',type:'paragraph',linkGroup:{heading:'Other group',links:[{id:'heading',label:'Another gallery',source:url}]}}
+ ]};
+ validateAnnouncementTemplate(template);
+ const output=renderAnnouncementTemplate({template,values});
+ const ids=[];const collect=blocks=>{for(const block of blocks){ids.push(block.id);if(block.children)collect(block.children);}};collect(output);
+ assert.equal(new Set(ids).size,ids.length);
+ assert.equal(output.find(block=>block.id==='wrapper').children[0].id,'previews-heading');
+ assert.deepEqual(renderAnnouncementTemplate({template,values}),output);
+ assert.deepEqual(output.filter(block=>block.type==='link').map(block=>block.label),['Gallery','Second','Another gallery']);
+});

@@ -79,8 +79,15 @@ export function validateAnnouncementLinkGroup(group: AnnouncementLinkGroup): voi
   }
 }
 /** Expands template-only groups into the existing provider document vocabulary. */
-export function renderAnnouncementLinkGroup(block: AnnouncementTemplateBlock, resolutions: AnnouncementLinkResolutions, replace: (value: string) => string): AnnouncementTemplateBlock[] {
+export function renderAnnouncementLinkGroup(block: AnnouncementTemplateBlock, resolutions: AnnouncementLinkResolutions, replace: (value: string) => string, usedIds = new Set<string>()): AnnouncementTemplateBlock[] {
   const group = block.linkGroup!;
+  const allocateId = (preferred: string): ContentBlock['id'] => {
+    let id = preferred, suffix = 2;
+    while (usedIds.has(id)) id = `${preferred}-${suffix++}`;
+    usedIds.add(id);
+    return id as ContentBlock['id'];
+  };
+  const headingId = group.heading ? allocateId(`${block.id}-heading`) : undefined;
   const links = group.links.flatMap(link => {
     const resolved = link.source.kind === 'url' ? { url: link.source.url } : resolutions[announcementLinkSourceKey(link.source)];
     if (!resolved) {
@@ -94,10 +101,10 @@ export function renderAnnouncementLinkGroup(block: AnnouncementTemplateBlock, re
       if (!Number.isSafeInteger(count) || count! < 0 || collections !== undefined && (!Number.isSafeInteger(collections) || collections < 0)) { if(link.required===false)return []; throw new AnnouncementOrchestrationError('LINK_NOT_READY', `Confirm the published count for ${link.label}.`); }
       label += ` (${collections !== undefined ? `${collections} galleries, ` : ''}${count}${link.countUnit ? ` ${replace(link.countUnit)}` : ''})`;
     }
-    return [{ id: `${block.id}-${link.id}` as ContentBlock['id'], type: 'link' as const, label, url: resolved.url, groupId: String(block.id), linkAppearance: link.appearance ?? 'url' }];
+    return [{ id: allocateId(`${block.id}-${link.id}`), type: 'link' as const, label, url: resolved.url, groupId: String(block.id), linkAppearance: link.appearance ?? 'url' }];
   });
   if (!links.length) return [];
-  return [...(group.heading ? [{ id: `${block.id}-heading` as ContentBlock['id'], type: 'heading' as const, level: 2, text: replace(group.heading) }] : []), ...links];
+  return [...(group.heading ? [{ id: headingId!, type: 'heading' as const, level: 2, text: replace(group.heading) }] : []), ...links];
 }
 export function announcementLayoutPreset(kind: 'release' | 'update' | 'simple' | 'blank', sources: readonly { destinationKey: string; label: string }[] = []): AnnouncementTemplate {
   const block = (id: string, type: AnnouncementTemplateBlock['type'], text: string): AnnouncementTemplateBlock => ({ id: id as ContentBlock['id'], type, text, ...(type === 'heading' ? { level: 1 } : {}) });

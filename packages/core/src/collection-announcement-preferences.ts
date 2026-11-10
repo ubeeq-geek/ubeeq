@@ -149,6 +149,12 @@ export function renderAnnouncementTemplate(input: {
 }): AnnouncementTemplateBlock[] {
   validateAnnouncementTemplate(input.template);
   const blocks = announcementTemplateBlocks(input.template, input.platform, input.destinationKey);
+  // Reserve authored IDs throughout the tree before expanding any link groups.
+  const usedIds = new Set<string>();
+  const reserveIds = (items: readonly AnnouncementTemplateBlock[]) => {
+    for (const block of items) { usedIds.add(block.id); if (block.children) reserveIds(block.children); }
+  };
+  reserveIds(blocks);
   const values = { ...input.values, 'series.name': input.template.fields?.seriesName || input.values['series.name'] || input.values['creator.name'], 'release.label': input.template.fields?.eventLabel ?? input.values['release.label'] ?? (input.values['release.kind'] === 'additions' ? 'UPDATE' : 'NEW') };
   const replace = (text: string): string => {
     variables(text);
@@ -169,7 +175,7 @@ export function renderAnnouncementTemplate(input: {
     if (original.linkGroup) {
       const links = { ...input.links };
       if (!links.primary && typeof input.values['primaryLink.url'] === 'string') links.primary = { url: input.values['primaryLink.url'] };
-      return renderAnnouncementLinkGroup(original, links, replace);
+      return renderAnnouncementLinkGroup(original, links, replace, usedIds);
     }
     const b = structuredClone(original);
     for (const field of templateFields) if (typeof b[field] === "string") b[field] = replace(b[field]!);
