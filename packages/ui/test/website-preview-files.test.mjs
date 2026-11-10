@@ -62,3 +62,11 @@ test('preview manifests reject traversal and oversized projections before fetchi
  for(const path of ['../secret','/secret','a\\secret'])assert.throws(()=>validateWebsitePreviewManifest({...manifest,files:{...manifest.files,[path]:{checksum:hash('x'),byteLength:1}}}));
  assert.throws(()=>validateWebsitePreviewManifest({...manifest,files:{'index.html':{checksum:hash('x'),byteLength:513*1024*1024}}}));
 });
+
+test('file brokers forward transfer progress to each waiting preview request',async()=>{
+ const {manifest,files}=fixture();let first=0,second=0;
+ const broker=createWebsitePreviewFileBroker(async(_build,paths,progress)=>{progress();return {digest:manifest.digest,files:Object.fromEntries(paths.map(path=>[path,files[path].toString('base64')]))};});
+ broker.register('build',manifest);
+ await Promise.all([broker.request('build','index.html',()=>{first++;}),broker.request('build','about/index.html',()=>{second++;})]);
+ assert.equal(first,1);assert.equal(second,1);
+});

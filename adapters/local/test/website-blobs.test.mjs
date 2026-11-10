@@ -7,7 +7,46 @@ import {DatabaseSync} from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {SqliteWebsiteStore} from '../dist/index.js';
 import {createWebsiteZip} from '../../../packages/portability/dist/index.js';
+import {WEBSITE_PREVIEW_CHUNK_BYTES as chunk} from '@ubeeq/core';
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+
+test('large immutable blobs store real chunks, read only intersecting rows, and retain frozen references',async t=>{
+ const directory=mkdtempSync(join(tmpdir(),'website-chunks-')),path=join(directory,'websites.sqlite');
+ let store=new SqliteWebsiteStore(path);const sql=new DatabaseSync(path);t.after(()=>{store.close();sql.close();rmSync(directory,{recursive:true,force:true});});
+ const media=Buffer.alloc(chunk*2+17,5),checksum=hash(media),file='assets/'+checksum+'.pdf',files=new Map([['index.html',Buffer.from('Home')],[file,media]]),zip=createWebsiteZip(files),digest=hash(zip);
+ await store.putArtifact('one',digest,zip,files);
+ assert.equal(sql.prepare('SELECT length(bytes) AS length FROM website_blobs WHERE checksum=?').get(checksum).length,0);
+ assert.equal(sql.prepare('SELECT count(*) AS count,max(length(bytes)) AS largest FROM website_blob_chunks').get().count,3);
+ assert.equal(sql.prepare('SELECT max(length(bytes)) AS largest FROM website_blob_chunks').get().largest,chunk);
+ await store.putPlan({id:'plan',workspaceId:'one',snapshotReference:'snapshot',expiresAt:'2020-01-01T00:00:00Z'},{assets:[{bytes:media}]});
+ assert.equal(sql.prepare('SELECT count(*) AS count FROM website_blob_chunks').get().count,3);
+ store.close();store=new SqliteWebsiteStore(path);
+ assert.equal(await store.getArtifactFileRange('other',digest,file,0,10),undefined);
+ const prepare=store.db.prepare.bind(store.db),reads=[];
+ store.db.prepare=query=>{assert.doesNotMatch(query,/SELECT bytes FROM website_blobs/);if(query.includes('FROM website_blob_chunks WHERE'))reads.push(query);return prepare(query);};
+ store.getArtifact=async()=>assert.fail('No archive reads');store.getArtifactFile=async()=>assert.fail('No whole-file reads');
+ assert.deepEqual(Buffer.from(await store.getArtifactFileRange('one',digest,file,chunk-3,chunk+9)),media.subarray(chunk-3,chunk+9));
+ assert.equal(reads.length,2);
+ await assert.rejects(store.getArtifactFileRange('one',digest,file,0,chunk+1),{code:'invalid_range'});
+ await store.removeArtifact('one',digest);
+ assert.deepEqual(Buffer.from((await store.getSnapshot('one','snapshot')).assets[0].bytes),media);
+ assert.equal(sql.prepare('SELECT count(*) AS count FROM website_blob_chunks').get().count,3);
+ await store.cleanupUnacceptedPlans('2026-11-05T00:00:00Z',100);
+ assert.equal(sql.prepare('SELECT count(*) AS count FROM website_blob_chunks').get().count,0);
+ assert.equal(sql.prepare('SELECT count(*) AS count FROM website_chunked_blobs').get().count,0);
+});
+
+test('older indexed blobs migrate once, and corrupt chunks fail closed',async t=>{
+ const store=new SqliteWebsiteStore(':memory:');t.after(()=>store.close());
+ const media=Buffer.alloc(chunk+10,6),checksum=hash(media),file='assets/'+checksum+'.pdf',files=new Map([['index.html',Buffer.from('Home')],[file,media]]),zip=createWebsiteZip(files),digest=hash(zip);
+ await store.putArtifact('one',digest,zip,files);
+ store.db.prepare('DELETE FROM website_blob_chunks').run();store.db.prepare('DELETE FROM website_chunked_blobs').run();
+ store.db.prepare('UPDATE website_blobs SET bytes=? WHERE checksum=?').run(media,checksum);
+ assert.deepEqual(Buffer.from(await store.getArtifactFileRange('one',digest,file,chunk,chunk+10)),media.subarray(chunk));
+ assert.equal(store.db.prepare('SELECT length(bytes) AS length FROM website_blobs WHERE checksum=?').get(checksum).length,0);
+ store.db.prepare('UPDATE website_blob_chunks SET bytes=? WHERE checksum=? AND offset=0').run(Buffer.alloc(chunk,9),checksum);
+ await assert.rejects(store.getArtifactFileRange('one',digest,file,0,1),{code:'artifact_unavailable'});
+});
 
 test('artifacts and frozen publish snapshots share blobs across releases, survive restart and isolate workspaces',async t=>{
  const directory=mkdtempSync(join(tmpdir(),'website-blobs-')),path=join(directory,'websites.sqlite');t.after(()=>rmSync(directory,{recursive:true,force:true}));

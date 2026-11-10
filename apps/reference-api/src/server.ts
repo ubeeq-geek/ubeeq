@@ -82,6 +82,7 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Optional host-composed deterministic activity interface; no LLM service. */
   /** Trusted product composition may supply catalogue/rendition and policy ports. */
   websiteService?: WebsiteService;
+  websitePreviewMaxFileBytes?:number;
   websitePublishing?: WebsitePublishingService;
   nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
   /** Explicit outbound policy is required before any external hosting connection is enabled. */
@@ -97,6 +98,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
     databasePath: environment.UBEEQ_DATABASE_PATH ?? `${dataDirectory}/ubeeq.sqlite`,
     dataDirectory,
     publicBaseUrl: environment.UBEEQ_PUBLIC_BASE_URL ?? `http://127.0.0.1:${port}`,
+    websitePreviewMaxFileBytes:environment.UBEEQ_WEBSITE_PREVIEW_MAX_FILE_BYTES===undefined?undefined:Number(environment.UBEEQ_WEBSITE_PREVIEW_MAX_FILE_BYTES),
     instanceId: environment.UBEEQ_INSTANCE_ID,
     cellId: environment.UBEEQ_CELL_ID ?? "local-single-cell",
     region: environment.UBEEQ_CELL_REGION ?? "local",
@@ -233,6 +235,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   };
   const websites = configuration.websiteService ?? (websiteStore ? new WebsiteService({
     store: websiteStore,
+    previewMaxFileBytes:configuration.websitePreviewMaxFileBytes,
     creatorIdentityAllowed: async (actor, identityId) => identityId === actor.workspaceId,
     membership: async actor => {
       const creator = await repositories.creators.get(actor.workspaceId);
@@ -677,7 +680,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
-      if (error instanceof WebsiteError) return json(response, error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
+      if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof PublicationRequestError) return json(response, ['invalid_request', 'invalid_idempotency_key'].includes(error.code) ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof UniqueConstraintError && error.constraint.name === 'creator_current_handle') {

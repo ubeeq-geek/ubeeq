@@ -22,12 +22,17 @@ for(let index=0;index<1000;index++){
 }
 assert.equal(new Set(assets.map(asset=>asset.checksum)).size,1000);
 const snapshot=websitePreviewFixture(assets),store=new SqliteWebsiteStore(':memory:'),actor={workspaceId:'workspace',actorId:'owner'};let allowed=true;
+const pdf=Buffer.alloc(33*1024*1024,32);pdf.write('%PDF-1.4\n');
+snapshot.assets=[...assets,{id:'large-pdf',workspaceId:'workspace',revision:1,checksum:websiteDigest(pdf),mimeType:'application/pdf',bytes:pdf,approvedPublic:true,metadataStripped:true}];
+snapshot.documents[0].blocks.push({id:'large-download',type:'file',fileId:'large-pdf',text:'Large PDF'});
 const service=new WebsiteService({store,membership:async()=>({workspaceId:'workspace',userId:'owner',role:'owner',status:'active'}),creatorIdentityAllowed:async()=>true,capabilities:async()=>({apiVersion:'1',export:true,maxPages:200,maxAssets:2000,maxBytes:256*1024*1024,deploymentAdapters:[]}),resolveSnapshot:async()=>snapshot,evaluateRelease:async()=>({decision:allowed?'allow':'hold',revision:'policy-1',reasons:[]}),dependenciesEligible:async()=>allowed,enqueue:async()=>{},audit:async()=>{}});
 for(const document of snapshot.documents)await store.saveDocument(document,0);await store.saveWebsite(snapshot.website,0);
 const requested=await service.requestBuild(actor,'site',1,'browser'),ready=await service.execute('workspace',requested.id);assert.equal(ready.state,'ready');
 const manifest=await service.previewManifest(actor,ready.id),galleryPage=Object.keys(manifest.files).find(path=>path.includes('/photos/all/')&&path.endsWith('index.html'));assert.ok(galleryPage);
 store.getArtifact=async()=>assert.fail('Browser preview downloaded the archive');
 let transferredMedia=0,mediaReads=0;const pathsRead=new Set(),read=service.previewFiles.bind(service);
+let rangeReads=0,rangeBytes=0;const readRange=service.previewFileRange.bind(service);
+service.previewFileRange=async(...args)=>{const result=await readRange(...args);rangeReads++;rangeBytes+=result.bytes.length;assert.ok(result.bytes.length<=2*1024*1024);return result;};
 service.previewFiles=async(...args)=>{const result=await read(...args);for(const file of result.files){pathsRead.add(file.path);if(/\.(jpg|png)$/.test(file.path)){mediaReads++;transferredMedia+=file.bytes?.length??0;}}return result;};
 const bundled=await build({stdin:{contents:"import {openWebsitePreview} from './packages/ui/src/website-workspace.ts';import {WebsiteClient} from './packages/ui/src/website-client.ts';const client=new WebsiteClient('site',()=> 'fixture-bearer','/v1/websites');document.getElementById('open').onclick=()=>{const popup=window.open('about:blank');window.previewError='';openWebsitePreview(client,popup,location.href).catch(error=>window.previewError=error.message);};",resolveDir:process.cwd()},bundle:true,minify:true,platform:'browser',write:false,format:'iife'});
 const server=createServer(async(request,response)=>{
@@ -53,6 +58,7 @@ try{
   else if(message.method==='Target.detachedFromTarget')frameSessions.delete(message.params.sessionId);
  };
  const send=(method,params={},sessionId)=>new Promise((resolve,reject)=>{const id=++sequence,timer=setTimeout(()=>{waiting.delete(id);reject(Error('CDP timeout: '+method));},15000);waiting.set(id,{resolve,reject,timer});socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})}));});
+ await send('Browser.setDownloadBehavior',{behavior:'deny'});
  const attach=async targetId=>{const {sessionId}=await send('Target.attachToTarget',{targetId,flatten:true});sessionTargets.set(sessionId,targetId);await send('Page.enable',{},sessionId);await send('Runtime.enable',{},sessionId);return sessionId;};
  const evaluate=async(sessionId,expression,contextId)=>{const result=await send('Runtime.evaluate',{expression,contextId,awaitPromise:true,returnByValue:true,userGesture:true},sessionId);if(result.exceptionDetails)throw Error(result.exceptionDetails.exception?.description??result.exceptionDetails.text);return result.result.value;};
  const wait=async condition=>{const deadline=Date.now()+15000;let last;while(Date.now()<deadline){try{if(await condition())return;}catch(error){last=error;}await new Promise(resolve=>setTimeout(resolve,50));}throw Error('Preview DOM condition timed out'+(last?': '+last.message:''));};
@@ -73,6 +79,9 @@ try{
  };
  const preview=await open();
  assert.ok(mediaReads<20,'initial preview fetched too many images');assert.equal(pathsRead.has('about/index.html'),false);
+ await frameEvaluate(preview,`(()=>{const create=URL.createObjectURL.bind(URL);URL.createObjectURL=blob=>{if(blob.size===${pdf.length})window.largePreviewLoaded=true;return create(blob);};document.querySelector('a[data-preview-download$=".pdf"]').click();})()`);
+ await wait(()=>frameEvaluate(preview,'window.largePreviewLoaded===true'));
+ assert.equal(rangeReads,17);assert.equal(rangeBytes,pdf.length);
  await frameEvaluate(preview,"document.querySelector('[data-gallery-open]').click()");
  await wait(()=>frameEvaluate(preview,"document.querySelector('dialog').open&&document.querySelector('[data-viewer-image]').naturalWidth>0"));
  await frameEvaluate(preview,"document.querySelector('[data-action=next]').click()");
@@ -88,5 +97,5 @@ try{
  allowed=false;await send('Page.bringToFront',{},preview);await frameEvaluate(preview,"document.querySelectorAll('.website-gallery-tile').item(500).scrollIntoView()");
  await wait(()=>evaluate(preview,"!!document.getElementById('website-preview-file-error')"));
  assert.deepEqual(exceptions,[]);
- console.log(JSON.stringify({images:assets.length,artifactFiles:Object.keys(manifest.files).length,mediaReads,mediaBytesTransferred:transferredMedia,archiveReads:0,checks:['lazy images','gallery viewer','page navigation','conditional cache reuse','revocation','opaque sandbox']},null,2));
+ console.log(JSON.stringify({images:assets.length,artifactFiles:Object.keys(manifest.files).length,mediaReads,mediaBytesTransferred:transferredMedia,rangeReads,rangeBytes,archiveReads:0,checks:['lazy images','33 MiB PDF in 2 MiB chunks','gallery viewer','page navigation','conditional cache reuse','revocation','opaque sandbox']},null,2));
 }finally{socket?.close();browser.kill('SIGKILL');await new Promise(resolve=>server.close(resolve));store.close();await new Promise(resolve=>setTimeout(resolve,100));rmSync(profile,{recursive:true,force:true});}

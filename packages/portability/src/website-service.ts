@@ -1,4 +1,4 @@
-import { WebsiteError, membershipAllows, websiteRoutes, websiteHistoricalRedirects, type Website, type WebsiteDocument, type WebsiteDependency, type WorkspaceMembership, type WebsiteReleaseDecision, type WebsiteCapabilities } from '@ubeeq/core';
+import { WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES, WEBSITE_PREVIEW_MAX_FILE_BYTES, WEBSITE_PREVIEW_MAX_ARTIFACT_BYTES, membershipAllows, websiteRoutes, websiteHistoricalRedirects, type Website, type WebsiteDocument, type WebsiteDependency, type WorkspaceMembership, type WebsiteReleaseDecision, type WebsiteCapabilities } from '@ubeeq/core';
 import type { WebsiteBuildRecord, WebsiteStore, WebsiteArtifactManifest } from '@ubeeq/persistence';
 import { buildWebsiteArtifact, validateWebsiteSnapshotBudget, createWebsiteZip, normalizeWebsiteDocument, websiteDigest, websiteFingerprint, type WebsiteSnapshot } from './website-artifact.js';
 import { parse, serialize, type DefaultTreeAdapterMap } from 'parse5';
@@ -27,6 +27,8 @@ export interface WebsiteServicePorts {
   enqueue(input: { buildId: string; workspaceId: string; actorId: string; idempotencyKey: string }): Promise<void>;
   audit(input: { actor: WebsiteActor; action: string; websiteId: string; buildId?: string; artifactDigest?: string; result: string }): Promise<void>;
   retryableBuildError?(error:unknown):boolean;
+  /** Independent of artifact storage/export budgets; limits preview assembly memory. */
+  previewMaxFileBytes?:number;
   /** Confirmed published snapshots only; previews and pending deployments do not establish URL history. */
   publishedWebsites?(actor:WebsiteActor,websiteId:string):Promise<readonly Website[]>;
   now?: () => Date; retentionSeconds?: number;
@@ -34,7 +36,9 @@ export interface WebsiteServicePorts {
 export class WebsiteService {
   constructor(private readonly ports: WebsiteServicePorts) {
     if (!Number.isSafeInteger(ports.retentionSeconds ?? 604800) || (ports.retentionSeconds ?? 604800) < 1) throw new WebsiteError('invalid_retention','Retention must be positive seconds.');
+    if(!Number.isSafeInteger(ports.previewMaxFileBytes??WEBSITE_PREVIEW_MAX_FILE_BYTES)||(ports.previewMaxFileBytes??WEBSITE_PREVIEW_MAX_FILE_BYTES)<1||(ports.previewMaxFileBytes??WEBSITE_PREVIEW_MAX_FILE_BYTES)>WEBSITE_PREVIEW_MAX_ARTIFACT_BYTES)throw new WebsiteError('invalid_preview_limit','Preview file limit must be between 1 byte and 512 MiB.');
   }
+  private get previewMaxFileBytes(){return this.ports.previewMaxFileBytes??WEBSITE_PREVIEW_MAX_FILE_BYTES;}
   private now() { return this.ports.now?.() ?? new Date(); }
   private async authorize(actor: WebsiteActor, operation: 'view' | 'edit' | 'export' | 'publish', resources: readonly string[]) {
     const member=await this.ports.membership(actor);
@@ -248,7 +252,7 @@ export class WebsiteService {
     return build;
   }
   private async previewIndex(actor:WebsiteActor,buildId:string,build:WebsiteBuildRecord):Promise<WebsiteArtifactManifest>{
-    if(this.ports.store.getArtifactManifest&&this.ports.store.getArtifactFile){
+    if(this.ports.store.getArtifactManifest&&(this.ports.store.getArtifactFile||this.ports.store.getArtifactFileRange)){
       const manifest=await this.ports.store.getArtifactManifest(actor.workspaceId,build.artifactDigest!);
       if(!manifest||manifest.digest!==build.artifactDigest)throw new WebsiteError('artifact_unavailable','Preview files are unavailable.');
       return manifest;
@@ -260,15 +264,18 @@ export class WebsiteService {
   async previewManifest(actor:WebsiteActor,buildId:string){
     const build=await this.previewAccess(actor,buildId),manifest=await this.previewIndex(actor,buildId,build);
     const current=await this.previewAccess(actor,buildId);if(current.artifactDigest!==manifest.digest)throw new WebsiteError('artifact_unavailable','Preview changed during retrieval.');
-    return manifest;
+    return {...manifest,maxFileBytes:this.previewMaxFileBytes};
   }
   /** Small authorized batches amortize policy checks while preserving revocation checks after IO. */
   async previewFiles(actor:WebsiteActor,buildId:string,paths:readonly string[],knownChecksums:Readonly<Record<string,string>>={}){
     if(!Array.isArray(paths)||!paths.length||paths.length>8||new Set(paths).size!==paths.length||paths.some(path=>typeof path!=='string'||path.length>2000||path.startsWith('/')||path.includes('\\')||path.split('/').some(part=>!part||part==='.'||part==='..')))throw new WebsiteError('invalid_path','Select 1–8 distinct safe preview files.');
     const build=await this.previewAccess(actor,buildId),manifest=await this.previewIndex(actor,buildId,build);
-    let size=0;for(const path of paths){const entry=Object.hasOwn(manifest.files,path)?manifest.files[path]:undefined;if(!entry)throw new WebsiteError('file_not_found','Preview file was not found.');size+=entry.byteLength;}
+    let size=0;for(const path of paths){const entry=Object.hasOwn(manifest.files,path)?manifest.files[path]:undefined;if(!entry)throw new WebsiteError('file_not_found','Preview file was not found.');
+      if(entry.byteLength>this.previewMaxFileBytes)throw new WebsiteError('preview_file_too_large','This file exceeds the configured preview file size limit.');
+      if(!Object.hasOwn(knownChecksums,path)||knownChecksums[path]!==entry.checksum)size+=entry.byteLength;
+    }
     if(size>32*1024*1024)throw new WebsiteError('quota_exceeded','Preview file batch exceeds its byte budget.');
-    const fallback=this.ports.store.getArtifactFile?undefined:(await this.artifact(actor,buildId,'preview')).artifact.files;
+    const fallback=this.ports.store.getArtifactFile||paths.every(path=>Object.hasOwn(knownChecksums,path)&&knownChecksums[path]===manifest.files[path].checksum)?undefined:(await this.artifact(actor,buildId,'preview')).artifact.files;
     const files=await mapWebsiteChecks(paths,async path=>{
       const entry=manifest.files[path];
       // This is an authenticated conditional read, not cached permission to release bytes.
@@ -279,6 +286,24 @@ export class WebsiteService {
     });
     const current=await this.previewAccess(actor,buildId);if(current.artifactDigest!==manifest.digest)throw new WebsiteError('artifact_unavailable','Preview changed during retrieval.');
     return {digest:manifest.digest,files};
+  }
+  /** end is exclusive. Stores must implement bounded range reads; never materialize
+   * a large file or archive merely to return a small slice. */
+  async previewFileRange(actor:WebsiteActor,buildId:string,path:string,start:number,end:number,checksum:string){
+    if(typeof path!=='string'||!path||path.length>2000||path.startsWith('/')||/[\\\x00-\x1f]/.test(path)||path.split('/').some(part=>!part||part==='.'||part==='..'))throw new WebsiteError('invalid_path','Invalid preview file path.');
+    if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<=start||end-start>WEBSITE_PREVIEW_CHUNK_BYTES)throw new WebsiteError('invalid_range','Select a preview range of at most 2 MiB.');
+    const build=await this.previewAccess(actor,buildId),manifest=await this.previewIndex(actor,buildId,build);
+    const entry=Object.hasOwn(manifest.files,path)?manifest.files[path]:undefined;
+    if(!entry)throw new WebsiteError('file_not_found','Preview file was not found.');
+    if(checksum!==entry.checksum)throw new WebsiteError('artifact_conflict','Preview file checksum changed.');
+    if(entry.byteLength>this.previewMaxFileBytes)throw new WebsiteError('preview_file_too_large','This file exceeds the configured preview file size limit.');
+    if(end>entry.byteLength)throw new WebsiteError('invalid_range','Preview byte range exceeds its file.');
+    if(!this.ports.store.getArtifactFileRange)throw new WebsiteError('preview_range_unavailable','This installation must provide bounded artifact range storage for larger preview files.');
+    const bytes=await this.ports.store.getArtifactFileRange(actor.workspaceId,manifest.digest,path,start,end);
+    if(!bytes||bytes.byteLength!==end-start)throw new WebsiteError('artifact_unavailable','Preview chunk is missing or corrupt.');
+    const current=await this.previewAccess(actor,buildId);
+    if(current.artifactDigest!==manifest.digest)throw new WebsiteError('artifact_unavailable','Preview changed during retrieval.');
+    return {digest:manifest.digest,checksum:entry.checksum,chunkChecksum:websiteDigest(bytes),byteLength:entry.byteLength,start,end,bytes};
   }
   async preview(actor: WebsiteActor, buildId: string, file: string) {
     const {artifact}=await this.artifact(actor,buildId,'preview');

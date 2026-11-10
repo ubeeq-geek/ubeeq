@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { WebsiteError, type Website, type WebsiteDocument } from '@ubeeq/core';
+import { WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES, type Website, type WebsiteDocument } from '@ubeeq/core';
 import type { WebsiteBuildRecord, WebsiteStore, WebsiteImageRecord, WebsiteArtifactManifest } from '@ubeeq/persistence';
 import { createHash } from 'node:crypto';
 import type { WebsiteHostingStore, WebsitePublishPlan, WebsitePublishIntent, WebsiteDeploymentAttempt } from '@ubeeq/persistence';
@@ -30,6 +30,8 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
     this.db.exec('CREATE TABLE IF NOT EXISTS website_images(workspace TEXT NOT NULL,id TEXT NOT NULL,metadata TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(workspace,id))');
     this.db.exec('CREATE TABLE IF NOT EXISTS website_hosting_outbox(workspace TEXT NOT NULL,attempt TEXT NOT NULL,PRIMARY KEY(workspace,attempt))');
     this.db.exec(`CREATE TABLE IF NOT EXISTS website_blobs(workspace TEXT NOT NULL,checksum TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(workspace,checksum));
+      CREATE TABLE IF NOT EXISTS website_blob_chunks(workspace TEXT NOT NULL,checksum TEXT NOT NULL,offset INTEGER NOT NULL,byte_length INTEGER NOT NULL,chunk_checksum TEXT NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(workspace,checksum,offset));
+      CREATE TABLE IF NOT EXISTS website_chunked_blobs(workspace TEXT NOT NULL,checksum TEXT NOT NULL,byte_length INTEGER NOT NULL,PRIMARY KEY(workspace,checksum));
       CREATE TABLE IF NOT EXISTS website_artifact_manifests(workspace TEXT NOT NULL,digest TEXT NOT NULL,manifest TEXT NOT NULL,checksum TEXT NOT NULL,PRIMARY KEY(workspace,digest));
       CREATE TABLE IF NOT EXISTS website_artifact_files(workspace TEXT NOT NULL,digest TEXT NOT NULL,path TEXT NOT NULL,checksum TEXT NOT NULL,byte_length INTEGER NOT NULL,PRIMARY KEY(workspace,digest,path));
       CREATE INDEX IF NOT EXISTS website_artifact_blob_refs ON website_artifact_files(workspace,checksum);
@@ -50,14 +52,39 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
   private checksum(bytes:Uint8Array) { return createHash('sha256').update(bytes).digest('hex'); }
   private putBlob(workspace:string,bytes:Uint8Array):string {
     const checksum=this.checksum(bytes);
-    this.db.prepare('INSERT OR IGNORE INTO website_blobs(workspace,checksum,bytes) VALUES(?,?,?)').run(workspace,checksum,bytes);
+    if(bytes.length<=WEBSITE_PREVIEW_CHUNK_BYTES){
+      this.db.prepare('INSERT OR IGNORE INTO website_blobs(workspace,checksum,bytes) VALUES(?,?,?)').run(workspace,checksum,bytes);
+      return checksum;
+    }
+    if(this.db.prepare('SELECT 1 FROM website_chunked_blobs WHERE workspace=? AND checksum=?').get(workspace,checksum))return checksum;
+    this.db.prepare("INSERT OR IGNORE INTO website_blobs(workspace,checksum,bytes) VALUES(?,?,X'')").run(workspace,checksum);
+    const put=this.db.prepare('INSERT INTO website_blob_chunks(workspace,checksum,offset,byte_length,chunk_checksum,bytes) VALUES(?,?,?,?,?,?)');
+    for(let offset=0;offset<bytes.length;offset+=WEBSITE_PREVIEW_CHUNK_BYTES){
+      const chunk=bytes.subarray(offset,offset+WEBSITE_PREVIEW_CHUNK_BYTES);
+      put.run(workspace,checksum,offset,chunk.length,this.checksum(chunk),chunk);
+    }
+    this.db.prepare('INSERT INTO website_chunked_blobs(workspace,checksum,byte_length) VALUES(?,?,?)').run(workspace,checksum,bytes.length);
+    this.db.prepare("UPDATE website_blobs SET bytes=X'' WHERE workspace=? AND checksum=?").run(workspace,checksum);
     return checksum;
   }
+  private blobChunk(workspace:string,checksum:string,offset:number,size:number):Uint8Array {
+    const row=this.db.prepare('SELECT bytes,chunk_checksum,byte_length FROM website_blob_chunks WHERE workspace=? AND checksum=? AND offset=?').get(workspace,checksum,offset) as {bytes:Uint8Array;chunk_checksum:string;byte_length:number}|undefined;
+    if(!row||row.byte_length!==size||row.bytes.length!==size||this.checksum(row.bytes)!==row.chunk_checksum)throw new WebsiteError('artifact_unavailable','Immutable website chunk is missing or corrupt.');
+    return row.bytes;
+  }
   private blob(workspace:string,checksum:string):Uint8Array|undefined {
-    const row=this.db.prepare('SELECT bytes FROM website_blobs WHERE workspace=? AND checksum=?').get(workspace,checksum) as {bytes:Uint8Array}|undefined;
-    if(!row)return undefined;
-    if(this.checksum(row.bytes)!==checksum)throw new WebsiteError('artifact_unavailable','Immutable website bytes are corrupt.');
-    return new Uint8Array(row.bytes);
+    const chunked=this.db.prepare('SELECT byte_length FROM website_chunked_blobs WHERE workspace=? AND checksum=?').get(workspace,checksum) as {byte_length:number}|undefined;
+    let bytes:Uint8Array;
+    if(chunked){
+      bytes=new Uint8Array(chunked.byte_length);
+      for(let offset=0;offset<bytes.length;offset+=WEBSITE_PREVIEW_CHUNK_BYTES)bytes.set(this.blobChunk(workspace,checksum,offset,Math.min(WEBSITE_PREVIEW_CHUNK_BYTES,bytes.length-offset)),offset);
+    }else{
+      const row=this.db.prepare('SELECT bytes FROM website_blobs WHERE workspace=? AND checksum=?').get(workspace,checksum) as {bytes:Uint8Array}|undefined;
+      if(!row)return undefined;
+      bytes=new Uint8Array(row.bytes);
+    }
+    if(this.checksum(bytes)!==checksum)throw new WebsiteError('artifact_unavailable','Immutable website bytes are corrupt.');
+    return bytes;
   }
   async putWebsiteImage(image:WebsiteImageRecord,bytes:Uint8Array) {
     if(image.id!==`website-image-${image.checksum}`||createHash('sha256').update(bytes).digest('hex')!==image.checksum||bytes.length!==image.sizeBytes)throw new WebsiteError('invalid_media','Image integrity check failed.');
@@ -145,12 +172,44 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
     if(!bytes||bytes.length!==entry.byte_length)throw new WebsiteError('artifact_unavailable','Immutable website file is missing.');
     return bytes;
   }
+  async getArtifactFileRange(workspace:string,digest:string,path:string,start:number,end:number){
+    if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<=start||end-start>WEBSITE_PREVIEW_CHUNK_BYTES)throw new WebsiteError('invalid_range','Invalid preview byte range.');
+    const read=()=>this.db.prepare('SELECT checksum,byte_length FROM website_artifact_files WHERE workspace=? AND digest=? AND path=?').get(workspace,digest,path) as {checksum:string;byte_length:number}|undefined;
+    let entry=read();if(!entry){await this.getArtifactManifest(workspace,digest);entry=read();}
+    if(!entry)return undefined;
+    if(end>entry.byte_length)throw new WebsiteError('invalid_range','Preview byte range exceeds its file.');
+    if(entry.byte_length<=WEBSITE_PREVIEW_CHUNK_BYTES){
+      const bytes=this.blob(workspace,entry.checksum);
+      if(!bytes||bytes.length!==entry.byte_length)throw new WebsiteError('artifact_unavailable','Immutable website file is missing.');
+      return bytes.slice(start,end);
+    }
+    let chunked=this.db.prepare('SELECT byte_length FROM website_chunked_blobs WHERE workspace=? AND checksum=?').get(workspace,entry.checksum) as {byte_length:number}|undefined;
+    if(!chunked){
+      // One-time migration of older indexed blobs. New writes are already chunked,
+      // and all subsequent range reads load only the intersecting chunk rows.
+      this.atomic(()=>{
+        const old=this.blob(workspace,entry!.checksum);
+        if(!old||old.length!==entry!.byte_length)throw new WebsiteError('artifact_unavailable','Immutable website file is missing.');
+        this.putBlob(workspace,old);
+      });
+      chunked=this.db.prepare('SELECT byte_length FROM website_chunked_blobs WHERE workspace=? AND checksum=?').get(workspace,entry.checksum) as {byte_length:number}|undefined;
+    }
+    if(chunked?.byte_length!==entry.byte_length)throw new WebsiteError('artifact_unavailable','Immutable website chunk index is corrupt.');
+    const bytes=new Uint8Array(end-start);
+    for(let offset=Math.floor(start/WEBSITE_PREVIEW_CHUNK_BYTES)*WEBSITE_PREVIEW_CHUNK_BYTES;offset<end;offset+=WEBSITE_PREVIEW_CHUNK_BYTES){
+      const chunk=this.blobChunk(workspace,entry.checksum,offset,Math.min(WEBSITE_PREVIEW_CHUNK_BYTES,entry.byte_length-offset));
+      const from=Math.max(start,offset),to=Math.min(end,offset+chunk.length);
+      bytes.set(chunk.subarray(from-offset,to-offset),from-start);
+    }
+    return bytes;
+  }
   private pruneUnusedBlobs(workspace:string,limit=100){
     this.db.prepare(`DELETE FROM website_blobs WHERE rowid IN (
       SELECT b.rowid FROM website_blobs b WHERE b.workspace=?
       AND NOT EXISTS(SELECT 1 FROM website_artifact_files f WHERE f.workspace=b.workspace AND f.checksum=b.checksum)
       AND NOT EXISTS(SELECT 1 FROM website_snapshot_blobs s WHERE s.workspace=b.workspace AND s.checksum=b.checksum) LIMIT ?)`)
       .run(workspace,limit);
+    for(const table of ['website_blob_chunks','website_chunked_blobs'])this.db.prepare(`DELETE FROM ${table} WHERE workspace=? AND NOT EXISTS(SELECT 1 FROM website_blobs b WHERE b.workspace=${table}.workspace AND b.checksum=${table}.checksum)`).run(workspace);
   }
   async removeArtifact(workspace:string,digest:string) { this.atomic(()=>{for(const table of ['website_artifacts','website_archives','website_artifact_manifests','website_artifact_files'])this.db.prepare(`DELETE FROM ${table} WHERE workspace=? AND digest=?`).run(workspace,digest);this.pruneUnusedBlobs(workspace);}); }
   async getPublicRendition(workspace:string,source:string) {

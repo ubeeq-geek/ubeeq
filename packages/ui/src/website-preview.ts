@@ -65,6 +65,7 @@ function runWebsitePreview(files:Record<string,string>,initial:string,nonce:stri
   const replyTo='ubeeq.website-preview.files:'+crypto.randomUUID(),channel=source?new BroadcastChannel(replyTo):undefined;
   if(channel)channel.onmessage=event=>{
     const data=event.data,request=pending.get(data?.requestId);if(!request)return;
+    if(data.type==='file-progress'&&data.path===request.path){clearTimeout(request.timer);request.timer=setTimeout(()=>{pending.delete(data.requestId);request.reject(new Error('Keep the website editor open to load this preview.'));},30000);return;}
     if(data.type!=='file'&&data.type!=='file-error')return;
     pending.delete(data.requestId);clearTimeout(request.timer);
     if(data.type==='file'&&data.path===request.path&&typeof data.base64==='string'){

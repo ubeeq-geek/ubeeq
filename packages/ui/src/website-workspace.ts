@@ -34,7 +34,7 @@ export interface WebsiteWorkspaceClient {
   builds?(previewRevision?:number): Promise<readonly {id:string;state:string;websiteRevision:number;stale?:boolean}[]>;
   previewSite?(id:string):Promise<Blob>;
   previewManifest?(id:string):Promise<WebsitePreviewManifest>;
-  previewFiles?(id:string,paths:readonly string[]):Promise<WebsitePreviewFiles>;
+  previewFiles?(id:string,paths:readonly string[],progress?:()=>void):Promise<WebsitePreviewFiles>;
   previewPages?(id:string): Promise<readonly string[]>;
   build(id: string): Promise<{ id: string; state: string; errorCode?: string; warnings: readonly string[]; stale?: boolean }>;
   export(id: string): Promise<Blob>;
@@ -85,7 +85,7 @@ const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClie
   if(typeof window==='undefined'||typeof BroadcastChannel==='undefined')return;
   const key=websitePreviewKey(saved),previous=previewProviders.get(key);
   if(previous){previous.client=client;previous.sourceUrl=sourceUrl;if(source)previous.broker.register(source.buildId,source.manifest);return;}
-  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID(),broker:createWebsitePreviewFileBroker((buildId,paths)=>previewProviders.get(key)!.client.previewFiles!(buildId,paths))};
+  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID(),broker:createWebsitePreviewFileBroker((buildId,paths,progress)=>previewProviders.get(key)!.client.previewFiles!(buildId,paths,progress))};
   if(source)provider.broker.register(source.buildId,source.manifest);
   const offers=new Map<string,{replyTo:string;pageId?:string;path?:string;expires:number}>();
   const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
@@ -93,7 +93,7 @@ const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClie
     const data=event.data;if(typeof data?.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))return;
     if(data.type==='file-request'){
       if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.files:[a-f0-9-]{36}$/.test(data.replyTo)||typeof data.buildId!=='string'||typeof data.path!=='string'||data.path.length>2000)return;
-      try{const base64=await provider.broker.request(data.buildId,data.path);send(data.replyTo,data.requestId,'file',{path:data.path,base64,embeds:data.path.endsWith('.html')?websitePreviewEmbeds(base64):[]});}
+      try{const base64=await provider.broker.request(data.buildId,data.path,()=>send(data.replyTo,data.requestId,'file-progress',{path:data.path}));send(data.replyTo,data.requestId,'file',{path:data.path,base64,embeds:data.path.endsWith('.html')?websitePreviewEmbeds(base64):[]});}
       catch(error){send(data.replyTo,data.requestId,'file-error',{message:error instanceof Error?error.message:'The preview file could not be loaded.'});}return;
     }
     if(data.type==='refresh-request'){

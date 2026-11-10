@@ -41,5 +41,8 @@ export interface WebsiteStore {
   /** Optional immutable blob access: preview reads do not materialize the archive or unrelated media. */
   getArtifactManifest?(workspaceId:string,digest:string):Promise<WebsiteArtifactManifest|undefined>;
   getArtifactFile?(workspaceId:string,digest:string,path:string):Promise<Uint8Array|undefined>;
+  /** Read and integrity-check only the requested byte interval, never the full file/ZIP.
+   * start is inclusive and end exclusive; requests contain at most 2 MiB. */
+  getArtifactFileRange?(workspaceId:string,digest:string,path:string,start:number,end:number):Promise<Uint8Array|undefined>;
   removeArtifact(workspaceId: string, digest: string): Promise<void>;
 }

@@ -96,6 +96,32 @@ before and after storage IO. They return checksums without retransmitting cached
 bytes. A new document/catalogue revision makes a build stale; it does not rewrite
 or silently replace an already-open preview or an approved publication snapshot.
 
+Small uncached files are batched within a 2 MiB transport budget. Larger files use
+`GET /v1/websites/builds/:id/preview-file?file=...` with one `Range: bytes=start-end`
+and `If-Match: "<manifest file checksum>"`. Responses use `206 Partial Content`,
+`Content-Range`, the pinned file `ETag`, `X-Website-Artifact-Digest` and a
+`X-Website-Chunk-Checksum`. Ranges contain at most 2 MiB; invalid ranges return
+416 and a stale/missing checksum precondition returns 412. Every chunk rechecks
+membership, identity, policy, expiry and artifact eligibility before and after IO.
+The browser allows two chunk requests at once across files, retries temporary
+network/5xx failures at most twice per chunk, cancels sibling requests on failure,
+and verifies chunk and complete-file checksums before exposing a file. Progress
+keeps the preview's idle timeout alive without granting additional access.
+
+Preview assembly has a separate 128 MiB default file limit. Configure it through
+`WebsiteServicePorts.previewMaxFileBytes` (or the reference API's
+`websitePreviewMaxFileBytes` / `UBEEQ_WEBSITE_PREVIEW_MAX_FILE_BYTES`) and
+`new WebsiteClient(id, token, basePath, {previewMaxFileBytes})`. The manifest
+advertises the server limit; the browser enforces the lower of its own and the
+server's limits before allocating a file buffer. The maximum configurable limit
+is 512 MiB, independently of build/export budgets. Files whose base64 representation
+exceeds the 64 MiB cache budget are not retained in the editor byte cache.
+Authenticated checksum hits for cached large files carry no file bytes and do
+not consume the batch's transfer budget.
+
+Custom artifact stores must implement `getArtifactFileRange` using bounded reads;
+the service never falls back to loading a complete archive/file to slice a range.
+
 The reference resolver indexes Works, assets, publications and holds once per
 source projection and checks each Work once. Projections are reused only while
 SQLite `data_version` **and** connection `total_changes()` are unchanged. This
@@ -120,6 +146,13 @@ remain readable. Removing artifacts or cleaning expired unaccepted reviews
 collects bounded batches of orphaned blobs while preserving references from
 retained artifacts and frozen snapshots. Products still own aggregate retention
 and the scheduling of cleanup; active/rollback releases must remain protected.
+
+Blobs larger than 2 MiB are stored as independently verified chunk rows, shared by
+artifacts and snapshots. Range reads load only the intersecting rows (at most two
+for an unaligned range). Older unchunked blobs migrate once on first range access;
+that migration validates the original full checksum. Subsequent range reads do
+not materialize the full blob. Exact ZIP exports and frozen publication bytes
+remain unchanged, including after restart and garbage collection.
 
 After `npm run build`, run:
 
