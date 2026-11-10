@@ -329,3 +329,19 @@ test('build document freshness checks use bounded concurrency and detect changed
  h.store.getDocument=async(workspace,id)=>{if(!id.startsWith('parallel-'))return read(workspace,id);peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return {id,revision:id==='parallel-11'?2:1};};
  assert.equal((await h.service.build(h.actor,base.id)).stale,true);assert.equal(peak,5);assert.equal(active,0);
 });
+
+test('renders resolved gallery links without changing the saved website', () => {
+  const snapshot = fixture();
+  snapshot.website.namedGalleries = [
+    {id:'gallery',title:'Preview',slug:'preview',kind:'works',access:'preview',publicationIds:['preview-private']}
+  ];
+  const url = 'https://example.com/premium';
+  snapshot.namedGalleryLinks = {gallery:{purchaseLinks:[{label:'Premium Volume',url}]}};
+  const artifact = buildWebsiteArtifact(snapshot, limits);
+  const html = Buffer.from(artifact.files.get('galleries/collections/preview/index.html')).toString();
+  assert.match(html, /Premium Volume/);
+  assert.ok(html.includes(url));
+  assert.equal(snapshot.website.namedGalleries[0].purchaseLinks, undefined);
+  snapshot.namedGalleryLinks = {other:{purchaseLinks:[{label:'Other',url}]}};
+  assert.throws(() => buildWebsiteArtifact(snapshot, limits), /existing website gallery/);
+});
