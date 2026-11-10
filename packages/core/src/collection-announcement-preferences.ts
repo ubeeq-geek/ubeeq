@@ -1,3 +1,4 @@
+import { announcementTemplateBlocks, renderAnnouncementLinkGroup, validateAnnouncementLinkGroup, type AnnouncementLinkGroup, type AnnouncementLinkResolutions, type AnnouncementPresentation, type AnnouncementTemplateCustomization } from './announcement-layout.js';
 import type { ContentBlock } from "./index.js";
 import { validateContentBlocks } from "./index.js";
 import { announcementDestinationKey, assertAnnouncementId, AnnouncementOrchestrationError } from "./announcement-orchestration.js";
@@ -7,12 +8,16 @@ import { isDurableAnnouncementUrl } from "./collection-release-readiness.js";
 import type { AnnouncementTiming, AnnouncementFollowUpTiming, AnnouncementLatePolicy } from "./announcement-plan-scheduler.js";
 import { validateAnnouncementTiming, validateAnnouncementLatePolicy } from "./announcement-plan-scheduler.js";
 
-export const ANNOUNCEMENT_TEMPLATE_VARIABLES = ["collection.title", "collection.description", "creator.name", "release.kind", "release.newWorkCount", "release.totalPublishedWorkCount", "release.publishedAt", "primaryLink.url", "primaryLink.label"] as const;
+export const ANNOUNCEMENT_TEMPLATE_VARIABLES = ["collection.title", "collection.description", "creator.name", "release.kind", "release.newWorkCount", "release.totalPublishedWorkCount", "release.publishedAt", "primaryLink.url", "primaryLink.label", "series.name", "release.label"] as const;
 export type AnnouncementTemplateVariable = typeof ANNOUNCEMENT_TEMPLATE_VARIABLES[number];
 export type AnnouncementTemplateValues = Partial<Record<AnnouncementTemplateVariable, string | number>>;
-export interface AnnouncementTemplateBlock extends ContentBlock {alt?:string;question?:string;items?:readonly string[];answers?:readonly string[];}
+export interface AnnouncementTemplateBlock extends ContentBlock {linkGroup?:AnnouncementLinkGroup;groupId?:string;linkAppearance?:'url'|'label'|'native';alt?:string;question?:string;items?:readonly string[];answers?:readonly string[];}
 export interface AnnouncementTemplate {
   blocks: readonly AnnouncementTemplateBlock[];
+  fields?: { seriesName?: string; eventLabel?: string };
+  presentation?: AnnouncementPresentation;
+  platformCustomizations?: Readonly<Record<string, AnnouncementTemplateCustomization>>;
+  destinationCustomizations?: Readonly<Record<string, AnnouncementTemplateCustomization>>;
   /** Keys identify complete destination bindings, never provider names alone. */
   destinationOverrides?: Readonly<Record<string, readonly AnnouncementTemplateBlock[]>>;
 }
@@ -88,9 +93,16 @@ function validateTemplateBlocks(blocks: readonly AnnouncementTemplateBlock[]): v
   const visit = (items: readonly AnnouncementTemplateBlock[], depth: number) => {
     if (depth > 16) throw new AnnouncementOrchestrationError("INVALID_INPUT", "Announcement templates are nested too deeply.");
     for (const b of items) {
+      if (b.linkGroup) {
+        if (b.type !== 'paragraph') throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Link groups use a template paragraph container.');
+        validateAnnouncementLinkGroup(b.linkGroup);
+        if (!/^[\w-]{1,48}$/.test(b.id) || b.linkGroup.links.some(link => link.id.length > 24)) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Use short stable IDs for grouped links.');
+        variables(b.linkGroup.heading);
+        for (const link of b.linkGroup.links) { variables(link.label); if (link.countUnit) variables(link.countUnit); }
+      }
       // Opaque data/HTML cannot be interpolated. Keep templates in explicitly typed fields.
       for (const [key, value] of Object.entries(b)) {
-        if (key === "children") continue;
+        if (key === "children" || key === "linkGroup") continue;
         if(templateArrayFields.includes(key as typeof templateArrayFields[number])&&Array.isArray(value)&&value.every(v=>typeof v==='string'))value.forEach(variables);
         else if (templateFields.includes(key as typeof templateFields[number]) && typeof value === "string") variables(value);
         else if (/\{\{|\}\}/.test(JSON.stringify(value) ?? "")) throw new AnnouncementOrchestrationError("INVALID_INPUT", "Template variables may only appear in typed text or link fields.");
@@ -107,23 +119,43 @@ function validateTemplateBlocks(blocks: readonly AnnouncementTemplateBlock[]): v
 export function validateAnnouncementTemplate(template: AnnouncementTemplate): void {
   validateTemplateBlocks(template.blocks);
   for (const blocks of Object.values(template.destinationOverrides ?? {})) validateTemplateBlocks(blocks);
+  for (const value of [template.fields?.seriesName, template.fields?.eventLabel]) if (value !== undefined && (typeof value !== 'string' || value.length > 200 || /[\r\n]/.test(value) || /\{\{|\}\}/.test(value))) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Use a short literal series name and event label.');
+  const presentation = (p: AnnouncementPresentation | undefined) => {
+    if (p !== undefined && (!p || typeof p !== 'object' || Array.isArray(p) || p.discord !== undefined && !['message','embed'].includes(p.discord) || p.title !== undefined && !['automatic','body'].includes(p.title))) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Choose a supported announcement presentation.');
+  };
+  presentation(template.presentation);
+  for (const map of [template.platformCustomizations, template.destinationCustomizations]) {
+    if (map !== undefined && (!map || typeof map !== 'object' || Array.isArray(map) || Object.keys(map).length > 100)) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Use bounded announcement customizations.');
+    for (const patch of Object.values(map ?? {})) {
+      if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Use valid announcement customizations.');
+      presentation(patch.presentation);
+      const overrides = patch.blockOverrides ?? {};
+      if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides) || Object.keys(overrides).length > 100 || Object.entries(overrides).some(([id, b]) => b !== null && b.id !== id)) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Bind section customizations to stable block IDs.');
+      validateTemplateBlocks(Object.values(overrides).filter((b): b is AnnouncementTemplateBlock => b !== null));
+      if (patch.order !== undefined && (!Array.isArray(patch.order) || patch.order.length > 100 || patch.order.some(id => typeof id !== 'string') || new Set(patch.order).size !== patch.order.length)) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Use a distinct bounded section order.');
+    }
+  }
+  if (new TextEncoder().encode(JSON.stringify(template)).length > 200000) throw new AnnouncementOrchestrationError('INVALID_INPUT', 'Announcement templates must be bounded.');
 }
 /** Values stay inert. The existing renderer and provider block validators remain mandatory. */
 export function renderAnnouncementTemplate(input: {
   template: AnnouncementTemplate;
   values: AnnouncementTemplateValues;
   destinationKey?: string;
+  platform?: string;
+  links?: AnnouncementLinkResolutions;
   /** Shared counts are forbidden when primary destination scopes differ. */
   sharedCountsAvailable?: boolean;
 }): AnnouncementTemplateBlock[] {
   validateAnnouncementTemplate(input.template);
-  const blocks = input.destinationKey && input.template.destinationOverrides?.[input.destinationKey] || input.template.blocks;
+  const blocks = announcementTemplateBlocks(input.template, input.platform, input.destinationKey);
+  const values = { ...input.values, 'series.name': input.template.fields?.seriesName || input.values['series.name'] || input.values['creator.name'], 'release.label': input.template.fields?.eventLabel ?? input.values['release.label'] ?? (input.values['release.kind'] === 'additions' ? 'UPDATE' : 'NEW') };
   const replace = (text: string): string => {
     variables(text);
     return text.replace(/\{\{([^{}]+)\}\}/g, (_match, name: AnnouncementTemplateVariable) => {
       if (input.sharedCountsAvailable === false && ["release.newWorkCount", "release.totalPublishedWorkCount"].includes(name))
         throw new AnnouncementOrchestrationError("REVIEW_REQUIRED", "Destination release scopes differ. Supply destination-specific counts or remove the count variable.");
-      const value = input.values[name];
+      const value = values[name];
       if (value === undefined || (typeof value !== "string" && typeof value !== "number") || (typeof value === "number" && !Number.isFinite(value)))
         throw new AnnouncementOrchestrationError("INVALID_INPUT", `Resolve ${name} from confirmed release evidence before preparing the announcement.`);
       if (name === "primaryLink.url" && !isDurableAnnouncementUrl(value))
@@ -133,16 +165,23 @@ export function renderAnnouncementTemplate(input: {
       return String(value);
     });
   };
-  const visit = (items: readonly AnnouncementTemplateBlock[]): AnnouncementTemplateBlock[] => items.map(original => {
+  const visit = (items: readonly AnnouncementTemplateBlock[]): AnnouncementTemplateBlock[] => items.flatMap(original => {
+    if (original.linkGroup) {
+      const links = { ...input.links };
+      if (!links.primary && typeof input.values['primaryLink.url'] === 'string') links.primary = { url: input.values['primaryLink.url'] };
+      return renderAnnouncementLinkGroup(original, links, replace);
+    }
     const b = structuredClone(original);
     for (const field of templateFields) if (typeof b[field] === "string") b[field] = replace(b[field]!);
     for(const field of templateArrayFields)if(b[field])b[field]=b[field]!.map(replace);
     if (b.url !== undefined && !isDurableAnnouncementUrl(b.url))
       throw new AnnouncementOrchestrationError("LINK_NOT_READY", "Resolve a durable, credential-free content link before preparing this announcement.");
     if (b.children) b.children = visit(b.children);
-    return b;
+    return [b];
   });
-  return visit(blocks);
+  const result=visit(blocks);
+  validateContentBlocks(result);
+  return result;
 }
 export function renderAnnouncementTemplateText(text:string,values:AnnouncementTemplateValues):string {
   return renderAnnouncementTemplate({template:{blocks:[{id:'template-text' as ContentBlock['id'],type:'paragraph',text}]},values})[0].text!;
@@ -175,14 +214,14 @@ export function validateCollectionAnnouncementPreferences(settings: CollectionAn
       assertAnnouncementId(link.destinationKey); assertAnnouncementId(link.label);
     }
     const destinationKeys = trigger.destinations.map(d => announcementDestinationKey(d.binding));
-    for (const key of Object.keys(trigger.template.destinationOverrides ?? {})) if (!destinationKeys.includes(key))
+    for (const key of [...Object.keys(trigger.template.destinationOverrides ?? {}), ...Object.keys(trigger.template.destinationCustomizations ?? {})]) if (!destinationKeys.includes(key))
       throw new AnnouncementOrchestrationError("INVALID_INPUT", "Template overrides must identify a selected announcement destination.");
     const f = trigger.followUp;
     if (f) {
       validateAnnouncementTemplate(f.template); validateDestinations(f.destinations, f.enabled); validateMedia(f.media);
       validateAnnouncementTiming(f.timing); validateAnnouncementLatePolicy(f.latePolicy);
       const followUpKeys = f.destinations.map(d => announcementDestinationKey(d.binding));
-      for (const key of Object.keys(f.template.destinationOverrides ?? {})) if (!followUpKeys.includes(key))
+      for (const key of [...Object.keys(f.template.destinationOverrides ?? {}), ...Object.keys(f.template.destinationCustomizations ?? {})]) if (!followUpKeys.includes(key))
         throw new AnnouncementOrchestrationError("INVALID_INPUT", "Follow-up template overrides must identify a selected follow-up destination.");
       const anchor = f.timing.anchor;
       if (!["corresponding_destination", "first_successful_initial_delivery", "parent_destination"].includes(anchor.mode)
