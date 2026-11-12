@@ -11,7 +11,7 @@ test('import checkpoints bind creator and manifest and commit atomically with im
   const directory = mkdtempSync(join(tmpdir(), 'ubeeq-import-checkpoint-'));
   const local = createLocalAdapterSet({ databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'cell' });
   const identity = { verifySession: async ({ credential }) => ({ id: credential, subject: { id: credential, roles: [], scopes: [] } }) };
-  const api = createReferenceApi({ publicBaseUrl: 'http://127.0.0.1:0', cellId: 'cell', adapters: {
+  const api = createReferenceApi({ publicBaseUrl: 'http://127.0.0.1:0', cellId: 'cell', tenancyMode: 'multi_tenant_saas', adapters: {
     repositories: local.repositories, storage: local.storage, uploads: local.storage, delivery: local.storage, jobs: local.jobs, identity } });
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const request = async (path, body, actor = 'owner') => {
