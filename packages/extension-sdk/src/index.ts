@@ -400,3 +400,8 @@ export const validateIntegrationConnectorManifest = (manifest: IntegrationConnec
   if (manifest.apiVersion !== EXTENSION_API_VERSION) throw new Error(`Integration connector ${manifest.id} requires unsupported API version ${manifest.apiVersion}`);
   if (new Set(manifest.capabilities).size !== manifest.capabilities.length) throw new Error(`Integration connector ${manifest.id} declares duplicate capabilities`);
 };
+
+/** A host tenancy rule denied creator onboarding; callers may display the host's actionable reason. */
+export class TenancyAdmissionError extends Error {
+  constructor(readonly reasonCode: string, message: string) { super(message); this.name = 'TenancyAdmissionError'; }
+}

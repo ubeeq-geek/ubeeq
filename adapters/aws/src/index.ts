@@ -107,6 +107,7 @@ export const createDynamoPublicationCommandRepositories = (base: Dynamo, config:
     outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') };
 };
 const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction,
+  hostRecords: cellRepository(dynamo, config, 'hostRecords'),
   creators: cellRepository(dynamo, config, 'creators'), works: cellRepository(dynamo, config, 'works'), assets: cellRepository(dynamo, config, 'assets'),
   collections: cellRepository(dynamo, config, 'collections'), workMemberships: cellRepository(dynamo, config, 'workMemberships'),
   publicationIntents: cellRepository(dynamo, config, 'publicationIntents'), publications: cellRepository(dynamo, config, 'publications'),
@@ -483,7 +484,7 @@ export class CognitoIdentity implements IdentityAdapter {
       const attributes = (user.UserAttributes ?? []) as Array<{ Name?: string; Value?: string }>;
       if (typeof id !== 'string' || !id || (payload.username && id !== payload.username) || attributes.find(item => item.Name === 'sub')?.Value !== payload.sub) return undefined;
       const customer = attributes.find(item => item.Name === 'custom:account_scope')?.Value === 'customer_account';
-      return { id: input.credential, subject: { id, roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
+      return { id: input.credential, subject: { id, email: attributes.find(item => item.Name === 'email')?.Value, emailVerified: attributes.find(item => item.Name === 'email_verified')?.Value === 'true', roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
         issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
     } catch { return undefined; }
   }

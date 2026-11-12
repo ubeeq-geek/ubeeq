@@ -3,6 +3,8 @@ export * from "./request-identity.js";
 export * from "./single-operator-tenancy.js";
 export { LocalSlidingWindowRateLimiter } from './local-rate-limit.js';
 export interface AuthorizationSubject {
+  email?: string;
+  emailVerified?: boolean;
   accountScope?: import("@ubeeq/extension-sdk").PrincipalAccountScope;
   id: string;
   roles: readonly string[];

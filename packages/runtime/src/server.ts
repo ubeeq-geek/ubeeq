@@ -1,3 +1,4 @@
+import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
@@ -659,22 +660,27 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         response.setHeader("cache-control", "private, no-store");
         return json(response, 200, { text, requestId }, requestId);
       }
+      if (method === 'POST' && url.pathname === '/v1/auth/sign-out') {
+        const identity = await session(request);
+        await adapters.identity.revokeSession({ sessionId: identity.id, reason: 'user.sign-out' });
+        return json(response, 204, undefined, requestId);
+      }
       if (method === "POST" && url.pathname === "/v1/auth/sign-in") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const result = await adapters.localIdentity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
 
       if (method === "POST" && url.pathname === "/v1/creators") {
         const identity = await session(request);
         const body = await parseBody(request);
+        const existingUsers = tenancy.mode === 'single_operator' ? await getDistinctOperatorUserIds() : [];
         const createCreator = () => repositories.transaction(async transaction => {
         if (tenancy.mode === 'single_operator') {
           const claims = repositories.instanceOperators;
           if (!claims) throw new HttpError(503, 'operator_claim_store_required', 'An atomic operator claim store is required.');
           const id = configuration.instanceId ?? 'local-reference';
           const claim = await claims.get(id);
-          const existing = await getDistinctOperatorUserIds();
+          const existing = existingUsers;
           if ((claim && claim.actorId !== identity.subject.id) || existing.some(actor => actor !== identity.subject.id)) throw new SingleOperatorLimitError();
           if (!claim) await claims.create({ id, instanceId: id, actorId: identity.subject.id }, { transaction });
         }
-        const existingUsers = await getDistinctOperatorUserIds();
         await tenancy.assertCanCreateCreatorUser({
           existingCreatorUserCount: existingUsers.length,
           actorUserId: identity.subject.id
@@ -781,7 +787,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
       if (method === "POST" && url.pathname === "/v1/uploads") { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); requireHomeCell({ cellId }, work); const byteLength = Number(body.byteLength); if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new HttpError(400, "invalid_request", "byteLength must be a non-negative integer"); const checksum = typeof body.checksum === "string" && /^[a-f0-9]{64}$/i.test(body.checksum) ? body.checksum.toLowerCase() : undefined; const object = { bucket: cellId, key: cellScopedObjectKey({ cellId, creatorId: work.creatorId, kind: "uploads", objectId: randomUUID() }), contentType: requireString(body.mimeType, "mimeType"), byteLength, checksum, scope: "private" as const }; const upload = await adapters.uploads.initiate({ object, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }); return json(response, 201, { upload, requestId }, requestId); }
       const contentMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/content$/);
-      if (method === "PUT" && contentMatch) { const identity = await session(request); if (!adapters.uploads.accept) throw new HttpError(405, "direct_upload_required", "Upload content must be sent to the issued direct-upload URL"); const creator = await creatorFor(identity.subject.id); await requireCreatorWritable(creator); const body = await parseBody(request); const base64 = requireString(body.base64, "base64"); await adapters.uploads.accept({ uploadId: contentMatch[1], cellId, creatorId: creator.id, body: Buffer.from(base64, "base64"), operation: "upload_content" }); return json(response, 204, undefined, requestId); }
+      if (method === "PUT" && contentMatch) { const identity = await session(request); if (!adapters.uploads.accept) throw new HttpError(405, "direct_upload_required", "Upload content must be sent to the issued direct-upload URL"); const creator = await creatorFor(identity.subject.id, resolveRequestCreatorId(request, url)); await requireCreatorWritable(creator); const role = await tenancy.resolveCreatorRole(identity.subject.id, creator.id); if (!role || !["owner", "admin", "editor"].includes(role)) throw new HttpError(403, "asset_edit_denied", "Asset editing access is required."); const body = await parseBody(request); const base64 = requireString(body.base64, "base64"); await adapters.uploads.accept({ uploadId: contentMatch[1], cellId, creatorId: creator.id, body: Buffer.from(base64, "base64"), operation: "upload_content" }); return json(response, 204, undefined, requestId); }
       const completeMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/complete$/);
       if (method === "POST" && completeMatch) { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const object = await adapters.uploads.complete({ uploadId: completeMatch[1], cellId, creatorId: work.creatorId, checksum: requireString(body.checksum, "checksum"), byteLength: Number(body.byteLength) }); const result = await repositories.transaction(async (transaction) => { const asset = await repositories.assets.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), creatorId: work.creatorId, workId: work.id, mimeType: object.contentType, checksum: object.checksum!, objectVersion: object.versionId!, status: "pending", storage: object } as AssetRecord & { storage: typeof object }, { transaction }); await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), subjectType: "asset", subjectId: asset.id, source: "reference.upload", payload: { checksum: object.checksum, byteLength: object.byteLength } }, { transaction }); await repositories.auditEvents.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), action: "asset.upload_completed", actorId: identity.subject.id, subjectId: asset.id, payload: { workId: work.id } }, { transaction }); const job = await adapters.jobs.enqueue({ cellId, type: "asset.process", payload: { assetId: asset.id }, idempotencyKey: `asset-process:${asset.id}:${asset.objectVersion}`, maxAttempts: 3, correlationId: requestId }); return { asset, job }; }); return json(response, 202, { ...result, requestId }, requestId); }
 
@@ -954,6 +960,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if (error instanceof TenancyAdmissionError) return json(response, 403, { error: { code: error.reasonCode, message: error.message, requestId } }, requestId);
       if (error instanceof SingleOperatorLimitError || (error as any)?.code === "SINGLE_OPERATOR_INSTANCE_LIMIT") {
         return json(response, 403, { error: { code: "SINGLE_OPERATOR_INSTANCE_LIMIT", message: (error as Error).message, requestId } }, requestId);
       }

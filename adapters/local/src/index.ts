@@ -239,6 +239,7 @@ export const createLocalPublicationCommandRepositories = (local: LocalSqliteData
 /** Durable local composition. It is intentionally a generic JSON-record adapter, not an in-memory default. */
 export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqRepositories => ({
   transaction: local.transaction.bind(local),
+  hostRecords: cellRepository(local, "hostRecords"),
   creators: cellRepository(local, "creators"), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
   publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
   moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
