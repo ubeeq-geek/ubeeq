@@ -25,6 +25,7 @@
   "dependencies": {
     "@ubeeq/core": "0.1.0",
     "@ubeeq/storage": "0.1.0",
+    "@ubeeq/extension-sdk": "^0.1.0",
     "blake3-wasm": "^2.1.5",
     "ssh2": "^1.17.0",
     "@ubeeq/commerce": "^0.1.0"

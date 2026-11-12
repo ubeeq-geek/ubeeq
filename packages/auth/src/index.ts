@@ -1,5 +1,6 @@
 /** An authenticated principal expressed without identity-provider assumptions. */
 export * from "./request-identity.js";
+export * from "./single-operator-tenancy.js";
 export { LocalSlidingWindowRateLimiter } from './local-rate-limit.js';
 export interface AuthorizationSubject {
   id: string;

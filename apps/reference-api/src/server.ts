@@ -14,7 +14,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID } from "node:crypto";
 import { PublicationService, PublicationRequestError } from '@ubeeq/api';
 import { createLocalAdapterSet, SqliteWebsiteStore, type LocalAdapterConfiguration } from "@ubeeq/adapter-local";
-import { AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
+import { SingleOperatorTenancyAdapter, AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
+import { SingleOperatorLimitError, FeatureDisabledInSingleOperatorModeError, type TenancyAndAccessPort } from "@ubeeq/extension-sdk";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
@@ -76,6 +77,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   mediaProcessor?: MediaProcessor;
   adapters?: ReferenceAdapterSet;
   regionalControlPlane?: RegionalControlPlane;
+  tenancy?: TenancyAndAccessPort;
+  tenancyMode?: "single_operator" | "multi_tenant_saas";
   /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
   operatorAuthorization?: AuthorizationRequirement;
   diagnostics?: readonly DependencyDiagnostic[];
@@ -158,15 +161,80 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     if (!configuration.regionalControlPlane) throw new HttpError(503, "regional_control_unavailable", "This cell is not configured with a managed routing control plane");
     return configuration.regionalControlPlane;
   };
-  const creatorFor = async (subjectId: string): Promise<CreatorRecord> => {
-    let cursor: string | undefined;
-    do { const page = await repositories.creators.list({ limit: 100, cursor }); const found = page.items.find((creator) => creator.subjectId === subjectId); if (found) return found; cursor = page.nextCursor; } while (cursor);
+  const getDistinctOperatorUserIds = async (): Promise<string[]> => {
+    const all = await allRecords(repositories.creators);
+    const ids = new Set<string>();
+    for (const c of all) if (c.subjectId) ids.add(c.subjectId);
+    return [...ids];
+  };
+
+  const tenancyMode = configuration.tenancy?.mode ?? configuration.tenancyMode ?? "single_operator";
+
+  const tenancy: TenancyAndAccessPort = configuration.tenancy ?? (
+    tenancyMode === "multi_tenant_saas"
+      ? {
+          mode: "multi_tenant_saas" as const,
+          async assertCanCreateCreatorUser() {},
+          async assertCanCreateCustomerAccount() {},
+          async listAccessibleCreatorIds(actorUserId: string) {
+            const all = await allRecords(repositories.creators);
+            return all.filter((c) => c.subjectId === actorUserId).map((c) => c.id);
+          },
+          async resolveCreatorRole(actorUserId: string, creatorId: string) {
+            const creator = await repositories.creators.get(creatorId);
+            return creator?.subjectId === actorUserId ? "owner" : null;
+          },
+          isContributorManagementEnabled: () => true,
+          isOrganizationManagementEnabled: () => true
+        }
+      : new SingleOperatorTenancyAdapter({
+          getOperatorUserId: async () => {
+            const all = await allRecords(repositories.creators);
+            if (!all.length) return null;
+            all.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+            return all[0]?.subjectId ?? null;
+          },
+          countCreatorUsers: async () => (await getDistinctOperatorUserIds()).length,
+          listOperatorCreatorIds: async (operatorId) => {
+            const all = await allRecords(repositories.creators);
+            return all
+              .filter((c) => c.subjectId === operatorId)
+              .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+              .map((c) => c.id);
+          }
+        })
+  );
+
+  const resolveRequestCreatorId = (request: IncomingMessage, url: URL): string | undefined => {
+    const headerId = request.headers["x-creator-id"];
+    if (typeof headerId === "string" && headerId.trim()) return headerId.trim();
+    const queryId = url.searchParams.get("creatorId");
+    if (queryId && queryId.trim()) return queryId.trim();
+    return undefined;
+  };
+
+  const creatorFor = async (subjectId: string, requestedCreatorId?: string): Promise<CreatorRecord> => {
+    const accessibleIds = await tenancy.listAccessibleCreatorIds(subjectId);
+    if (!accessibleIds.length) {
+      throw new HttpError(403, "creator_access_denied", "This account does not have creator access in this instance.");
+    }
+
+    if (requestedCreatorId) {
+      if (!accessibleIds.includes(requestedCreatorId)) {
+        throw new HttpError(403, "creator_not_accessible", "The requested creator identity does not belong to your account.");
+      }
+      const selected = await repositories.creators.get(requestedCreatorId);
+      if (selected && selected.subjectId === subjectId) return selected;
+    }
+
+    const defaultCreator = await repositories.creators.get(accessibleIds[0]);
+    if (defaultCreator) return defaultCreator;
     throw new HttpError(404, "creator_not_found", "No creator profile belongs to the current subject");
   };
-  const ownedWork = async (workId: string, subjectId: string): Promise<WorkRecord> => {
+  const ownedWork = async (workId: string, subjectId: string, requestedCreatorId?: string): Promise<WorkRecord> => {
     const work = await repositories.works.get(workId);
     if (!work) throw new HttpError(404, "work_not_found", "Work was not found");
-    const creator = await creatorFor(subjectId);
+    const creator = await creatorFor(subjectId, requestedCreatorId ?? work.creatorId);
     requireHomeCell({ cellId }, creator);
     await requireCreatorWritable(creator);
     requireHomeCell({ cellId }, work);
@@ -436,7 +504,25 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const ready = dependencies.every((dependency) => dependency.status === "ok");
         return json(response, ready ? 200 : 503, { ok: ready, status: ready ? "ok" : "degraded", cell: composition.configuration.cell, routingRevision: 1, dependencies, requestId }, requestId);
       }
-      if (!url.pathname.startsWith("/v1/")) throw new HttpError(404, "not_found", "Route was not found");
+      const isContributorMutation = (pathname: string, httpMethod: string) =>
+        httpMethod !== "GET" && /^\/(?:v1|studio)\/creators\/[^/]+\/(members|invitations)/.test(pathname);
+
+      const isOrganizationMutation = (pathname: string, httpMethod: string) =>
+        httpMethod !== "GET" && /^\/(?:v1|studio)\/organizations(\/|$)/.test(pathname);
+
+      if (isContributorMutation(url.pathname, method)) {
+        if (!tenancy.isContributorManagementEnabled()) {
+          throw new FeatureDisabledInSingleOperatorModeError("Contributor management");
+        }
+      }
+
+      if (isOrganizationMutation(url.pathname, method)) {
+        if (!tenancy.isOrganizationManagementEnabled()) {
+          throw new FeatureDisabledInSingleOperatorModeError("Organization management");
+        }
+      }
+
+      if (!url.pathname.startsWith("/v1/") && !url.pathname.startsWith("/studio/")) throw new HttpError(404, "not_found", "Route was not found");
 
       if (url.pathname === '/v1/websites' || url.pathname.startsWith('/v1/websites/')) {
         response.setHeader('cache-control','private, no-store');
@@ -545,10 +631,73 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       if (method === "POST" && url.pathname === "/v1/auth/sign-in") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const result = await adapters.localIdentity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
 
-      if (method === "POST" && url.pathname === "/v1/creators") { const identity = await session(request); const body = await parseBody(request); const creator = await repositories.creators.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, handle: requireString(body.handle, "handle"), displayName: requireString(body.displayName, "displayName"), subjectId: identity.subject.id }); return json(response, 201, { creator, requestId }, requestId); }
-      if (method === "GET" && url.pathname === "/v1/creators/me") { const identity = await session(request); return json(response, 200, { creator: await creatorFor(identity.subject.id), requestId }, requestId); }
-      if (method === "POST" && url.pathname === "/v1/works") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator); const body = await parseBody(request); const work = await repositories.works.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, title: requireString(body.title, "title"), status: "draft" }); return json(response, 201, { work, requestId }, requestId); }
-      if (method === "POST" && url.pathname === "/v1/collections") { const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator); const body = await parseBody(request); const collection = await repositories.collections.create({ id: randomUUID(), instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, title: requireString(body.title, "title"), visibility: body.visibility === "public" || body.visibility === "unlisted" ? body.visibility : "private" }); return json(response, 201, { collection, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/creators") {
+        const identity = await session(request);
+        const body = await parseBody(request);
+        const existingUsers = await getDistinctOperatorUserIds();
+        await tenancy.assertCanCreateCreatorUser({
+          existingCreatorUserCount: existingUsers.length,
+          actorUserId: identity.subject.id
+        });
+        const creator = await repositories.creators.create({
+          id: randomUUID(),
+          instanceId: configuration.instanceId ?? "local-reference",
+          ...cellOwned,
+          handle: requireString(body.handle, "handle"),
+          displayName: requireString(body.displayName, "displayName"),
+          subjectId: identity.subject.id
+        });
+        return json(response, 201, { creator, requestId }, requestId);
+      }
+      if (method === "GET" && url.pathname === "/v1/creators") {
+        const identity = await session(request);
+        const accessibleIds = await tenancy.listAccessibleCreatorIds(identity.subject.id);
+        const creators = [];
+        for (const id of accessibleIds) {
+          const c = await repositories.creators.get(id);
+          if (c) creators.push(c);
+        }
+        return json(response, 200, { creators, requestId }, requestId);
+      }
+      if (method === "GET" && url.pathname === "/v1/creators/me") {
+        const identity = await session(request);
+        const requestedId = resolveRequestCreatorId(request, url);
+        return json(response, 200, { creator: await creatorFor(identity.subject.id, requestedId), requestId }, requestId);
+      }
+      if (method === "POST" && url.pathname === "/v1/works") {
+        const identity = await session(request);
+        const requestedId = resolveRequestCreatorId(request, url);
+        const creator = await creatorFor(identity.subject.id, requestedId);
+        requireHomeCell({ cellId }, creator);
+        await requireCreatorWritable(creator);
+        const body = await parseBody(request);
+        const work = await repositories.works.create({
+          id: randomUUID(),
+          instanceId: creator.instanceId,
+          ...dataHomeOf(creator),
+          creatorId: creator.id,
+          title: requireString(body.title, "title"),
+          status: "draft"
+        });
+        return json(response, 201, { work, requestId }, requestId);
+      }
+      if (method === "POST" && url.pathname === "/v1/collections") {
+        const identity = await session(request);
+        const requestedId = resolveRequestCreatorId(request, url);
+        const creator = await creatorFor(identity.subject.id, requestedId);
+        requireHomeCell({ cellId }, creator);
+        await requireCreatorWritable(creator);
+        const body = await parseBody(request);
+        const collection = await repositories.collections.create({
+          id: randomUUID(),
+          instanceId: creator.instanceId,
+          ...dataHomeOf(creator),
+          creatorId: creator.id,
+          title: requireString(body.title, "title"),
+          visibility: body.visibility === "public" || body.visibility === "unlisted" ? body.visibility : "private"
+        });
+        return json(response, 201, { collection, requestId }, requestId);
+      }
 
       if (method === "POST" && url.pathname === "/v1/uploads") { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); requireHomeCell({ cellId }, work); const byteLength = Number(body.byteLength); if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new HttpError(400, "invalid_request", "byteLength must be a non-negative integer"); const checksum = typeof body.checksum === "string" && /^[a-f0-9]{64}$/i.test(body.checksum) ? body.checksum.toLowerCase() : undefined; const object = { bucket: cellId, key: cellScopedObjectKey({ cellId, creatorId: work.creatorId, kind: "uploads", objectId: randomUUID() }), contentType: requireString(body.mimeType, "mimeType"), byteLength, checksum, scope: "private" as const }; const upload = await adapters.uploads.initiate({ object, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }); return json(response, 201, { upload, requestId }, requestId); }
       const contentMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/content$/);
@@ -582,6 +731,38 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           await requireClearAdmission('Publication', [work.id, work.creatorId, ...assets.map(asset => asset.id)]);
         });
         const result = await service.publish({ workId: publicationMatch[1], actorId: identity.subject.id, destination: requireString(body.destination, 'destination'), idempotencyKey: request.headers['idempotency-key'] });
+        return json(response, result.idempotent ? 200 : 201, { ...result, requestId }, requestId);
+      }
+      const nativePublicationMatch = url.pathname.match(/^\/(?:v1|studio)\/works\/([^/]+)\/publications\/(native|[a-zA-Z0-9_-]+)$/);
+      if (method === "PUT" && nativePublicationMatch) {
+        const identity = await session(request);
+        const workId = nativePublicationMatch[1];
+        const requestedDestination = nativePublicationMatch[2];
+        const body = await parseBody(request);
+        const work = await ownedWork(workId, identity.subject.id);
+        const shouldPublish = body.published !== false;
+        const canonicalDestination = requestedDestination;
+
+        if (!shouldPublish) {
+          const allPubs = await allRecords(repositories.publications);
+          const existing = allPubs.find((p) => p.workId === work.id && p.destination === canonicalDestination && p.status === 'live');
+          if (existing) {
+            await repositories.publications.update(existing.id, existing.revision, { status: 'removed' });
+            await repositories.works.update(work.id, work.revision, { status: 'draft' });
+            await audit({ action: 'work.withdrawn', actorId: identity.subject.id, subjectId: work.id, payload: { destination: canonicalDestination } });
+          }
+          return json(response, 200, { workId, status: 'withdrawn', requestId }, requestId);
+        }
+
+        const service = new PublicationService(repositories, ownedWork, async (w, assets) => {
+          await requireClearAdmission('Publication', [w.id, w.creatorId, ...assets.map(asset => asset.id)]);
+        });
+        const result = await service.publish({
+          workId,
+          actorId: identity.subject.id,
+          destination: canonicalDestination,
+          idempotencyKey: request.headers['idempotency-key']
+        });
         return json(response, result.idempotent ? 200 : 201, { ...result, requestId }, requestId);
       }
       const publicMatch = url.pathname.match(/^\/v1\/public\/works\/([^/]+)$/);
@@ -685,6 +866,12 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if (error instanceof SingleOperatorLimitError || (error as any)?.code === "SINGLE_OPERATOR_INSTANCE_LIMIT") {
+        return json(response, 403, { error: { code: "SINGLE_OPERATOR_INSTANCE_LIMIT", message: (error as Error).message, requestId } }, requestId);
+      }
+      if (error instanceof FeatureDisabledInSingleOperatorModeError || (error as any)?.code === "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE") {
+        return json(response, 403, { error: { code: "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE", message: (error as Error).message, requestId } }, requestId);
+      }
       if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof PublicationRequestError) return json(response, ['invalid_request', 'invalid_idempotency_key'].includes(error.code) ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);

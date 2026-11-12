@@ -2,6 +2,7 @@ import sharp from "sharp";
 export * from './rendition.js';
 export * from './rendition-set.js';
 export * from './cover-renditions.js';
+export * from './watermarkTransformAdapter.js';
 import type { MediaProcessor } from "@ubeeq/processing";
 
 export interface ImagePreviewOptions {

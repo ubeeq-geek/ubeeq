@@ -127,7 +127,7 @@ export class FeatureDisabledInSingleOperatorModeError extends Error {
 
 export interface TenancyAndAccessPort {
   readonly mode: "single_operator" | "multi_tenant_saas";
-  assertCanCreateCreatorUser(context: { existingCreatorUserCount: number }): Promise<void>;
+  assertCanCreateCreatorUser(context: { existingCreatorUserCount: number; actorUserId?: string }): Promise<void>;
   assertCanCreateCustomerAccount?(context: { email: string }): Promise<void>;
   listAccessibleCreatorIds(actorUserId: string): Promise<string[]>;
   resolveCreatorRole(actorUserId: string, creatorId: string): Promise<CreatorAccessRole | null>;
@@ -264,7 +264,10 @@ export const createSingleOperatorTenancyPort = (options?: {
   listOperatorCreatorIds?: (operatorUserId: string) => Promise<string[]> | string[];
 }): TenancyAndAccessPort => ({
   mode: "single_operator",
-  async assertCanCreateCreatorUser({ existingCreatorUserCount }) {
+  async assertCanCreateCreatorUser({ existingCreatorUserCount, actorUserId }) {
+    const operatorId = await options?.getOperatorUserId?.();
+    if (operatorId && actorUserId && actorUserId === operatorId) return;
+    if (operatorId && actorUserId && actorUserId !== operatorId) throw new SingleOperatorLimitError();
     if (existingCreatorUserCount >= 1) {
       throw new SingleOperatorLimitError();
     }

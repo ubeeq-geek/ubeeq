@@ -9,5 +9,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/extension-sdk": "^0.1.0"
   }
 }

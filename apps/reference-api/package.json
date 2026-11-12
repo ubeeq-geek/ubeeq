@@ -19,6 +19,7 @@
     "@ubeeq/adapter-machine": "^0.1.0",
     "@ubeeq/auth": "^0.1.0",
     "@ubeeq/api": "^0.1.0",
+    "@ubeeq/extension-sdk": "^0.1.0",
     "@ubeeq/deployment-platform": "^0.1.0",
     "@ubeeq/moderation": "^0.1.0",
     "@ubeeq/federation": "^0.1.0",

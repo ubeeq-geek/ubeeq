@@ -10,7 +10,7 @@ import {DatabaseSync} from 'node:sqlite';
 
 test('personal website API persists pages, queues builds, isolates previews and downloads an authorized ZIP',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'ubeeq-websites-'));
-  const api=createReferenceApi({databasePath:join(dir,'state.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',operatorAuthorization:{anyRoles:['creator']}});
+  const api=createReferenceApi({databasePath:join(dir,'state.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',operatorAuthorization:{anyRoles:['creator']},tenancyMode:'multi_tenant_saas'});
   await new Promise(resolve=>api.server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+api.server.address().port;
   t.after(async()=>{await api.close();rmSync(dir,{recursive:true,force:true});});
   let token;

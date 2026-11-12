@@ -347,3 +347,25 @@ export * from './website-hosting-connections.js';
 
 export * from './website-hosting-hostinger.js';
 export * from './collection-release-completion.js';
+
+export * from './connector-credentials.js';
+export * from './local-connector-tables.js';
+export * from './instagram.js';
+export * from './instagram-provider.js';
+export * from './tumblr.js';
+export * from './patreon.js';
+export * from './patreon-policy.js';
+export * from './patreon-downloads.js';
+export * from './fanvue.js';
+export * from './bluesky.js';
+export * from './bluesky-announcement.js';
+export * from './facebook.js';
+export * from './linkedin.js';
+export * from './wordpress-client.js';
+export * from './ghost-client.js';
+export * from './discord-publishing.js';
+export * from './persistentMessagingWorker.js';
+export * from './externalSyncEngine.js';
+export * from './integrationPreflight.js';
+export * from './integrationReconciliation.js';
+

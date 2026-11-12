@@ -78,3 +78,60 @@ test("schedule is effective only when due and unpublished is distinct from manag
     false,
   );
 });
+
+test("native destination alias aggregation and resolution supports multi-destination aliases without ambiguity", async () => {
+  const {
+    isNativeDestination,
+    aggregateNativePublications,
+    resolveNativePublication,
+    evaluateWorkNativePublicationEligibility,
+  } = await import("../dist/index.js");
+
+  const aliases = ["native", "custom-alias", "partner-channel"];
+
+  assert.equal(isNativeDestination("native", aliases), true);
+  assert.equal(isNativeDestination("custom-alias", aliases), true);
+  assert.equal(isNativeDestination("partner-channel", aliases), true);
+  assert.equal(isNativeDestination("unknown-store", aliases), false);
+
+  const publications = [
+    { id: "pub-1", creatorId: "creator-1", workId: "w-1", destination: "native", status: "live", visibility: "public" },
+    { id: "pub-2", creatorId: "creator-1", workId: "w-1", destination: "custom-alias", status: "live", visibility: "public" },
+    { id: "pub-3", creatorId: "creator-1", workId: "w-2", destination: "partner-channel", status: "live", visibility: "unlisted" },
+    { id: "pub-4", creatorId: "creator-1", workId: "w-3", destination: "native", status: "removed", visibility: "public" },
+    { id: "pub-5", creatorId: "creator-1", workId: "w-4", destination: "other-destination", status: "live", visibility: "public" },
+  ];
+
+  const aggregated = aggregateNativePublications(publications, aliases);
+  assert.equal(aggregated.length, 3);
+  assert.deepEqual(aggregated.map(p => p.id), ["pub-1", "pub-2", "pub-3"]);
+
+  // resolveNativePublication prefers canonical 'native'
+  const resolvedW1 = resolveNativePublication(publications.filter(p => p.workId === "w-1"), aliases);
+  assert.equal(resolvedW1?.id, "pub-1");
+
+  // resolveNativePublication falls back to valid alias if canonical 'native' is not present
+  const resolvedW2 = resolveNativePublication(publications.filter(p => p.workId === "w-2"), aliases);
+  assert.equal(resolvedW2?.id, "pub-3");
+
+  // evaluateWorkNativePublicationEligibility allows multi-alias publications without ambiguity error
+  const eligibilityW1 = await evaluateWorkNativePublicationEligibility({
+    workId: "w-1",
+    creatorId: "creator-1",
+    publications: publications.filter(p => p.workId === "w-1"),
+    destination: "custom-alias",
+    options: { nativeDestinationAliases: aliases },
+  });
+  assert.equal(eligibilityW1.allowed, true);
+
+  const eligibilityW3 = await evaluateWorkNativePublicationEligibility({
+    workId: "w-3",
+    creatorId: "creator-1",
+    publications: publications.filter(p => p.workId === "w-3"),
+    destination: "native",
+    options: { nativeDestinationAliases: aliases },
+  });
+  assert.equal(eligibilityW3.allowed, false);
+  assert.match(eligibilityW3.reason ?? "", /No released native Work Publication/);
+});
+
