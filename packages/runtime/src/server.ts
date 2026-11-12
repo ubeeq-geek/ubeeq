@@ -16,7 +16,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomUUID } from "node:crypto";
 import { PublicationService, PublicationRequestError } from '@ubeeq/api';
 import { createLocalAdapterSet, SqliteWebsiteStore, type LocalAdapterConfiguration } from "@ubeeq/adapter-local";
-import { SingleOperatorTenancyAdapter, AuthorizationDeniedError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter } from "@ubeeq/auth";
+import { SingleOperatorTenancyAdapter, AuthorizationDeniedError, PasswordAuthenticationError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter, type PasswordAuthenticationPort } from "@ubeeq/auth";
 import { SingleOperatorLimitError, FeatureDisabledInSingleOperatorModeError, type TenancyAndAccessPort, type HostExtensionRuntimePorts, createDefaultOpenCorePorts } from "@ubeeq/extension-sdk";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
@@ -57,6 +57,7 @@ export type ReferenceAdapterSet = {
   jobs: JobQueue;
   identity: IdentityAdapter;
   localIdentity?: PasswordIdentityAdapter;
+  passwordAuthentication?: PasswordAuthenticationPort;
   federation?: FederationSignatureVerifier & FederationReplayStore & { keyId: string; publicKey: string };
 };
 
@@ -700,7 +701,21 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         await adapters.identity.revokeSession({ sessionId: identity.id, reason: 'user.sign-out' });
         return json(response, 204, undefined, requestId);
       }
-      if (method === "POST" && url.pathname === "/v1/auth/sign-in") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const result = await adapters.localIdentity.authenticate({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/auth/sign-in") {
+        response.setHeader('cache-control', 'no-store');
+        const authentication = adapters.passwordAuthentication ?? adapters.localIdentity;
+        if (!authentication) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider");
+        const body = await parseBody(request);
+        const credentials = { email: requireString(body.email, "email"), password: requireString(body.password, "password") };
+        let result;
+        try { result = await authentication.authenticate(credentials); }
+        catch (error) {
+          if (error instanceof PasswordAuthenticationError || !adapters.passwordAuthentication) throw error;
+          throw new PasswordAuthenticationError('identity_provider_unavailable');
+        }
+        if (!result || typeof result.token !== 'string' || !result.token || result.token.trim() !== result.token || typeof result.session?.subject?.id !== 'string' || !result.session.subject.id || typeof result.session.expiresAt !== 'string' || !Number.isFinite(Date.parse(result.session.expiresAt)) || Date.parse(result.session.expiresAt) <= Date.now()) throw new PasswordAuthenticationError('identity_provider_unavailable');
+        return json(response, 200, { token: result.token, expiresAt: result.session.expiresAt, requestId }, requestId);
+      }
 
       if (method === "POST" && url.pathname === "/v1/creators") {
         const identity = await session(request);
@@ -1012,6 +1027,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (error instanceof FeatureDisabledInSingleOperatorModeError || (error as any)?.code === "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE") {
         return json(response, 403, { error: { code: "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE", message: (error as Error).message, requestId } }, requestId);
       }
+      if (error instanceof PasswordAuthenticationError) return json(response, error.code === 'invalid_credentials' ? 401 : error.code === 'authentication_challenge_required' ? 409 : 503, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof PublicationRequestError) return json(response, ['invalid_request', 'invalid_idempotency_key'].includes(error.code) ? 400 : 409, { error: { code: error.code, message: error.message, requestId } }, requestId);

@@ -17,7 +17,7 @@ import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord,
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
-import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
+import { PasswordAuthenticationError, type AuthenticatedSession, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
@@ -508,7 +508,28 @@ export class CognitoIdentity implements IdentityAdapter {
   }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
-  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> { const result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); if (!result.AuthenticationResult?.AccessToken) throw new Error("Cognito authentication did not return an access token."); return { token: result.AuthenticationResult.AccessToken }; }
+  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> {
+    let result;
+    try { result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); }
+    catch (error) {
+      const name = (error as { name?: string })?.name;
+      throw new PasswordAuthenticationError(['NotAuthorizedException','UserNotFoundException'].includes(name ?? '') ? 'invalid_credentials' : ['UserNotConfirmedException','PasswordResetRequiredException'].includes(name ?? '') ? 'authentication_challenge_required' : 'identity_provider_unavailable');
+    }
+    if (result?.ChallengeName) throw new PasswordAuthenticationError('authentication_challenge_required');
+    const token = result?.AuthenticationResult?.AccessToken;
+    if (typeof token !== 'string' || !token || token.trim() !== token) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    return { token };
+  }
+  async authenticateSession(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
+    const { token } = await this.authenticate({ username: input.email, password: input.password });
+    const session = await this.verifySession({ credential: token });
+    if (!session) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    let account;
+    try { account = await this.getAccount(session.subject.id); }
+    catch { throw new PasswordAuthenticationError('identity_provider_unavailable'); }
+    if (!account || account.status !== 'active') throw new PasswordAuthenticationError('invalid_credentials');
+    return { token, session };
+  }
 }
 
 export const issueCloudFrontDelivery = (input: { url: string; privateKey: string; keyPairId: string; expiresAt: string }): string => getCloudFrontSignedUrl({ url: input.url, privateKey: input.privateKey, keyPairId: input.keyPairId, dateLessThan: input.expiresAt });
@@ -522,16 +543,18 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 }
 
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
-export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
+  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId);
   return {
     repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),
     jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
-    identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
+    identity,
+    ...(configuration.passwordAuthenticationEnabled ? { passwordAuthentication: { authenticate: (input: { email: string; password: string }) => identity.authenticateSession(input) } } : {}),
     credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
   };
 };

@@ -34,5 +34,11 @@ test('API and worker account-status permission is scoped to their configured use
       assert.match(roles[0].Ref, /Reference(Api|Worker)ServiceRole/);
     }
     assert.notDeepEqual(grants[0].roles, grants[1].roles);
+    const api = Object.values(template.Resources).find(value => value.Type === 'AWS::Lambda::Function' && value.Properties.Handler === 'lambda.handler');
+    assert.equal(api.Properties.Environment.Variables.UBEEQ_PASSWORD_AUTH_ENABLED, 'true');
+    const appClient = Object.values(template.Resources).find(value => value.Type === 'AWS::Cognito::UserPoolClient');
+    assert.ok(appClient.Properties.ExplicitAuthFlows.includes('ALLOW_USER_PASSWORD_AUTH'));
+    assert.notEqual(appClient.Properties.GenerateSecret, true);
+    assert.equal(template.Resources[pool].Properties.AdminCreateUserConfig.AllowAdminCreateUserOnly, true);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

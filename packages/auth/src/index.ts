@@ -54,6 +54,15 @@ export interface PasswordIdentityAdapter extends IdentityAdapter {
   authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }>;
 }
 
+/** Password sign-in can exist without promising local account registration. */
+export type PasswordAuthenticationPort = Pick<PasswordIdentityAdapter, 'authenticate'>;
+export class PasswordAuthenticationError extends Error {
+  constructor(readonly code: 'invalid_credentials' | 'authentication_challenge_required' | 'identity_provider_unavailable') {
+    super(code === 'invalid_credentials' ? 'Sign-in could not be completed with these credentials.' : code === 'authentication_challenge_required' ? 'Complete the required account confirmation, password reset or sign-in challenge before signing in.' : 'Sign-in is temporarily unavailable.');
+    this.name = 'PasswordAuthenticationError';
+  }
+}
+
 /** Executable baseline shared by OIDC/Cognito and password-capable identity adapters. */
 export const verifyIdentityAdapterContract = async (adapter: IdentityAdapter, fixture: { credential: string; subjectId: string }): Promise<void> => {
   const session = await adapter.verifySession({ credential: fixture.credential });
