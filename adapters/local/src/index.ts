@@ -29,7 +29,7 @@ const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
 const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
-type SqliteDatabase = { exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
+type SqliteDatabase = { close(): void; exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
 
 export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
@@ -38,6 +38,8 @@ export class LocalSqliteDatabase {
   private readonly transactionContext = new AsyncLocalStorage<{ id: string; active: boolean; rollbackOnly: boolean }>();
   private owner?: { id: string; active: boolean; rollbackOnly: boolean };
   private transactionTail: Promise<void> = Promise.resolve();
+
+  close(): void { this.database.close(); }
 
   constructor(readonly configuration: LocalAdapterConfiguration) {
     mkdirSync(resolve(configuration.dataDirectory), { recursive: true });

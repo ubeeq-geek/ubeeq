@@ -197,6 +197,8 @@ export interface WatermarkAndTransformPort {
 }
 
 export interface UsageQuotaReservationInput {
+  idempotencyKey?: string;
+  reservationId?: string;
   creatorId: string;
   storageBytesDelta?: number;
   deliveryBytesDelta?: number;
@@ -205,6 +207,7 @@ export interface UsageQuotaReservationInput {
 }
 
 export interface UsageQuotaReservationResult {
+  reservationId?: string;
   allowed: boolean;
   reasonCode?: string;
   remainingCredits?: number;
