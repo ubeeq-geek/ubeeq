@@ -1,0 +1,65 @@
+{
+  "name": "@ubeeq/runtime",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./commerce": {
+      "types": "./dist/commerce.d.ts",
+      "default": "./dist/commerce.js"
+    },
+    "./commerce-page": {
+      "types": "./dist/commerce-page.d.ts",
+      "default": "./dist/commerce-page.js"
+    },
+    "./website-hosting": {
+      "types": "./dist/website-hosting.d.ts",
+      "default": "./dist/website-hosting.js"
+    },
+    "./websites": {
+      "types": "./dist/websites.d.ts",
+      "default": "./dist/websites.js"
+    },
+    "./website-sources": {
+      "types": "./dist/website-sources.d.ts",
+      "default": "./dist/website-sources.js"
+    },
+    "./website-hosting-connections": {
+      "types": "./dist/website-hosting-connections.d.ts",
+      "default": "./dist/website-hosting-connections.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/adapter-local": "^0.1.0",
+    "@ubeeq/auth": "^0.1.0",
+    "@ubeeq/api": "^0.1.0",
+    "@ubeeq/extension-sdk": "^0.1.0",
+    "@ubeeq/deployment-platform": "^0.1.0",
+    "@ubeeq/moderation": "^0.1.0",
+    "@ubeeq/federation": "^0.1.0",
+    "@ubeeq/portability": "^0.1.0",
+    "@ubeeq/processing": "^0.1.0",
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/core": "^0.1.0",
+    "@ubeeq/commerce-runtime": "^0.1.0",
+    "@ubeeq/integrations": "^0.1.0",
+    "@ubeeq/jobs": "^0.1.0",
+    "@ubeeq/media-sharp": "^0.1.0",
+    "@ubeeq/storage": "^0.1.0"
+  }
+}

@@ -136,6 +136,9 @@ export interface TenancyAndAccessPort {
 }
 
 export interface PublicationAdmissionEvaluationInput {
+  /** Persisted revision and authenticated publisher supplied by the core host. */
+  workRevision?: number;
+  actorUserId?: string;
   workId: string;
   creatorId: string;
   destination: string;
@@ -197,6 +200,8 @@ export interface WatermarkAndTransformPort {
 }
 
 export interface UsageQuotaReservationInput {
+  idempotencyKey?: string;
+  reservationId?: string;
   creatorId: string;
   storageBytesDelta?: number;
   deliveryBytesDelta?: number;
@@ -205,12 +210,15 @@ export interface UsageQuotaReservationInput {
 }
 
 export interface UsageQuotaReservationResult {
+  reservationId?: string;
   allowed: boolean;
   reasonCode?: string;
   remainingCredits?: number;
 }
 
 export interface UsageSettlementInput {
+  /** Trusted time of the measured effect, preserved across settlement delivery retries. */
+  observedAt?: string;
   creatorId: string;
   operation: string;
   processingCreditsUsed?: number;
@@ -221,6 +229,9 @@ export interface UsageSettlementInput {
 
 export interface UsageQuotaPort {
   checkAndReserveQuota(input: UsageQuotaReservationInput): Promise<UsageQuotaReservationResult>;
+  /** Recheck current execution eligibility separately from an idempotent reservation receipt.
+   * Recovery must still settle old reservations when new execution is no longer allowed. */
+  checkCurrentAdmission?(input: Pick<UsageSettlementInput, 'creatorId' | 'operation' | 'idempotencyKey'>): Promise<UsageQuotaReservationResult>;
   recordUsageSettlement(input: UsageSettlementInput): Promise<void>;
 }
 
@@ -394,3 +405,8 @@ export const validateIntegrationConnectorManifest = (manifest: IntegrationConnec
   if (manifest.apiVersion !== EXTENSION_API_VERSION) throw new Error(`Integration connector ${manifest.id} requires unsupported API version ${manifest.apiVersion}`);
   if (new Set(manifest.capabilities).size !== manifest.capabilities.length) throw new Error(`Integration connector ${manifest.id} declares duplicate capabilities`);
 };
+
+/** A host tenancy rule denied creator onboarding; callers may display the host's actionable reason. */
+export class TenancyAdmissionError extends Error {
+  constructor(readonly reasonCode: string, message: string) { super(message); this.name = 'TenancyAdmissionError'; }
+}

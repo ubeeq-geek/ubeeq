@@ -1,3 +1,6 @@
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
+export type { AwsCommandClient } from './client-port.js';
+import type { AwsCommandClient } from './client-port.js';
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DescribeTableCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -7,14 +10,14 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
+import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
-import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
+import { PasswordAuthenticationError, type AuthenticatedSession, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
@@ -29,7 +32,7 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
 export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
-type Dynamo = Pick<DynamoDBDocumentClient, "send"> & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
+type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
 const now = () => new Date().toISOString();
 const pk = (repository: string, id: string) => `${repository}#${id}`;
@@ -75,7 +78,7 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
   }
   async get(id: string, options?: { transaction?: { id: string } }): Promise<T | undefined> { this.assertTransaction(options); const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConsistentRead: true })); return response.Item?.value as T | undefined; }
   /** Records are queried through the explicit repository/id index, never a filtered scan. */
-  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: (response.Items ?? []).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
+  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, 'id' | 'revision' | 'createdAt' | 'updatedAt'>>, options?: { transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
     const current = await this.get(id);
@@ -104,6 +107,7 @@ export const createDynamoPublicationCommandRepositories = (base: Dynamo, config:
     outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') };
 };
 const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction,
+  hostRecords: cellRepository(dynamo, config, 'hostRecords'),
   creators: cellRepository(dynamo, config, 'creators'), works: cellRepository(dynamo, config, 'works'), assets: cellRepository(dynamo, config, 'assets'),
   collections: cellRepository(dynamo, config, 'collections'), workMemberships: cellRepository(dynamo, config, 'workMemberships'),
   publicationIntents: cellRepository(dynamo, config, 'publicationIntents'), publications: cellRepository(dynamo, config, 'publications'),
@@ -113,7 +117,7 @@ const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['tran
   creditLots: cellRepository(dynamo, config, 'creditLots'), creditReservations: cellRepository(dynamo, config, 'creditReservations'), balances: cellRepository(dynamo, config, 'balances'),
   integrationAccounts: cellRepository(dynamo, config, 'integrationAccounts'), syncCursors: cellRepository(dynamo, config, 'syncCursors'),
   integrationJobs: cellRepository(dynamo, config, 'integrationJobs'), exportManifests: cellRepository(dynamo, config, 'exportManifests'),
-  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), federationActors: repository(dynamo, config, 'federationActors'),
+  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), instanceOperators: repository(dynamo, config, 'instanceOperators'), federationActors: repository(dynamo, config, 'federationActors'),
   remotePublicationReferences: repository(dynamo, config, 'remotePublicationReferences')
 });
 export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
@@ -152,7 +156,7 @@ export class DynamoRoutingDirectory implements RoutingDirectory {
   }
   async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }> {
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "route" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    return { items: (response.Items ?? []).map((item) => validateCellRoute(item.route as CellRoute)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+    return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateCellRoute(item.route as CellRoute)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
 
@@ -178,7 +182,7 @@ export class DynamoMigrationCheckpoints implements MigrationCheckpointStore {
     // The partition remains intentionally small metadata. Querying the dedicated
     // control-plane table avoids scans across any regional creator records.
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "migration" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    const items = (response.Items ?? []).map((item) => validateMigrationCheckpoint(item.checkpoint as MigrationCheckpoint)).filter((checkpoint) => !input.creatorId || checkpoint.creatorId === input.creatorId);
+    const items = ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateMigrationCheckpoint(item.checkpoint as MigrationCheckpoint)).filter((checkpoint) => !input.creatorId || checkpoint.creatorId === input.creatorId);
     return { items, nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
@@ -206,7 +210,7 @@ export class DynamoMigrationCellRegistry implements MigrationCellRegistry {
   }
   async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly MigrationCellRegistration[]; nextCursor?: string }> {
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "cell" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    return { items: (response.Items ?? []).map((item) => validateMigrationCellRegistration(item.cell as MigrationCellRegistration)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+    return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateMigrationCellRegistration(item.cell as MigrationCellRegistration)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
 
@@ -220,7 +224,7 @@ export const createAwsRoutingControlPlane = (configuration: { tableName: string;
 
 /** Private synchronous invocation client for a cell registered by an operator. */
 export class LambdaMigrationCellEndpoint implements MigrationCellEndpoint {
-  constructor(private readonly lambda: Pick<LambdaClient, "send">, private readonly functionName: string) {}
+  constructor(private readonly lambda: AwsCommandClient, private readonly functionName: string) {}
   async execute(command: MigrationCellCommand): Promise<MigrationCellCommandResult> {
     const response = await this.lambda.send(new InvokeCommand({ FunctionName: this.functionName, InvocationType: "RequestResponse", Payload: Buffer.from(JSON.stringify(command)) }));
     const payload = response.Payload ? JSON.parse(Buffer.from(response.Payload).toString("utf8")) as { error?: { message?: string }; result?: MigrationCellCommandResult } : {};
@@ -250,7 +254,7 @@ export const createAwsMigrationCommandQueue = (configuration: { queueUrl: string
  * record table or participates in normal creator request handling.
  */
 export class AwsMigrationControlWorker {
-  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: Pick<LambdaClient, "send">; lambdaForRegion?: (region: string) => Pick<LambdaClient, "send">; s3ForRegion?: (region: string) => Pick<S3Client, "send">; clock?: () => string }) {}
+  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: AwsCommandClient; lambdaForRegion?: (region: string) => AwsCommandClient; s3ForRegion?: (region: string) => AwsCommandClient; clock?: () => string }) {}
   async execute(command: AwsMigrationCommand): Promise<MigrationCheckpoint> {
     if (!command.migrationId.trim() || !["resume", "rollback", "retire"].includes(command.operation)) throw new Error("Migration command is invalid.");
     const checkpoint = await this.input.checkpoints.get(command.migrationId);
@@ -272,7 +276,7 @@ export class AwsMigrationControlWorker {
 }
 
 export class S3ObjectStorage implements ObjectStorage {
-  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
+  constructor(private readonly s3: AwsCommandClient, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
   private objectKey(key: string): string { return this.keyPrefix && !key.startsWith(`${this.keyPrefix}/`) ? `${this.keyPrefix}/${key}` : key; }
   private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }
   async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> {
@@ -295,7 +299,7 @@ export class S3ObjectStorage implements ObjectStorage {
  * Normal Ubeeq uploads never instantiate or call this adapter.
  */
 export class S3MigrationObjectTransfer implements MigrationObjectTransfer {
-  constructor(private readonly source: Pick<S3Client, "send">, private readonly destination: Pick<S3Client, "send">) {}
+  constructor(private readonly source: AwsCommandClient, private readonly destination: AwsCommandClient) {}
   private validate(checkpoint: MigrationCheckpoint, object: MigrationObjectInventoryEntry): void {
     if (!object.source.key.startsWith(`cells/${checkpoint.source.homeCellId}/`) || !object.destination.key.startsWith(`cells/${checkpoint.destination.cellId}/`)) throw new Error("Migration object inventory crosses an undeclared cell boundary.");
   }
@@ -461,14 +465,71 @@ export class SecretsManagerCredentialVault implements CredentialVault {
   async revoke(input: { cellId: string; reference: string }): Promise<void> { const id = this.id(input); if (id) await this.secrets.send(new UpdateSecretCommand({ SecretId: id, SecretString: "revoked" })); }
 }
 
+export interface VerifiedCognitoAccessClaims {
+  sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[];
+}
 export class CognitoIdentity implements IdentityAdapter {
-  constructor(private readonly cognito: Pick<CognitoIdentityProviderClient, "send">, private readonly userPoolId: string, private readonly clientId: string) {}
+  private verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> };
+  constructor(private readonly cognito: AwsCommandClient, private readonly userPoolId: string, private readonly clientId: string,
+    options: { verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { this.verifier = options.verifier; }
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
-  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> { try { const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential })); const id = user.Username; if (!id) return undefined; return { id: input.credential, subject: { id, roles: [], scopes: user.UserAttributes?.filter((item) => item.Name === "scope").flatMap((item) => item.Value?.split(" ") ?? []) }, issuedAt: "", expiresAt: "", authenticationMethod: "oidc" }; } catch { return undefined; } }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return { id: subjectId, subjectId, status: "active", createdAt: "", updatedAt: "" }; }
+  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
+    try {
+      // Verify the signature, issuer, client_id, access-token use and time claims before GetUser.
+      this.verifier ??= CognitoJwtVerifier.create({ userPoolId: this.userPoolId, clientId: this.clientId, tokenUse: 'access' });
+      const payload = await this.verifier.verify(input.credential);
+      if (!payload.sub || !Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now()) return undefined;
+      const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential }));
+      const id = user.Username;
+      const attributes = (user.UserAttributes ?? []) as Array<{ Name?: string; Value?: string }>;
+      if (typeof id !== 'string' || !id || (payload.username && id !== payload.username) || attributes.find(item => item.Name === 'sub')?.Value !== payload.sub) return undefined;
+      const customer = attributes.find(item => item.Name === 'custom:account_scope')?.Value === 'customer_account';
+      return { id: input.credential, subject: { id, email: attributes.find(item => item.Name === 'email')?.Value, emailVerified: attributes.find(item => item.Name === 'email_verified')?.Value === 'true', roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
+        issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
+    } catch { return undefined; }
+  }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    if (typeof subjectId !== 'string' || !subjectId || subjectId.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(subjectId)) return undefined;
+    let user;
+    try { user = await this.cognito.send(new AdminGetUserCommand({ UserPoolId: this.userPoolId, Username: subjectId })); }
+    catch (error) {
+      if ((error as { name?: string })?.name === 'UserNotFoundException') return undefined;
+      // Never substitute an active account when the provider is unavailable or the host lacks permission.
+      throw new Error('Cognito account status is unavailable.');
+    }
+    const status = user.UserStatus;
+    if (user.Username !== subjectId || typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
+    const timestamp = (value: unknown) => {
+      if (value === undefined) return '';
+      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error('Cognito account timestamp is invalid.');
+      return value.toISOString();
+    };
+    return { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status) ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
-  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> { const result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); if (!result.AuthenticationResult?.AccessToken) throw new Error("Cognito authentication did not return an access token."); return { token: result.AuthenticationResult.AccessToken }; }
+  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> {
+    let result;
+    try { result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); }
+    catch (error) {
+      const name = (error as { name?: string })?.name;
+      throw new PasswordAuthenticationError(['NotAuthorizedException','UserNotFoundException'].includes(name ?? '') ? 'invalid_credentials' : ['UserNotConfirmedException','PasswordResetRequiredException'].includes(name ?? '') ? 'authentication_challenge_required' : 'identity_provider_unavailable');
+    }
+    if (result?.ChallengeName) throw new PasswordAuthenticationError('authentication_challenge_required');
+    const token = result?.AuthenticationResult?.AccessToken;
+    if (typeof token !== 'string' || !token || token.trim() !== token) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    return { token };
+  }
+  async authenticateSession(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
+    const { token } = await this.authenticate({ username: input.email, password: input.password });
+    const session = await this.verifySession({ credential: token });
+    if (!session) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    let account;
+    try { account = await this.getAccount(session.subject.id); }
+    catch { throw new PasswordAuthenticationError('identity_provider_unavailable'); }
+    if (!account || account.status !== 'active') throw new PasswordAuthenticationError('invalid_credentials');
+    return { token, session };
+  }
 }
 
 export const issueCloudFrontDelivery = (input: { url: string; privateKey: string; keyPairId: string; expiresAt: string }): string => getCloudFrontSignedUrl({ url: input.url, privateKey: input.privateKey, keyPairId: input.keyPairId, dateLessThan: input.expiresAt });
@@ -482,16 +543,18 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 }
 
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
-export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
+  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId);
   return {
     repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),
     jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
-    identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
+    identity,
+    ...(configuration.passwordAuthenticationEnabled ? { passwordAuthentication: { authenticate: (input: { email: string; password: string }) => identity.authenticateSession(input) } } : {}),
     credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
   };
 };

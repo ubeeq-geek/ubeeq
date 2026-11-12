@@ -155,7 +155,18 @@ export interface ImportCheckpointRecord extends RevisionedRecord, CellOwnedRecor
 export interface FederationActorRecord extends RevisionedRecord { instanceId: string; actorUri: string; host: string; publicKey?: string; }
 export interface RemotePublicationReferenceRecord extends RevisionedRecord { instanceId: string; actorId: string; publicationUri: string; immutableId: string; state: "accepted" | "withdrawn" | "rejected"; }
 
+/** Host-owned records share the adapter transaction and cell boundary without adding host policy to core. */
+export interface HostRecord extends RevisionedRecord, CellOwnedRecord {
+  instanceId: string;
+  namespace: string;
+  scopeId: string;
+  key: string;
+  value: Readonly<Record<string, unknown>>;
+}
+export interface InstanceOperatorRecord extends RevisionedRecord { instanceId: string; actorId: string; }
 export interface UbeeqRepositories extends TransactionRunner {
+  hostRecords?: RevisionedRepository<HostRecord>;
+  instanceOperators?: RevisionedRepository<InstanceOperatorRecord>;
   creators: RevisionedRepository<CreatorRecord>;
   works: RevisionedRepository<WorkRecord>;
   assets: RevisionedRepository<AssetRecord>;

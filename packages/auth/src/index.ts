@@ -3,6 +3,9 @@ export * from "./request-identity.js";
 export * from "./single-operator-tenancy.js";
 export { LocalSlidingWindowRateLimiter } from './local-rate-limit.js';
 export interface AuthorizationSubject {
+  email?: string;
+  emailVerified?: boolean;
+  accountScope?: import("@ubeeq/extension-sdk").PrincipalAccountScope;
   id: string;
   roles: readonly string[];
   scopes?: readonly string[];
@@ -49,6 +52,15 @@ export interface IdentityAdapter {
 export interface PasswordIdentityAdapter extends IdentityAdapter {
   register(input: { email: string; password: string }): Promise<IdentityAccount>;
   authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }>;
+}
+
+/** Password sign-in can exist without promising local account registration. */
+export type PasswordAuthenticationPort = Pick<PasswordIdentityAdapter, 'authenticate'>;
+export class PasswordAuthenticationError extends Error {
+  constructor(readonly code: 'invalid_credentials' | 'authentication_challenge_required' | 'identity_provider_unavailable') {
+    super(code === 'invalid_credentials' ? 'Sign-in could not be completed with these credentials.' : code === 'authentication_challenge_required' ? 'Complete the required account confirmation, password reset or sign-in challenge before signing in.' : 'Sign-in is temporarily unavailable.');
+    this.name = 'PasswordAuthenticationError';
+  }
 }
 
 /** Executable baseline shared by OIDC/Cognito and password-capable identity adapters. */

@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "synth": "cdk synth",
-    "deploy": "npm run package:lambda --workspace @ubeeq/reference-api && cdk deploy"
+    "deploy": "npm run package:lambda --workspace @ubeeq/reference-api && cdk deploy",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "aws-cdk-lib": "^2.131.0",

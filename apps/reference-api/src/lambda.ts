@@ -82,6 +82,7 @@ const referenceApi = (): ReturnType<typeof createReferenceApi> => application ??
     queueUrl: required("UBEEQ_JOBS_QUEUE_URL"),
     userPoolId: required("UBEEQ_USER_POOL_ID"),
     userPoolClientId: required("UBEEQ_USER_POOL_CLIENT_ID"),
+    passwordAuthenticationEnabled: process.env.UBEEQ_PASSWORD_AUTH_ENABLED === "true",
     credentialSecretPrefix: required("UBEEQ_CREDENTIAL_SECRET_PREFIX"),
   }) as ReferenceAdapterSet,
   ...(process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME ? { regionalControlPlane: createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME, region: required("UBEEQ_ROUTING_DIRECTORY_REGION") }) } : {}),

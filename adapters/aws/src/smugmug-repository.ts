@@ -1,10 +1,11 @@
+import type { AwsCommandClient } from './client-port.js';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { isSmugMugOAuthClaimable, validateSmugMugItemPage, validateInventoryCompletion, validateConnectionCheckpoint, validateInventoryPageWrite, SmugMugError } from '@ubeeq/integrations';
 import type { SmugMugConnection, SmugMugMigration, SmugMugMigrationItem, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugRepository } from '@ubeeq/integrations';
 
 /** DynamoDB persistence for resumable migrations in a caller-supplied uppercase PK/SK table. */
 export class DynamoSmugMugRepository implements SmugMugRepository {
-  constructor(private readonly client: DynamoDBDocumentClient, private readonly tableName: string) {}
+  constructor(private readonly client: AwsCommandClient, private readonly tableName: string) {}
 
   async mergeInventoryPage(expected: SmugMugConnection, collections: SmugMugRemoteCollection[], images: SmugMugRemoteImage[]) {
     validateInventoryPageWrite(expected, collections, images);
@@ -102,7 +103,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
         TableName: this.tableName, KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
         ExpressionAttributeValues: { ':pk': PK, ':sk': prefix }, ExclusiveStartKey, ConsistentRead
       }));
-      values.push(...(response.Items || []).map((item) => item.value as T));
+      values.push(...((response.Items || []) as Record<string, any>[]).map((item) => item.value as T));
       ExclusiveStartKey = response.LastEvaluatedKey;
     } while (ExclusiveStartKey);
     return values;
@@ -129,7 +130,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
     const response = await this.client.send(new QueryCommand({ TableName: this.tableName, Limit: limit, ConsistentRead: true,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': PK, ':sk': 'CONNECTION#' },
       ...(afterId === undefined ? {} : { ExclusiveStartKey: { PK, SK: `CONNECTION#${afterId}` } }) }));
-    const ids = (response.Items || []).map(item => {
+    const ids = ((response.Items || []) as Record<string, any>[]).map(item => {
       const id = item.value?.connectionId;
       if (typeof id !== 'string' || !id || item.SK !== `CONNECTION#${id}`) throw new Error('Invalid connection index record.');
       return id;
@@ -177,7 +178,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
     const response = await this.client.send(new QueryCommand({ TableName: this.tableName, Limit: limit, ConsistentRead: true,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': PK, ':sk': 'MIGRATION#' },
       ...(afterId === undefined ? {} : { ExclusiveStartKey: { PK, SK: `MIGRATION#${afterId}` } }) }));
-    const ids = (response.Items || []).map(item => {
+    const ids = ((response.Items || []) as Record<string, any>[]).map(item => {
       const id = item.value?.migrationId;
       if (typeof id !== 'string' || !id || item.SK !== `MIGRATION#${id}`) throw new Error('Invalid migration index record.');
       return id;
@@ -196,7 +197,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
     const response = await this.client.send(new QueryCommand({ TableName: this.tableName,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': PK, ':sk': 'COLLECTION#' },
       Limit: limit, ConsistentRead: true, ...(afterRemoteId === undefined ? {} : { ExclusiveStartKey: { PK, SK: `COLLECTION#${afterRemoteId}` } }) }));
-    const items = (response.Items || []).map(item => item.value as SmugMugRemoteCollection);
+    const items = ((response.Items || []) as Record<string, any>[]).map(item => item.value as SmugMugRemoteCollection);
     const key = response.LastEvaluatedKey;
     if (key && (key.PK !== PK || typeof key.SK !== 'string' || !key.SK.startsWith('COLLECTION#') || !key.SK.slice(11))) throw new Error('Invalid SmugMug collection continuation.');
     return { items, ...(key ? { nextAfterRemoteId: (key.SK as string).slice(11) } : {}) };
@@ -210,7 +211,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
     const response = await this.client.send(new QueryCommand({ TableName: this.tableName,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': PK, ':sk': 'IMAGE#' },
       Limit: limit, ConsistentRead: true, ...(afterRemoteId === undefined ? {} : { ExclusiveStartKey: { PK, SK: `IMAGE#${afterRemoteId}` } }) }));
-    const items = (response.Items || []).map(item => item.value as SmugMugRemoteImage);
+    const items = ((response.Items || []) as Record<string, any>[]).map(item => item.value as SmugMugRemoteImage);
     const key = response.LastEvaluatedKey;
     if (key && (key.PK !== PK || typeof key.SK !== 'string' || !key.SK.startsWith('IMAGE#') || !key.SK.slice(6))) throw new Error('Invalid SmugMug image continuation.');
     return { items, ...(key ? { nextAfterRemoteId: (key.SK as string).slice(6) } : {}) };
@@ -228,7 +229,7 @@ export class DynamoSmugMugRepository implements SmugMugRepository {
     const response = await this.client.send(new QueryCommand({ TableName: this.tableName,
       KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': PK, ':sk': 'ITEM#' },
       Limit: limit, ConsistentRead: true, ...(afterRemoteId === undefined ? {} : { ExclusiveStartKey: { PK, SK: `ITEM#${afterRemoteId}` } }) }));
-    const items = (response.Items || []).map(item => item.value as SmugMugMigrationItem);
+    const items = ((response.Items || []) as Record<string, any>[]).map(item => item.value as SmugMugMigrationItem);
     const key = response.LastEvaluatedKey;
     if (key && (key.PK !== PK || typeof key.SK !== 'string' || !key.SK.startsWith('ITEM#') || !key.SK.slice(5))) throw new Error('Invalid SmugMug item continuation.');
     return { items, ...(key ? { nextAfterRemoteId: (key.SK as string).slice(5) } : {}) };

@@ -1,1 +1,1 @@
-export {createCommerceRuntime as createReferenceCommerce,referenceCommerceConfigurationFromEnvironment,type CommerceRuntimeConfiguration as ReferenceCommerceConfiguration,type CommerceRuntimeDependencies as ReferenceCommerceDependencies,type CommerceRuntimeStore} from '@ubeeq/commerce-runtime';
+export * from '@ubeeq/runtime/commerce';

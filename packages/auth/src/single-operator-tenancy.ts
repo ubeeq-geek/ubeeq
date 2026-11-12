@@ -24,17 +24,14 @@ export class SingleOperatorTenancyAdapter implements TenancyAndAccessPort {
   }
 
   async getOperatorUserId(): Promise<string | null> {
+    if (this.options.operatorUserId) return this.options.operatorUserId;
+    if (this.options.getOperatorUserId) return await this.options.getOperatorUserId();
     if (this.localOperatorUserId) return this.localOperatorUserId;
-    if (this.options.getOperatorUserId) {
-      const resolved = await this.options.getOperatorUserId();
-      if (resolved) this.localOperatorUserId = resolved;
-      return resolved;
-    }
     return null;
   }
 
   async setOperatorUserId(userId: string): Promise<void> {
-    this.localOperatorUserId = userId;
+    if (!this.options.getOperatorUserId) this.localOperatorUserId = userId;
     if (this.options.setOperatorUserId) {
       await this.options.setOperatorUserId(userId);
     }

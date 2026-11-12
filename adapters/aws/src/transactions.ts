@@ -1,10 +1,11 @@
+import type { AwsCommandClient } from './client-port.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, type TransactWriteCommandInput, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { PersistenceTransaction } from '@ubeeq/persistence';
 import { OptimisticConcurrencyError } from '@ubeeq/persistence';
 
-type Dynamo = Pick<DynamoDBDocumentClient, 'send'> & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
+type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
 type State = { id: string; active: boolean; failed: boolean; writes: NonNullable<TransactWriteCommandInput['TransactItems']>; overlay: Map<string, Record<string, any> | undefined> };
 const keyOf = (table: string | undefined, key: Record<string, any>) => JSON.stringify([table, key.pk, key.sk]);

@@ -29,7 +29,7 @@ const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
 const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
-type SqliteDatabase = { exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
+type SqliteDatabase = { close(): void; exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
 
 export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
@@ -38,6 +38,8 @@ export class LocalSqliteDatabase {
   private readonly transactionContext = new AsyncLocalStorage<{ id: string; active: boolean; rollbackOnly: boolean }>();
   private owner?: { id: string; active: boolean; rollbackOnly: boolean };
   private transactionTail: Promise<void> = Promise.resolve();
+
+  close(): void { this.database.close(); }
 
   constructor(readonly configuration: LocalAdapterConfiguration) {
     mkdirSync(resolve(configuration.dataDirectory), { recursive: true });
@@ -237,11 +239,12 @@ export const createLocalPublicationCommandRepositories = (local: LocalSqliteData
 /** Durable local composition. It is intentionally a generic JSON-record adapter, not an in-memory default. */
 export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqRepositories => ({
   transaction: local.transaction.bind(local),
+  hostRecords: cellRepository(local, "hostRecords"),
   creators: cellRepository(local, "creators"), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
   publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
   moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
   usageEvents: cellRepository(local, "usageEvents"), creditLots: cellRepository(local, "creditLots"), creditReservations: cellRepository(local, "creditReservations"), balances: cellRepository(local, "balances"),
-  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
+  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), instanceOperators: repository(local, "instanceOperators"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
 });
 
 export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
