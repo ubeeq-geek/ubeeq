@@ -62,7 +62,7 @@ export function validateContentPreparationArchive(value: unknown, scope: {
         if (!draft || draft.creatorId !== scope.creatorId || draft.tenantId !== scope.tenantId || draft.schemaVersion !== 1 || typeof draft.id !== 'string' || !Number.isSafeInteger(draft.revision) || draft.revision < 1 || !Array.isArray(draft.units) || !Array.isArray(draft.previews) || draft.review || draft.state !== 'draft')
             throw Error('Invalid portable preparation.');
         validateContentObjects(draft.objects);
-        validateContentPreparation(draft.settings);
+        validateContentPreparation(draft.settings,{allowIncompleteMedia:true});
         for (const ref of [...draft.units, ...(draft.entry.target ? [draft.entry.target] : []), ...(draft.hierarchy?.children ?? []), ...draft.objects.flatMap(o => o.existingCollection ? [o.existingCollection] : [])])
             if (references && !(ref.kind === 'work' ? references.workIds : references.collectionIds).has(ref.id))
                 throw Error('Preparation references missing content.');

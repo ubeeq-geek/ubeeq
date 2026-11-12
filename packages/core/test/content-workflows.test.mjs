@@ -88,3 +88,9 @@ test('initial and follow-up managed selections become explicit fresh-media requi
  const preset=captureContentPreset({id:'media',creatorId:'creator',name:'Media',revision:1,applicability:{arrangement:'work',media:'image'},settings,isDefault:false});
  assert.equal(JSON.stringify(preset).includes('private-source'),false);assert.equal(preset.settings.announce.followUp.mediaRequirement,'select_managed_previews');
 });
+test('an empty managed-media choice is a durable incomplete draft, never a ready release or preset',()=>{
+ const settings=defaultContentPreparation();settings.announce.media={mode:'managed_previews',assets:[]};
+ const draft={title:'One',entry:{intent:'work'},objects:[object('one')],settings,arrangement:'work',arrangementConfirmed:true};
+ assert.equal(contentWorkflowBlockers(draft)[0].code,'announcement_media_required');
+ assert.throws(()=>captureContentPreset({id:'empty',creatorId:'creator',name:'Empty',revision:1,applicability:{arrangement:'work',media:'image'},settings,isDefault:false}));
+});

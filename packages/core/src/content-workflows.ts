@@ -325,7 +325,7 @@ export function validateContentObjects(objects: readonly ContentIntakeObject[]):
             parseStoredPostBlocks(o.body);
     }
 }
-export function validateContentPreparation(settings: ContentPreparationSettings): void {
+export function validateContentPreparation(settings: ContentPreparationSettings, options: {allowIncompleteMedia?:boolean} = {}): void {
     if (!settings || !['private', 'free', 'premium', 'members'].includes(settings.access) || typeof settings.discovery !== 'boolean' ||
         !['none', 'uploaded', 'generated'].includes(settings.preview) || typeof settings.previewWatermark !== 'boolean' ||
         !Number.isSafeInteger(settings.previewMaxWidth) || settings.previewMaxWidth < 64 || settings.previewMaxWidth > 10000 ||
@@ -396,7 +396,8 @@ export function validateContentPreparation(settings: ContentPreparationSettings)
     // Binding ownership is validated with real host bindings at release preparation;
     // neutral draft validation cannot invent the destination keys of those bindings.
     const withoutBindings = (template: AnnouncementTemplate | undefined) => template ? { ...template, destinationOverrides: undefined, destinationCustomizations: undefined } : undefined;
-    const validation = { ...a, template: withoutBindings(a.template), followUp: a.followUp ? { ...a.followUp, template: withoutBindings(a.followUp.template) } : undefined };
+    const draftMedia=(media:AnnouncementMediaSelection|undefined)=>options.allowIncompleteMedia&&media?.mode==='managed_previews'&&Array.isArray(media.assets)&&!media.assets.length?{mode:'none' as const}:media;
+    const validation = { ...a, media:draftMedia(a.media), template: withoutBindings(a.template), followUp: a.followUp ? { ...a.followUp, media:draftMedia(a.followUp.media)!, template: withoutBindings(a.followUp.template) } : undefined };
     try {
         contentAnnouncementTrigger(validation, ids.map(id => ({ binding: { provider: 'validation', accountId: id, connectionId: id, targetId: id, postType: 'announcement' }, settings: { destinationId: id } })), 'native');
     }
@@ -540,7 +541,7 @@ export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
     objectId?: string;
 }> {
     validateContentObjects(draft.objects);
-    validateContentPreparation(draft.settings);
+    validateContentPreparation(draft.settings,{allowIncompleteMedia:true});
     const blockers: Array<{
         code: string;
         message: string;
@@ -569,5 +570,7 @@ export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
         blockers.push({ code: 'announcement_media_required', message: 'Select fresh public announcement previews for this setup.' });
     if (draft.settings.announce.mode !== 'off' && draft.settings.announce.followUp?.mediaRequirement === 'select_managed_previews' && draft.settings.announce.followUp.media.mode !== 'managed_previews')
         blockers.push({ code: 'announcement_media_required', message: 'Select fresh public previews for the follow-up announcement.' });
+    if(draft.settings.announce.mode!=='off'&&draft.settings.announce.media?.mode==='managed_previews'&&!draft.settings.announce.media.assets.length)blockers.push({code:'announcement_media_required',message:'Select announcement previews, or choose no media.'});
+    if(draft.settings.announce.mode!=='off'&&draft.settings.announce.followUp?.media.mode==='managed_previews'&&!draft.settings.announce.followUp.media.assets.length)blockers.push({code:'announcement_media_required',message:'Select follow-up previews, or choose no media.'});
     return blockers;
 }
