@@ -64,3 +64,27 @@ test('neutral draft validation retains real destination customizations while rel
  const preset=captureContentPreset({id:'custom',creatorId:'creator',name:'Custom',revision:1,applicability:{arrangement:'work',media:'image'},settings:{...defaultContentPreparation(),announce},isDefault:false});assert.deepEqual(preset.settings.announce.template.fields,{seriesName:'Recurring series',eventLabel:'UPDATE'});
  assert.throws(()=>contentAnnouncementTrigger(announce,[{binding:{...binding,targetId:'different'},settings:{destinationId:'selected'}}],'native'),/selected announcement destination/);
 });
+test('Volume defaults are selected independently from flat grouping defaults and never contain child content identities',()=>{
+ const settings={...defaultContentPreparation(),structure:{collectionType:'volume',order:'intake',cover:'first_eligible_image'}};
+ const volume=captureContentPreset({id:'volume',creatorId:'creator',name:'Volumes',revision:1,applicability:{arrangement:'collection',collectionType:'volume',media:'mixed',childIds:['private-child']},settings,isDefault:true});
+ assert.equal(JSON.stringify(volume).includes('private-child'),false);
+ assert.equal(resolveContentPreset([volume],'creator','collection','mixed',undefined,undefined,'gallery'),undefined);
+ assert.equal(resolveContentPreset([volume],'creator','collection','mixed',undefined,undefined,'volume').id,'volume');
+ const existing={...object('grouping'),media:'mixed',state:'reference',provenance:'existing',existingCollection:{kind:'collection',id:'child',revision:3}};
+ assert.equal(inferContentArrangement({intent:'new'},[existing]).arrangement,'collection');
+ assert.equal(contentWorkflowBlockers({title:'Group',entry:{intent:'new'},objects:[existing],settings:defaultContentPreparation(),arrangement:'work',arrangementConfirmed:true})[0].code,'hierarchy_required');
+});
+test('reusable metadata, exact image choices and commerce terms omit execution and offer bindings',()=>{
+ const settings={...defaultContentPreparation(),metadata:{titlePattern:'{creator}: {title}',shared:{tags:['series'],noAi:true},overrides:[{destination:'deviantart',accountId:'creator-account',targetIds:['gallery'],values:{allowComments:false}}]},commerce:{kind:'purchase',amount:'15.00',currency:'CAD',terms:'Personal licence, including future reviewed additions.',supportEmail:'help@example.test',downloads:true,packageDownload:true,futureAdditions:'included',customerId:'private-customer'},commerceOffer:{id:'private-offer',environment:'live'},publishDestinations:[{destination:'deviantart',connectionId:'creator-account',targetId:'gallery',representation:'full',imageVariant:'share',required:true}]};
+ const preset=captureContentPreset({id:'terms',creatorId:'creator',name:'Paid',revision:1,applicability:{arrangement:'work',media:'image'},settings,isDefault:false});
+ assert.equal(preset.settings.commerce.amount,'15.00');assert.equal(preset.settings.publishDestinations[0].imageVariant,'share');assert.equal(preset.settings.metadata.overrides[0].targetIds[0],'gallery');
+ assert.equal(JSON.stringify(preset).includes('private-offer'),false);assert.equal(JSON.stringify(preset).includes('private-customer'),false);
+ assert.throws(()=>captureContentPreset({...preset,settings:{...settings,metadata:{shared:{secret:'credential'},overrides:[]}}}));
+ assert.throws(()=>captureContentPreset({...preset,settings:{...settings,metadata:{...settings.metadata,titlePattern:'{privateKey}'}}}));
+});
+test('initial and follow-up managed selections become explicit fresh-media requirements in reusable presets',()=>{
+ const settings=defaultContentPreparation(),media={mode:'managed_previews',assets:[{assetId:'private-source',altText:'Preview'}]};
+ settings.announce={...settings.announce,destinationIds:['channel'],media,followUp:{destinationIds:['channel'],media,timing:{mode:'delay_after_parent',durationMs:600000,timeZone:'Etc/UTC',anchor:{mode:'corresponding_destination'}},latePolicy:{mode:'hold',maximumLatenessMs:86400000}}};
+ const preset=captureContentPreset({id:'media',creatorId:'creator',name:'Media',revision:1,applicability:{arrangement:'work',media:'image'},settings,isDefault:false});
+ assert.equal(JSON.stringify(preset).includes('private-source'),false);assert.equal(preset.settings.announce.followUp.mediaRequirement,'select_managed_previews');
+});

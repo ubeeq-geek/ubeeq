@@ -1,3 +1,4 @@
+import type { PublicationImageVariant } from './publication-image.js';
 import type { WorkKind, WorkAssetRole, CollectionType } from './index.js';
 import type { AnnouncementTiming, AnnouncementFollowUpTiming, AnnouncementLatePolicy } from './announcement-plan-scheduler.js';
 import type { AnnouncementMediaSelection, AnnouncementDestinationSelection, CollectionAnnouncementTriggerPreferences } from './collection-announcement-preferences.js';
@@ -28,6 +29,7 @@ export interface ContentIntakeObject {
     state: 'pending' | 'processing' | 'ready' | 'failed' | 'reference';
     sourceFileId?: string;
     existingWork?: ContentUnitRef;
+    existingCollection?: ContentUnitRef;
     result?: ContentUnitRef;
     checksum?: string;
     targets: string[];
@@ -125,9 +127,42 @@ export function standaloneImageWorkIds(works: readonly {
     const named = new Set(memberships.map(m => m.workId));
     return works.filter(w => w.kind === 'image' && !named.has(w.workId)).map(w => w.workId);
 }
+export interface ContentCommerceDefaults {
+    kind: 'purchase' | 'subscription';
+    amount: string;
+    currency: 'USD' | 'CAD' | 'EUR' | 'GBP' | 'AUD' | 'JPY';
+    terms: string;
+    supportEmail: string;
+    downloads: boolean;
+    packageDownload: boolean;
+    /** Installed purchase/subscription services include subsequently reviewed additions. */
+    futureAdditions: 'included';
+    billing?: 'month' | 'year';
+    planName?: string;
+}
+export type ContentMetadataField = 'tags' | 'isMature' | 'matureLevel' | 'matureClassification' | 'isAiGenerated' | 'noAi' | 'displayResolution' | 'allowFreeDownload' | 'addWatermark' | 'allowComments';
+export type ContentMetadataValues = Partial<Record<ContentMetadataField, string | string[] | boolean | number | null>>;
+export interface ContentMetadataDefaults {
+    titlePattern?: string;
+    descriptionPattern?: string;
+    shared: ContentMetadataValues;
+    overrides: Array<{
+        destination: string;
+        accountId?: string;
+        targetIds?: string[];
+        values: ContentMetadataValues;
+    }>;
+}
 export interface ContentPreparationSettings {
+    metadata?: ContentMetadataDefaults;
+    commerce?: ContentCommerceDefaults;
+    /** Current host offering version binding; never captured in a reusable preset. */
+    commerceOffer?: {
+        id: string;
+        environment: 'sandbox' | 'live';
+    };
     structure?: {
-        collectionType: 'collection' | 'gallery' | 'series' | 'playlist';
+        collectionType: 'collection' | 'gallery' | 'series' | 'playlist' | 'volume';
         order: 'intake';
         cover: 'first_eligible_image' | 'none';
     };
@@ -151,6 +186,7 @@ export interface ContentPreparationSettings {
         connectionId?: string;
         targetId?: string;
         representation: 'full' | 'preview' | 'link';
+        imageVariant?: PublicationImageVariant;
         required: boolean;
     }>;
     announce: {
@@ -168,6 +204,7 @@ export interface ContentPreparationSettings {
             template?: AnnouncementTemplate;
             destinationIds: string[];
             media: AnnouncementMediaSelection;
+            mediaRequirement?: 'select_managed_previews';
             timing: AnnouncementFollowUpTiming;
             latePolicy: AnnouncementLatePolicy;
         };
@@ -181,6 +218,7 @@ export interface ContentUnitPreset {
     revision: number;
     applicability: {
         arrangement: ContentArrangement;
+        collectionType?: CollectionType;
         media: WorkKind | 'any';
         previewOrigin?: ContentIntakeObject['provenance'];
     };
@@ -226,6 +264,11 @@ export interface ContentWorkflowDraft {
         name: string;
     };
     changes?: ContentChangeSet;
+    /** Referenced child groupings. These links grant no access or publication authority. */
+    hierarchy?: {
+        children: ContentUnitRef[];
+        state: 'draft' | 'applied';
+    };
     releaseScope?: {
         workIds: string[];
         componentIds?: string[];
@@ -251,6 +294,8 @@ export function inferContentArrangement(entry: ContentEntryContext, objects: rea
     primaryCount: number;
 } {
     const primaryCount = objects.filter(o => o.role === 'original').length;
+    if (!entry.target && objects.some(o => o.role === 'original' && o.existingCollection))
+        return { arrangement: 'collection', needsChoice: entry.intent === 'work' || primaryCount > 1, primaryCount };
     if (entry.target)
         return { arrangement: entry.target.kind, needsChoice: false, primaryCount };
     if (entry.intent === 'work' || entry.intent === 'collection')
@@ -264,6 +309,8 @@ export function validateContentObjects(objects: readonly ContentIntakeObject[]):
     if (ids.size !== objects.length)
         invalid('Intake object identities must be distinct.');
     for (const o of objects) {
+        if (o.existingCollection && (o.existingCollection.kind !== 'collection' || o.provenance !== 'existing' || !['original', 'excluded'].includes(o.role)))
+            invalid('A referenced Collection must remain a child grouping or be excluded.');
         if (!o.id || o.id.length > 200 || !o.operationId || o.operationId.length > 200 || typeof o.filename !== 'string' || o.filename.length > 255 ||
             !['image', 'gallery', 'video', 'audio', 'literature', 'article', 'animation', 'mixed'].includes(o.media) ||
             !['original', 'preview', 'cover', 'attachment', 'excluded'].includes(o.role) ||
@@ -286,11 +333,50 @@ export function validateContentPreparation(settings: ContentPreparationSettings)
         invalid('Invalid content preparation settings.');
     for (const d of settings.publishDestinations)
         if (!d || typeof d.destination !== 'string' || !d.destination || d.destination.length > 100 ||
-            !['full', 'preview', 'link'].includes(d.representation) || typeof d.required !== 'boolean' ||
+            !['full', 'preview', 'link'].includes(d.representation) || d.imageVariant !== undefined && !['original', 'thumbnail', 'reduced', 'share', 'share-alternate', 'watermarked-original'].includes(d.imageVariant) || typeof d.required !== 'boolean' ||
             [d.connectionId, d.targetId].some(id => id !== undefined && (typeof id !== 'string' || !id || id.length > 200)))
             invalid('Invalid publication destination.');
-    if (settings.structure && (!['collection', 'gallery', 'series', 'playlist'].includes(settings.structure.collectionType) || settings.structure.order !== 'intake' || !['first_eligible_image', 'none'].includes(settings.structure.cover)))
+    if (settings.structure && (!['collection', 'gallery', 'series', 'playlist', 'volume'].includes(settings.structure.collectionType) || settings.structure.order !== 'intake' || !['first_eligible_image', 'none'].includes(settings.structure.cover)))
         invalid('Choose supported content structure defaults.');
+    const c = settings.commerce;
+    if (c && (!['purchase', 'subscription'].includes(c.kind) || typeof c.amount !== 'string' || !/^\d{1,10}(?:\.\d{1,2})?$/.test(c.amount) || Number(c.amount) <= 0 || !['USD', 'CAD', 'EUR', 'GBP', 'AUD', 'JPY'].includes(c.currency) || c.currency === 'JPY' && c.amount.includes('.') || typeof c.terms !== 'string' || c.terms.length > 10000 || typeof c.supportEmail !== 'string' || c.supportEmail.length > 254 || typeof c.downloads !== 'boolean' || typeof c.packageDownload !== 'boolean' || c.futureAdditions !== 'included' || c.kind === 'subscription' && !['month', 'year'].includes(c.billing ?? '') || c.planName !== undefined && (typeof c.planName !== 'string' || c.planName.length > 127)))
+        invalid('Choose supported reusable purchase terms.');
+    if (settings.commerceOffer && (!settings.commerceOffer.id || typeof settings.commerceOffer.id !== 'string' || settings.commerceOffer.id.length > 200 || !['sandbox', 'live'].includes(settings.commerceOffer.environment)))
+        invalid('Choose a current offering version.');
+    const m = settings.metadata;
+    if (m) {
+        const fields = ['tags', 'isMature', 'matureLevel', 'matureClassification', 'isAiGenerated', 'noAi', 'displayResolution', 'allowFreeDownload', 'addWatermark', 'allowComments'];
+        const values = (v: ContentMetadataValues) => { if (!v || typeof v !== 'object' || Array.isArray(v))
+            invalid('Choose metadata defaults.'); for (const [key, value] of Object.entries(v)) {
+            if (!fields.includes(key))
+                invalid('Choose reusable metadata fields.');
+            if (['tags', 'matureClassification'].includes(key)) {
+                if (!Array.isArray(value) || value.length > 100 || value.some(item => typeof item !== 'string' || item.length > 100))
+                    invalid('Choose bounded metadata lists.');
+            }
+            else if (key === 'matureLevel') {
+                if (!['moderate', 'strict'].includes(String(value)))
+                    invalid('Choose a maturity level.');
+            }
+            else if (key === 'displayResolution') {
+                if (value !== null && ![400, 600, 800, 900, 1024, 1280, 1600, 1920].includes(value as number))
+                    invalid('Choose a supported display width.');
+            }
+            else if (typeof value !== 'boolean')
+                invalid('Choose enabled or disabled metadata defaults.');
+        } };
+        for (const pattern of [m.titlePattern, m.descriptionPattern])
+            if (pattern !== undefined && (typeof pattern !== 'string' || pattern.length > 10000 || /\{(?!title\}|description\}|creator\})[^}]*\}/.test(pattern)))
+                invalid('Use title, description or creator variables in metadata patterns.');
+        if (!Array.isArray(m.overrides) || m.overrides.length > 100)
+            invalid('Choose bounded destination defaults.');
+        values(m.shared);
+        for (const row of m.overrides) {
+            if (!row || typeof row.destination !== 'string' || row.destination.length > 100 || row.accountId !== undefined && (typeof row.accountId !== 'string' || row.accountId.length > 200) || row.targetIds !== undefined && (!Array.isArray(row.targetIds) || row.targetIds.length > 100 || row.targetIds.some(id => typeof id !== 'string' || !id || id.length > 200)))
+                invalid('Choose creator-bound metadata destinations.');
+            values(row.values);
+        }
+    }
     const a = settings.announce;
     if (!a || !['off', 'draft', 'after_publication'].includes(a.mode) || !Array.isArray(a.destinationIds) || a.destinationIds.length > 20 ||
         a.destinationIds.some(id => typeof id !== 'string' || !id || id.length > 200) || new Set(a.destinationIds).size !== a.destinationIds.length ||
@@ -300,13 +386,17 @@ export function validateContentPreparation(settings: ContentPreparationSettings)
     if (a.template)
         validateAnnouncementTemplate(a.template);
     // The ordinary workflow and advanced editor share the established scheduler/media contract.
-    if(a.followUp&&(!Array.isArray(a.followUp.destinationIds)||a.followUp.destinationIds.some(id=>typeof id!=='string'||!id||id.length>200)))invalid('Choose valid follow-up destination references.');
-    if(a.followUp?.template)validateAnnouncementTemplate(a.followUp.template);
+    if (a.followUp && (!Array.isArray(a.followUp.destinationIds) || a.followUp.destinationIds.some(id => typeof id !== 'string' || !id || id.length > 200)))
+        invalid('Choose valid follow-up destination references.');
+    if (a.followUp?.template)
+        validateAnnouncementTemplate(a.followUp.template);
+    if (a.followUp?.mediaRequirement !== undefined && a.followUp.mediaRequirement !== 'select_managed_previews')
+        invalid('Choose a supported follow-up media requirement.');
     const ids = [...new Set([...a.destinationIds, ...(a.followUp?.destinationIds ?? [])])];
     // Binding ownership is validated with real host bindings at release preparation;
     // neutral draft validation cannot invent the destination keys of those bindings.
-    const withoutBindings=(template:AnnouncementTemplate|undefined)=>template?{...template,destinationOverrides:undefined,destinationCustomizations:undefined}:undefined;
-    const validation={...a,template:withoutBindings(a.template),followUp:a.followUp?{...a.followUp,template:withoutBindings(a.followUp.template)}:undefined};
+    const withoutBindings = (template: AnnouncementTemplate | undefined) => template ? { ...template, destinationOverrides: undefined, destinationCustomizations: undefined } : undefined;
+    const validation = { ...a, template: withoutBindings(a.template), followUp: a.followUp ? { ...a.followUp, template: withoutBindings(a.followUp.template) } : undefined };
     try {
         contentAnnouncementTrigger(validation, ids.map(id => ({ binding: { provider: 'validation', accountId: id, connectionId: id, targetId: id, postType: 'announcement' }, settings: { destinationId: id } })), 'native');
     }
@@ -343,18 +433,19 @@ export function suggestContentPairs(objects: readonly ContentIntakeObject[]) {
         candidateIds: objects.filter(other => other.id !== o.id && other.role === 'original' && stem(other.filename) === stem(o.filename)).map(other => other.id) }));
 }
 export function contentPresetKey(preset: Pick<ContentUnitPreset, 'applicability'>): string {
-    return JSON.stringify([preset.applicability.arrangement, preset.applicability.media, preset.applicability.previewOrigin ?? null]);
+    return JSON.stringify([preset.applicability.arrangement, preset.applicability.media, preset.applicability.previewOrigin ?? null, preset.applicability.collectionType ?? null]);
 }
-export function resolveContentPreset(presets: readonly ContentUnitPreset[], creatorId: string, arrangement: ContentArrangement, media: WorkKind | 'any', explicitId?: string, previewOrigin?: ContentIntakeObject['provenance']): ContentUnitPreset | undefined {
+export function resolveContentPreset(presets: readonly ContentUnitPreset[], creatorId: string, arrangement: ContentArrangement, media: WorkKind | 'any', explicitId?: string, previewOrigin?: ContentIntakeObject['provenance'], collectionType?: CollectionType): ContentUnitPreset | undefined {
     const candidates = presets.filter(p => p.creatorId === creatorId && !p.archived && p.applicability.arrangement === arrangement &&
-        (p.applicability.media === media || p.applicability.media === 'any') && (!p.applicability.previewOrigin || p.applicability.previewOrigin === previewOrigin));
+        (!p.applicability.collectionType || p.applicability.collectionType === collectionType) && (p.applicability.media === media || p.applicability.media === 'any') && (!p.applicability.previewOrigin || p.applicability.previewOrigin === previewOrigin));
     if (explicitId) {
         const chosen = candidates.find(p => p.id === explicitId);
         if (!chosen)
             throw new ContentWorkflowError('preset_incompatible', 'Choose a preset matching this Creator, arrangement, media, and preview source.');
         return structuredClone(chosen);
     }
-    const defaults = candidates.filter(p => p.isDefault), exact = defaults.filter(p => p.applicability.media === media && p.applicability.previewOrigin === previewOrigin);
+    const matchingDefaults = candidates.filter(p => p.isDefault), typedDefaults = collectionType ? matchingDefaults.filter(p => p.applicability.collectionType === collectionType) : [];
+    const defaults = typedDefaults.length ? typedDefaults : matchingDefaults, exact = defaults.filter(p => p.applicability.media === media && p.applicability.previewOrigin === previewOrigin);
     const ranked = exact.length ? exact : defaults.filter(p => p.applicability.media === media).length ? defaults.filter(p => p.applicability.media === media) : defaults;
     if (ranked.length > 1)
         throw new ContentWorkflowError('preset_incompatible', 'Several matching defaults are available. Choose a preset.');
@@ -363,8 +454,12 @@ export function resolveContentPreset(presets: readonly ContentUnitPreset[], crea
 /** Resolve current destination bindings in the host; reusable preferences carry no delivery authority. */
 export function contentAnnouncementTrigger(value: ContentPreparationSettings['announce'], destinations: readonly AnnouncementDestinationSelection[], nativeKey: string): CollectionAnnouncementTriggerPreferences {
     const preferences = defaultCollectionAnnouncementPreferences('Etc/UTC'), trigger = preferences.initial;
-    const bind = (ids: readonly string[]) => ids.map(id => { const destination = destinations.find(d => d.settings.destinationId === id); if (!destination)
-        invalid('Rebind the unavailable announcement destination.'); return structuredClone(destination!); });
+    const bind = (ids: readonly string[]) => ids.map(id => {
+        const destination = destinations.find(d => d.settings.destinationId === id);
+        if (!destination)
+            invalid('Rebind the unavailable announcement destination.');
+        return structuredClone(destination!);
+    });
     trigger.behaviour = value.mode === 'off' || !value.destinationIds.length ? 'off' : value.mode === 'draft' ? 'draft' : 'automatic';
     trigger.template = value.template ?? trigger.template;
     trigger.destinations = bind(value.destinationIds);
@@ -392,12 +487,10 @@ function reusableContentAnnouncement(value: ContentPreparationSettings['announce
     const policy = (p: AnnouncementLatePolicy | undefined) => p ? { mode: p.mode, maximumLatenessMs: p.maximumLatenessMs } : undefined;
     const follow = value.followUp;
     const anchor = follow?.timing.anchor;
-    if (follow?.media.mode === 'managed_previews')
-        invalid('Choose a reusable follow-up media strategy before saving this preset.');
     return { mode: value.mode, template: value.template ? reusableContentTemplate(value.template) : undefined, destinationIds: [...value.destinationIds], delayMs: value.delayMs, followUpDelayMs: value.followUpDelayMs,
         timing: relative(value.timing), media: publicMedia(value.media), mediaRequirement: value.media?.mode === 'managed_previews' ? 'select_managed_previews' : value.mediaRequirement,
         links: value.links ? { primary: value.links.primary ? { destinationKey: value.links.primary.destinationKey, label: value.links.primary.label } : undefined, secondary: value.links.secondary.map(l => ({ destinationKey: l.destinationKey, label: l.label })) } : undefined, latePolicy: policy(value.latePolicy),
-        followUp: follow ? { template: follow.template ? reusableContentTemplate(follow.template) : undefined, destinationIds: [...follow.destinationIds], media: publicMedia(follow.media)!, latePolicy: policy(follow.latePolicy)!, timing: { mode: 'delay_after_parent', durationMs: follow.timing.mode === 'at_time' ? value.followUpDelayMs ?? 86400000 : follow.timing.durationMs, timeZone: follow.timing.mode === 'at_time' ? follow.timing.civilTime.timeZone : follow.timing.timeZone, anchor: anchor!.mode === 'parent_destination' ? { mode: anchor!.mode, destinationKey: anchor!.destinationKey } : { mode: anchor!.mode } } } : undefined };
+        followUp: follow ? { template: follow.template ? reusableContentTemplate(follow.template) : undefined, destinationIds: [...follow.destinationIds], media: publicMedia(follow.media)!, mediaRequirement: follow.media.mode === 'managed_previews' ? 'select_managed_previews' : follow.mediaRequirement, latePolicy: policy(follow.latePolicy)!, timing: { mode: 'delay_after_parent', durationMs: follow.timing.mode === 'at_time' ? value.followUpDelayMs ?? 86400000 : follow.timing.durationMs, timeZone: follow.timing.mode === 'at_time' ? follow.timing.civilTime.timeZone : follow.timing.timeZone, anchor: anchor!.mode === 'parent_destination' ? { mode: anchor!.mode, destinationKey: anchor!.destinationKey } : { mode: anchor!.mode } } } : undefined };
 }
 /** Presets carry reusable choices only. Content refs and absolute schedules never enter this projection. */
 export function captureContentPreset(input: {
@@ -412,12 +505,14 @@ export function captureContentPreset(input: {
     if (!input.id || !input.creatorId || typeof input.name !== 'string' || !input.name.trim() || input.name.length > 80 || !Number.isSafeInteger(input.revision) || input.revision < 1 ||
         !['work', 'collection', 'separate_works'].includes(input.applicability.arrangement) || !['any', 'image', 'gallery', 'video', 'audio', 'literature', 'article', 'animation', 'mixed'].includes(input.applicability.media) || input.applicability.previewOrigin !== undefined && !['uploaded_original', 'uploaded_prepared', 'existing', 'authored', 'external_reference'].includes(input.applicability.previewOrigin))
         invalid('Choose a valid preset name and applicability.');
+    if (input.applicability.collectionType !== undefined && (!['collection', 'gallery', 'series', 'playlist', 'volume'].includes(input.applicability.collectionType) || input.applicability.arrangement !== 'collection'))
+        invalid('Choose a supported grouping shape for this preset.');
     validateContentPreparation(input.settings);
     const s = input.settings;
     return { id: input.id, creatorId: input.creatorId, name: input.name.trim(), schemaVersion: 1, revision: input.revision,
-        applicability: structuredClone(input.applicability), isDefault: input.isDefault, archived: false,
-        settings: { structure: s.structure ? { collectionType: s.structure.collectionType, order: s.structure.order, cover: s.structure.cover } : undefined, access: s.access, discovery: s.discovery, preview: s.preview, previewWatermark: s.previewWatermark, previewMaxWidth: s.previewMaxWidth,
-            publishDestinations: s.publishDestinations.map(d => ({ destination: d.destination, connectionId: d.connectionId, targetId: d.targetId, representation: d.representation, required: d.required })),
+        applicability: { arrangement: input.applicability.arrangement, media: input.applicability.media, previewOrigin: input.applicability.previewOrigin, collectionType: input.applicability.collectionType }, isDefault: input.isDefault, archived: false,
+        settings: { metadata: s.metadata ? { titlePattern: s.metadata.titlePattern, descriptionPattern: s.metadata.descriptionPattern, shared: structuredClone(s.metadata.shared), overrides: s.metadata.overrides.map(row => ({ destination: row.destination, accountId: row.accountId, targetIds: row.targetIds ? [...row.targetIds] : undefined, values: structuredClone(row.values) })) } : undefined, commerce: s.commerce ? { kind: s.commerce.kind, amount: s.commerce.amount, currency: s.commerce.currency, terms: s.commerce.terms, supportEmail: s.commerce.supportEmail, downloads: s.commerce.downloads, packageDownload: s.commerce.packageDownload, futureAdditions: s.commerce.futureAdditions, billing: s.commerce.billing, planName: s.commerce.planName } : undefined, structure: s.structure ? { collectionType: s.structure.collectionType, order: s.structure.order, cover: s.structure.cover } : undefined, access: s.access, discovery: s.discovery, preview: s.preview, previewWatermark: s.previewWatermark, previewMaxWidth: s.previewMaxWidth,
+            publishDestinations: s.publishDestinations.map(d => ({ destination: d.destination, connectionId: d.connectionId, targetId: d.targetId, representation: d.representation, imageVariant: d.imageVariant, required: d.required })),
             visibility: s.visibility,
             announce: reusableContentAnnouncement(s.announce) } };
 }
@@ -435,8 +530,9 @@ export function reusableContentTemplate(template: AnnouncementTemplate): Announc
         return { id: b.id, type: b.type, text: b.text, level: b.level, caption: b.caption, quote: b.quote, author: b.author, title: b.title, label: b.label, alt: b.alt, question: b.question, items: b.items, answers: b.answers, groupId: b.groupId, linkAppearance: b.linkAppearance, linkGroup };
     };
     const customization = (map: AnnouncementTemplate['platformCustomizations']) => map ? Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { order: value.order ? [...value.order] : undefined, presentation: value.presentation ? { discord: value.presentation.discord, title: value.presentation.title } : undefined, blockOverrides: value.blockOverrides ? Object.fromEntries(Object.entries(value.blockOverrides).map(([id, b]) => [id, b ? block(b) : null])) : undefined }])) : undefined;
-    if([template.fields?.seriesName,template.fields?.eventLabel].some(value=>value&&/https?:\/\//i.test(value)))invalid('Use reusable branding or event labels instead of concrete URLs in preset fields.');
-    return { blocks: template.blocks.map(block), fields:template.fields?{seriesName:template.fields.seriesName,eventLabel:template.fields.eventLabel}:undefined, presentation: template.presentation ? { discord: template.presentation.discord, title: template.presentation.title } : undefined, platformCustomizations: customization(template.platformCustomizations), destinationCustomizations: customization(template.destinationCustomizations), destinationOverrides: template.destinationOverrides ? Object.fromEntries(Object.entries(template.destinationOverrides).map(([key, blocks]) => [key, blocks.map(block)])) : undefined };
+    if ([template.fields?.seriesName, template.fields?.eventLabel].some(value => value && /https?:\/\//i.test(value)))
+        invalid('Use reusable branding or event labels instead of concrete URLs in preset fields.');
+    return { blocks: template.blocks.map(block), fields: template.fields ? { seriesName: template.fields.seriesName, eventLabel: template.fields.eventLabel } : undefined, presentation: template.presentation ? { discord: template.presentation.discord, title: template.presentation.title } : undefined, platformCustomizations: customization(template.platformCustomizations), destinationCustomizations: customization(template.destinationCustomizations), destinationOverrides: template.destinationOverrides ? Object.fromEntries(Object.entries(template.destinationOverrides).map(([key, blocks]) => [key, blocks.map(block)])) : undefined };
 }
 export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
     code: string;
@@ -455,6 +551,8 @@ export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
         blockers.push({ code: 'missing_original', message: 'Upload, write, or select content to prepare.' });
     if (!draft.title.trim() && !draft.entry.target)
         blockers.push({ code: 'missing_title', message: 'Give this content a title.' });
+    if (active.some(o => o.existingCollection) && (draft.arrangement !== 'collection' || draft.settings.structure?.collectionType !== 'volume'))
+        blockers.push({ code: 'hierarchy_required', message: 'Choose a Volume to include existing Collections without flattening their contents.' });
     if (active.some(o => o.role === 'original') && inferContentArrangement(draft.entry, draft.objects).needsChoice && !draft.arrangementConfirmed)
         blockers.push({ code: 'arrangement_required', message: 'Confirm how these originals should be arranged.' });
     for (const o of active) {
@@ -469,5 +567,7 @@ export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
         blockers.push({ code: 'preview_missing', message: 'This setup expects a prepared preview. Upload one and choose its target.' });
     if (draft.settings.announce.mode !== 'off' && draft.settings.announce.mediaRequirement === 'select_managed_previews' && draft.settings.announce.media?.mode !== 'managed_previews')
         blockers.push({ code: 'announcement_media_required', message: 'Select fresh public announcement previews for this setup.' });
+    if (draft.settings.announce.mode !== 'off' && draft.settings.announce.followUp?.mediaRequirement === 'select_managed_previews' && draft.settings.announce.followUp.media.mode !== 'managed_previews')
+        blockers.push({ code: 'announcement_media_required', message: 'Select fresh public previews for the follow-up announcement.' });
     return blockers;
 }
