@@ -364,3 +364,4 @@ export * from "./announcement-plan-scheduler.js";
 export * from "./announcement-plans.js";
 
 export * from './announcement-layout.js';
+export * from './content-workflows.js';
