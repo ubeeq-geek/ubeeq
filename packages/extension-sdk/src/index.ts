@@ -136,6 +136,9 @@ export interface TenancyAndAccessPort {
 }
 
 export interface PublicationAdmissionEvaluationInput {
+  /** Persisted revision and authenticated publisher supplied by the core host. */
+  workRevision?: number;
+  actorUserId?: string;
   workId: string;
   creatorId: string;
   destination: string;

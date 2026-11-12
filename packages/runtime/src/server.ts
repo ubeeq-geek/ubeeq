@@ -809,7 +809,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const body = await parseBody(request);
         const service = new PublicationService(repositories, ownedWork, async (work, assets) => {
           await requireClearAdmission('Publication', [work.id, work.creatorId, ...assets.map(asset => asset.id)]);
-          const decision = await hostPorts.publicationAdmission.evaluatePublication({ workId: work.id, creatorId: work.creatorId,
+          const decision = await hostPorts.publicationAdmission.evaluatePublication({ workId: work.id, workRevision: work.revision, actorUserId: identity.subject.id, creatorId: work.creatorId,
             destination: requireString(body.destination, 'destination'), visibility: 'public', textSignals: { title: work.title },
             mediaSignals: { assets: assets.map(asset => ({ id: asset.id, revision: asset.revision, checksum: asset.checksum, sourceVersionId: asset.objectVersion })) } });
           if (!decision.allowed) throw new HttpError(403, decision.reasonCodes[0] ?? 'publication_denied', decision.userMessage ?? 'Publication requires admission.');
@@ -840,7 +840,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
         const service = new PublicationService(repositories, ownedWork, async (w, assets) => {
           await requireClearAdmission('Publication', [w.id, w.creatorId, ...assets.map(asset => asset.id)]);
-          const decision = await hostPorts.publicationAdmission.evaluatePublication({ workId: w.id, creatorId: w.creatorId,
+          const decision = await hostPorts.publicationAdmission.evaluatePublication({ workId: w.id, workRevision: w.revision, actorUserId: identity.subject.id, creatorId: w.creatorId,
             destination: canonicalDestination, visibility: 'public', textSignals: { title: w.title },
             mediaSignals: { assets: assets.map(asset => ({ id: asset.id, revision: asset.revision, checksum: asset.checksum, sourceVersionId: asset.objectVersion })) } });
           if (!decision.allowed) throw new HttpError(403, decision.reasonCodes[0] ?? 'publication_denied', decision.userMessage ?? 'Publication requires admission.');

@@ -47,7 +47,11 @@ test('operational HTTP and worker paths invoke configured admission, quota, tran
     await request(`/v1/uploads/${upload.uploadId}/content`, token, { base64: bytes.toString('base64') }, 'PUT');
     assert.equal((await request(`/v1/uploads/${upload.uploadId}/complete`, token, { workId: work.id, byteLength: bytes.length, checksum })).status, 202);
     await runtime.runNextJob('worker');
+    const persistedDraft = (await request(`/v1/works/${work.id}`, token)).body.work;
     assert.equal((await request(`/v1/works/${work.id}/publications`, token, { destination: 'native' })).status, 403);
+    const admissionInput = calls.find(call => call[0] === 'admission')[1];
+    assert.equal(admissionInput.workRevision, persistedDraft.revision);
+    assert.equal(admissionInput.actorUserId, creator.subjectId);
     deny = false;
     assert.equal((await request(`/v1/works/${work.id}/publications`, token, { destination: 'native' })).status, 201);
     const visible = await request(`/v1/public/works/${work.id}`);
