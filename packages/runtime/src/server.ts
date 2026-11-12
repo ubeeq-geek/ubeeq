@@ -1,4 +1,5 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
+import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
@@ -19,7 +20,7 @@ import { SingleOperatorTenancyAdapter, AuthorizationDeniedError, requireAuthoriz
 import { SingleOperatorLimitError, FeatureDisabledInSingleOperatorModeError, type TenancyAndAccessPort, type HostExtensionRuntimePorts, createDefaultOpenCorePorts } from "@ubeeq/extension-sdk";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
-import { JobRecoveryError } from "@ubeeq/jobs";
+import { JobRecoveryError, requireRecoverableJob } from "@ubeeq/jobs";
 import { repositoryItems, type Page, type PageRequest } from "@ubeeq/persistence";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
 import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, validateCreatorExport, restorePublicationImageRecord } from "@ubeeq/portability";
@@ -214,6 +215,12 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   );
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
+  const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
+  const processingUsageKey = (asset: AssetRecord) => (asset as AssetRecord & { processingUsageKey?: string }).processingUsageKey ?? `asset-processing:${asset.id}:${asset.objectVersion}`;
+  const deferUsage = async (intent: import('@ubeeq/persistence').HostRecord) => {
+    try { await usageOutbox!.deliver(intent); }
+    catch { await audit({ action: 'usage.settlement_deferred', subjectId: intent.scopeId, payload: { settlementId: intent.id } }); }
+  };
 
   const resolveRequestCreatorId = (request: IncomingMessage, url: URL): string | undefined => {
     const headerId = request.headers["x-creator-id"];
@@ -426,6 +433,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   let lastWebsitePolicyScan=0;
   let commerceTurn=true;
   const runNextJob = async (workerId: string) => {
+    if (usageOutbox) try { await usageOutbox.recoverTerminal(adapters.jobs); await usageOutbox.drain(); } catch { await audit({ action: 'usage.settlement_retry_deferred', subjectId: cellId }); }
     if (commerce && commerceTurn) { commerceTurn=false; const job = await commerce.runNextJob(workerId); if (job) return job; }
     commerceTurn=true;
     // Recover policy changes from authoritative hold records, even if the process crashed after the hold committed.
@@ -461,18 +469,27 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
     const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: 60, workerId });
     if (!lease) return commerce?.runNextJob(workerId);
+    let reservedUsageKey: string | undefined;
     try {
       if (lease.job.cellId !== cellId) throw new Error(`Foreign-cell job ${lease.job.cellId} rejected by ${cellId}`);
       const asset = await repositories.assets.get(lease.job.payload.assetId);
       if (!asset) throw new Error("Processing asset was not found.");
-      const usageKey = `asset-processing:${asset.id}:${asset.objectVersion}`;
-      const reservation = await hostPorts.usageQuota.checkAndReserveQuota({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsDelta: 1, idempotencyKey: usageKey });
+      requireHomeCell({ cellId }, asset);
+      if (asset.instanceId !== (configuration.instanceId ?? 'local-reference')) throw new Error('Foreign-instance asset rejected.');
+      const usageKey = processingUsageKey(asset);
+      const reservationInput = { creatorId: asset.creatorId, operation: 'asset.process', processingCreditsDelta: 1, idempotencyKey: usageKey };
+      if (usageOutbox) await usageOutbox.trackReservation(reservationInput, asset, lease.job);
+      const reservation = await hostPorts.usageQuota.checkAndReserveQuota(reservationInput);
       if (!reservation.allowed) throw new Error(reservation.reasonCode ?? 'Processing quota exceeded.');
+      reservedUsageKey = usageKey;
       if (asset.status === "ready") {
-        await hostPorts.usageQuota.recordUsageSettlement({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey });
+        const input = { creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey };
+        if (usageOutbox) await deferUsage(await repositories.transaction(transaction => usageOutbox.enqueue(input, dataHomeOf(asset), transaction)));
+        else await hostPorts.usageQuota.recordUsageSettlement(input);
         await adapters.jobs.complete({ id: lease.job.id, leaseToken: lease.leaseToken });
         return { job: await adapters.jobs.get(lease.job.id), asset };
       }
+      if (asset.status === 'failed' || asset.status === 'deleted') throw new Error('This asset requires explicit processing recovery.');
       const storage = (asset as AssetRecord & { storage?: { bucket: string; key: string; versionId?: string } }).storage;
       if (!storage) throw new Error("Processing asset has no source object.");
       const processing = await repositories.assets.update(asset.id, asset.revision, { status: "processing" });
@@ -490,14 +507,17 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       rendition.byteLength = transformed.bytes.byteLength;
       rendition.checksum = createHash('sha256').update(transformed.bytes).digest('hex');
       await adapters.storage.put({ object: rendition, body: transformed.bytes });
-      const processed = await repositories.transaction(async (transaction) => {
+      const completed = await repositories.transaction(async (transaction) => {
         const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready", storage: rendition, originalStorage: storage } as Partial<AssetRecord>, { transaction });
         await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions, outputLineage: processingResult.renditions.map((rendition) => ({ outputId: rendition.id, sourceVersionId: rendition.sourceVersionId, role: rendition.role })) } }, { transaction });
         await repositories.usageEvents.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), accountId: processing.creatorId, meter: "processing_units", quantity: 1, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` }, { transaction, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` });
         await repositories.auditEvents.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), action: "asset.processing_completed", subjectId: processing.id, payload: { jobId: lease.job.id, sourceVersionId: processing.objectVersion } }, { transaction });
-        return ready;
+        const intent = usageOutbox ? await usageOutbox.enqueue({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey }, dataHomeOf(asset), transaction) : undefined;
+        return { ready, intent };
       });
-      await hostPorts.usageQuota.recordUsageSettlement({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey });
+      const processed = completed.ready;
+      if (completed.intent) await deferUsage(completed.intent);
+      else await hostPorts.usageQuota.recordUsageSettlement({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey });
       // Prepare reusable, metadata-clean website bytes before Preview is requested.
       // A failed optional prewarm is retried by the normal snapshot resolver.
       if(websiteStore&&processed.mimeType.startsWith('image/'))try{await websiteRendition(processed,source.body);}catch{await audit({action:'website.rendition_deferred',subjectId:processed.id});}
@@ -506,7 +526,18 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     } catch (error) {
       const details = { code: "processing_failed", message: error instanceof Error ? error.message : "Unknown processing failure" };
       await audit({ action: "asset.processing_failed", subjectId: lease.job.payload.assetId, payload: { jobId: lease.job.id, attempt: lease.job.attempt + 1, error: details } });
-      if (lease.job.attempt >= lease.job.maxAttempts) await adapters.jobs.deadLetter({ id: lease.job.id, leaseToken: lease.leaseToken, error: details });
+      if (lease.job.attempt >= lease.job.maxAttempts) {
+        if (usageOutbox && lease.job.cellId === cellId) {
+          const intent = await repositories.transaction(async transaction => {
+            const asset = await repositories.assets.get(lease.job.payload.assetId, { transaction });
+            if (!asset || asset.homeCellId !== cellId || asset.instanceId !== (configuration.instanceId ?? 'local-reference') || asset.status === 'ready') return;
+            if (asset.status !== 'failed' && asset.status !== 'deleted') await repositories.assets.update(asset.id, asset.revision, { status: 'failed' }, { transaction });
+            if (reservedUsageKey && reservedUsageKey === processingUsageKey(asset)) return usageOutbox.enqueue({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 0, idempotencyKey: reservedUsageKey }, dataHomeOf(asset), transaction);
+          });
+          if (intent) await deferUsage(intent);
+        }
+        await adapters.jobs.deadLetter({ id: lease.job.id, leaseToken: lease.leaseToken, error: details });
+      }
       else await adapters.jobs.retry({ id: lease.job.id, leaseToken: lease.leaseToken, error: details, retryAt: new Date(Date.now() + 1_000).toISOString() });
       throw error;
     }
@@ -794,7 +825,17 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && url.pathname === "/v1/operations/jobs/run-next") { await session(request); const body = await parseBody(request); const result = await runNextJob(typeof body.workerId === "string" && body.workerId.trim() ? body.workerId.trim() : "local-reference-worker"); return json(response, 200, { result: result ?? null, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/operations/jobs") { await session(request); const states = url.searchParams.getAll("state").filter((state): state is import("@ubeeq/jobs").JobState => ["queued", "leased", "completed", "retry_scheduled", "dead_lettered", "cancelled"].includes(state)); return json(response, 200, { jobs: await adapters.jobs.list({ cellId, states, limit: Number(url.searchParams.get("limit") ?? 50) }), requestId }, requestId); }
       const recoverJobMatch = url.pathname.match(/^\/v1\/operations\/jobs\/([^/]+)\/recover$/);
-      if (method === "POST" && recoverJobMatch) { const identity = await session(request); const existingJob = await adapters.jobs.get(recoverJobMatch[1]); if (!existingJob) throw new HttpError(404, "job_not_found", "Job was not found"); if (existingJob.cellId !== cellId) throw new CellRoutingError(cellId, existingJob.cellId); const job = await adapters.jobs.recover({ id: existingJob.id }); await audit({ action: "job.recovered", actorId: identity.subject.id, subjectId: job.id, payload: { type: job.type } }); return json(response, 200, { job, requestId }, requestId); }
+      if (method === "POST" && recoverJobMatch) { const identity = await session(request); const existingJob = await adapters.jobs.get(recoverJobMatch[1]); if (!existingJob) throw new HttpError(404, "job_not_found", "Job was not found"); if (existingJob.cellId !== cellId) throw new CellRoutingError(cellId, existingJob.cellId); requireRecoverableJob(existingJob.state);
+        if (existingJob.type === 'asset.process') {
+          const assetId = (existingJob.payload as { assetId?: string }).assetId;
+          if (assetId) await repositories.transaction(async transaction => {
+            const asset = await repositories.assets.get(assetId, { transaction });
+            if (!asset || asset.instanceId !== (configuration.instanceId ?? 'local-reference')) throw new HttpError(404, 'asset_not_found', 'Processing asset was not found.');
+            requireHomeCell({ cellId }, asset);
+            if (asset.status === 'failed') await repositories.assets.update(asset.id, asset.revision, { status: 'pending', processingUsageKey: `asset-processing:${asset.id}:${asset.objectVersion}:recovery:${randomUUID()}` } as Partial<AssetRecord>, { transaction });
+          });
+        }
+        const job = await adapters.jobs.recover({ id: existingJob.id }); await audit({ action: "job.recovered", actorId: identity.subject.id, subjectId: job.id, payload: { type: job.type } }); return json(response, 200, { job, requestId }, requestId); }
       const cancelJobMatch = url.pathname.match(/^\/v1\/operations\/jobs\/([^/]+)\/cancel$/);
       if (method === "POST" && cancelJobMatch) { const identity = await session(request); const body = await parseBody(request); const job = await adapters.jobs.get(cancelJobMatch[1]); if (!job) throw new HttpError(404, "job_not_found", "Job was not found"); if (job.cellId !== cellId) throw new CellRoutingError(cellId, job.cellId); await adapters.jobs.cancel({ id: job.id, reason: typeof body.reason === "string" ? body.reason : undefined }); await audit({ action: "job.cancelled", actorId: identity.subject.id, subjectId: job.id }); return json(response, 204, undefined, requestId); }
       if (method === "POST" && url.pathname === "/v1/operations/holds") { const identity = await session(request); const body = await parseBody(request); const hold = await repositories.moderationHolds.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, subjectType: requireString(body.subjectType, "subjectType"), subjectId: requireString(body.subjectId, "subjectId"), state: "active", reason: typeof body.reason === "string" ? body.reason : undefined }); lastWebsitePolicyScan=0;await audit({ action: "moderation.hold_created", actorId: identity.subject.id, subjectId: hold.subjectId, payload: { holdId: hold.id, reason: hold.reason } }); return json(response, 201, { hold, requestId }, requestId); }
