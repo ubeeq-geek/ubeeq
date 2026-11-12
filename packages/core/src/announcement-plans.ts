@@ -6,6 +6,7 @@ import { validateAnnouncementLatePolicy } from "./announcement-plan-scheduler.js
 import type { CollectionReleaseReadiness } from "./collection-release-readiness.js";
 
 export interface AnnouncementPlan extends Pick<AnnouncementScope, "tenantId" | "creatorId"> {
+  subject?: import('./content-workflows.js').ContentReleaseSubject;
   schemaVersion: 1;
   /** Separate from the existing authoring payload's planVersion. */
   stage: "first_delivery";

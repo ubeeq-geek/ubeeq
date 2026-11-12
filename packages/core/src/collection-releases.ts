@@ -10,6 +10,8 @@ export interface CollectionReleaseManifestReference {
   checksumSha256: string;
 }
 export interface CollectionRelease extends AnnouncementScope {
+  /** Absent on legacy Collection records. No synthetic catalogue unit is required for Works. */
+  subject?: import('./content-workflows.js').ContentReleaseSubject;
   schemaVersion: 1;
   releaseId: string;
   operationKey: string;
@@ -65,6 +67,8 @@ export function reserveCollectionRelease(input: {
   expectedRevision: number;
   releaseId: string;
   requestedWorkIds: readonly string[];
+  /** Work subjects may release new components under an existing Work identity. */
+  requestedRevisions?: readonly {workId:string;contentRevision:string}[];
 }): CollectionReleaseClaim {
   const { baseline: b, releaseId } = input;
   assertBaseline(b, input.expectedRevision); assertAnnouncementId(releaseId);
@@ -76,7 +80,7 @@ export function reserveCollectionRelease(input: {
   if (b.initialClaimReleaseId && b.initialClaimReleaseId !== releaseId)
     return { state: "waiting", blockingReleaseIds: [b.initialClaimReleaseId], baseline: structuredClone(b) };
   const released = new Set(b.releasedWorkIds);
-  const candidates = input.requestedWorkIds.filter(id => !released.has(id));
+  const candidates = input.requestedWorkIds.filter(id => !released.has(id)||input.requestedRevisions?.some(r=>r.workId===id&&!b.evidence.some(e=>e.workId===id&&e.contentRevision===r.contentRevision)));
   if (!candidates.length) return { state: "noop", baseline: structuredClone(b) };
   const blocking = b.reservations.filter(r => r.workIds.some(id => candidates.includes(id)));
   // Wait for overlap to settle, so an unrelated subset cannot silently replace the approved scope.

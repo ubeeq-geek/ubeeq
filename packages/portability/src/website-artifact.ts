@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { parse, type DefaultTreeAdapterMap } from 'parse5';
-import { WebsiteError, websitePath, type Website, type WebsiteDependency, type WebsiteDocument, type WebsiteGallery, type WebsitePublicationMapping } from '@ubeeq/core';
+import { WebsiteError, websitePath, type Website, type WebsiteDependency, type WebsiteDocument, type WebsiteGallery, type WebsiteNamedGallery, type WebsitePublicationMapping } from '@ubeeq/core';
 import { renderStaticWebsite, STATIC_BLOCK_SUPPORT, websiteGalleryViewerScript, resolveMediaEmbed, type StaticWebsiteMedia } from '@ubeeq/ui';
 import { parseContentBlocks, resolveWebsiteGallery, websiteRoutes, websiteExternalUrl } from '@ubeeq/core';
 
@@ -14,6 +14,8 @@ export interface WebsitePublicAsset {
 export interface WebsiteSnapshot {
   /** Approved cover rendition per named gallery; independent of its Work images. */
   namedGalleryCovers?:Readonly<Record<string,string>>;
+  /** Resolved public gallery links for this build, outside the saved website settings. */
+  namedGalleryLinks?: Readonly<Record<string, Pick<WebsiteNamedGallery, 'purchaseLinks' | 'externalLinks'>>>;
   copyrightYear?:number;
   creatorIdentities?:readonly {id:string;title:string}[];
   mailingList?: {signupUrl:string;submitUrl:string;consentText:string;offers:readonly {id:string;title:string}[]};
@@ -129,7 +131,7 @@ export const validateWebsiteSnapshotBudget = (raw: WebsiteSnapshot, limits: {max
   if(raw.creatorIdentities&&(raw.creatorIdentities.length>51||new Set(raw.creatorIdentities.map(creator=>creator.id)).size!==raw.creatorIdentities.length||raw.creatorIdentities.some(creator=>![raw.website.creatorIdentityId,...raw.website.contributingCreatorIds??[]].includes(creator.id)||typeof creator.title!=='string'||!creator.title.trim()||creator.title.length>500)))throw new WebsiteError('invalid_contributors','Resolve only the connected public creator identities.');
   if (raw.website.pages.length > limits.maxPages || raw.assets.length > limits.maxAssets || raw.galleries.length > 1000) throw new WebsiteError('quota_exceeded','Website page, gallery or media quota exceeded.');
   // Bound the source projection before cloning it or allocating rendered output.
-  let sourceBytes=Buffer.byteLength(JSON.stringify(raw.website));
+  let sourceBytes=Buffer.byteLength(JSON.stringify(raw.website)) + Buffer.byteLength(JSON.stringify(raw.namedGalleryLinks ?? {}));
   for(const value of [...raw.documents,...raw.galleries]) { sourceBytes+=Buffer.byteLength(JSON.stringify(value)); if(sourceBytes>limits.maxBytes) throw new WebsiteError('quota_exceeded','Website source projection exceeds the build byte budget.'); }
   for(const asset of raw.assets) { sourceBytes+=asset.bytes?.byteLength??0; if(sourceBytes>limits.maxBytes) throw new WebsiteError('quota_exceeded','Website source media exceeds the build byte budget.'); }
 };
@@ -178,7 +180,19 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,namedGalleryCovers:snapshot.namedGalleryCovers,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
+  const galleryLinks = snapshot.namedGalleryLinks;
+  if (galleryLinks && Object.keys(galleryLinks).some(id => !site.namedGalleries?.some(gallery => gallery.id === id))) {
+    throw new WebsiteError('foreign_reference', 'Resolved gallery links must reference an existing website gallery.');
+  }
+  const renderSite = galleryLinks ? {
+    ...site,
+    namedGalleries: site.namedGalleries?.map(gallery => {
+      const links = Object.hasOwn(galleryLinks, gallery.id) ? galleryLinks[gallery.id] : undefined;
+      return links ? { ...gallery, purchaseLinks: links.purchaseLinks, externalLinks: links.externalLinks } : gallery;
+    })
+  } : site;
+  if (galleryLinks) websiteRoutes(renderSite);
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:renderSite,routes,documents,galleries,media,namedGalleryCovers:snapshot.namedGalleryCovers,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');

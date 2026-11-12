@@ -96,6 +96,33 @@ media to authorized asset revisions and pin those references on the authoring
 snapshot. Never put signed URLs or current, unsnapshotted collection members in
 the delivery content. Refreshing content requires an explicit reviewed revision.
 
+## Reusable announcement layouts
+
+`announcementLayoutPreset` supplies release, update, simple and blank starting
+documents. Templates may bind a literal series/campaign name and event label to
+`series.name` and `release.label`; the creator name remains independent.
+
+A template paragraph can carry a typed `linkGroup` with an editable heading and
+ordered links. Sources identify the primary publication, an exact publishing
+destination (optionally in an explicitly related collection), or a durable custom
+URL. Products resolve publication URLs and counts from authoritative evidence and
+pass them as `AnnouncementLinkResolutions`. Custom URLs cannot request counts.
+Required unresolved links or counts hold rendering; optional unavailable links
+are omitted, along with empty groups. Groups expand to existing heading and link
+blocks before provider validation. Generated links retain their group ID and
+preferred URL, linked-label or native appearance for adapter conversion.
+
+Platform and destination customizations store changed sections by stable block
+ID, optional ordering and presentation settings. Unchanged sections inherit
+later shared edits; new destinations inherit their platform customization.
+Existing complete `destinationOverrides` retain their original semantics.
+`announcementTemplateBlocks`, `announcementTemplateCustomization` and
+`announcementTemplatePresentation` provide the shared resolution and diff rules.
+Presentation can select Discord message/embedded output and whether the title
+is already in the body; products still enforce required native title fields.
+`announcementTemplateExampleLinks` is for explicitly provisional UI previews,
+never publication evidence or delivery snapshots.
+
 ## Scheduling and follow-ups
 
 `resolveAnnouncementCivilTime` records the local civil time, IANA zone, selected

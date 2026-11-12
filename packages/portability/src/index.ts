@@ -1,3 +1,4 @@
+export * from './content-preparations.js';
 import { createHash } from "node:crypto";
 import { portablePublicationImageRecord, restorePublicationImageRecord, validatePortablePublicationImage } from './publication-images.js';
 export * from './publication-images.js';

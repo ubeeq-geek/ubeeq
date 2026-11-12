@@ -330,6 +330,22 @@ test('build document freshness checks use bounded concurrency and detect changed
  assert.equal((await h.service.build(h.actor,base.id)).stale,true);assert.equal(peak,5);assert.equal(active,0);
 });
 
+test('renders resolved gallery links without changing the saved website', () => {
+  const snapshot = fixture();
+  snapshot.website.namedGalleries = [
+    {id:'gallery',title:'Preview',slug:'preview',kind:'works',access:'preview',publicationIds:['preview-private']}
+  ];
+  const url = 'https://example.com/premium';
+  snapshot.namedGalleryLinks = {gallery:{purchaseLinks:[{label:'Premium Volume',url}]}};
+  const artifact = buildWebsiteArtifact(snapshot, limits);
+  const html = Buffer.from(artifact.files.get('galleries/collections/preview/index.html')).toString();
+  assert.match(html, /Premium Volume/);
+  assert.ok(html.includes(url));
+  assert.equal(snapshot.website.namedGalleries[0].purchaseLinks, undefined);
+  snapshot.namedGalleryLinks = {other:{purchaseLinks:[{label:'Other',url}]}};
+  assert.throws(() => buildWebsiteArtifact(snapshot, limits), /existing website gallery/);
+});
+
 test('1000-image previews retrieve only selected immutable files, reauthorize conditional hits and reject corrupt bytes',async t=>{
  const h=await harness();t.after(()=>h.store.close());
  const requested=await h.service.requestBuild(h.actor,h.snapshot.website.id,1,'large-preview');
