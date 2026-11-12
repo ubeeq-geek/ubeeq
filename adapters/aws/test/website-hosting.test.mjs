@@ -1,6 +1,17 @@
 import test from 'node:test';import assert from 'node:assert/strict';import { createHash } from 'node:crypto';
 import { AwsWebsiteHostingAdapter,routeAwsWebsite,awsWebsiteRouterSource,awsWebsiteEmbeddingResponseSource } from '../dist/index.js';
 const hash=b=>createHash('sha256').update(b).digest('hex');
+test('AWS warm releases verify retained media without uploading it again',async()=>{
+ const media=Buffer.from('retained public rendition'),path='assets/'+hash(media)+'.jpg',objects=new Map();let uploads=0;
+ const s3={send:async command=>{const input=command.input;if(command.constructor.name==='PutObjectCommand'){uploads++;objects.set(input.Key,input);return {};}
+  const object=objects.get(input.Key);if(!object)throw Object.assign(Error('missing'),{name:'NotFound'});return {ChecksumSHA256:object.ChecksumSHA256,ContentLength:object.Body.length};}};
+ const kvs={send:async command=>command.constructor.name==='DescribeKeyValueStoreCommand'?{ETag:'etag'}:{}};
+ const adapter=new AwsWebsiteHostingAdapter({id:'profile',accountId:'account',bucket:'bucket',keyValueStoreArn:'arn'},{s3,kvs,inspect:async()=>({privateBucket:true,originAccessControl:true,hostnameAssociated:true,functionAssociated:true}),probe:async()=>({})});
+ const context={target:{id:'target',workspaceId:'workspace',accountId:'account',remoteId:hash(JSON.stringify(['workspace','target'])).slice(0,32),activeGeneration:0},artifact:{digest:hash('release'),files:new Map([[path,media]])}};
+ assert.ok(adapter.capabilities.maxFiles>1000);await adapter.prepare(context);assert.equal(uploads,1);
+ context.target.activeGeneration=1;await adapter.prepare(context);assert.equal(uploads,1);
+ objects.values().next().value.ChecksumSHA256='corrupt';await assert.rejects(adapter.prepare(context),{code:'release_drift'});assert.equal(uploads,1);
+});
 test('AWS host and release keys isolate tenants, retain only approved hashed assets and deny disabled/missing/traversal paths before cache lookup',async()=>{
  const one='1'.repeat(32),two='2'.repeat(32),release='a'.repeat(64),asset='assets/'+hash('image')+'.jpg';const data=new Map();
  for(const [host,site] of [['one.example',one],['two.example',two]]){data.set('host:'+host,JSON.stringify({site,release,state:'active',basePath:'/portfolio/'}));data.set('file:'+site+':'+release+':'+hash('index.html'),'1');data.set('file:'+site+':'+release+':'+hash('nested/index.html'),'1');data.set('asset:'+site+':'+hash(asset),'1');}

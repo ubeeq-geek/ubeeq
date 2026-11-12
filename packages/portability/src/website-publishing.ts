@@ -111,7 +111,7 @@ export class WebsitePublishingService {
       await guard();await adapter.validateTarget(t,connection);
       if(intent.operation!=='unpublish'&&!attempt.artifactDigest){await update({state:'generating'});const snapshot=await this.ports.store.getSnapshot(workspaceId,intent.snapshotReference!) as WebsiteSnapshot|undefined;if(!snapshot)throw new WebsiteError('snapshot_unavailable','Approved source snapshot was not found.');
         // Render variants contain the same approved revisions with target-specific URLs.
-        const variant=structuredClone(snapshot),url=new URL(t.publicUrl);variant.website={...variant.website,basePath:decodeURIComponent(t.basePath),publicBaseUrl:url.origin};
+        const url=new URL(t.publicUrl),variant={...snapshot,website:{...snapshot.website,basePath:decodeURIComponent(t.basePath),publicBaseUrl:url.origin}};
         const limits=attempt.renderLimits;
         if(!limits)throw new WebsiteError('snapshot_unavailable','Approved render limits are unavailable.');
         const built=buildWebsiteArtifact(variant,{maxPages:limits.maxPages,maxAssets:Math.min(limits.maxAssets,adapter.capabilities.maxFiles),maxBytes:Math.min(limits.maxBytes,adapter.capabilities.maxBytes)});

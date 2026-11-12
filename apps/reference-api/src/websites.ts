@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { WebsiteError, type Website, type WebsiteDocument } from '@ubeeq/core';
+import { WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES, type Website, type WebsiteDocument } from '@ubeeq/core';
 import { WebsiteService } from '@ubeeq/portability';
 import type { WebsiteActor } from '@ubeeq/portability';
 
@@ -18,6 +18,35 @@ export const handleWebsiteRequest = async (input: {
     if(method==='PUT') { const b=await input.body(),doc=b.document as WebsiteDocument; if(doc?.id!==parts[1]) throw new WebsiteError('invalid_document','Document ID must match the route.'); return {document:await service.saveDocument(actor,doc,Number(b.expectedRevision))}; }
   }
   if(parts[0]==='builds' && parts[1]) {
+    if(method==='GET'&&parts[2]==='preview-file'){
+      const path=url.searchParams.get('file')??'',manifest=await service.previewManifest(actor,parts[1]);
+      const entry=Object.hasOwn(manifest.files,path)?manifest.files[path]:undefined;
+      if(!entry)throw new WebsiteError('file_not_found','Preview file was not found.');
+      response.setHeader('accept-ranges','bytes');response.setHeader('etag',`"${entry.checksum}"`);
+      const fail=(status:number,code:string,message:string)=>{response.statusCode=status;response.setHeader('content-type','application/json');response.end(JSON.stringify({error:{code,message}}));};
+      if(request.headers['if-match']!==`"${entry.checksum}"`){fail(412,'artifact_conflict','Preview file checksum changed.');return;}
+      const range=typeof request.headers.range==='string'?/^bytes=(\d*)-(\d*)$/.exec(request.headers.range):null;
+      let start=NaN,end=NaN;
+      if(range&&(range[1]||range[2])){
+        if(!range[1]){const suffix=Number(range[2]);if(Number.isSafeInteger(suffix)&&suffix>0){start=Math.max(0,entry.byteLength-suffix);end=entry.byteLength;}}
+        else {start=Number(range[1]);const last=range[2]?Number(range[2]):entry.byteLength-1;if(Number.isSafeInteger(last)&&last<Number.MAX_SAFE_INTEGER)end=Math.min(entry.byteLength,last+1);}
+      }
+      if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<=start||end-start>WEBSITE_PREVIEW_CHUNK_BYTES){
+        response.setHeader('content-range',`bytes */${entry.byteLength}`);fail(416,'invalid_range','Select one byte range of at most 2 MiB.');return;
+      }
+      const result=await service.previewFileRange(actor,parts[1],path,start,end,entry.checksum);
+      response.statusCode=206;response.setHeader('content-type','application/octet-stream');response.setHeader('content-length',result.bytes.length);
+      response.setHeader('content-range',`bytes ${start}-${end-1}/${result.byteLength}`);
+      response.setHeader('x-website-artifact-digest',result.digest);response.setHeader('x-website-chunk-checksum',result.chunkChecksum);
+      response.end(result.bytes);return;
+    }
+    if(method==='GET'&&parts[2]==='preview-manifest')return service.previewManifest(actor,parts[1]);
+    if(method==='POST'&&parts[2]==='preview-files'){
+      const body=await input.body(),known=body.knownChecksums;
+      if(known!==undefined&&(!known||typeof known!=='object'||Array.isArray(known)))throw new WebsiteError('invalid_path','Invalid preview checksums.');
+      const result=await service.previewFiles(actor,parts[1],body.paths as string[],known as Record<string,string>|undefined);
+      return {digest:result.digest,files:result.files.map(file=>({path:file.path,checksum:file.checksum,...(file.bytes?{base64:Buffer.from(file.bytes).toString('base64')}:{})}))};
+    }
     if(method==='GET' && parts[2]==='preview-site'){const archive=await service.previewArchive(actor,parts[1]);response.setHeader('content-type','application/zip');response.end(archive.bytes);return;}
     if(method==='GET' && parts[2]==='pages') return {pages:await service.previewPages(actor,parts[1])};
     if(method==='GET' && parts.length===2) return {build:await service.build(actor,parts[1])};
@@ -47,6 +76,6 @@ export const handleWebsiteRequest = async (input: {
   }
   if(method==='GET' && parts.length===1) return {website:await service.get(actor,parts[0])};
   if(method==='POST' && parts[1]==='builds') { const b=await input.body(); return {build:await service.requestBuild(actor,parts[0],Number(b.expectedRevision),String(b.idempotencyKey??''))}; }
-  if(method==='GET' && parts[1]==='builds') return {builds:await service.builds(actor,parts[0])};
+  if(method==='GET' && parts[1]==='builds') return {builds:await service.builds(actor,parts[0],url.searchParams.has('previewRevision')?Number(url.searchParams.get('previewRevision')):undefined)};
   throw new WebsiteError('website_route_not_found','Website operation was not found.');
 };
