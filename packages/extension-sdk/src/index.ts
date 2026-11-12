@@ -217,6 +217,8 @@ export interface UsageQuotaReservationResult {
 }
 
 export interface UsageSettlementInput {
+  /** Trusted time of the measured effect, preserved across settlement delivery retries. */
+  observedAt?: string;
   creatorId: string;
   operation: string;
   processingCreditsUsed?: number;

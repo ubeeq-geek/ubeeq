@@ -145,3 +145,19 @@ test('a configured current-admission checker must return affirmative evidence be
   assert.equal(f.processCalls, 0); assert.equal(quota.consumed, 0);
   assert.equal([...quota.settlements.values()][0].processingCreditsUsed, 0);
 });
+
+test('settlement outbox preserves the physical observation time and rejects a changed fact on replay', async t => {
+  const f = await fixture(t), asset = await f.local.repositories.assets.get('asset');
+  const outbox = new UsageSettlementOutbox(f.local.repositories, f.quota, instanceId, cellId);
+  const reservation = { creatorId, operation:'asset.process', idempotencyKey:'timed-effect', processingCreditsDelta:1 };
+  await f.quota.checkAndReserveQuota(reservation);
+  const input = { creatorId, operation:'asset.process', idempotencyKey:'timed-effect', processingCreditsUsed:1, observedAt:'2026-09-30T23:59:59.000Z' };
+  await f.local.repositories.transaction(tx => outbox.enqueue(input, asset, tx));
+  await f.restart();
+  const replay = new UsageSettlementOutbox(f.local.repositories, f.quota, instanceId, cellId);
+  await replay.drain();
+  assert.equal(f.quota.settlements.get('timed-effect').observedAt, input.observedAt);
+  await assert.rejects(() => f.local.repositories.transaction(tx => replay.enqueue({ ...input, observedAt:'2026-10-01T00:00:01.000Z' }, asset, tx)), /intent conflicts/);
+  await assert.rejects(() => f.local.repositories.transaction(tx => replay.enqueue({ ...input, idempotencyKey:'invalid-time', observedAt:'not-a-time' }, asset, tx)), /observation time/);
+  assert.equal(f.quota.consumed, 1);
+});

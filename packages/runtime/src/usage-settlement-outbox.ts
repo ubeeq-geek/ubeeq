@@ -4,7 +4,11 @@ import type { UsageQuotaPort, UsageSettlementInput, UsageQuotaReservationInput }
 import type { DurableJob, JobQueue } from '@ubeeq/jobs';
 
 const namespace = 'runtime-usage-settlement';
-const fingerprint = (input: UsageSettlementInput) => JSON.stringify([input.creatorId, input.operation, input.idempotencyKey, input.processingCreditsUsed ?? 0, input.storageBytesDelta ?? 0, input.deliveryBytesDelta ?? 0]);
+const fingerprint = (input: UsageSettlementInput) => {
+  if (input.observedAt !== undefined && (typeof input.observedAt !== 'string' || !Number.isFinite(Date.parse(input.observedAt)) || new Date(input.observedAt).toISOString() !== input.observedAt)) throw new Error('Invalid usage observation time.');
+  // Preserve existing hashes when no observation timestamp was supplied.
+  return JSON.stringify([input.creatorId, input.operation, input.idempotencyKey, input.processingCreditsUsed ?? 0, input.storageBytesDelta ?? 0, input.deliveryBytesDelta ?? 0, ...(input.observedAt === undefined ? [] : [input.observedAt])]);
+};
 interface Intent { input: UsageSettlementInput; fingerprint: string; state: 'pending' | 'settled'; }
 interface ReservationIntent { input: UsageQuotaReservationInput; assetId: string; objectVersion: string; jobId: string; leaseExpiresAt?: string; state: 'pending' | 'recorded'; }
 const reservationNamespace = 'runtime-processing-reservation';
