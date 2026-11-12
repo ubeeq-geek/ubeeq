@@ -10,7 +10,7 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
+import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
@@ -488,7 +488,24 @@ export class CognitoIdentity implements IdentityAdapter {
         issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
     } catch { return undefined; }
   }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return { id: subjectId, subjectId, status: "active", createdAt: "", updatedAt: "" }; }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    if (typeof subjectId !== 'string' || !subjectId || subjectId.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(subjectId)) return undefined;
+    let user;
+    try { user = await this.cognito.send(new AdminGetUserCommand({ UserPoolId: this.userPoolId, Username: subjectId })); }
+    catch (error) {
+      if ((error as { name?: string })?.name === 'UserNotFoundException') return undefined;
+      // Never substitute an active account when the provider is unavailable or the host lacks permission.
+      throw new Error('Cognito account status is unavailable.');
+    }
+    const status = user.UserStatus;
+    if (user.Username !== subjectId || typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
+    const timestamp = (value: unknown) => {
+      if (value === undefined) return '';
+      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error('Cognito account timestamp is invalid.');
+      return value.toISOString();
+    };
+    return { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status) ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
   async authenticate(input: { username: string; password: string }): Promise<{ token: string }> { const result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); if (!result.AuthenticationResult?.AccessToken) throw new Error("Cognito authentication did not return an access token."); return { token: result.AuthenticationResult.AccessToken }; }

@@ -64,6 +64,9 @@ export class AwsServerlessSingleCellStack extends Stack {
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
     records.grantReadWriteData(migrationCell); sourceStore.grantReadWrite(migrationCell);
+    // Account-status reads must resolve the configured pool rather than synthesize active users.
+    userPool.grant(health, "cognito-idp:AdminGetUser");
+    userPool.grant(worker, "cognito-idp:AdminGetUser");
     if (migrationControlWorkerPrincipalArn) migrationCell.addPermission("MigrationControlWorkerInvoke", { action: "lambda:InvokeFunction", principal: new iam.ArnPrincipal(migrationControlWorkerPrincipalArn) });
     if (routingDirectoryTableName && routingDirectoryTableArn) {
       const routingDirectory = dynamodb.Table.fromTableArn(this, "RoutingDirectory", routingDirectoryTableArn);
