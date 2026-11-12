@@ -495,6 +495,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const processing = await repositories.assets.update(asset.id, asset.revision, { status: "processing" });
       const source = await adapters.storage.get(storage);
       if (source.object.checksum !== processing.checksum || source.object.byteLength <= 0) throw new Error("Processing source object failed checksum or metadata verification.");
+      if (hostPorts.usageQuota.checkCurrentAdmission) {
+        const currentQuota = await hostPorts.usageQuota.checkCurrentAdmission({ creatorId: asset.creatorId, operation: reservationInput.operation, idempotencyKey: usageKey });
+        if (currentQuota?.allowed !== true) throw new Error(currentQuota?.reasonCode ?? 'Processing admission is no longer available.');
+      }
       const processingResult = await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
       // Keep the physical object-store location from the verified source. For a
       // local cell this is its logical cell store; for S3 it is the actual

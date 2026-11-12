@@ -124,3 +124,24 @@ test('cancellation waits for the lease deadline and prevents an old processor fr
   assert.equal((await f.local.repositories.assets.get('asset')).status, 'failed');
   assert.equal(f.quota.consumed, 0, 'a stale processing revision cannot become a free ready asset');
 });
+
+test('a replayable reservation cannot authorize new processing after current admission is revoked', async t => {
+  const quota = quotaFixture(); let checks = 0;
+  quota.checkCurrentAdmission = async () => { checks++; return { allowed: false, reasonCode: 'CURRENT_ADMISSION_REVOKED' }; };
+  const f = await fixture(t, quota);
+  await assert.rejects(() => f.runtime.runNextJob('worker'), /CURRENT_ADMISSION_REVOKED/);
+  assert.equal(checks, 1); assert.equal(f.processCalls, 0);
+  assert.equal((await f.local.repositories.assets.get('asset')).status, 'failed');
+  assert.equal(quota.consumed, 0); assert.equal(quota.settlements.size, 1);
+  assert.equal([...quota.settlements.values()][0].processingCreditsUsed, 0);
+  await f.restart(); await f.runtime.runNextJob('recovery');
+  assert.equal(quota.settlements.size, 1); assert.equal(checks, 1);
+});
+
+test('a configured current-admission checker must return affirmative evidence before processing', async t => {
+  const quota = quotaFixture(); quota.checkCurrentAdmission = async () => undefined;
+  const f = await fixture(t, quota);
+  await assert.rejects(() => f.runtime.runNextJob('worker'), /admission is no longer available/);
+  assert.equal(f.processCalls, 0); assert.equal(quota.consumed, 0);
+  assert.equal([...quota.settlements.values()][0].processingCreditsUsed, 0);
+});

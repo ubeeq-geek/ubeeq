@@ -227,6 +227,9 @@ export interface UsageSettlementInput {
 
 export interface UsageQuotaPort {
   checkAndReserveQuota(input: UsageQuotaReservationInput): Promise<UsageQuotaReservationResult>;
+  /** Recheck current execution eligibility separately from an idempotent reservation receipt.
+   * Recovery must still settle old reservations when new execution is no longer allowed. */
+  checkCurrentAdmission?(input: Pick<UsageSettlementInput, 'creatorId' | 'operation' | 'idempotencyKey'>): Promise<UsageQuotaReservationResult>;
   recordUsageSettlement(input: UsageSettlementInput): Promise<void>;
 }
 
