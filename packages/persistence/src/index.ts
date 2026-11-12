@@ -155,7 +155,9 @@ export interface ImportCheckpointRecord extends RevisionedRecord, CellOwnedRecor
 export interface FederationActorRecord extends RevisionedRecord { instanceId: string; actorUri: string; host: string; publicKey?: string; }
 export interface RemotePublicationReferenceRecord extends RevisionedRecord { instanceId: string; actorId: string; publicationUri: string; immutableId: string; state: "accepted" | "withdrawn" | "rejected"; }
 
+export interface InstanceOperatorRecord extends RevisionedRecord { instanceId: string; actorId: string; }
 export interface UbeeqRepositories extends TransactionRunner {
+  instanceOperators?: RevisionedRepository<InstanceOperatorRecord>;
   creators: RevisionedRepository<CreatorRecord>;
   works: RevisionedRepository<WorkRecord>;
   assets: RevisionedRepository<AssetRecord>;

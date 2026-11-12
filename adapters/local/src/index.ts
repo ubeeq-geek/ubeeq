@@ -243,7 +243,7 @@ export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqReposi
   publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
   moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
   usageEvents: cellRepository(local, "usageEvents"), creditLots: cellRepository(local, "creditLots"), creditReservations: cellRepository(local, "creditReservations"), balances: cellRepository(local, "balances"),
-  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
+  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), instanceOperators: repository(local, "instanceOperators"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
 });
 
 export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {

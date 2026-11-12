@@ -385,9 +385,19 @@ test("S3 direct upload binds a checksum and returns the immutable object version
 
 test("Cognito identity verifies opaque sessions and maps access scopes", async () => {
   let revoked = false;
-  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); return { Username: "subject-1", UserAttributes: [{ Name: "scope", Value: "works:write exports:read" }] }; } }, "pool", "client");
+  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); return { Username: "subject-1", UserAttributes: [{ Name: "sub", Value: "subject-sub" }] }; } }, "pool", "client", { verifier: { verify: async () => ({ sub: "subject-sub", username: "subject-1", iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000)+3600, scope: "works:write exports:read" }) } });
   const session = await identity.verifySession({ credential: "opaque-access-token" });
   assert.equal(session?.subject.id, "subject-1");
   assert.deepEqual(session?.subject.scopes, ["works:write", "exports:read"]);
   await verifyIdentityAdapterContract(identity, { credential: "opaque-access-token", subjectId: "subject-1" });
+});
+
+test('Cognito identity rejects unverified or expired tokens before invoking GetUser', async () => {
+  let calls = 0;
+  const client = { send: async () => { calls++; return {}; } };
+  const unverified = new CognitoIdentity(client, 'us-east-1_test', 'client');
+  assert.equal(await unverified.verifySession({ credential: 'not-a-signed-jwt' }), undefined);
+  const expired = new CognitoIdentity(client, 'pool', 'client', { verifier: { verify: async () => ({ sub: 'subject', iat: 0, exp: 1 }) } });
+  assert.equal(await expired.verifySession({ credential: 'expired' }), undefined);
+  assert.equal(calls, 0);
 });

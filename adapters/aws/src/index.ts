@@ -1,3 +1,4 @@
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
 export type { AwsCommandClient } from './client-port.js';
 import type { AwsCommandClient } from './client-port.js';
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
@@ -115,7 +116,7 @@ const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['tran
   creditLots: cellRepository(dynamo, config, 'creditLots'), creditReservations: cellRepository(dynamo, config, 'creditReservations'), balances: cellRepository(dynamo, config, 'balances'),
   integrationAccounts: cellRepository(dynamo, config, 'integrationAccounts'), syncCursors: cellRepository(dynamo, config, 'syncCursors'),
   integrationJobs: cellRepository(dynamo, config, 'integrationJobs'), exportManifests: cellRepository(dynamo, config, 'exportManifests'),
-  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), federationActors: repository(dynamo, config, 'federationActors'),
+  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), instanceOperators: repository(dynamo, config, 'instanceOperators'), federationActors: repository(dynamo, config, 'federationActors'),
   remotePublicationReferences: repository(dynamo, config, 'remotePublicationReferences')
 });
 export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
@@ -463,10 +464,29 @@ export class SecretsManagerCredentialVault implements CredentialVault {
   async revoke(input: { cellId: string; reference: string }): Promise<void> { const id = this.id(input); if (id) await this.secrets.send(new UpdateSecretCommand({ SecretId: id, SecretString: "revoked" })); }
 }
 
+export interface VerifiedCognitoAccessClaims {
+  sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[];
+}
 export class CognitoIdentity implements IdentityAdapter {
-  constructor(private readonly cognito: Pick<CognitoIdentityProviderClient, "send">, private readonly userPoolId: string, private readonly clientId: string) {}
+  private verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> };
+  constructor(private readonly cognito: AwsCommandClient, private readonly userPoolId: string, private readonly clientId: string,
+    options: { verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { this.verifier = options.verifier; }
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
-  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> { try { const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential })); const id = user.Username; if (!id) return undefined; return { id: input.credential, subject: { id, roles: [], scopes: user.UserAttributes?.filter((item) => item.Name === "scope").flatMap((item) => item.Value?.split(" ") ?? []) }, issuedAt: "", expiresAt: "", authenticationMethod: "oidc" }; } catch { return undefined; } }
+  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
+    try {
+      // Verify the signature, issuer, client_id, access-token use and time claims before GetUser.
+      this.verifier ??= CognitoJwtVerifier.create({ userPoolId: this.userPoolId, clientId: this.clientId, tokenUse: 'access' });
+      const payload = await this.verifier.verify(input.credential);
+      if (!payload.sub || !Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now()) return undefined;
+      const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential }));
+      const id = user.Username;
+      const attributes = (user.UserAttributes ?? []) as Array<{ Name?: string; Value?: string }>;
+      if (typeof id !== 'string' || !id || (payload.username && id !== payload.username) || attributes.find(item => item.Name === 'sub')?.Value !== payload.sub) return undefined;
+      const customer = attributes.find(item => item.Name === 'custom:account_scope')?.Value === 'customer_account';
+      return { id: input.credential, subject: { id, roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
+        issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
+    } catch { return undefined; }
+  }
   async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return { id: subjectId, subjectId, status: "active", createdAt: "", updatedAt: "" }; }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }

@@ -6,10 +6,11 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { createDefaultOpenCorePorts, createSingleOperatorTenancyPort } from '@ubeeq/extension-sdk';
 import { createCoreRuntime } from '../dist/index.js';
+import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 
 async function fixture(configuration, run) {
   const directory = await mkdtemp(join(tmpdir(), 'core-runtime-'));
-  const runtime = createCoreRuntime({ databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', ...configuration });
+  const runtime = createCoreRuntime({ databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', ...(typeof configuration === 'function' ? configuration(directory) : configuration) });
   await new Promise(resolve => runtime.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${runtime.server.address().port}`;
   const request = async (path, token, body, method = body ? 'POST' : 'GET') => {
@@ -65,4 +66,41 @@ test('concurrent first-creator claims cannot create two operator users', async (
     const results = await Promise.all([request('/v1/creators', first, { handle: 'one', displayName: 'One' }), request('/v1/creators', second, { handle: 'two', displayName: 'Two' })]);
     assert.deepEqual(results.map(result => result.status).sort(), [201, 403]);
   });
+});
+
+test('registration admission runs before account creation and does not consume a refused email', async () => {
+  let allowed = false;
+  await fixture({ registrationAdmission: async () => ({ allowed, reasonCode: 'INVITATION_REQUIRED' }) }, async ({ request }) => {
+    const body = { email: 'invite@example.test', password: 'Strong password 123!' };
+    assert.equal((await request('/v1/auth/sign-up', null, body)).status, 403);
+    allowed = true;
+    assert.equal((await request('/v1/auth/sign-up', null, body)).status, 201);
+  });
+});
+test('failed initial creator validation does not pin the instance to the refused actor', async () => {
+  await fixture({}, async ({ request, signIn }) => {
+    const first = await signIn('invalid@example.test'); const second = await signIn('valid@example.test');
+    assert.equal((await request('/v1/creators', first, { handle: '', displayName: 'Invalid' })).status, 400);
+    assert.equal((await request('/v1/creators', second, { handle: 'valid', displayName: 'Valid' })).status, 201);
+  });
+});
+
+test('customer principals cannot claim the first operator or read creator content', async () => {
+  let owned;
+  try {
+    await fixture(directory => {
+      owned = createLocalAdapterSet({ databasePath: join(directory, 'state.sqlite'), dataDirectory: directory, publicBaseUrl: 'http://localhost', cellId: 'local-single-cell' });
+      const identity = new Proxy(owned.identity, { get(target, key) {
+        if (key === 'verifySession') return async input => { const session = await target.verifySession(input); if (session) session.subject.accountScope = 'customer_account'; return session; };
+        const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      return { adapters: { repositories: owned.repositories, storage: owned.storage, uploads: owned.storage, delivery: owned.storage, jobs: owned.jobs, identity, localIdentity: owned.identity } };
+    }, async ({ request, signIn }) => {
+      const first = await signIn('buyer-one@example.test'); const second = await signIn('buyer-two@example.test');
+      for (const token of [first, second]) {
+        assert.equal((await request('/v1/creators', token, { handle: 'buyer', displayName: 'Buyer' })).status, 403);
+        assert.equal((await request('/v1/works', token)).status, 403);
+      }
+    });
+  } finally { owned?.database.close(); }
 });

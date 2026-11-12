@@ -67,6 +67,8 @@ export interface RegionalControlPlane {
 
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   commerce?: ReferenceCommerceConfiguration;
+  registrationAdmission?: (input: { email: string; invitationCode?: string; organizationName?: string }) => Promise<{ allowed: boolean; reasonCode?: string }>;
+
   publicBaseUrl: string;
   instanceId?: string;
   cellId?: string;
@@ -145,11 +147,12 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   const { repositories } = composition.dependencies;
   const processor = configuration.mediaProcessor ?? new LocalImageProcessor();
 
-  const session = async (request: IncomingMessage) => {
+  const session = async (request: IncomingMessage, allowCustomer = false) => {
     const credential = request.headers.authorization?.replace(/^Bearer\s+/i, "");
     if (!credential || credential === request.headers.authorization) throw new HttpError(401, "authentication_required", "A bearer session is required");
     const verified = await adapters.identity.verifySession({ credential });
     if (!verified) throw new HttpError(401, "authentication_invalid", "The session is invalid or expired");
+    if (!allowCustomer && (verified.subject.accountScope === 'customer_account' || verified.subject.roles.includes('customer_account'))) throw new HttpError(403, 'creator_access_denied', 'Customer accounts do not have creator access.');
     return verified;
   };
   const operatorSession = async (request: IncomingMessage) => {
@@ -191,6 +194,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         }
       : new SingleOperatorTenancyAdapter({
           getOperatorUserId: async () => {
+            const claim = await repositories.instanceOperators?.get(configuration.instanceId ?? 'local-reference');
+            if (claim) return claim.actorId;
             const all = await allRecords(repositories.creators);
             if (!all.length) return null;
             all.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -408,7 +413,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   if (configuration.commerce && ((!localAdapters && !(configuration.commerce.store && configuration.commerce.vault)) || (!configuration.commerce.vault && (!configuration.credentialEncryptionKey || configuration.credentialEncryptionKey.length < 32)))) throw new Error('Commerce requires a durable store and an encrypted vault; local vaults require an explicit encryption key of at least 32 characters.');
   const commerce = configuration.commerce ? createReferenceCommerce(configuration.commerce, {
     deploymentId: configuration.instanceId ?? 'local-reference', cellId, publicBaseUrl: configuration.publicBaseUrl, dataDirectory: localConfiguration.dataDirectory,
-    vault: configuration.commerce.vault ?? localAdapters!.credentials, storage: adapters.storage, subject: async request => (await session(request)).subject.id,
+    vault: configuration.commerce.vault ?? localAdapters!.credentials, storage: adapters.storage, subject: async request => (await session(request, true)).subject.id,
     creator: async(subjectId,ownerId)=>{if(!ownerId)return creatorFor(subjectId);const creator=await repositories.creators.get(ownerId);if(!creator)throw new HttpError(404,'creator_not_found','Creator was not found.');
       if(creator.subjectId!==subjectId){const at=new Date().toISOString(),delegations=await adapters.identity.listDelegations({creatorId:ownerId,subjectId,at});
         if(!delegations.some(d=>d.creatorId===ownerId&&d.subjectId===subjectId&&(!d.expiresAt||d.expiresAt>at)&&d.scopes.includes('commerce.manage')))throw new HttpError(403,'creator_authorization_denied','Commerce management delegation is required.');}
@@ -640,7 +645,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         await session(request);
         return json(response, 200, { slots: hostPorts.studioUiSlots, transforms: { graphicWatermark: hostPorts.watermarkAndTransform.supportsGraphicWatermark, imageAdjustments: hostPorts.watermarkAndTransform.supportsImageAdjustments }, requestId }, requestId);
       }
-      if (method === "POST" && url.pathname === "/v1/auth/sign-up") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const account = await adapters.localIdentity.register({ email: requireString(body.email, "email"), password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
+      if (method === "POST" && url.pathname === "/v1/auth/sign-up") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const email = requireString(body.email, "email");
+        const admission = await configuration.registrationAdmission?.({ email, invitationCode: typeof body.invitationCode === 'string' ? body.invitationCode : undefined, organizationName: typeof body.organizationName === 'string' ? body.organizationName : undefined });
+        if (admission && !admission.allowed) throw new HttpError(403, admission.reasonCode ?? 'registration_not_admitted', 'Registration requirements have not been satisfied.');
+        const account = await adapters.localIdentity.register({ email, password: requireString(body.password, "password") }); return json(response, 201, { account, requestId }, requestId); }
       if (method === "POST" && url.pathname === "/v1/activity/command") {
         const identity = await session(request);
         if (!configuration.activityCommands) throw new HttpError(404, "activity_unavailable", "Activity interface is not configured");
@@ -656,7 +664,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && url.pathname === "/v1/creators") {
         const identity = await session(request);
         const body = await parseBody(request);
-        const creator = await repositories.transaction(async transaction => {
+        const createCreator = () => repositories.transaction(async transaction => {
+        if (tenancy.mode === 'single_operator') {
+          const claims = repositories.instanceOperators;
+          if (!claims) throw new HttpError(503, 'operator_claim_store_required', 'An atomic operator claim store is required.');
+          const id = configuration.instanceId ?? 'local-reference';
+          const claim = await claims.get(id);
+          const existing = await getDistinctOperatorUserIds();
+          if ((claim && claim.actorId !== identity.subject.id) || existing.some(actor => actor !== identity.subject.id)) throw new SingleOperatorLimitError();
+          if (!claim) await claims.create({ id, instanceId: id, actorId: identity.subject.id }, { transaction });
+        }
         const existingUsers = await getDistinctOperatorUserIds();
         await tenancy.assertCanCreateCreatorUser({
           existingCreatorUserCount: existingUsers.length,
@@ -671,6 +688,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           subjectId: identity.subject.id
         }, { transaction });
         });
+        let creator: CreatorRecord;
+        try { creator = await createCreator(); }
+        catch (error) {
+          const claim = tenancy.mode === 'single_operator' ? await repositories.instanceOperators?.get(configuration.instanceId ?? 'local-reference') : undefined;
+          if (claim && claim.actorId !== identity.subject.id) throw new SingleOperatorLimitError();
+          throw error;
+        }
         return json(response, 201, { creator, requestId }, requestId);
       }
       if (method === "GET" && url.pathname === "/v1/creators") {
