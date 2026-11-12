@@ -61,6 +61,6 @@ the bridge does not manufacture completion of a challenge. See the official
 
 A real-provider HTTP rehearsal used this bridge with the commercial API: sign-in,
 organization and creator setup, a queued job fenced after actual user disablement,
-released reservation, preserved original input, reauthentication and provider
+no reserved or consumed credits, preserved original input, reauthentication and provider
 sign-out revocation. Its core/quota data used disposable local SQLite; it does not
 certify deployed managed persistence or paid credit delivery.
