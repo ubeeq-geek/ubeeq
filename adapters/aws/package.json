@@ -35,6 +35,7 @@
     "@ubeeq/persistence": "^0.1.0",
     "@ubeeq/storage": "^0.1.0",
     "@ubeeq/commerce": "^0.1.0",
-    "aws-jwt-verify": "^4.0.1"
+    "aws-jwt-verify": "^4.0.1",
+    "@ubeeq/core": "^0.1.0"
   }
 }
