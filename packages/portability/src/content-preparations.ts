@@ -9,10 +9,13 @@ function portableAnnouncement(value: ContentWorkflowDraft['settings']['announce'
     const result = structuredClone(value);
     result.destinationIds = [];
     result.mode = result.mode === 'off' ? 'off' : 'draft';
-    const clearBindings = (template: typeof result.template) => { if (template) {
-        delete template.destinationOverrides;
-        delete template.destinationCustomizations;
-    } return template; };
+    const clearBindings = (template: typeof result.template) => {
+        if (template) {
+            delete template.destinationOverrides;
+            delete template.destinationCustomizations;
+        }
+        return template;
+    };
     result.template = clearBindings(result.template);
     if (result.timing?.mode === 'at_time')
         result.timing = { mode: 'after_publication', timeZone: result.timing.civilTime.timeZone };
@@ -36,10 +39,14 @@ export function portableContentPreparations(drafts: readonly ContentWorkflowDraf
             draft.actorId = 'restore-required';
             draft.operationIds = [];
             draft.settings.releaseTime = undefined;
+            delete draft.settings.commerceOffer;
+            delete draft.settings.offerId;
+            if (draft.settings.metadata)
+                draft.settings.metadata.overrides = draft.settings.metadata.overrides.filter(row => !row.accountId && !row.targetIds?.length);
             draft.settings.publishDestinations = draft.settings.publishDestinations.map(d => ({ ...d, connectionId: undefined, targetId: undefined }));
             draft.settings.announce = portableAnnouncement(draft.settings.announce);
             return draft;
-        }), presets: presets.map(source => { const preset = captureContentPreset({ ...source, settings: { ...source.settings, publishDestinations: source.settings.publishDestinations.map(d => ({ ...d, connectionId: undefined, targetId: undefined })), announce: portableAnnouncement(source.settings.announce) } }); return { ...preset, isDefault: false, archived: source.archived }; }) };
+        }), presets: presets.map(source => { const preset = captureContentPreset({ ...source, settings: { ...source.settings, publishDestinations: source.settings.publishDestinations.map(d => ({ ...d, connectionId: undefined, targetId: undefined })), metadata: source.settings.metadata ? { ...source.settings.metadata, overrides: source.settings.metadata.overrides.filter(row => !row.accountId && !row.targetIds?.length) } : undefined, announce: portableAnnouncement(source.settings.announce) } }); return { ...preset, isDefault: false, archived: source.archived }; }) };
 }
 export function validateContentPreparationArchive(value: unknown, scope: {
     tenantId: string;
@@ -55,8 +62,8 @@ export function validateContentPreparationArchive(value: unknown, scope: {
         if (!draft || draft.creatorId !== scope.creatorId || draft.tenantId !== scope.tenantId || draft.schemaVersion !== 1 || typeof draft.id !== 'string' || !Number.isSafeInteger(draft.revision) || draft.revision < 1 || !Array.isArray(draft.units) || !Array.isArray(draft.previews) || draft.review || draft.state !== 'draft')
             throw Error('Invalid portable preparation.');
         validateContentObjects(draft.objects);
-        validateContentPreparation(draft.settings);
-        for (const ref of [...draft.units, ...(draft.entry.target ? [draft.entry.target] : [])])
+        validateContentPreparation(draft.settings,{allowIncompleteMedia:true});
+        for (const ref of [...draft.units, ...(draft.entry.target ? [draft.entry.target] : []), ...(draft.hierarchy?.children ?? []), ...draft.objects.flatMap(o => o.existingCollection ? [o.existingCollection] : [])])
             if (references && !(ref.kind === 'work' ? references.workIds : references.collectionIds).has(ref.id))
                 throw Error('Preparation references missing content.');
     }
