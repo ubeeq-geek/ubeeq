@@ -185,6 +185,7 @@ export interface Collection extends CellOwned {
 }
 
 export interface CollectionWork {
+  representationId?: string;
   collectionId: EntityId;
   workId: EntityId;
   position: number;

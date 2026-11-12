@@ -1,6 +1,8 @@
 import type { WorkKind, WorkAssetRole, CollectionType } from './index.js';
 import type { AnnouncementTemplate } from './collection-announcement-preferences.js';
 import {parseStoredPostBlocks,type StoredPostBlock} from './content-blocks.js';
+import {validateAnnouncementTemplate} from './collection-announcement-preferences.js';
+import {validateAnnouncementTiming} from './announcement-plan-scheduler.js';
 
 /** Preparation never grants publication, access, or delivery authority. */
 export type ContentUnitRef = { kind: 'work' | 'collection'; id: string; revision: number };
@@ -60,13 +62,35 @@ export interface ContentPreviewRelationship {
   revision: number;
   components: Array<{ intakeId?: string; assetId?: string; workId?: string; sourceRevision: string; recipe: ContentPreviewRecipe }>;
   offeringId?: string;
+  representationIds?: string[];
+  previewCollectionId?: string;
+}
+/** Exact approved output. Storage locations belong to the host, never this portable contract. */
+export interface ContentRepresentation {
+  id: string;
+  subject: ContentUnitRef;
+  kind: 'full' | 'preview';
+  relationshipId?: string;
+  components: Array<{id:string;assetId?:string;sourceFileId?:string;checksum:string;recipe:ContentPreviewRecipe}>;
+  body?: StoredPostBlock[];
+}
+export type ContentReleaseSubject = {kind:'work'|'collection'|'works';ids:string[]};
+/** A fallback is derived catalogue membership and confers no visibility or access rights. */
+export function standaloneImageWorkIds(works:readonly {workId:string;kind:string}[],memberships:readonly {workId:string}[]):string[] {
+  const named=new Set(memberships.map(m=>m.workId));
+  return works.filter(w=>w.kind==='image'&&!named.has(w.workId)).map(w=>w.workId);
 }
 export interface ContentPreparationSettings {
+  structure?: {collectionType:'collection'|'gallery'|'series'|'playlist';order:'intake';cover:'first_eligible_image'|'none'};
   access: 'private' | 'free' | 'premium' | 'members';
   discovery: boolean;
   preview: 'none' | 'uploaded' | 'generated';
   previewWatermark: boolean;
   previewMaxWidth: number;
+  visibility?: 'public'|'unlisted';
+  releaseTime?: {instant:string;localDateTime:string;timeZone:string;offsetMinutes:number};
+  /** Existing offering binding; capture omits it and requires a fresh binding on reuse. */
+  offerId?: string;
   /** References are creator-bound configuration, never exported credentials. */
   publishDestinations: Array<{ destination: string; connectionId?: string; targetId?: string; representation: 'full' | 'preview' | 'link'; required: boolean }>;
   announce: {
@@ -118,6 +142,7 @@ export interface ContentWorkflowDraft {
   settings: ContentPreparationSettings;
   preset?: { id: string; revision: number; name: string };
   changes?: ContentChangeSet;
+  releaseScope?: {workIds:string[];componentIds?:string[]};
   previews: ContentPreviewRelationship[];
   review?: ContentWorkflowReview;
   operationIds: string[];
@@ -163,11 +188,16 @@ export function validateContentPreparation(settings: ContentPreparationSettings)
   for (const d of settings.publishDestinations) if (!d || typeof d.destination !== 'string' || !d.destination || d.destination.length > 100 ||
     !['full','preview','link'].includes(d.representation) || typeof d.required !== 'boolean' ||
     [d.connectionId,d.targetId].some(id => id !== undefined && (typeof id !== 'string' || !id || id.length > 200))) invalid('Invalid publication destination.');
+  if(settings.structure&&(!['collection','gallery','series','playlist'].includes(settings.structure.collectionType)||settings.structure.order!=='intake'||!['first_eligible_image','none'].includes(settings.structure.cover)))invalid('Choose supported content structure defaults.');
   const a = settings.announce;
   if (!a || !['off','draft','after_publication'].includes(a.mode) || !Array.isArray(a.destinationIds) || a.destinationIds.length > 20 ||
     a.destinationIds.some(id => typeof id !== 'string' || !id || id.length > 200) || new Set(a.destinationIds).size !== a.destinationIds.length ||
     !Number.isSafeInteger(a.delayMs) || a.delayMs < 0 || a.delayMs > 31536000000 ||
     a.followUpDelayMs !== undefined && (!Number.isSafeInteger(a.followUpDelayMs) || a.followUpDelayMs < 600000 || a.followUpDelayMs > 31536000000)) invalid('Invalid announcement preparation.');
+  if(a.template)validateAnnouncementTemplate(a.template);
+  if(settings.visibility!==undefined&&!['public','unlisted'].includes(settings.visibility))invalid('Choose public or unlisted visibility.');
+  if(settings.releaseTime)validateAnnouncementTiming({mode:'at_time',civilTime:settings.releaseTime});
+  if(settings.offerId!==undefined&&(typeof settings.offerId!=='string'||!settings.offerId||settings.offerId.length>200))invalid('Choose a valid offering.');
 }
 export function validatePreviewRecipe(recipe: ContentPreviewRecipe): void {
   if (!recipe || !['uploaded_prepared','independent','image','text','time_range'].includes(recipe.kind)) invalid('Choose a supported preview recipe.');
@@ -200,15 +230,29 @@ export function resolveContentPreset(presets: readonly ContentUnitPreset[], crea
 }
 /** Presets carry reusable choices only. Content refs and absolute schedules never enter this projection. */
 export function captureContentPreset(input: { id: string; creatorId: string; name: string; revision: number; applicability: ContentUnitPreset['applicability']; settings: ContentPreparationSettings; isDefault: boolean }): ContentUnitPreset {
-  if (!input.id || !input.creatorId || !input.name.trim() || input.name.length > 80 || !Number.isSafeInteger(input.revision) || input.revision < 1 ||
-    !['work','collection','separate_works'].includes(input.applicability.arrangement)) invalid('Choose a valid preset name and applicability.');
+  if (!input.id || !input.creatorId || typeof input.name!=='string'||!input.name.trim() || input.name.length > 80 || !Number.isSafeInteger(input.revision) || input.revision < 1 ||
+    !['work','collection','separate_works'].includes(input.applicability.arrangement)||!['any','image','gallery','video','audio','literature','article','animation','mixed'].includes(input.applicability.media)||input.applicability.previewOrigin!==undefined&&!['uploaded_original','uploaded_prepared','existing','authored','external_reference'].includes(input.applicability.previewOrigin)) invalid('Choose a valid preset name and applicability.');
   validateContentPreparation(input.settings);
   const s = input.settings;
   return { id: input.id, creatorId: input.creatorId, name: input.name.trim(), schemaVersion: 1, revision: input.revision,
     applicability: structuredClone(input.applicability), isDefault: input.isDefault, archived: false,
-    settings: { access:s.access, discovery:s.discovery, preview:s.preview, previewWatermark:s.previewWatermark, previewMaxWidth:s.previewMaxWidth,
+    settings: { structure:s.structure?{collectionType:s.structure.collectionType,order:s.structure.order,cover:s.structure.cover}:undefined,access:s.access, discovery:s.discovery, preview:s.preview, previewWatermark:s.previewWatermark, previewMaxWidth:s.previewMaxWidth,
       publishDestinations:s.publishDestinations.map(d=>({destination:d.destination,connectionId:d.connectionId,targetId:d.targetId,representation:d.representation,required:d.required})),
-      announce:{mode:s.announce.mode,template:s.announce.template ? structuredClone(s.announce.template) : undefined,destinationIds:[...s.announce.destinationIds],delayMs:s.announce.delayMs,followUpDelayMs:s.announce.followUpDelayMs} } };
+      visibility:s.visibility,
+      announce:{mode:s.announce.mode,template:s.announce.template ? reusableContentTemplate(s.announce.template) : undefined,destinationIds:[...s.announce.destinationIds],delayMs:s.announce.delayMs,followUpDelayMs:s.announce.followUpDelayMs} } };
+}
+/** Reject concrete media and links rather than silently copying another subject's private data. */
+export function reusableContentTemplate(template:AnnouncementTemplate):AnnouncementTemplate {
+  validateAnnouncementTemplate(template);
+  const block=(b:AnnouncementTemplate['blocks'][number]):AnnouncementTemplate['blocks'][number]=>{
+    if(b.assetId||b.fileId||b.url||b.html||b.data||b.children?.length)invalid('Replace content-specific media, links and embedded content with reusable subject variables before saving this preset.');
+    if(b.linkGroup?.links.some(link=>link.source.kind==='url'||link.source.kind==='publication'&&link.source.collectionId))invalid('Use links to the current subject instead of specific URLs or Collections in this preset.');
+    if([b.text,b.quote,b.caption,b.title].some(value=>value&&/https?:\/\//i.test(value)))invalid('Use a subject link variable instead of a specific URL in this preset.');
+    const linkGroup=b.linkGroup?{heading:b.linkGroup.heading,links:b.linkGroup.links.map(link=>({id:link.id,label:link.label,appearance:link.appearance,required:link.required,showCount:link.showCount,countUnit:link.countUnit,source:link.source.kind==='publication'?{kind:'publication' as const,destinationKey:link.source.destinationKey}:{kind:'primary' as const}}))}:undefined;
+    return {id:b.id,type:b.type,text:b.text,level:b.level,caption:b.caption,quote:b.quote,author:b.author,title:b.title,label:b.label,alt:b.alt,question:b.question,items:b.items,answers:b.answers,groupId:b.groupId,linkAppearance:b.linkAppearance,linkGroup};
+  };
+  const customization=(map:AnnouncementTemplate['platformCustomizations'])=>map?Object.fromEntries(Object.entries(map).map(([key,value])=>[key,{order:value.order?[...value.order]:undefined,presentation:value.presentation?{discord:value.presentation.discord,title:value.presentation.title}:undefined,blockOverrides:value.blockOverrides?Object.fromEntries(Object.entries(value.blockOverrides).map(([id,b])=>[id,b?block(b):null])):undefined}])):undefined;
+  return {blocks:template.blocks.map(block),presentation:template.presentation?{discord:template.presentation.discord,title:template.presentation.title}:undefined,platformCustomizations:customization(template.platformCustomizations),destinationCustomizations:customization(template.destinationCustomizations),destinationOverrides:template.destinationOverrides?Object.fromEntries(Object.entries(template.destinationOverrides).map(([key,blocks])=>[key,blocks.map(block)])):undefined};
 }
 export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{code:string;message:string;objectId?:string}> {
   validateContentObjects(draft.objects); validateContentPreparation(draft.settings);
@@ -221,6 +265,8 @@ export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{cod
   for (const o of active) {
     if (!['ready','reference'].includes(o.state)) blockers.push({code:o.state==='failed'?'processing_failed':'processing_pending',message:o.error || `${o.filename} is not ready.`,objectId:o.id});
     if (o.role==='preview' && !o.targets.length && !draft.entry.target) blockers.push({code:'ambiguous_file_roles',message:`Choose what ${o.filename} promotes, or explicitly prepare a preview-only Work.`,objectId:o.id});
+    if(['cover','attachment'].includes(o.role)&&!o.targets.length&&active.filter(o=>o.role==='original').length>1)blockers.push({code:'ambiguous_file_roles',message:`Choose the Work that ${o.filename} belongs to. Collection covers can also be prepared in Collection management.`,objectId:o.id});
   }
+  if(draft.settings.preview==='uploaded'&&!active.some(o=>o.role==='preview')&&!draft.previews?.length)blockers.push({code:'preview_missing',message:'This setup expects a prepared preview. Upload one and choose its target.'});
   return blockers;
 }

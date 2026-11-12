@@ -16,6 +16,8 @@ export interface CollectionReleaseRequirement {
   required: boolean;
   kind: "native" | "website" | "external_gallery" | "collection_forum" | "adapter";
   deploymentRevision?: string;
+  /** Exact complete component/body snapshot for compositional content. */
+  representationId?: string;
 }
 /** Only adapters reading authoritative publication state may construct these observations. */
 export interface CollectionReleaseObservation {

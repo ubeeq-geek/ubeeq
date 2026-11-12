@@ -37,3 +37,13 @@ test('presets strip content-specific outer settings and resolve exact creator/ar
   assert.equal(preset.settings.preview,'none');
   assert.throws(()=>resolveContentPreset([preset,{...preset,id:'another'}],'creator','work','image'),/Several/);
 });
+test('preset templates cannot retain concrete private media, signed links or unrelated subject bindings',()=>{
+ const settings=defaultContentPreparation(),base={id:'preset',creatorId:'creator',name:'Reusable',revision:1,applicability:{arrangement:'work',media:'image'},settings,isDefault:false};
+ for(const block of [{id:'media',type:'image',assetId:'original'},{id:'link',type:'paragraph',url:'https://private.example?token=secret'},{id:'message',type:'paragraph',text:'https://private.example?token=secret'}])assert.throws(()=>captureContentPreset({...base,settings:{...settings,announce:{...settings.announce,template:{blocks:[block]}}}}));
+});
+test('Work subjects can reserve a new component revision without repeating an already exposed revision',async()=>{
+ const {reserveCollectionRelease}=await import('../dist/index.js');
+ const baseline={tenantId:'tenant',creatorId:'creator',collectionId:'work-scope',schemaVersion:1,revision:1,initialized:true,releasedWorkIds:['work'],evidence:[{workId:'work',destinationKey:'native',contentRevision:'1',evidenceReference:'prior'}],initialReleaseId:'original',reservations:[]};
+ assert.equal(reserveCollectionRelease({baseline,expectedRevision:1,releaseId:'repeat',requestedWorkIds:['work'],requestedRevisions:[{workId:'work',contentRevision:'1'}]}).state,'noop');
+ const next=reserveCollectionRelease({baseline,expectedRevision:1,releaseId:'components',requestedWorkIds:['work'],requestedRevisions:[{workId:'work',contentRevision:'2'}]});assert.equal(next.state,'reserved');assert.equal(next.reservation.kind,'additions');assert.deepEqual(next.reservation.workIds,['work']);
+});
