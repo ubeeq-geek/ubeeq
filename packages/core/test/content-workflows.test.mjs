@@ -55,3 +55,12 @@ test('advanced announcement settings use the existing scheduler and presets remo
  const preset=captureContentPreset({id:'advanced',creatorId:'creator',name:'Advanced',revision:1,applicability:{arrangement:'work',media:'image'},settings:{...defaultContentPreparation(),announce},isDefault:false});
  assert.equal(preset.settings.announce.timing.mode,'after_publication');assert.equal(preset.settings.announce.followUp.timing.mode,'delay_after_parent');assert.equal(preset.settings.announce.mediaRequirement,'select_managed_previews');assert.equal(JSON.stringify(preset).includes('private-original-id'),false);assert.equal(JSON.stringify(preset).includes('2027-01-02'),false);
 });
+
+test('neutral draft validation retains real destination customizations while release resolution checks actual bindings',async()=>{
+ const {validateContentPreparation,contentAnnouncementTrigger,announcementDestinationKey}=await import('../dist/index.js');
+ const binding={provider:'discord',accountId:'guild',connectionId:'bot',targetId:'channel',postType:'announcement'},key=announcementDestinationKey(binding),announce={mode:'draft',destinationIds:['selected'],delayMs:0,template:{fields:{seriesName:'Recurring series',eventLabel:'UPDATE',secret:'omit'},blocks:[{id:'message',type:'paragraph',text:'Standard'}],destinationCustomizations:{[key]:{blockOverrides:{message:{id:'message',type:'paragraph',text:'Custom destination copy'}}}}}};
+ validateContentPreparation({...defaultContentPreparation(),announce});
+ const trigger=contentAnnouncementTrigger(announce,[{binding,settings:{destinationId:'selected'}}],'native');assert.equal(trigger.template.destinationCustomizations[key].blockOverrides.message.text,'Custom destination copy');
+ const preset=captureContentPreset({id:'custom',creatorId:'creator',name:'Custom',revision:1,applicability:{arrangement:'work',media:'image'},settings:{...defaultContentPreparation(),announce},isDefault:false});assert.deepEqual(preset.settings.announce.template.fields,{seriesName:'Recurring series',eventLabel:'UPDATE'});
+ assert.throws(()=>contentAnnouncementTrigger(announce,[{binding:{...binding,targetId:'different'},settings:{destinationId:'selected'}}],'native'),/selected announcement destination/);
+});

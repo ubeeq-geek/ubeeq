@@ -300,9 +300,15 @@ export function validateContentPreparation(settings: ContentPreparationSettings)
     if (a.template)
         validateAnnouncementTemplate(a.template);
     // The ordinary workflow and advanced editor share the established scheduler/media contract.
+    if(a.followUp&&(!Array.isArray(a.followUp.destinationIds)||a.followUp.destinationIds.some(id=>typeof id!=='string'||!id||id.length>200)))invalid('Choose valid follow-up destination references.');
+    if(a.followUp?.template)validateAnnouncementTemplate(a.followUp.template);
     const ids = [...new Set([...a.destinationIds, ...(a.followUp?.destinationIds ?? [])])];
+    // Binding ownership is validated with real host bindings at release preparation;
+    // neutral draft validation cannot invent the destination keys of those bindings.
+    const withoutBindings=(template:AnnouncementTemplate|undefined)=>template?{...template,destinationOverrides:undefined,destinationCustomizations:undefined}:undefined;
+    const validation={...a,template:withoutBindings(a.template),followUp:a.followUp?{...a.followUp,template:withoutBindings(a.followUp.template)}:undefined};
     try {
-        contentAnnouncementTrigger(a, ids.map(id => ({ binding: { provider: 'validation', accountId: id, connectionId: id, targetId: id, postType: 'announcement' }, settings: { destinationId: id } })), 'native');
+        contentAnnouncementTrigger(validation, ids.map(id => ({ binding: { provider: 'validation', accountId: id, connectionId: id, targetId: id, postType: 'announcement' }, settings: { destinationId: id } })), 'native');
     }
     catch (error) {
         invalid(error instanceof Error ? error.message : 'Invalid announcement preparation.');
@@ -429,7 +435,8 @@ export function reusableContentTemplate(template: AnnouncementTemplate): Announc
         return { id: b.id, type: b.type, text: b.text, level: b.level, caption: b.caption, quote: b.quote, author: b.author, title: b.title, label: b.label, alt: b.alt, question: b.question, items: b.items, answers: b.answers, groupId: b.groupId, linkAppearance: b.linkAppearance, linkGroup };
     };
     const customization = (map: AnnouncementTemplate['platformCustomizations']) => map ? Object.fromEntries(Object.entries(map).map(([key, value]) => [key, { order: value.order ? [...value.order] : undefined, presentation: value.presentation ? { discord: value.presentation.discord, title: value.presentation.title } : undefined, blockOverrides: value.blockOverrides ? Object.fromEntries(Object.entries(value.blockOverrides).map(([id, b]) => [id, b ? block(b) : null])) : undefined }])) : undefined;
-    return { blocks: template.blocks.map(block), presentation: template.presentation ? { discord: template.presentation.discord, title: template.presentation.title } : undefined, platformCustomizations: customization(template.platformCustomizations), destinationCustomizations: customization(template.destinationCustomizations), destinationOverrides: template.destinationOverrides ? Object.fromEntries(Object.entries(template.destinationOverrides).map(([key, blocks]) => [key, blocks.map(block)])) : undefined };
+    if([template.fields?.seriesName,template.fields?.eventLabel].some(value=>value&&/https?:\/\//i.test(value)))invalid('Use reusable branding or event labels instead of concrete URLs in preset fields.');
+    return { blocks: template.blocks.map(block), fields:template.fields?{seriesName:template.fields.seriesName,eventLabel:template.fields.eventLabel}:undefined, presentation: template.presentation ? { discord: template.presentation.discord, title: template.presentation.title } : undefined, platformCustomizations: customization(template.platformCustomizations), destinationCustomizations: customization(template.destinationCustomizations), destinationOverrides: template.destinationOverrides ? Object.fromEntries(Object.entries(template.destinationOverrides).map(([key, blocks]) => [key, blocks.map(block)])) : undefined };
 }
 export function contentWorkflowBlockers(draft: ContentWorkflowDraft): Array<{
     code: string;
