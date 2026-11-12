@@ -1,3 +1,4 @@
+import type { AwsCommandClient } from './client-port.js';
 import { randomUUID } from 'node:crypto';
 import { TransactGetCommand, TransactWriteCommand, UpdateCommand, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
@@ -41,7 +42,7 @@ export const publicDerivativeAssetKey = (assetId: string): string => `ASSET#${as
  * cannot publish a different Asset version.
  */
 export const createDynamoPublicDerivativeRepository = (input: {
-  client: DynamoDBDocumentClient;
+  client: AwsCommandClient;
   metadataTableName: string;
   auditTableName: string;
 }): PublicDerivativeRepository => ({

@@ -1,3 +1,4 @@
+import type { AwsCommandClient } from './client-port.js';
 import { createHash } from 'node:crypto';
 import { S3Client, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { CloudFrontKeyValueStoreClient, DescribeKeyValueStoreCommand, GetKeyCommand, UpdateKeysCommand } from '@aws-sdk/client-cloudfront-keyvaluestore';
@@ -9,7 +10,7 @@ export interface AwsWebsiteHostingProfile { id:string; accountId:string; bucket:
 export class AwsWebsiteHostingAdapter implements WebsiteHostingAdapter {
   readonly apiVersion='2' as const;readonly family='aws' as const;readonly id:string;
   readonly capabilities:HostingCapabilities={emergencySuspension:true,provision:false,select:true,staging:'private',activation:'release_reference',propagation:'provider',rollback:'retained_artifact',domains:'operator_managed',redirects:'portable',headers:false,unpublish:'confirmed',maxFiles:5000,maxBytes:512*1024*1024,maxFileBytes:128*1024*1024};
-  constructor(readonly profile:AwsWebsiteHostingProfile,private readonly ports:{s3:Pick<S3Client,'send'>;kvs:Pick<CloudFrontKeyValueStoreClient,'send'>;inspect:(target:WebsiteHostingTarget)=>Promise<{privateBucket:boolean;originAccessControl:boolean;hostnameAssociated:boolean;functionAssociated:boolean;embeddingPolicyAssociated?:boolean}>;probe:HostingPublicProbe}){this.id='aws:'+profile.id;}
+  constructor(readonly profile:AwsWebsiteHostingProfile,private readonly ports:{s3:AwsCommandClient;kvs:AwsCommandClient;inspect:(target:WebsiteHostingTarget)=>Promise<{privateBucket:boolean;originAccessControl:boolean;hostnameAssociated:boolean;functionAssociated:boolean;embeddingPolicyAssociated?:boolean}>;probe:HostingPublicProbe}){this.id='aws:'+profile.id;}
   private prefix(t:WebsiteHostingTarget){if(t.accountId!==this.profile.accountId||!/^[a-f0-9]{32}$/.test(t.remoteId)||t.remoteId!==sha(JSON.stringify([t.workspaceId,t.id])).slice(0,32))throw new WebsiteError('target_identity_changed','AWS profile and site namespace must match this exact target.');return 'sites/'+t.remoteId;}
   private key(t:WebsiteHostingTarget){return 'host:'+new URL(t.publicUrl).hostname;}
   private async get(key:string):Promise<any>{try{const r=await this.ports.kvs.send(new GetKeyCommand({KvsARN:this.profile.keyValueStoreArn,Key:key}));return JSON.parse(r.Value!);}catch(e){if((e as Error).name==='ResourceNotFoundException')return undefined;throw e;}}
