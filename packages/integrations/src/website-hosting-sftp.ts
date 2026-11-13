@@ -42,19 +42,28 @@ export class SftpWebsiteHostingAdapter implements WebsiteHostingAdapter {
         const path=await this.path(s,releaseRoot,file),st=await s.stat(path);
         if(st){if(digest(await s.read(path))!==digest(bytes))throw new WebsiteError('release_drift','Immutable SFTP release differs from the artifact.');}
         else await s.write(path,bytes);
-        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){
-          const shared=await this.path(s,root,file);
-          // A release upload may outlive its writer authority; recheck before
-          // making a second copy in the retained public-asset directory.
-          if(!await s.stat(shared)){await c.beforeUpload?.();await s.write(shared,bytes);}
-          else if(digest(await s.read(shared))!==digest(bytes))throw new WebsiteError('asset_drift','Retained SFTP asset changed.');
-        }
       }
       await c.beforeUpload?.();return {releaseId:release};
     }finally{await s.close();}
   }
   async activate(c:HostingDeploymentContext):Promise<HostingOutcome>{const s=await this.session(c.target,c.connection);try{const root=await this.owned(s,c.target);
-      if(this.mode==='pointer'){const current=posix.join(root,'current');if(await s.stat(current)){const previous=await s.readlink(current);if(c.target.activeReleaseId&&previous!=='releases/'+c.target.activeReleaseId)throw new WebsiteError('remote_drift','SFTP serving pointer changed outside Ubeeq.');}const temp=posix.join(root,'.current-'+digest(c.attemptId).slice(0,24));if(await s.stat(temp))await s.remove(temp);await s.symlink('releases/'+c.artifact!.digest,temp);await c.beforeActivation();await s.rename(temp,current,true);}
+      if(this.mode==='pointer'){
+        const current=posix.join(root,'current');
+        const checkPointer=async()=>{if(await s.stat(current)){const previous=await s.readlink(current);if(c.target.activeReleaseId&&previous!=='releases/'+c.target.activeReleaseId)throw new WebsiteError('remote_drift','SFTP serving pointer changed outside Ubeeq.');}};
+        await checkPointer();
+        const releaseRoot=posix.join(root,'releases',c.artifact!.digest);
+        for(const [file,bytes] of c.artifact!.files){
+          if(!/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file))continue;
+          const source=await this.path(s,releaseRoot,file,false),shared=await this.path(s,root,file);
+          if(digest(await s.read(source))!==digest(bytes))throw new WebsiteError('release_drift','Staged SFTP asset changed before activation.');
+          if(await s.stat(shared)){if(digest(await s.read(shared))!==digest(bytes))throw new WebsiteError('asset_drift','Retained SFTP asset changed.');continue;}
+          // Standard SFTP has no hardlink/copy primitive. Write a private
+          // temporary file, then publish complete bytes by atomic rename.
+          const staged=await this.path(s,releaseRoot,'.asset-'+digest(JSON.stringify([c.attemptId,file])).slice(0,32));
+          try{await c.beforeActivation();await s.write(staged,bytes);await c.beforeActivation();await s.rename(staged,shared);}
+          finally{if(await s.stat(staged))await s.remove(staged);}
+        }
+        await checkPointer();const temp=posix.join(root,'.current-'+digest(c.attemptId).slice(0,24));if(await s.stat(temp))await s.remove(temp);await s.symlink('releases/'+c.artifact!.digest,temp);await c.beforeActivation();await s.rename(temp,current,true);}
       else{const entries=[...c.artifact!.files].sort(([a],[b])=>(a==='ubeeq-release.json'?2:a.startsWith('assets/')?0:1)-(b==='ubeeq-release.json'?2:b.startsWith('assets/')?0:1)||a.localeCompare(b));
         for(const [file,bytes] of entries){if(file==='ubeeq-release.json')continue;const path=await this.path(s,root,file),temp=await this.path(s,root,file+'.ubeeq-'+digest(c.attemptId).slice(0,16));await c.beforeActivation();await s.write(temp,bytes);await c.beforeActivation();try{await s.rename(temp,path);}catch(error){if(!await s.stat(path))throw error;await c.beforeActivation();await s.remove(path);await c.beforeActivation();await s.rename(temp,path);}}
         for(const file of await this.ports.managedFiles(c.target)){if(c.artifact!.files.has(file)||/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file))continue;const path=await this.path(s,root,file);if(await s.stat(path)){await c.beforeActivation();await s.remove(path);}}

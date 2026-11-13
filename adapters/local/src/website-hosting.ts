@@ -40,7 +40,7 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
     // Reusing retained bytes still requires current writer authorization.
     if(await exists(releaseRoot)){for(const [file,bytes] of artifact.files){await context.beforeUpload?.();const destination=await this.safeParent(releaseRoot,file);if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('release_drift','An immutable release has changed.');}return {releaseId};}
     await mkdir(stage,{mode:0o750});try{for(const [file,bytes] of artifact.files){await context.beforeUpload?.();const destination=await this.safeParent(stage,file);
-        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}else{try{await writeSynced(asset,bytes);}catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST'||hash(await readFile(asset))!==hash(bytes))throw error;}}await link(asset,destination);}
+        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');await link(asset,destination);}else await writeSynced(destination,bytes);}
         else await writeSynced(destination,bytes);}
       // The last file and directory syncs may have outlived the prior guard.
       await syncTree(stage);await syncDirectory(assets);await context.beforeUpload?.();await rename(stage,releaseRoot);await syncDirectory(releases);return {releaseId};
@@ -51,7 +51,20 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
     const releaseId=disabled?'disabled-'+context.generation:context.checkpoint.releaseId;
     if(!disabled&&(!releaseId||releaseId!==context.artifact?.digest))throw new WebsiteError('artifact_unavailable','Staged release does not match the exact artifact.');
     const temp=join(site,'.current-'+randomUUID());await writeSynced(temp,JSON.stringify({version:'1',generation:context.generation,state:disabled?'disabled':'active',releaseId,marker:context.artifact?.marker??null}));
-    try{await context.beforeActivation();await rename(temp,file);await syncDirectory(site);}finally{await rm(temp,{force:true});}
+    try{
+      // New content-addressed bytes remain private until publication authority
+      // is checked. Previously published assets retain their stable URLs.
+      if(!disabled)for(const [name,bytes] of context.artifact!.files){
+        if(!/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(name))continue;
+        const source=await this.safeParent(join(site,'releases',releaseId!),name),destination=await this.safeParent(site,name);
+        if(hash(await readFile(source))!==hash(bytes))throw new WebsiteError('release_drift','Staged asset changed before activation.');
+        const retained=await exists(destination);
+        if(retained){if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}
+        else{await context.beforeActivation();await link(source,destination);}
+      }
+      if(!disabled)await syncDirectory(join(site,'assets'));
+      await context.beforeActivation();await rename(temp,file);await syncDirectory(site);
+    }finally{await rm(temp,{force:true});}
     return {state:disabled?'disabled' as const:'activated' as const,releaseId,publicUrl:context.target.publicUrl};
   }
   private async policyGate(target:WebsiteHostingTarget,state:'active'|'suspended',beforeServing?:()=>Promise<void>){

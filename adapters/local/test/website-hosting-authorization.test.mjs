@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {mkdtemp,realpath,readdir,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,realpath,readdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {NativeWebsiteHostingAdapter,nativeWebsiteKey} from '../dist/index.js';
+import {createServer,get} from 'node:http';
+import {NativeWebsiteHostingAdapter,nativeWebsiteKey,createNativeWebsiteHandler} from '../dist/index.js';
 
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function fixture(t){
@@ -25,10 +26,10 @@ test('native rejects revoked authorization before writing the first payload',asy
  assert.deepEqual(await readdir(join(f.site,'releases')),[]);
  assert.ok(!(await readdir(f.site)).some(name=>name.startsWith('.staging-')));
 });
-test('native stops between payloads and removes its private stage while retaining accepted shared bytes',async t=>{
+test('native stops between payloads and removes new private bytes without exposing a shared asset',async t=>{
  const f=await fixture(t);let calls=0;
  await assert.rejects(f.adapter.prepare({...f.context,beforeUpload:async()=>{if(++calls===2)throw Error('writer fenced');}}),/writer fenced/);
- assert.equal(calls,2);assert.deepEqual(await readFile(join(f.site,f.asset)),f.artifact.files.get(f.asset));
+ assert.equal(calls,2);assert.deepEqual(await readdir(join(f.site,'assets')),[]);
  assert.deepEqual(await readdir(join(f.site,'releases')),[]);
  assert.ok(!(await readdir(f.site)).some(name=>name.startsWith('.staging-')));
 });
@@ -45,4 +46,31 @@ test('native checks authorization when reusing an immutable release without chan
  assert.equal(await readFile(join(f.site,'releases',f.artifact.digest,'index.html'),'utf8'),'Approved content');
  let allowedCalls=0;assert.equal((await f.adapter.prepare({...f.context,beforeUpload:async()=>{allowedCalls++;}})).releaseId,f.artifact.digest);
  assert.equal(allowedCalls,2);
+});
+
+
+test('new native assets stay private behind an existing active site until guarded activation', async t => {
+ const f=await fixture(t),first={...f.context,checkpoint:await f.adapter.prepare(f.context)};
+ await f.adapter.activate(first);
+ const server=createServer(createNativeWebsiteHandler([f.adapter.profile]));
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>server.close(resolve)));
+ const read=file=>new Promise((resolve,reject)=>{const url=new URL(file,f.target.publicUrl);get({hostname:'127.0.0.1',port:server.address().port,path:url.pathname,headers:{host:url.hostname}},response=>{const chunks=[];response.on('data',bytes=>chunks.push(bytes));response.on('error',reject);response.on('end',()=>resolve({status:response.statusCode,body:Buffer.concat(chunks)}));}).on('error',reject);});
+ assert.equal((await read(f.asset)).status,200);
+ const bytes=Buffer.from('new privately staged image'),asset='assets/'+hash(bytes)+'.jpg';
+ const artifact={digest:hash('next-release'),files:new Map([[asset,bytes],['index.html',Buffer.from('Next content')]])};
+ const next={...f.context,generation:2,artifact,checkpoint:{},beforeActivation:async()=>{throw Error('approval revoked');}};
+ next.checkpoint=await f.adapter.prepare(next);
+ assert.equal((await read(asset)).status,404);
+ await assert.rejects(f.adapter.activate(next),/approval revoked/);
+ assert.equal((await read(asset)).status,404);assert.equal((await read(f.asset)).status,200);
+ next.beforeActivation=async()=>{};await f.adapter.activate(next);
+ assert.deepEqual((await read(asset)).body,bytes);assert.equal((await read(f.asset)).status,200);
+});
+
+
+test('native refuses changed private asset bytes before exposing the retained path',async t=>{
+ const f=await fixture(t),checkpoint=await f.adapter.prepare(f.context);
+ await writeFile(join(f.site,'releases',f.artifact.digest,f.asset),'changed staged bytes');
+ await assert.rejects(f.adapter.activate({...f.context,checkpoint}),{code:'release_drift'});
+ assert.deepEqual(await readdir(join(f.site,'assets')),[]);
 });
