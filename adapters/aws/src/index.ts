@@ -13,7 +13,7 @@ import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, Secret
 import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, repositoryItems, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
@@ -374,7 +374,10 @@ export class S3PresignedDelivery implements DeliveryAdapter {
  * truth. Workers lease atomically from DynamoDB, so duplicate SQS delivery and lost
  * notifications are harmless: a periodic recovery worker can always re-offer queued work.
  */
-interface AwsJobRecord extends DurableJob, RevisionedRecord {}
+interface AwsJobRecord extends DurableJob, RevisionedRecord {
+  /** Separate request trace from the existing correlationId lease fence. Null means no retained trace. */
+  requestCorrelationId?: string | null;
+}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
@@ -382,17 +385,16 @@ export class AwsJobQueue implements JobQueue {
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
     const id = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
-    const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
-    if (existing) return existing;
-    const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
+    const existing = await this.jobs.get(id);
+    if (existing) return this.publicJob(existing) as DurableJob<TPayload>;
+    const created = await this.jobs.create({ id, ...input, requestCorrelationId: input.correlationId ?? null, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey });
     await this.notify(created.id, created.type, created.cellId);
-    return created;
+    return this.publicJob(created) as DurableJob<TPayload>;
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const candidates = await this.jobs.list({ limit: 100 });
-    const timestamp = Date.now();
-    for (const candidate of candidates.items) {
+    for await (const candidate of repositoryItems(request => this.jobs.list(request))) {
+      const timestamp = Date.now();
       if (candidate.cellId !== input.cellId || (input.types?.length && !input.types.includes(candidate.type))) continue;
       const expired = candidate.state === 'leased' && Boolean(candidate.leaseExpiresAt) && Date.parse(candidate.leaseExpiresAt!) <= timestamp;
       const available = ['queued', 'retry_scheduled'].includes(candidate.state) && Date.parse(candidate.availableAt) <= timestamp;
@@ -404,14 +406,18 @@ export class AwsJobQueue implements JobQueue {
           continue;
         }
         const leased = await this.claimOrExpire(candidate, timestamp, expired, { state: 'leased', attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
-        return { job: leased as DurableJob<TPayload>, leaseToken };
+        return { job: this.publicJob(leased) as DurableJob<TPayload>, leaseToken };
       } catch (error) { if (!(error instanceof OptimisticConcurrencyError)) throw error; }
     }
     return undefined;
   }
   private async claimOrExpire(job: AwsJobRecord, timestamp: number, expired: boolean, change: Partial<AwsJobRecord>): Promise<AwsJobRecord> {
     const currentTime = new Date(timestamp).toISOString();
-    const value = { ...job, ...change, revision: job.revision + 1, updatedAt: currentTime };
+    // Keep the raw ownership marker for both old and new workers. Historical jobs
+    // already leased by an older writer have lost their original trace; never
+    // mistake the old worker/token for a request ID.
+    const requestCorrelationId = job.requestCorrelationId === undefined ? (job.attempt === 0 ? job.correlationId ?? null : null) : job.requestCorrelationId;
+    const value = { ...job, ...change, requestCorrelationId, revision: job.revision + 1, updatedAt: currentTime };
     try {
       await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
@@ -429,9 +435,25 @@ export class AwsJobQueue implements JobQueue {
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.updateLeased(job, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
-  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return recovered; }
-  async get(id: string): Promise<DurableJob | undefined> { return this.jobs.get(id); }
-  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> { const page = await this.jobs.list({ limit: Math.max(input.limit * 4, input.limit) }); return page.items.filter((job) => job.cellId === input.cellId && (!input.states || input.states.includes(job.state))).slice(0, input.limit); }
+  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return this.publicJob(recovered); }
+  async get(id: string): Promise<DurableJob | undefined> { const job = await this.jobs.get(id); return job && this.publicJob(job); }
+  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> {
+    if (!input.cellId.trim() || !Number.isSafeInteger(input.limit) || input.limit < 1) throw new Error('A cell and positive integer job limit are required.');
+    const found: DurableJob[] = [];
+    for await (const job of repositoryItems(request => this.jobs.list(request))) {
+      if (job.cellId !== input.cellId || input.states?.length && !input.states.includes(job.state)) continue;
+      found.push(this.publicJob(job));
+      if (found.length >= input.limit) break;
+    }
+    return found;
+  }
+  private publicJob(record: AwsJobRecord): DurableJob {
+    const { requestCorrelationId, ...job } = record;
+    const trace = requestCorrelationId === undefined && record.attempt === 0 ? record.correlationId : requestCorrelationId;
+    if (typeof trace === 'string') job.correlationId = trace;
+    else delete job.correlationId;
+    return job;
+  }
   private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
   private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || !leaseToken || job.correlationId?.split(":").at(-1) !== leaseToken || !job.leaseExpiresAt || !(Date.parse(job.leaseExpiresAt) > Date.now())) throw new Error(`Job ${id} does not hold this lease.`); return job; }
   private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.updateLeased(job, change); }
