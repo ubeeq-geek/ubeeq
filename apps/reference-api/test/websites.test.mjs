@@ -48,7 +48,10 @@ test('personal website API persists pages, queues builds, isolates previews and 
   await call('/v1/uploads/'+upload.uploadId+'/content','PUT',{base64:source.toString('base64')});
   await call('/v1/uploads/'+upload.uploadId+'/complete','POST',{workId:work.id,checksum,byteLength:source.length});await api.runNextJob('image-worker');
   const cache=new DatabaseSync(join(dir,'websites.sqlite'));
-  assert.equal(cache.prepare('SELECT count(*) AS count FROM website_renditions').get().count,1,'processing prewarms the website rendition');cache.close();
+  assert.equal(cache.prepare('SELECT count(*) AS count FROM website_renditions').get().count,0,'new accounted cache bytes are not duplicated in SQLite');cache.close();
+  const records=new DatabaseSync(join(dir,'state.sqlite'));
+  const renditions=records.prepare("SELECT payload FROM ubeeq_records WHERE repository='hostRecords'").all().map(row=>JSON.parse(row.payload)).filter(row=>row.namespace==='runtime-owned-object'&&row.value.operation==='website.rendition'&&row.value.phase==='completed');records.close();
+  assert.equal(renditions.length,1,'processing prewarms one owned website rendition');
   const pub=(await call('/v1/works/'+work.id+'/publications','POST',{destination:'local'})).body.publication;
   assert.equal((await call('/v1/websites/catalogue')).body.publications[0].id,pub.id);
   const gallerySite={...site,revision:2,galleryPublicationIds:[pub.id]};

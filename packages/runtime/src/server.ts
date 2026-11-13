@@ -32,7 +32,7 @@ import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
 import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
-import { cellScopedObjectKey, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
+import { cellScopedObjectKey, requireCreatorScopedObject, type StoredObject, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
 import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
 const json = (response: ServerResponse, status: number, body: unknown, requestId: string): void => {
@@ -316,20 +316,42 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   ]):undefined);
   const renditionFlights=new Map<string,Promise<{bytes:Uint8Array;width:number;height:number}>>();
   const renditionWaiters:Array<()=>void>=[];let activeRenditions=0;
-  const websiteRendition=(asset:AssetRecord,sourceBytes?:Uint8Array)=>{
-    const recipe=`website-jpeg-1600-v1:${asset.id}:${asset.checksum}`,key=asset.creatorId+':'+recipe,existing=renditionFlights.get(key);if(existing)return existing;
+  const websiteRendition=(asset:AssetRecord)=>{
+    // Website pixels must come from the approved public presentation. Reading
+    // the private original here would bypass the Creator's crop or watermark.
+    const location=(asset as AssetRecord&{storage?:StoredObject}).storage;
+    if(asset.instanceId!==(configuration.instanceId??'local-reference')||asset.homeCellId!==cellId||asset.status!=='ready'||!location||location.scope!=='public'||!location.versionId||!location.contentType.startsWith('image/')||!/^[a-f0-9]{64}$/.test(location.checksum??'')||!Number.isSafeInteger(location.byteLength)||location.byteLength<=0||location.byteLength>50*1024*1024)throw new WebsiteError('media_not_public','An immutable approved public image is required.');
+    requireCreatorScopedObject(location.key,{cellId,creatorId:asset.creatorId});
+    const reference=structuredClone(location),legacyRecipe=`website-jpeg-1600-v1:${asset.id}:${asset.checksum}`;
+    const recipe='website-jpeg-1600-v2:'+createHash('sha256').update(JSON.stringify([asset.id,reference.bucket,reference.key,reference.versionId,reference.checksum])).digest('hex');
+    const identity={creatorId:asset.creatorId,operation:'website.rendition',idempotencyKey:recipe};
+    const key=asset.creatorId+':'+recipe,existing=renditionFlights.get(key);if(existing)return existing;
+    const cached=async()=>{
+      // Earlier blobs remain subject to the cutover inventory baseline. Reuse
+      // one only when its original input was also the approved public bytes.
+      const pinned=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(pinned)return pinned;
+      const legacy=reference.checksum===asset.checksum?await websiteStore!.getPublicRendition(asset.creatorId,legacyRecipe):undefined;
+      if(legacy)return legacy;
+      const saved=await ownedObjectWrites?.recover(identity);if(!saved)return;
+      const {width,height}=saved.metadata;
+      if(!Number.isSafeInteger(width)||!Number.isSafeInteger(height)||(width as number)<=0||(height as number)<=0||saved.object.scope!=='private'||saved.object.contentType!=='image/jpeg'||saved.object.byteLength>10*1024*1024)throw new WebsiteError('invalid_media','The saved website image needs recovery.');
+      const loaded=await adapters.storage.get(saved.object);
+      if(['bucket','key','versionId','contentType','byteLength','checksum','scope'].some(field=>loaded.object[field as keyof StoredObject]!==saved.object[field as keyof StoredObject])||loaded.body.byteLength!==saved.object.byteLength||websiteDigest(loaded.body)!==saved.object.checksum)throw new WebsiteError('invalid_media','The saved website image failed integrity verification.');
+      return {bytes:loaded.body,width:width as number,height:height as number};
+    };
     const value=(async()=>{
-      const cached=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(cached)return cached;
+      const found=await cached();if(found)return found;
       if(activeRenditions>=2)await new Promise<void>(resolve=>renditionWaiters.push(resolve));else activeRenditions++;
       try{
         // Another worker/process may have populated the persistent cache while this operation waited.
-        const ready=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(ready)return ready;
-        let bytes=sourceBytes;
-        if(!bytes){const location=(asset as AssetRecord&{storage?:{bucket:string;key:string;versionId?:string;scope?:string}}).storage;if(!location||location.scope!=='public')throw new WebsiteError('media_not_public','Public storage rendition was not found.');bytes=(await adapters.storage.get(location)).body;}
-        if(bytes.length>50*1024*1024||websiteDigest(bytes)!==asset.checksum)throw new WebsiteError('invalid_media','Image source is oversized or changed.');
+        const ready=await cached();if(ready)return ready;
+        const loaded=await adapters.storage.get(reference),bytes=loaded.body;
+        if(['bucket','key','versionId','contentType','byteLength','checksum','scope'].some(field=>loaded.object[field as keyof StoredObject]!==reference[field as keyof StoredObject])||bytes.length!==reference.byteLength||websiteDigest(bytes)!==reference.checksum)throw new WebsiteError('invalid_media','The approved public image changed or failed integrity verification.');
         const {createCropSourcePreview}=await import('@ubeeq/media-sharp');
         const result=await createCropSourcePreview(bytes,{maxPreviewEdge:1600,maxOutputBytes:10*1024*1024}),clean={bytes:result.body,width:result.width,height:result.height};
-        await websiteStore!.putPublicRendition(asset.creatorId,recipe,clean);return clean;
+        if(ownedObjectWrites)await ownedObjectWrites.write({...identity,home:dataHomeOf(asset),bucket:reference.bucket,kind:'renditions',scope:'private',contentType:'image/jpeg',body:clean.bytes,metadata:{width:clean.width,height:clean.height,sourceVersionId:reference.versionId,sourceChecksum:reference.checksum,recipe:'website-jpeg-1600-v2'}});
+        else await websiteStore!.putPublicRendition(asset.creatorId,recipe,clean);
+        return clean;
       }finally{const next=renditionWaiters.shift();if(next)next();else activeRenditions--;}
     })();
     renditionFlights.set(key,value);void value.finally(()=>renditionFlights.delete(key)).catch(()=>{});return value;
@@ -546,7 +568,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       else await hostPorts.usageQuota.recordUsageSettlement({ creatorId: asset.creatorId, operation: 'asset.process', processingCreditsUsed: 1, idempotencyKey: usageKey });
       // Prepare reusable, metadata-clean website bytes before Preview is requested.
       // A failed optional prewarm is retried by the normal snapshot resolver.
-      if(websiteStore&&processed.mimeType.startsWith('image/'))try{await websiteRendition(processed,source.body);}catch{await audit({action:'website.rendition_deferred',subjectId:processed.id});}
+      if(websiteStore&&processed.mimeType.startsWith('image/'))try{await websiteRendition(processed);}catch{await audit({action:'website.rendition_deferred',subjectId:processed.id});}
       await adapters.jobs.complete({ id: lease.job.id, leaseToken: lease.leaseToken });
       return { job: await adapters.jobs.get(lease.job.id), asset: processed };
     } catch (error) {
