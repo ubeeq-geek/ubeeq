@@ -15,6 +15,31 @@ test('SFTP pointer capability is probed on the actual protocol; immutable stagin
  f.target.activeReleaseId=c.artifact.digest;const next=f.context('two','Updated');next.checkpoint=await f.adapter.prepare(next);assert.equal((await f.adapter.activate(next)).state,'activated');assert.equal((await f.adapter.reconcile(next)).state,'activated');
  f.records.set('/managed/current',{link:'../../private'});await assert.rejects(f.adapter.reconcile(next),{code:'unsafe_sftp_path'});
 });
+test('SFTP pointer checks upload authority before the first payload and between release and shared copies',async()=>{
+ const f=fixture('pointer');await f.adapter.validateTarget(f.target,f.connection);f.operations.length=0;
+ const c=f.context('revoked','Approved');c.beforeUpload=async()=>{throw Error('revoked');};
+ await assert.rejects(f.adapter.prepare(c),/revoked/);assert.deepEqual(f.operations,[]);
+ let checks=0;c.beforeUpload=async()=>{if(++checks===2)throw Error('writer fenced');};
+ await assert.rejects(f.adapter.prepare(c),/writer fenced/);
+ assert.equal(checks,2);assert.equal(f.operations.length,1);
+ const asset=[...c.artifact.files.keys()][0];
+ assert.ok(f.records.has('/managed/releases/'+c.artifact.digest+'/'+asset));
+ assert.equal(f.records.has('/managed/'+asset),false);assert.equal(f.records.has('/managed/current'),false);
+});
+test('SFTP pointer stops between files, closes its session and can resume the same immutable artifact',async()=>{
+ const f=fixture('pointer');await f.adapter.validateTarget(f.target,f.connection);
+ const c=f.context('interrupted','Approved');let checks=0,closed=0;
+ f.session.close=async()=>{closed++;};c.beforeUpload=async()=>{if(++checks===3)throw Error('superseded');};
+ await assert.rejects(f.adapter.prepare(c),/superseded/);assert.equal(closed,1);
+ assert.equal(f.records.has('/managed/releases/'+c.artifact.digest+'/index.html'),false);
+ const retained=f.operations.filter(([op])=>op==='write').length;
+ c.beforeUpload=async()=>{};c.checkpoint=await f.adapter.prepare(c);
+ assert.equal((await f.adapter.activate(c)).state,'activated');assert.equal((await f.adapter.reconcile(c)).state,'activated');
+ assert.equal(f.operations.filter(([op,path])=>op==='write'&&path.endsWith('.jpg')).length,2);
+ assert.ok(f.operations.filter(([op])=>op==='write').length>retained);
+ const writes=f.operations.length;c.beforeUpload=async()=>{throw Error('offboarded');};
+ await assert.rejects(f.adapter.prepare(c),/offboarded/);assert.equal(f.operations.length,writes);
+});
 test('in-place SFTP discloses mixed interruption, repairs the same artifact, preserves unrelated files and removes only its private manifest inventory',async()=>{
  const f=fixture('in_place');await f.adapter.validateTarget(f.target,f.connection);assert.equal(f.adapter.capabilities.activation,'in_place');f.records.set('/managed/unrelated.txt',{bytes:Buffer.from('untouched')});
  const c=f.context('one','Approved');await f.adapter.activate(c);f.records.set('/managed/stale.html',{bytes:Buffer.from('old')}); // no managed inventory entry: it must survive.
