@@ -1,4 +1,4 @@
-import type { Website, WebsiteDocument, WebsiteDependency } from '@ubeeq/core';
+import { WebsiteError, type Website, type WebsiteDocument, type WebsiteDependency } from '@ubeeq/core';
 /** Immutable, workspace-scoped bytes. Implementations own receipts and accounting;
  * logical retention cleanup must not silently refund or remove physical versions. */
 export interface WebsiteBlobStore {
@@ -52,4 +52,17 @@ export interface WebsiteStore {
    * start is inclusive and end exclusive; requests contain at most 2 MiB. */
   getArtifactFileRange?(workspaceId:string,digest:string,path:string,start:number,end:number):Promise<Uint8Array|undefined>;
   removeArtifact(workspaceId: string, digest: string): Promise<void>;
+}
+
+/** Bind the file projection to its exact stored (uncompressed) ZIP bytes. */
+export function verifyWebsiteArtifactProjection(digest:string,zip:Uint8Array,files:ReadonlyMap<string,Uint8Array>,checksum:(bytes:Uint8Array)=>string):void {
+  if(checksum(zip)!==digest)throw new WebsiteError('artifact_conflict','Artifact checksum does not match.');
+  const view=new DataView(zip.buffer,zip.byteOffset,zip.byteLength),seen=new Set<string>(),decoder=new TextDecoder();let offset=0;
+  while(offset+30<=zip.length&&view.getUint32(offset,true)===0x04034b50){
+    const size=view.getUint32(offset+18,true),nameLength=view.getUint16(offset+26,true),extra=view.getUint16(offset+28,true),start=offset+30+nameLength+extra,end=start+size;
+    const name=decoder.decode(zip.subarray(offset+30,offset+30+nameLength)),bytes=files.get(name);
+    if(view.getUint16(offset+8,true)!==0||end>zip.length||seen.has(name)||!bytes||bytes.length!==size||checksum(zip.subarray(start,end))!==checksum(bytes))throw new WebsiteError('artifact_conflict','Artifact files do not match its archive.');
+    seen.add(name);offset=end;
+  }
+  if(seen.size!==files.size||offset+4>zip.length||view.getUint32(offset,true)!==0x02014b50)throw new WebsiteError('artifact_conflict','Artifact archive is incomplete.');
 }

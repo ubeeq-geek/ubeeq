@@ -15,6 +15,10 @@ const canonical = (value: unknown): unknown => {
 };
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 const conflict = (error: unknown) => /conflict|revision|conditional|already exists|transaction.*cancel/i.test(String(error));
+/** A host quota decision is distinct from an uncertain provider write. */
+export class OwnedObjectQuotaError extends Error {
+  constructor(readonly reasonCode:string,readonly stage:'reservation'|'admission'){super(reasonCode);this.name='OwnedObjectQuotaError';}
+}
 export interface OwnedObjectIdentity {creatorId: string; operation: string; idempotencyKey: string;}
 export interface OwnedObjectWrite extends OwnedObjectIdentity {
   home: CellOwnedRecord; bucket: string; kind: 'renditions' | 'exports'; scope: StoredObject['scope'];
@@ -166,12 +170,12 @@ export class OwnedObjectWrites {
       value=this.value(row);if(value.requestHash!==requestHash)throw new Error('Owned output request identity conflicts.');
     }
     const reservation=await this.quota.checkAndReserveQuota({creatorId:input.creatorId,operation:input.operation,idempotencyKey:this.usageKey(row!),storageBytesDelta:body.byteLength});
-    if(!reservation.allowed){await this.close(row!);throw new Error(reservation.reasonCode??'Output storage quota exceeded.');}
+    if(!reservation.allowed){await this.close(row!);throw new OwnedObjectQuotaError(reservation.reasonCode??'Output storage quota exceeded.','reservation');}
     // This re-read fences a late reserve or capability reply after closure.
     row=(await this.records.get(row!.id))!;value=this.value(row);
     if(value.phase==='completed')return this.commitObject(row,value.completedObject!);
     if(!['prepared','issued'].includes(value.phase))throw new Error('Owned output was closed. Retry the same operation.');
-    if(this.quota.checkCurrentAdmission){const current=await this.quota.checkCurrentAdmission({creatorId:input.creatorId,operation:input.operation,idempotencyKey:this.usageKey(row)});if(!current.allowed){await this.close(row);throw new Error(current.reasonCode??'Output storage admission denied.');}}
+    if(this.quota.checkCurrentAdmission){const current=await this.quota.checkCurrentAdmission({creatorId:input.creatorId,operation:input.operation,idempotencyKey:this.usageKey(row)});if(!current.allowed){await this.close(row);throw new OwnedObjectQuotaError(current.reasonCode??'Output storage admission denied.','admission');}}
     if(!value.provider){
       const provider=await this.uploads.initiate({object:structuredClone(value.object),checksumAlgorithm:'sha256',expiresAt:value.expiresAt,idempotencyKey:row.id});this.proveProvider(value,provider);
       for(let attempt=0;attempt<5;attempt++){

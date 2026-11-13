@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES} from '@ubeeq/core';
 import type {HostRecord, UbeeqRepositories, WebsiteBlobStore} from '@ubeeq/persistence';
 import {requireCreatorScopedObject, type ObjectStorage, type StoredObject} from '@ubeeq/storage';
-import {OwnedObjectWrites} from './owned-object-writes.js';
+import {OwnedObjectWrites,OwnedObjectQuotaError} from './owned-object-writes.js';
 
 const digest=(body:Uint8Array)=>createHash('sha256').update(body).digest('hex');
 // The 256 MiB website file budget also needs ZIP headers and directory entries.
@@ -41,7 +41,7 @@ export class OwnedWebsiteBlobs implements WebsiteBlobStore {
     if(existing){if(this.value(existing,workspace,checksum).byteLength!==bytes.length)throw new WebsiteError('artifact_conflict','Website byte identity conflicts.');return;}
     let chunkCount=0;
     for(let offset=0;offset<bytes.length;offset+=WEBSITE_PREVIEW_CHUNK_BYTES){
-      const index=chunkCount;try{await this.writes.write({creatorId:workspace,operation:'website.blob',idempotencyKey:`${checksum}:${index}`,home:owner,bucket:this.bucket,kind:'exports',scope:'private',contentType:'application/octet-stream',body:bytes.subarray(offset,offset+WEBSITE_PREVIEW_CHUNK_BYTES),metadata:{checksum,index,byteLength:bytes.length}});}catch(error){if(error instanceof Error&&error.message==='STORAGE_QUOTA_EXCEEDED')throw new WebsiteError('quota_exceeded','Website storage quota exceeded.');throw error;}
+      const index=chunkCount;try{await this.writes.write({creatorId:workspace,operation:'website.blob',idempotencyKey:`${checksum}:${index}`,home:owner,bucket:this.bucket,kind:'exports',scope:'private',contentType:'application/octet-stream',body:bytes.subarray(offset,offset+WEBSITE_PREVIEW_CHUNK_BYTES),metadata:{checksum,index,byteLength:bytes.length}});}catch(error){if(error instanceof OwnedObjectQuotaError){if(error.reasonCode==='STORAGE_QUOTA_EXCEEDED')throw new WebsiteError('quota_exceeded','Website storage quota exceeded.');throw new WebsiteError('authorization_denied','Website changes are not currently permitted for this account.');}throw error;}
       chunkCount++;
     }
     const value:BlobRecord={checksum,byteLength:bytes.length,chunkCount};
