@@ -331,32 +331,40 @@ const objectForDirectUpload = (uploadId: string): StoredObject => {
   catch { throw new Error("AWS direct upload identifier is invalid."); }
 };
 
-/** S3 direct uploads bind the SHA-256 checksum to the presigned write and verify the immutable version at completion. */
+/** S3 direct uploads bind the exact body and permit one current object at the issued key. */
 export class S3DirectUploadAdapter implements UploadAdapter {
   constructor(private readonly s3: S3Client, private readonly bucket: string, private readonly cellId?: string) {}
-  async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
+  async initiate(input: Parameters<UploadAdapter['initiate']>[0]): Promise<UploadInitiation> {
     if (input.multipart) throw new Error("Multipart uploads require a dedicated multipart adapter.");
-    if (Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
+    if (!Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
     if (this.cellId) requireCellScopedObject(input.object.key, this.cellId);
     const requestedChecksum = input.object.checksum;
-    if (!requestedChecksum) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!requestedChecksum || !/^[a-f0-9]{64}$/i.test(requestedChecksum) && !/^[A-Za-z0-9+/]{43}=$/.test(requestedChecksum)) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!Number.isSafeInteger(input.object.byteLength) || input.object.byteLength < 0 || !input.object.contentType.trim()) throw new Error('AWS direct uploads require an exact byte length and content type.');
     const object = { ...input.object, checksum: requestedChecksum, bucket: this.bucket, scope: input.object.scope };
     const expiresIn = Math.max(1, Math.min(900, Math.floor((Date.parse(input.expiresAt) - Date.now()) / 1_000)));
     const checksum = checksumBase64(object.checksum);
-    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentType: object.contentType, ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
+    const headers = { 'content-type': object.contentType, 'if-none-match': '*', 'x-amz-checksum-sha256': checksum, 'x-amz-meta-checksum': object.checksum!, 'x-amz-meta-scope': object.scope, 'x-amz-meta-bytelength': String(object.byteLength) };
+    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentLength: object.byteLength, ContentType: object.contentType, IfNoneMatch: '*', ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
       expiresIn,
       // The browser must send these headers with the object. Keeping them in the
       // canonical request prevents clients from changing integrity or access metadata.
       unhoistableHeaders: new Set(["x-amz-checksum-sha256", "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength"]),
+      signableHeaders: new Set(['content-length', 'content-type', 'if-none-match']),
     });
-    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
+    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, headers, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     const requested = objectForDirectUpload(input.uploadId);
     requireCreatorScopedObject(requested.key, input); if (this.cellId) requireCellScopedObject(requested.key, this.cellId);
-    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key }));
-    if (!response.VersionId || response.ContentLength !== input.byteLength || response.Metadata?.checksum !== input.checksum || (response.ChecksumSHA256 && response.ChecksumSHA256 !== checksumBase64(input.checksum))) throw new Error("AWS upload completion did not match the signed object checksum, size, or version.");
-    return { ...requested, versionId: response.VersionId, contentType: response.ContentType ?? requested.contentType, byteLength: response.ContentLength, checksum: input.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? requested.scope };
+    if (requested.bucket !== this.bucket || requested.byteLength !== input.byteLength || requested.checksum !== input.checksum) throw new Error('AWS upload completion differs from the issued request.');
+    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key, ChecksumMode: 'ENABLED' }));
+    if (!response.VersionId || response.ContentLength !== requested.byteLength || response.ContentType !== requested.contentType || response.Metadata?.checksum !== requested.checksum || response.Metadata?.scope !== requested.scope || response.Metadata?.bytelength !== String(requested.byteLength) || response.ChecksumSHA256 !== checksumBase64(input.checksum)) throw new Error("AWS upload completion did not match the signed object checksum, size, type, scope, or version.");
+    return { ...requested, versionId: response.VersionId };
+  }
+  async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
+    try { return await this.complete(input); }
+    catch (error) { if ((error as { name?: string }).name === 'NotFound' || (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return undefined; throw error; }
   }
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });

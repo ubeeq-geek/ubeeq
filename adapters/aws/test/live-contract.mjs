@@ -37,7 +37,7 @@ if (missing.length) {
     await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET, undefined, `cells/${key}`));
     const direct = new S3DirectUploadAdapter(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET);
     const initiated = await direct.initiate({ object: directObject, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() });
-    const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: { "content-type": directObject.contentType, "x-amz-checksum-sha256": Buffer.from(directChecksum, "hex").toString("base64"), "x-amz-meta-checksum": directChecksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(directBody.byteLength) }, body: directBody });
+    const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: initiated.parts[0].headers, body: directBody });
     if (!put.ok) throw new Error(`Direct S3 upload failed with ${put.status}: ${await put.text()}`);
     directCompleted = await direct.complete({ uploadId: initiated.uploadId, cellId: directCellId, creatorId: directCreatorId, checksum: directChecksum, byteLength: directBody.byteLength });
     if (!directCompleted.versionId) throw new Error("Direct S3 upload did not return an immutable version.");

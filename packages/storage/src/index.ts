@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isObjectKeyWithinPrefix } from './object-key-scope.js';
 export * from './object-key-scope.js';
 export { readBoundedBytes } from './bounded-bytes.js';
 export { transferVerifiedObject, type VerifiedObjectTransferPorts } from './verified-transfer.js';
@@ -36,7 +37,8 @@ export interface DeliveryAdapter {
 export interface UploadInitiation {
   uploadId: string;
   object: StoredObject;
-  parts?: readonly { partNumber: number; url: string; expiresAt: string }[];
+  /** Required application-set headers. Providers must omit browser-controlled headers such as Content-Length. */
+  parts?: readonly { partNumber: number; url: string; expiresAt: string; headers?: Readonly<Record<string, string>> }[];
   completeUrl?: string;
   expiresAt: string;
 }
@@ -54,7 +56,7 @@ export interface UploadAcceptance { uploadId: string; cellId: string; creatorId:
 
 export const requireCreatorScopedObject = (key: string, input: { cellId: string; creatorId: string }): void => {
   const prefix = `cells/${input.cellId}/creators/${input.creatorId}/`;
-  if (!key.startsWith(prefix)) throw new Error(`Object key is not scoped to creator ${input.creatorId} in cell ${input.cellId}`);
+  if (!isObjectKeyWithinPrefix(key,prefix)) throw new Error(`Object key is not scoped to creator ${input.creatorId} in cell ${input.cellId}`);
 };
 
 export interface ObjectLifecycleSignal {
@@ -125,7 +127,7 @@ export const cellScopedObjectKey = (input: { cellId: string; creatorId: string; 
 };
 
 export const requireCellScopedObject = (key: string, cellId: string): void => {
-  if (!key.startsWith(`cells/${cellId}/`)) throw new Error(`Object key is not scoped to cell ${cellId}`);
+  if (!isObjectKeyWithinPrefix(key,`cells/${cellId}/`)) throw new Error(`Object key is not scoped to cell ${cellId}`);
 };
 
 /** Executable baseline for provider-neutral object storage adapters. */

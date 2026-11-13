@@ -9,6 +9,7 @@ import { DynamoDBDocumentClient,GetCommand,ScanCommand } from '@aws-sdk/lib-dyna
 import { createDynamoRepositories,AwsJobQueue,DynamoRevisionedRepository } from '../dist/index.js';
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 import { UploadLifecycle } from '../../../packages/runtime/dist/upload-lifecycle.js';
+import { createIntakeWork } from '../../../packages/runtime/dist/work-intake.js';
 const endpoint=process.env.TEST_DYNAMODB_ENDPOINT;
 if(!endpoint || !/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(endpoint))throw Error('An explicit loopback DynamoDB test endpoint is required.');
 test('actual DynamoDB upload/asset transaction and independent queue acknowledgement recover without duplication',async()=>{
@@ -18,6 +19,10 @@ test('actual DynamoDB upload/asset transaction and independent queue acknowledge
  try{
   await client.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:'pk',AttributeType:'S'},{AttributeName:'sk',AttributeType:'S'},{AttributeName:'repository',AttributeType:'S'},{AttributeName:'id',AttributeType:'S'}],GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
   const configuration={tableName:table,cellId:'cell'},repositories=createDynamoRepositories(document,configuration);
+  const creator=await repositories.creators.create({id:'intake-creator',instanceId:'instance',handle:'intake',displayName:'Intake Creator',homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1});
+  const draftResults=await Promise.all([createIntakeWork(repositories,creator,'operator','One draft','same-draft'),createIntakeWork(repositories,creator,'operator','One draft','same-draft')]);
+  assert.equal(draftResults[0].id,draftResults[1].id);
+  await assert.rejects(createIntakeWork(repositories,creator,'operator','Changed title','same-draft'),error=>error.status===409);
   let notifications=0,loseQueueReply=true;
   const jobs=new AwsJobQueue(document,configuration,{async send(){notifications++;return {}; }},'http://localhost/unused-notification-fixture');
   const enqueue=jobs.enqueue.bind(jobs);
@@ -43,7 +48,7 @@ test('actual DynamoDB upload/asset transaction and independent queue acknowledge
   const secondUpload=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'concurrent-file');await journal().accept(secondUpload.uploadId,'creator',body);
   const concurrent=await Promise.all([journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length}),journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length})]);
   assert.equal(concurrent[0].asset.id,concurrent[1].asset.id);assert.equal(concurrent[0].job.id,concurrent[1].job.id);
-  console.log('Verified actual DynamoDB atomic asset/evidence/audit/upload receipts, unordered maps, concurrent completion and lost independent queue acknowledgement.');
+  console.log('Verified actual DynamoDB atomic Work intake receipts, asset/evidence/audit/upload receipts, unordered maps, concurrent completion and lost independent queue acknowledgement.');
  }finally{
   if(local)local.database.close();await rm(directory,{recursive:true,force:true});if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();
  }

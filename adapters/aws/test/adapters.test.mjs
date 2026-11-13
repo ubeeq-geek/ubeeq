@@ -377,7 +377,7 @@ test("operator migration queue accepts only checkpoint commands", async () => {
 test("S3 direct upload binds a checksum and returns the immutable object version", async () => {
   const checksum = "a".repeat(64); const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects");
   // Replace the network boundary only for the completion assertion; initiation is covered by its signed-command shape below.
-  upload.s3 = { send: async (command) => command.constructor.name === "HeadObjectCommand" ? { VersionId: "v1", ContentLength: 4, ContentType: "image/png", ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"), Metadata: { checksum, scope: "private" } } : {} };
+  upload.s3 = { send: async (command) => command.constructor.name === "HeadObjectCommand" ? { VersionId: "v1", ContentLength: 4, ContentType: "image/png", ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"), Metadata: { checksum, scope: "private", bytelength: "4" } } : {} };
   const uploadId = Buffer.from(JSON.stringify({ bucket: "objects", key: "cells/cell-a/creators/creator-a/uploads/a", contentType: "image/png", byteLength: 4, checksum, scope: "private" })).toString("base64url");
   const completed = await upload.complete({ uploadId, cellId: "cell-a", creatorId: "creator-a", checksum, byteLength: 4 });
   assert.equal(completed.versionId, "v1"); assert.equal(completed.checksum, checksum);

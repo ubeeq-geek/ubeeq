@@ -1,5 +1,6 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
+import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
@@ -808,14 +809,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const role = await tenancy.resolveCreatorRole(identity.subject.id, creator.id);
         if (!role || !['owner', 'admin', 'editor'].includes(role)) throw new HttpError(403, 'work_edit_denied', 'Work editing access is required.');
         const body = await parseBody(request);
-        const work = await repositories.works.create({
-          id: randomUUID(),
-          instanceId: creator.instanceId,
-          ...dataHomeOf(creator),
-          creatorId: creator.id,
-          title: requireString(body.title, "title"),
-          status: "draft"
-        });
+        const work = await createIntakeWork(repositories,creator,identity.subject.id,requireString(body.title,'title'),body.idempotencyKey as string | undefined);
         return json(response, 201, { work, requestId }, requestId);
       }
       if (method === "POST" && url.pathname === "/v1/collections") {
@@ -1053,7 +1047,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (error instanceof FeatureDisabledInSingleOperatorModeError || (error as any)?.code === "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE") {
         return json(response, 403, { error: { code: "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE", message: (error as Error).message, requestId } }, requestId);
       }
-      if (error instanceof UploadLifecycleError) return json(response,error.status,{error:{code:error.code,message:error.message,requestId}},requestId);
+      if (error instanceof UploadLifecycleError || error instanceof WorkIntakeError) return json(response,error.status,{error:{code:error.code,message:error.message,requestId}},requestId);
       if (error instanceof PasswordAuthenticationError) return json(response, error.code === 'invalid_credentials' ? 401 : error.code === 'authentication_challenge_required' ? 409 : 503, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
