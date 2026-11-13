@@ -33,6 +33,29 @@ A deployment becomes Published only after provider/pointer association and a bou
 
 Rollback uses retained exact target-variant bytes and rechecks current membership, publishing identity, eligibility and release policy. Hosting does not require private ZIP export authority. Products supply hosting entitlements through `hostingEnabled` and authorization ports; private export remains independent.
 
+### Private staging and retained asset promotion
+
+On an already active site, newly prepared media must not become accessible through
+its retained-asset namespace. Native preparation writes new media only into the
+private release and may hardlink previously published assets. Activation verifies
+staged bytes and guards each new hardlink before exposing it at the retained URL.
+SFTP pointer preparation similarly writes only protected releases. Activation
+verifies the staged media, writes a protected temporary copy and guards its atomic
+rename into the retained mapping; it never streams a partial temporary object into
+the public assets directory. A denial removes its private temporary copy.
+
+AWS preparation uploads private S3 bytes and registers release-specific page keys.
+Retained asset routing grants are written only during guarded activation. Because
+those grants change the KVS version, activation obtains a fresh ETag and rechecks
+host ownership/mapping and the policy deny gate before conditionally updating the
+host pointer.
+
+The release-pointer switch is atomic; a group of retained-asset promotions is not
+a single atomic transaction. Failure after a guarded serving mutation may leave
+some promoted assets, so existing unknown-outcome fencing/reconciliation remains
+required. This does not implement serving-byte metering, old-release dependency
+revocation, public-byte garbage collection or provider propagation acceptance.
+
 ### Unknown or mixed SFTP recovery
 
 1. Reconcile the recorded attempt and remote release. Never clear a lock because a timeout elapsed.
