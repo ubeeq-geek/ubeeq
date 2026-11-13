@@ -127,3 +127,47 @@ This covers clean image caches in the local reference composition, including a
 commercial host using that composition. Website images, snapshots, build files,
 ZIP archives and managed website persistence still require their own integration
 and accounting before the full website release gate can pass.
+
+## Website files and frozen sources
+
+The default local website composition can now use a `WebsiteBlobStore` backed by
+`OwnedWebsiteBlobs`. Uploaded website images, immutable build files, frozen
+publish-source bytes and ZIP archives use private owned objects, with no second
+SQL BLOB copy. File and archive copies are distinct physical bytes and each is
+counted; matching content reused by files, images and frozen sources shares its
+existing owned blob within the same Creator workspace.
+
+Each blob is divided into at most 2 MiB chunks. Its constant-size manifest stores
+the total checksum, length and chunk count; immutable per-chunk receipts remain
+in the owned-write journal. Preview ranges recover and verify only intersecting
+chunks. This keeps the existing 256 MiB website file budget and large-site
+capacity without embedding the archive or a growing object list in one database
+record. Full reads also verify the aggregate checksum.
+
+Physical writes and settlements precede the logical metadata transaction. Failed
+manifest or website transactions leave charged bytes recoverable under the same
+identity; retry does not write another version. A quota denial midway through a
+blob retains already accepted chunks, closes the unused generation and leaves no
+partial readable manifest. Snapshot and file references become visible only
+after their complete bytes are available.
+
+Logical artifact/plan cleanup removes references, not provider payloads or their
+charges. A future verified reclamation protocol must retain capability fences,
+reconcile all references and prove physical version removal before releasing
+quota. Legacy SQL bytes stay readable and require their cutover baseline; they
+are not copied or charged again solely because the owned backend is enabled.
+Unmetered installations can keep the SQL backend by omitting the blob port.
+
+This still uses the local SQL metadata and hosting store. A managed website
+metadata/hosting implementation, deployed serving-copy accounting, retention and
+restore, and full migration/browser/provider acceptance remain separate release
+gates. The owned blob port alone does not make the website API available when a
+host injects managed core adapters without a website service.
+
+Once external references have been committed, opening that SQL database without
+its configured blob backend fails closed. Cutover and rollback must restore a
+compatible metadata/byte-store pair; the earlier SQL-only binary is not a reader
+for newly owned references. Legacy inline ZIP projections may still migrate to
+the old indexed SQL representation under their baseline, without minting a new
+owned storage charge. A retention race that removes reused legacy bytes during
+staging aborts the metadata transaction with a revision conflict and can be retried.

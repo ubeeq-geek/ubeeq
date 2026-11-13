@@ -1,6 +1,7 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { OwnedObjectWrites } from './owned-object-writes.js';
+import { OwnedWebsiteBlobs } from './owned-website-blobs.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
@@ -309,7 +310,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     catch (error) { if (error instanceof AdmissionBlockedError) throw denied(); throw error; }
     return { work, assets, publications };
   };
-  const websiteStore = localAdapters && !configuration.websiteService ? new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`) : undefined;
+  const websiteBlobs=ownedObjectWrites?new OwnedWebsiteBlobs(repositories,ownedObjectWrites,adapters.storage,configuration.instanceId??'local-reference',cellId,cellId):undefined;
+  const websiteStore = localAdapters && !configuration.websiteService ? new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`,websiteBlobs) : undefined;
   const websiteLimits={apiVersion:'1' as const,export:true,maxPages:2000,maxAssets:2000,maxBytes:256*1024*1024,deploymentAdapters:[]};
   const websiteSources=createWebsiteSourceReader(repositories,localAdapters?()=>JSON.stringify([
     localAdapters.database.database.prepare('PRAGMA data_version').get(),localAdapters.database.database.prepare('SELECT total_changes() AS changes').get()

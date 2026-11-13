@@ -42,6 +42,10 @@
     "./owned-object-writes": {
       "types": "./dist/owned-object-writes.d.ts",
       "default": "./dist/owned-object-writes.js"
+    },
+    "./owned-website-blobs": {
+      "types": "./dist/owned-website-blobs.d.ts",
+      "default": "./dist/owned-website-blobs.js"
     }
   },
   "scripts": {
