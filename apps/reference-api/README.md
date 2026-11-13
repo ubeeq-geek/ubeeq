@@ -80,3 +80,43 @@ for required keys, mail relay, callback, storage, worker and provider eligibilit
 configuration. `/commerce/creator` manages setup; `/commerce/purchases` is the
 customer access/recovery page. Managed hosts must inject durable commerce/vault
 adapters instead of relying on ephemeral local storage.
+
+### Durable upload completion
+
+`POST /v1/uploads` accepts an optional `idempotencyKey` (1–128 letters, digits,
+underscores or hyphens). Reuse it for the same initiating actor, Creator, Work,
+type, size and checksum when an initiation response is lost. The returned
+`uploadId` is an opaque application session; clients must not derive it from a
+provider object or substitute a provider upload identifier. A replay whose asset is already committed returns
+`upload.completed: true`; clients can skip retransmitting its bytes and replay
+completion to recover the existing result.
+
+The upload journal binds content and completion to the original Work and
+Creator. Completion retries return the same asset and processing job. The asset,
+moderation evidence, audit entry and pending processing intent commit together;
+queue dispatch happens afterward. If the queue is unavailable, completion still
+returns HTTP 202 with the committed asset, `job: null` and `queuePending: true`.
+The worker repairs that pending intent before leasing processing jobs. A queued
+acknowledgement and a completed media operation remain distinct states.
+
+Upload providers can implement `recoverCompletion` to recover the exact physical
+object after a lost completion response without writing another version. The
+local adapter persists a prepared/completed receipt and uses exclusive writes to
+a stable provider-owned version. It verifies the stored body and metadata before
+recovering; changed facts or missing/corrupt bytes require reconciliation. Its
+ordinary `complete` method remains one-use. The separate recovery operation
+returns the existing accounting fact.
+
+This journal does not itself certify complete physical-byte quota accounting.
+Bounded immutable direct writes, retained-version reconciliation, physical
+removal proofs and actual served-byte ingestion must be integrated with the host
+quota port before claiming complete managed storage/delivery accounting.
+
+The additional AWS transaction-engine check requires a separately started local
+DynamoDB engine and refuses non-loopback endpoints. It uses dummy credentials,
+creates a uniquely named table and deletes that table in `finally`:
+
+```sh
+npm run build
+TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:8239 node --test adapters/aws/test/upload-lifecycle.dynamodb.mjs
+```

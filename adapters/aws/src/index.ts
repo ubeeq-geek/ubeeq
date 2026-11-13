@@ -13,7 +13,7 @@ import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, Secret
 import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, repositoryItems, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
@@ -331,32 +331,40 @@ const objectForDirectUpload = (uploadId: string): StoredObject => {
   catch { throw new Error("AWS direct upload identifier is invalid."); }
 };
 
-/** S3 direct uploads bind the SHA-256 checksum to the presigned write and verify the immutable version at completion. */
+/** S3 direct uploads bind the exact body and permit one current object at the issued key. */
 export class S3DirectUploadAdapter implements UploadAdapter {
   constructor(private readonly s3: S3Client, private readonly bucket: string, private readonly cellId?: string) {}
-  async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
+  async initiate(input: Parameters<UploadAdapter['initiate']>[0]): Promise<UploadInitiation> {
     if (input.multipart) throw new Error("Multipart uploads require a dedicated multipart adapter.");
-    if (Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
+    if (!Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
     if (this.cellId) requireCellScopedObject(input.object.key, this.cellId);
     const requestedChecksum = input.object.checksum;
-    if (!requestedChecksum) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!requestedChecksum || !/^[a-f0-9]{64}$/i.test(requestedChecksum) && !/^[A-Za-z0-9+/]{43}=$/.test(requestedChecksum)) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!Number.isSafeInteger(input.object.byteLength) || input.object.byteLength < 0 || !input.object.contentType.trim()) throw new Error('AWS direct uploads require an exact byte length and content type.');
     const object = { ...input.object, checksum: requestedChecksum, bucket: this.bucket, scope: input.object.scope };
     const expiresIn = Math.max(1, Math.min(900, Math.floor((Date.parse(input.expiresAt) - Date.now()) / 1_000)));
     const checksum = checksumBase64(object.checksum);
-    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentType: object.contentType, ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
+    const headers = { 'content-type': object.contentType, 'if-none-match': '*', 'x-amz-checksum-sha256': checksum, 'x-amz-meta-checksum': object.checksum!, 'x-amz-meta-scope': object.scope, 'x-amz-meta-bytelength': String(object.byteLength) };
+    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentLength: object.byteLength, ContentType: object.contentType, IfNoneMatch: '*', ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
       expiresIn,
       // The browser must send these headers with the object. Keeping them in the
       // canonical request prevents clients from changing integrity or access metadata.
       unhoistableHeaders: new Set(["x-amz-checksum-sha256", "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength"]),
+      signableHeaders: new Set(['content-length', 'content-type', 'if-none-match']),
     });
-    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
+    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, headers, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     const requested = objectForDirectUpload(input.uploadId);
     requireCreatorScopedObject(requested.key, input); if (this.cellId) requireCellScopedObject(requested.key, this.cellId);
-    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key }));
-    if (!response.VersionId || response.ContentLength !== input.byteLength || response.Metadata?.checksum !== input.checksum || (response.ChecksumSHA256 && response.ChecksumSHA256 !== checksumBase64(input.checksum))) throw new Error("AWS upload completion did not match the signed object checksum, size, or version.");
-    return { ...requested, versionId: response.VersionId, contentType: response.ContentType ?? requested.contentType, byteLength: response.ContentLength, checksum: input.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? requested.scope };
+    if (requested.bucket !== this.bucket || requested.byteLength !== input.byteLength || requested.checksum !== input.checksum) throw new Error('AWS upload completion differs from the issued request.');
+    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key, ChecksumMode: 'ENABLED' }));
+    if (!response.VersionId || response.ContentLength !== requested.byteLength || response.ContentType !== requested.contentType || response.Metadata?.checksum !== requested.checksum || response.Metadata?.scope !== requested.scope || response.Metadata?.bytelength !== String(requested.byteLength) || response.ChecksumSHA256 !== checksumBase64(input.checksum)) throw new Error("AWS upload completion did not match the signed object checksum, size, type, scope, or version.");
+    return { ...requested, versionId: response.VersionId };
+  }
+  async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
+    try { return await this.complete(input); }
+    catch (error) { if ((error as { name?: string }).name === 'NotFound' || (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return undefined; throw error; }
   }
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
@@ -374,7 +382,10 @@ export class S3PresignedDelivery implements DeliveryAdapter {
  * truth. Workers lease atomically from DynamoDB, so duplicate SQS delivery and lost
  * notifications are harmless: a periodic recovery worker can always re-offer queued work.
  */
-interface AwsJobRecord extends DurableJob, RevisionedRecord {}
+interface AwsJobRecord extends DurableJob, RevisionedRecord {
+  /** Separate request trace from the existing correlationId lease fence. Null means no retained trace. */
+  requestCorrelationId?: string | null;
+}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
@@ -382,17 +393,16 @@ export class AwsJobQueue implements JobQueue {
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
     const id = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
-    const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
-    if (existing) return existing;
-    const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
+    const existing = await this.jobs.get(id);
+    if (existing) return this.publicJob(existing) as DurableJob<TPayload>;
+    const created = await this.jobs.create({ id, ...input, requestCorrelationId: input.correlationId ?? null, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey });
     await this.notify(created.id, created.type, created.cellId);
-    return created;
+    return this.publicJob(created) as DurableJob<TPayload>;
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const candidates = await this.jobs.list({ limit: 100 });
-    const timestamp = Date.now();
-    for (const candidate of candidates.items) {
+    for await (const candidate of repositoryItems(request => this.jobs.list(request))) {
+      const timestamp = Date.now();
       if (candidate.cellId !== input.cellId || (input.types?.length && !input.types.includes(candidate.type))) continue;
       const expired = candidate.state === 'leased' && Boolean(candidate.leaseExpiresAt) && Date.parse(candidate.leaseExpiresAt!) <= timestamp;
       const available = ['queued', 'retry_scheduled'].includes(candidate.state) && Date.parse(candidate.availableAt) <= timestamp;
@@ -404,14 +414,18 @@ export class AwsJobQueue implements JobQueue {
           continue;
         }
         const leased = await this.claimOrExpire(candidate, timestamp, expired, { state: 'leased', attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
-        return { job: leased as DurableJob<TPayload>, leaseToken };
+        return { job: this.publicJob(leased) as DurableJob<TPayload>, leaseToken };
       } catch (error) { if (!(error instanceof OptimisticConcurrencyError)) throw error; }
     }
     return undefined;
   }
   private async claimOrExpire(job: AwsJobRecord, timestamp: number, expired: boolean, change: Partial<AwsJobRecord>): Promise<AwsJobRecord> {
     const currentTime = new Date(timestamp).toISOString();
-    const value = { ...job, ...change, revision: job.revision + 1, updatedAt: currentTime };
+    // Keep the raw ownership marker for both old and new workers. Historical jobs
+    // already leased by an older writer have lost their original trace; never
+    // mistake the old worker/token for a request ID.
+    const requestCorrelationId = job.requestCorrelationId === undefined ? (job.attempt === 0 ? job.correlationId ?? null : null) : job.requestCorrelationId;
+    const value = { ...job, ...change, requestCorrelationId, revision: job.revision + 1, updatedAt: currentTime };
     try {
       await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
@@ -429,9 +443,25 @@ export class AwsJobQueue implements JobQueue {
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.updateLeased(job, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
-  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return recovered; }
-  async get(id: string): Promise<DurableJob | undefined> { return this.jobs.get(id); }
-  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> { const page = await this.jobs.list({ limit: Math.max(input.limit * 4, input.limit) }); return page.items.filter((job) => job.cellId === input.cellId && (!input.states || input.states.includes(job.state))).slice(0, input.limit); }
+  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return this.publicJob(recovered); }
+  async get(id: string): Promise<DurableJob | undefined> { const job = await this.jobs.get(id); return job && this.publicJob(job); }
+  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> {
+    if (!input.cellId.trim() || !Number.isSafeInteger(input.limit) || input.limit < 1) throw new Error('A cell and positive integer job limit are required.');
+    const found: DurableJob[] = [];
+    for await (const job of repositoryItems(request => this.jobs.list(request))) {
+      if (job.cellId !== input.cellId || input.states?.length && !input.states.includes(job.state)) continue;
+      found.push(this.publicJob(job));
+      if (found.length >= input.limit) break;
+    }
+    return found;
+  }
+  private publicJob(record: AwsJobRecord): DurableJob {
+    const { requestCorrelationId, ...job } = record;
+    const trace = requestCorrelationId === undefined && record.attempt === 0 ? record.correlationId : requestCorrelationId;
+    if (typeof trace === 'string') job.correlationId = trace;
+    else delete job.correlationId;
+    return job;
+  }
   private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
   private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || !leaseToken || job.correlationId?.split(":").at(-1) !== leaseToken || !job.leaseExpiresAt || !(Date.parse(job.leaseExpiresAt) > Date.now())) throw new Error(`Job ${id} does not hold this lease.`); return job; }
   private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.updateLeased(job, change); }
