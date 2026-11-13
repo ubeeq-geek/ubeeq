@@ -8,6 +8,7 @@ import { DynamoDBClient,CreateTableCommand,DeleteTableCommand } from '@aws-sdk/c
 import { DynamoDBDocumentClient,GetCommand,ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { createDynamoRepositories,AwsJobQueue,DynamoRevisionedRepository } from '../dist/index.js';
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
+import {OwnedObjectWrites} from '../../../packages/runtime/dist/owned-object-writes.js';
 import { UploadLifecycle } from '../../../packages/runtime/dist/upload-lifecycle.js';
 import { createIntakeWork } from '../../../packages/runtime/dist/work-intake.js';
 import {UsageSettlementOutbox} from '../../../packages/runtime/dist/usage-settlement-outbox.js';
@@ -106,4 +107,36 @@ test('actual DynamoDB job pagination finds later work and retains request traces
  }finally{
   if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();
  }
+});
+
+test('actual DynamoDB owned output receipts and usage survive rollback, unordered maps and late grants',async()=>{
+ const client=new DynamoDBClient({endpoint,region:'ca-central-1',maxAttempts:1,credentials:{accessKeyId:'DUMMYLOCALTEST',secretAccessKey:'DUMMYLOCALTEST'}}),document=DynamoDBDocumentClient.from(client);
+ const table='owned-output-'+randomUUID(),directory=await mkdtemp(join(tmpdir(),'owned-output-dynamo-'));let created=false,local;
+ try{
+  await client.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:'pk',AttributeType:'S'},{AttributeName:'sk',AttributeType:'S'},{AttributeName:'repository',AttributeType:'S'},{AttributeName:'id',AttributeType:'S'}],GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
+  const config={tableName:table,cellId:'cell'},repositories=createDynamoRepositories(document,config),settled=new Map(),closed=new Map();let lostSettlement=true,lostClosure=true;
+  const quota={async checkAndReserveQuota(input){return {allowed:!closed.has(input.idempotencyKey),reasonCode:'RESERVATION_CLOSED'};},async recordUsageSettlement(input){
+   const rows=(await document.send(new ScanCommand({TableName:table}))).Items,journal=rows.find(row=>row.value?.namespace==='runtime-owned-object' && 'physical-object:'+row.value.id===input.idempotencyKey);
+   assert.equal(journal.value.value.phase,'completed');const intent=rows.find(row=>row.value?.id===journal.value.value.usageIntentId);assert.equal(intent.value.namespace,'runtime-usage-settlement');assert.notEqual(intent.value.id,journal.value.id);
+   if(settled.has(input.idempotencyKey))assert.deepEqual(settled.get(input.idempotencyKey),input);settled.set(input.idempotencyKey,input);if(lostSettlement){lostSettlement=false;throw Error('Lost committed usage reply');}
+  },async closeStorageReservation(input){
+   const rows=(await document.send(new ScanCommand({TableName:table}))).Items,journal=rows.find(row=>row.value?.namespace==='runtime-owned-object' && 'physical-object:'+row.value.id===input.idempotencyKey);
+   assert.equal(journal.value.value.phase,'sealed');assert.equal(journal.value.value.seal.proofId,input.proofId);assert.ok(rows.find(row=>row.value?.id===journal.value.value.closureIntentId));
+   if(closed.has(input.idempotencyKey))assert.deepEqual(closed.get(input.idempotencyKey),input);closed.set(input.idempotencyKey,input);if(lostClosure){lostClosure=false;throw Error('Lost committed closure reply');}
+  }};
+  local=createLocalAdapterSet({databasePath:join(directory,'provider.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
+  const writer=repo=>new OwnedObjectWrites(repo,local.storage,quota,'instance','cell');
+  const input={creatorId:'creator',operation:'asset.rendition',idempotencyKey:'source-v1',home:{homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1},bucket:'cell',kind:'renditions',scope:'public',contentType:'text/plain',body:Buffer.from('Synthetic derived output'),metadata:{source:{id:'asset',version:'original'}}};
+  const update=repositories.hostRecords.update.bind(repositories.hostRecords);let fail=true;
+  repositories.hostRecords.update=async(id,revision,patch,options)=>{if(fail&&patch.value?.phase==='completed'){fail=false;throw Error('Receipt commit unavailable');}return update(id,revision,patch,options);};
+  await assert.rejects(()=>writer(repositories).write(input),/Receipt commit unavailable/);assert.equal(settled.size,0);
+  const fresh=()=>writer(createDynamoRepositories(document,config));const recovered=await fresh().recover(input);assert.ok(recovered.object.versionId);await fresh().repair();assert.deepEqual(await fresh().write(input),recovered);assert.equal(settled.size,1);
+  const unused={...input,idempotencyKey:'unused'},accept=local.storage.accept.bind(local.storage);local.storage.accept=async()=>{throw Error('No body sent');};await assert.rejects(()=>fresh().write(unused),/No body sent/);local.storage.accept=accept;
+  assert.equal(await fresh().recover(unused),undefined);await fresh().repair();assert.equal(closed.size,1);const replacement=await fresh().write(unused);assert.ok(replacement.object.versionId);assert.equal(settled.size,2);
+  let enter,release;const entered=new Promise(resolve=>{enter=resolve;}),gate=new Promise(resolve=>{release=resolve;}),reserve=quota.checkAndReserveQuota.bind(quota);
+  quota.checkAndReserveQuota=async input=>{enter();await gate;return reserve(input);};
+  const late={...input,idempotencyKey:'late-reserve'},pending=fresh().write(late);await entered;assert.equal(await fresh().recover(late),undefined);release();await assert.rejects(()=>pending,/RESERVATION_CLOSED/);assert.equal(closed.size,2);
+  const rows=(await document.send(new ScanCommand({TableName:table}))).Items;assert.equal(rows.filter(row=>row.repository==='assets').length,0);assert.equal(rows.filter(row=>row.value?.namespace==='runtime-owned-object'&&row.value.value.phase==='completed').length,2);
+  console.log('Verified actual DynamoDB physical output/outbox atomicity before callbacks, rollback and lost-reply recovery, empty-generation fencing and late-grant denial.');
+ }finally{if(local)local.database.close();await rm(directory,{recursive:true,force:true});if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();}
 });

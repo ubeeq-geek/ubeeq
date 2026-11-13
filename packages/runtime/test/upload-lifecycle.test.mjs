@@ -10,12 +10,13 @@ import {createDefaultOpenCorePorts,createSingleOperatorTenancyPort} from '@ubeeq
 async function fixture(t,quota) {
  const directory=await mkdtemp(join(tmpdir(),'durable-upload-'));
  const config={databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://127.0.0.1'};
- let local,runtime,providerCalls=0,processCalls=0,loseReply=false,failAsset=false,queueUnavailable=false,verifyCommitted=false;
+ let local,runtime,providerCalls=0,processCalls=0,loseReply=false,failAsset=false,failReady=false,queueUnavailable=false,verifyCommitted=false;
  const start=async()=>{
   local=createLocalAdapterSet(config);
-  const complete=local.storage.complete.bind(local.storage),create=local.repositories.assets.create.bind(local.repositories.assets),enqueue=local.jobs.enqueue.bind(local.jobs);
+  const complete=local.storage.complete.bind(local.storage),create=local.repositories.assets.create.bind(local.repositories.assets),update=local.repositories.assets.update.bind(local.repositories.assets),enqueue=local.jobs.enqueue.bind(local.jobs);
   local.storage.complete=async input=>{providerCalls++;const object=await complete(input);if(loseReply){loseReply=false;throw Error('Lost provider completion response');}return object;};
   local.repositories.assets.create=async(...args)=>{if(failAsset){failAsset=false;throw Error('Asset commit unavailable');}return create(...args);};
+  local.repositories.assets.update=async(...args)=>{if(failReady&&args[2]?.status==='ready'){failReady=false;throw Error('Ready asset commit unavailable');}return update(...args);};
   local.jobs.enqueue=async input=>{
    if(queueUnavailable)throw Error('Queue unavailable');
    if(verifyCommitted){const observer=createLocalAdapterSet(config);try{assert.ok(await observer.repositories.assets.get(input.payload.assetId),'queue dispatch must observe an already committed asset from another connection');}finally{observer.database.close();}}
@@ -40,8 +41,22 @@ async function fixture(t,quota) {
  const upload=async()=>{const result=await request('/v1/uploads',init);assert.equal(result.status,201);return result.body.upload;};
  const content=upload=>request(`/v1/uploads/${upload.uploadId}/content`,{base64:bytes.toString('base64')},'PUT');
  const finish=(upload,patch={})=>request(`/v1/uploads/${upload.uploadId}/complete`,{workId:work.id,checksum,byteLength:bytes.length,...patch});
- return {request,work,creator,init,upload,content,finish,get local(){return local;},get runtime(){return runtime;},get providerCalls(){return providerCalls;},get processCalls(){return processCalls;},loseReply(){loseReply=true;},failAsset(){failAsset=true;},queueUnavailable(v){queueUnavailable=v;},verifyCommitted(){verifyCommitted=true;},async restart(){await stop();await start();}};
+ return {request,work,creator,init,upload,content,finish,get local(){return local;},get runtime(){return runtime;},get providerCalls(){return providerCalls;},get processCalls(){return processCalls;},loseReply(){loseReply=true;},failAsset(){failAsset=true;},failReady(){failReady=true;},queueUnavailable(v){queueUnavailable=v;},verifyCommitted(){verifyCommitted=true;},async restart(){await stop();await start();}};
 }
+test('processing counts a retained rendition before asset attachment and retries the exact output after restart',async t=>{
+ const usage=new Map(),quota={async checkAndReserveQuota(){return {allowed:true};},async recordUsageSettlement(input){const previous=usage.get(input.idempotencyKey);if(previous)assert.deepEqual(previous,input);usage.set(input.idempotencyKey,input);},async closeStorageReservation(){}};
+ const f=await fixture(t,quota),upload=await f.upload();await f.content(upload);const completion=await f.finish(upload);f.failReady();
+ await assert.rejects(()=>f.runtime.runNextJob('writer'),/Ready asset commit unavailable/);
+ const row=(await f.local.repositories.hostRecords.list({limit:100})).items.find(row=>row.namespace==='runtime-owned-object');assert.equal(row.value.phase,'completed');
+ assert.equal((await f.local.repositories.assets.get(completion.body.asset.id)).status,'processing');
+ assert.equal([...usage.values()].filter(input=>input.storageBytesDelta).reduce((n,input)=>n+input.storageBytesDelta,0),2*f.init.byteLength);
+ assert.equal(f.processCalls,1);const version=row.value.completedObject.versionId;
+ await f.restart();await new Promise(resolve=>setTimeout(resolve,1100));await f.runtime.runNextJob('recovery');
+ const ready=await f.local.repositories.assets.get(completion.body.asset.id);assert.equal(ready.status,'ready');assert.equal(ready.storage.versionId,version);assert.equal(f.processCalls,1);
+ assert.equal([...usage.values()].filter(input=>input.processingCreditsUsed===1).length,1);
+ assert.equal(ready.originalStorage.versionId,completion.body.asset.storage.versionId);
+ assert.deepEqual((await f.local.storage.get(ready.originalStorage)).body,Buffer.from('Synthetic immutable upload source'));
+});
 test('owned upload initiation and completion replay after restart retain one provider version, asset and job',async t=>{
  const f=await fixture(t),upload=await f.upload();
  assert.equal((await f.upload()).uploadId,upload.uploadId);

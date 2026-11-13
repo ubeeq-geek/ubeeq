@@ -1,5 +1,6 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
+import { OwnedObjectWrites } from './owned-object-writes.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
@@ -87,7 +88,7 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   regionalControlPlane?: RegionalControlPlane;
   tenancy?: TenancyAndAccessPort;
   hostPorts?: HostExtensionRuntimePorts | ((adapters: ReferenceAdapterSet) => HostExtensionRuntimePorts);
-  /** Commercial hosts require bounded physical closure and durable quota fencing. */
+  /** Require original/output receipts, physical closure and durable quota fencing. */
   requireUploadAccounting?:boolean;
   tenancyMode?: "single_operator" | "multi_tenant_saas";
   /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
@@ -226,6 +227,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   if(configuration.requireUploadAccounting && !uploadAccountingAvailable){localAdapters?.database.close();throw new Error('Physical upload closure and terminal storage quota reservations are required.');}
   const uploadAccounting=uploadAccountingAvailable ? {quota:hostPorts.usageQuota,usageOutbox:usageOutbox!,closureOutbox:new StorageClosureOutbox(repositories,hostPorts.usageQuota,configuration.instanceId??'local-reference',cellId)} : undefined;
   const uploadLifecycle = repositories.hostRecords ? new UploadLifecycle(repositories,adapters.uploads,adapters.jobs,configuration.instanceId ?? 'local-reference',cellId,configuration.publicBaseUrl,uploadAccounting) : undefined;
+  const ownedObjectWrites = uploadAccounting && adapters.uploads.recoverCompletion ? new OwnedObjectWrites(repositories,adapters.uploads,hostPorts.usageQuota,configuration.instanceId ?? 'local-reference',cellId) : undefined;
+  if(configuration.requireUploadAccounting && !ownedObjectWrites){localAdapters?.database.close();throw new Error('Recoverable physical output writes are required.');}
   const processingUsageKey = (asset: AssetRecord) => (asset as AssetRecord & { processingUsageKey?: string }).processingUsageKey ?? `asset-processing:${asset.id}:${asset.objectVersion}`;
   const deferUsage = async (intent: import('@ubeeq/persistence').HostRecord) => {
     try { await usageOutbox!.deliver(intent); }
@@ -444,6 +447,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   let commerceTurn=true;
   const runNextJob = async (workerId: string) => {
     if (uploadLifecycle) try { await uploadLifecycle.repair(); } catch { await audit({ action:'upload.queue_repair_deferred',subjectId:cellId }); }
+    if (ownedObjectWrites) try { await ownedObjectWrites.repair(); } catch { await audit({action:'storage.output_repair_deferred',subjectId:cellId}); }
     if (usageOutbox) try { await usageOutbox.recoverTerminal(adapters.jobs); await usageOutbox.drain(); } catch { await audit({ action: 'usage.settlement_retry_deferred', subjectId: cellId }); }
     if (commerce && commerceTurn) { commerceTurn=false; const job = await commerce.runNextJob(workerId); if (job) return job; }
     commerceTurn=true;
@@ -510,18 +514,25 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const currentQuota = await hostPorts.usageQuota.checkCurrentAdmission({ creatorId: asset.creatorId, operation: reservationInput.operation, idempotencyKey: usageKey });
         if (currentQuota?.allowed !== true) throw new Error(currentQuota?.reasonCode ?? 'Processing admission is no longer available.');
       }
-      const processingResult = await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
+      const outputIdentity = {creatorId:processing.creatorId,operation:'asset.rendition',idempotencyKey:usageKey};
+      const recoveredOutput = await ownedObjectWrites?.recover(outputIdentity);
+      const result = recoveredOutput ? recoveredOutput.metadata.processingResult as Awaited<ReturnType<typeof processor.process>> : await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
+      const processingResult = result && {...result,renditions:result.renditions?.map(value=>{const {body:_body,...rendition}=value as import('@ubeeq/processing').ProcessedRendition;return rendition;})};
+      if (!processingResult || !Array.isArray(processingResult.renditions) || !processingResult.metadata) throw new Error('Recovered processing evidence requires reconciliation.');
       // Keep the physical object-store location from the verified source. For a
       // local cell this is its logical cell store; for S3 it is the actual
       // regional bucket required by the explicit migration transfer adapter.
-      const rendition = { bucket: source.object.bucket, key: cellScopedObjectKey({ cellId, creatorId: processing.creatorId, kind: "renditions", objectId: processing.id }), versionId: randomUUID(), contentType: processing.mimeType, byteLength: source.body.byteLength, checksum: processing.checksum, scope: "public" as const };
-      const transformed = processing.mimeType.startsWith('image/')
-        ? await hostPorts.watermarkAndTransform.applyDerivativeTransform({ sourceBytes: source.body, mimeType: processing.mimeType, creatorId: processing.creatorId })
-        : { bytes: source.body, mimeType: processing.mimeType };
-      rendition.contentType = transformed.mimeType;
-      rendition.byteLength = transformed.bytes.byteLength;
-      rendition.checksum = createHash('sha256').update(transformed.bytes).digest('hex');
-      await adapters.storage.put({ object: rendition, body: transformed.bytes });
+      let rendition = recoveredOutput?.object;
+      if (!rendition) {
+        const transformed = processing.mimeType.startsWith('image/')
+          ? await hostPorts.watermarkAndTransform.applyDerivativeTransform({ sourceBytes: source.body, mimeType: processing.mimeType, creatorId: processing.creatorId })
+          : { bytes: source.body, mimeType: processing.mimeType };
+        if (ownedObjectWrites) rendition = (await ownedObjectWrites.write({...outputIdentity,home:dataHomeOf(processing),bucket:source.object.bucket,kind:'renditions',scope:'public',contentType:transformed.mimeType,body:transformed.bytes,metadata:{processingResult}})).object;
+        else {
+          rendition = {bucket:source.object.bucket,key:cellScopedObjectKey({cellId,creatorId:processing.creatorId,kind:'renditions',objectId:processing.id}),versionId:randomUUID(),contentType:transformed.mimeType,byteLength:transformed.bytes.byteLength,checksum:createHash('sha256').update(transformed.bytes).digest('hex'),scope:'public'};
+          await adapters.storage.put({object:rendition,body:transformed.bytes});
+        }
+      }
       const completed = await repositories.transaction(async (transaction) => {
         const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready", storage: rendition, originalStorage: storage } as Partial<AssetRecord>, { transaction });
         await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions, outputLineage: processingResult.renditions.map((rendition) => ({ outputId: rendition.id, sourceVersionId: rendition.sourceVersionId, role: rendition.role })) } }, { transaction });
