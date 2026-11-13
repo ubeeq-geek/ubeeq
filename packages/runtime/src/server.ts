@@ -3,6 +3,7 @@ import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { OwnedObjectWrites } from './owned-object-writes.js';
 import { OwnedWebsiteBlobs } from './owned-website-blobs.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
+import { createIntakeCreator, CreatorIntakeError } from './creator-intake.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
@@ -85,6 +86,14 @@ export interface RegionalControlPlane {
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   commerce?: ReferenceCommerceConfiguration;
   registrationAdmission?: (input: { email: string; invitationCode?: string; organizationName?: string }) => Promise<{ allowed: boolean; reasonCode?: string }>;
+  /** Trusted host preparation is database-only and atomic with Creator creation.
+   * Activation runs after commit and must be idempotent; a deferred activation
+   * returns the persisted Creator with an honest pending state for worker recovery.
+   */
+  creatorLifecycle?: {
+    prepare(input: { creator: Readonly<CreatorRecord>; actorUserId: string; repositories: UbeeqRepositories; transaction: import('@ubeeq/persistence').PersistenceTransaction }): Promise<void>;
+    activate?(input: { creator: Readonly<CreatorRecord>; actorUserId: string }): Promise<{ state: 'ready' | 'pending' }>;
+  };
 
   publicBaseUrl: string;
   instanceId?: string;
@@ -781,7 +790,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const identity = await session(request);
         const body = await parseBody(request);
         const existingUsers = tenancy.mode === 'single_operator' ? await getDistinctOperatorUserIds() : [];
-        const createCreator = () => repositories.transaction(async transaction => {
+        const handle = requireString(body.handle, 'handle'), displayName = requireString(body.displayName, 'displayName');
+        const createCreator = () => createIntakeCreator(repositories, { instanceId: configuration.instanceId ?? 'local-reference', cellId, region, actorId: identity.subject.id,
+          handle, displayName, idempotencyKey: body.idempotencyKey as string | undefined }, async (transaction, creatorId) => {
         if (tenancy.mode === 'single_operator') {
           const claims = repositories.instanceOperators;
           if (!claims) throw new HttpError(503, 'operator_claim_store_required', 'An atomic operator claim store is required.');
@@ -795,14 +806,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           existingCreatorUserCount: existingUsers.length,
           actorUserId: identity.subject.id
         });
-        return repositories.creators.create({
-          id: randomUUID(),
+        const created = await repositories.creators.create({
+          id: creatorId,
           instanceId: configuration.instanceId ?? "local-reference",
           ...cellOwned,
-          handle: requireString(body.handle, "handle"),
-          displayName: requireString(body.displayName, "displayName"),
+          handle,
+          displayName,
           subjectId: identity.subject.id
         }, { transaction });
+        await configuration.creatorLifecycle?.prepare({ creator: Object.freeze(structuredClone(created)), actorUserId: identity.subject.id, repositories, transaction });
+        return created;
         });
         let creator: CreatorRecord;
         try { creator = await createCreator(); }
@@ -811,7 +824,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           if (claim && claim.actorId !== identity.subject.id) throw new SingleOperatorLimitError();
           throw error;
         }
-        return json(response, 201, { creator, requestId }, requestId);
+        if (body.idempotencyKey !== undefined && !await tenancy.resolveCreatorRole(identity.subject.id, creator.id)) throw new HttpError(403, 'creator_not_accessible', 'Current access to this Creator is required.');
+        let provisioning: { state: 'ready' | 'pending' } | undefined;
+        if (configuration.creatorLifecycle) {
+          provisioning = { state: 'pending' };
+          try {
+            const result = await configuration.creatorLifecycle.activate?.({ creator: Object.freeze(structuredClone(creator)), actorUserId: identity.subject.id });
+            if (result?.state === 'ready') provisioning = { state: 'ready' };
+          } catch { /* The committed host receipt remains pending for its worker. */ }
+        }
+        return json(response, provisioning?.state === 'pending' ? 202 : 201, { creator, ...(provisioning ? { provisioning } : {}), requestId }, requestId);
       }
       if (method === "GET" && url.pathname === "/v1/creators") {
         const identity = await session(request);
@@ -1103,7 +1125,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (error instanceof FeatureDisabledInSingleOperatorModeError || (error as any)?.code === "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE") {
         return json(response, 403, { error: { code: "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE", message: (error as Error).message, requestId } }, requestId);
       }
-      if (error instanceof UploadLifecycleError || error instanceof WorkIntakeError) return json(response,error.status,{error:{code:error.code,message:error.message,requestId}},requestId);
+      if (error instanceof UploadLifecycleError || error instanceof WorkIntakeError || error instanceof CreatorIntakeError) return json(response,error.status,{error:{code:error.code,message:error.message,requestId}},requestId);
       if (error instanceof PasswordAuthenticationError) return json(response, error.code === 'invalid_credentials' ? 401 : error.code === 'authentication_challenge_required' ? 409 : 503, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
