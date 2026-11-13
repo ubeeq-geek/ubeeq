@@ -38,7 +38,8 @@
     "test:commerce-browser": "node scripts/smoke-commerce-browser.mjs",
     "test:website-preview-browser": "node scripts/smoke-website-preview-browser.mjs",
     "benchmark:website-preview": "node scripts/benchmark-website-preview.mjs",
-    "check:package-boundaries": "node scripts/check-package-boundaries.mjs"
+    "check:package-boundaries": "node scripts/check-package-boundaries.mjs",
+    "test:managed-websites": "npm run test:managed-websites --workspace @ubeeq/adapter-aws"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

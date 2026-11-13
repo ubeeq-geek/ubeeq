@@ -14,7 +14,8 @@
     "build": "tsc -p tsconfig.json",
     "test:contract": "npm run build && node --test test/*.test.mjs",
     "test:live": "npm run build && node test/live-contract.mjs",
-    "test": "npm run test:contract"
+    "test": "npm run test:contract",
+    "test:managed-websites": "node scripts/wait-for-dynamodb-local.mjs && node --test test/website-records.dynamodb.mjs test/website-hosting-store.dynamodb.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-cloudfront-keyvaluestore": "^3.1152.0",

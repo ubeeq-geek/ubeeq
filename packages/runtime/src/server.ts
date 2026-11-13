@@ -32,7 +32,7 @@ import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, 
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
-import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
+import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type WebsiteStore, type WebsiteHostingStore, type WebsiteBlobStore, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
 import { cellScopedObjectKey, requireCreatorScopedObject, type StoredObject, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
 import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
@@ -63,8 +63,17 @@ export type ReferenceAdapterSet = {
   identity: IdentityAdapter;
   localIdentity?: PasswordIdentityAdapter;
   passwordAuthentication?: PasswordAuthenticationPort;
+  credentials?: import('@ubeeq/integrations').CredentialVault;
   federation?: FederationSignatureVerifier & FederationReplayStore & { keyId: string; publicKey: string };
 };
+
+/** The host owns injected persistence/client lifecycles. Optional cache ports
+ * support unmetered adapters; metered runtimes use their owned-write journal. */
+export interface RuntimeWebsitePersistence extends WebsiteStore,WebsiteHostingStore {
+  hostingOAuthStates?:import('@ubeeq/integrations').OAuthStateStore;
+  getPublicRendition?(workspaceId:string,source:string):Promise<{bytes:Uint8Array;width:number;height:number}|undefined>;
+  putPublicRendition?(workspaceId:string,source:string,image:{bytes:Uint8Array;width:number;height:number}):Promise<void>;
+}
 
 export interface RegionalControlPlane {
   routingDirectory: RoutingDirectory;
@@ -98,6 +107,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Optional host-composed deterministic activity interface; no LLM service. */
   /** Trusted product composition may supply catalogue/rendition and policy ports. */
   websiteService?: WebsiteService;
+  websitePersistence?: RuntimeWebsitePersistence | ((context:{adapters:ReferenceAdapterSet;blobs?:WebsiteBlobStore})=>RuntimeWebsitePersistence);
+  websiteHostingAdapters?:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
   websitePreviewMaxFileBytes?:number;
   websitePublishing?: WebsitePublishingService;
   nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
@@ -311,7 +322,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     return { work, assets, publications };
   };
   const websiteBlobs=ownedObjectWrites?new OwnedWebsiteBlobs(repositories,ownedObjectWrites,adapters.storage,configuration.instanceId??'local-reference',cellId,cellId):undefined;
-  const websiteStore = localAdapters && !configuration.websiteService ? new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`,websiteBlobs) : undefined;
+  const suppliedWebsiteStore=typeof configuration.websitePersistence==='function'?configuration.websitePersistence({adapters,blobs:websiteBlobs}):configuration.websitePersistence;
+  const localWebsiteStore=localAdapters&&!configuration.websiteService&&!suppliedWebsiteStore?new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`,websiteBlobs):undefined;
+  const websiteStore:RuntimeWebsitePersistence|undefined=suppliedWebsiteStore??localWebsiteStore;
   const websiteLimits={apiVersion:'1' as const,export:true,maxPages:2000,maxAssets:2000,maxBytes:256*1024*1024,deploymentAdapters:[]};
   const websiteSources=createWebsiteSourceReader(repositories,localAdapters?()=>JSON.stringify([
     localAdapters.database.database.prepare('PRAGMA data_version').get(),localAdapters.database.database.prepare('SELECT total_changes() AS changes').get()
@@ -331,8 +344,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     const cached=async()=>{
       // Earlier blobs remain subject to the cutover inventory baseline. Reuse
       // one only when its original input was also the approved public bytes.
-      const pinned=await websiteStore!.getPublicRendition(asset.creatorId,recipe);if(pinned)return pinned;
-      const legacy=reference.checksum===asset.checksum?await websiteStore!.getPublicRendition(asset.creatorId,legacyRecipe):undefined;
+      const pinned=await websiteStore!.getPublicRendition?.(asset.creatorId,recipe);if(pinned)return pinned;
+      const legacy=reference.checksum===asset.checksum?await websiteStore!.getPublicRendition?.(asset.creatorId,legacyRecipe):undefined;
       if(legacy)return legacy;
       const saved=await ownedObjectWrites?.recover(identity);if(!saved)return;
       const {width,height}=saved.metadata;
@@ -352,7 +365,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const {createCropSourcePreview}=await import('@ubeeq/media-sharp');
         const result=await createCropSourcePreview(bytes,{maxPreviewEdge:1600,maxOutputBytes:10*1024*1024}),clean={bytes:result.body,width:result.width,height:result.height};
         if(ownedObjectWrites)await ownedObjectWrites.write({...identity,home:dataHomeOf(asset),bucket:reference.bucket,kind:'renditions',scope:'private',contentType:'image/jpeg',body:clean.bytes,metadata:{width:clean.width,height:clean.height,sourceVersionId:reference.versionId,sourceChecksum:reference.checksum,recipe:'website-jpeg-1600-v2'}});
-        else await websiteStore!.putPublicRendition(asset.creatorId,recipe,clean);
+        else if(websiteStore!.putPublicRendition)await websiteStore!.putPublicRendition(asset.creatorId,recipe,clean);
+        else throw new WebsiteError('website_rendition_storage_required','Persistent website image storage is required.');
         return clean;
       }finally{const next=renditionWaiters.shift();if(next)next();else activeRenditions--;}
     })();
@@ -438,9 +452,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   const authorizeHostingManager=async(actor:{workspaceId:string;actorId:string})=>{const creator=await repositories.creators.get(actor.workspaceId);if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);};
   const external=configuration.websiteHostingExternal;
   if(external&&localAdapters&&!configuration.credentialEncryptionKey)throw new WebsiteError('hosting_vault_key_required','External hosting requires an explicit credential vault encryption key.');
-  const hostingConnections=external&&websiteStore&&localAdapters?new WebsiteHostingConnections({cellId,vault:localAdapters.credentials,states:websiteStore.hostingOAuthStates,authorize:authorizeHostingManager,get:(w,id)=>websiteStore.getConnection(w,id),list:w=>websiteStore.listConnections(w),save:(c,r)=>websiteStore.saveConnection(c,r),netlify:external.netlify}):undefined;
+  if(external&&websiteStore&&(!adapters.credentials||!websiteStore.hostingOAuthStates))throw new WebsiteError('hosting_credentials_required','External hosting requires a durable credential vault and OAuth state store.');
+  const hostingConnections=external&&websiteStore?.hostingOAuthStates&&adapters.credentials?new WebsiteHostingConnections({cellId,vault:adapters.credentials,states:websiteStore.hostingOAuthStates,authorize:authorizeHostingManager,get:(w,id)=>websiteStore.getConnection(w,id),list:w=>websiteStore.listConnections(w),save:(c,r)=>websiteStore.saveConnection(c,r),netlify:external.netlify}):undefined;
   const externalProbe=external?createHostingPublicProbe({authorizeUrl:external.authorizeUrl}):undefined;
-  const hostingAdapters:import('@ubeeq/core').WebsiteHostingAdapter[]=[...nativeHosting];
+  const hostingAdapters:import('@ubeeq/core').WebsiteHostingAdapter[]=[...nativeHosting,...configuration.websiteHostingAdapters??[]];
   if(hostingConnections&&externalProbe&&external&&websiteStore){
     const credential=(c:import('@ubeeq/core').HostingConnection)=>hostingConnections.credential(c);
     if(external.netlify)hostingAdapters.push(new NetlifyWebsiteHostingAdapter({credential,probe:externalProbe}));
@@ -1110,7 +1125,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     return hostPorts.connectorAppCredentials.resolveOAuthClient(input.provider, input.creatorId);
   };
   let disposed = false;
-  const dispose = () => { if (disposed) return; disposed = true; websiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
+  const dispose = () => { if (disposed) return; disposed = true; localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
   return { server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
     if (!server.listening) { dispose(); resolve(); return; }
     server.close(error => { if (error) reject(error); else { dispose(); resolve(); } });

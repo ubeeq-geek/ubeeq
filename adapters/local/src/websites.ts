@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import {verifyWebsiteArtifactProjection} from '@ubeeq/persistence';
 import { WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES, type Website, type WebsiteDocument } from '@ubeeq/core';
 import type { WebsiteBuildRecord, WebsiteStore, WebsiteImageRecord, WebsiteArtifactManifest, WebsiteBlobStore } from '@ubeeq/persistence';
 import { createHash } from 'node:crypto';
@@ -162,16 +163,7 @@ export class SqliteWebsiteStore implements WebsiteStore, WebsiteHostingStore {
   async putArtifact(workspace:string,digest:string,zip:Uint8Array,files:ReadonlyMap<string,Uint8Array>) {return this.saveArtifact(workspace,digest,zip,files,false);}
   private async saveArtifact(workspace:string,digest:string,zip:Uint8Array,files:ReadonlyMap<string,Uint8Array>,legacy:boolean) {
     files=new Map(files);
-    if(this.checksum(zip)!==digest)throw new WebsiteError('artifact_conflict','Artifact checksum does not match.');
-    // Bind the index to the exact stored ZIP once, without rebuilding another archive.
-    const archive=Buffer.from(zip.buffer,zip.byteOffset,zip.byteLength),seen=new Set<string>();let offset=0;
-    while(offset+30<=archive.length&&archive.readUInt32LE(offset)===0x04034b50){
-      const size=archive.readUInt32LE(offset+18),nameLength=archive.readUInt16LE(offset+26),extra=archive.readUInt16LE(offset+28),start=offset+30+nameLength+extra,end=start+size;
-      const name=archive.subarray(offset+30,offset+30+nameLength).toString('utf8'),bytes=files.get(name);
-      if(archive.readUInt16LE(offset+8)!==0||end>archive.length||seen.has(name)||!bytes||bytes.length!==size||this.checksum(archive.subarray(start,end))!==this.checksum(bytes))throw new WebsiteError('artifact_conflict','Artifact files do not match its archive.');
-      seen.add(name);offset=end;
-    }
-    if(seen.size!==files.size||offset+4>archive.length||archive.readUInt32LE(offset)!==0x02014b50)throw new WebsiteError('artifact_conflict','Artifact archive is incomplete.');
+    verifyWebsiteArtifactProjection(digest,zip,files,bytes=>this.checksum(bytes));
     const expectedFiles=new Map([...files].map(([path,body])=>[path,this.checksum(body)]));
     const oldArchive=this.db.prepare('SELECT zip FROM website_archives WHERE workspace=? AND digest=?').get(workspace,digest) as {zip:Uint8Array}|undefined;
     const useOwned=Boolean(this.blobs&&!legacy);

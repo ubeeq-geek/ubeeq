@@ -9,6 +9,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     services:
+      dynamodb:
+        # Official DynamoDB Local 3.3.2 multi-platform manifest, pinned by digest.
+        image: amazon/dynamodb-local@sha256:6ada631ec7aa5fc83446855eb17233e3dad184fec47477e8140c6c569cfe0c86
+        ports:
+          - 127.0.0.1:8000:8000
       postgres:
         image: postgres:16-alpine
         env:
@@ -23,6 +28,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
       UBEEQ_POSTGRES_TEST_URL: postgresql://ubeeq:ubeeq@localhost:5432/ubeeq_contract
     steps:
       - uses: actions/checkout@v4
@@ -33,3 +39,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm run test:managed-websites

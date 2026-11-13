@@ -622,3 +622,6 @@ export { createDynamoPublicDerivativeRepository, publicDerivativePublicationKey,
 export * from './website-hosting.js';
 
 export {DynamoCommerceStore} from './commerce.js';
+
+export {DynamoWebsiteStore,type DynamoWebsiteConfiguration} from './websites.js';
+export {DynamoWebsiteHostingStore} from './website-hosting-store.js';

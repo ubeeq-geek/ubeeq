@@ -158,11 +158,11 @@ quota. Legacy SQL bytes stay readable and require their cutover baseline; they
 are not copied or charged again solely because the owned backend is enabled.
 Unmetered installations can keep the SQL backend by omitting the blob port.
 
-This still uses the local SQL metadata and hosting store. A managed website
-metadata/hosting implementation, deployed serving-copy accounting, retention and
-restore, and full migration/browser/provider acceptance remain separate release
-gates. The owned blob port alone does not make the website API available when a
-host injects managed core adapters without a website service.
+The local composition uses SQL metadata and hosting state. Hosts may inject the
+[DynamoDB website implementation](managed-websites.md) for managed adapters.
+Live provider composition, deployed serving-copy accounting, retention/restore
+and full migration/browser acceptance remain release gates. The owned blob port
+alone does not make website APIs available without a configured metadata store.
 
 Once external references have been committed, opening that SQL database without
 its configured blob backend fails closed. Cutover and rollback must restore a
