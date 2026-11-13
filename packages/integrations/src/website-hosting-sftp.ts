@@ -31,7 +31,28 @@ export class SftpWebsiteHostingAdapter implements WebsiteHostingAdapter {
       if(t.config.stagingProtected!=='confirmed'||t.config.retainedAssetsMapping!=='confirmed')throw new WebsiteError('sftp_server_configuration_required','Pointer mode requires protected staging and a retained-assets server mapping.');
       const area=posix.join(root,'.ubeeq-probe-'+randomUUID());await s.mkdir(area);try{await s.symlink('.',area+'/a');await s.symlink('.',area+'/b');await s.rename(area+'/a',area+'/b',true);if(await s.readlink(area+'/b')!=='.')throw new WebsiteError('atomic_activation_unavailable','Server pointer replacement failed.');}finally{for(const p of ['a','b'])if(await s.stat(area+'/'+p))await s.remove(area+'/'+p);await s.rmdir(area);}
     }}finally{await s.close();}}
-  async prepare(c:HostingDeploymentContext){if(this.mode==='in_place')return {data:{profile:'in_place'}};const s=await this.session(c.target,c.connection);try{const root=await this.owned(s,c.target),release=c.artifact!.digest,releaseRoot=posix.join(root,'releases',release);await this.path(s,root,'releases/'+release+'/placeholder');for(const [file,bytes] of c.artifact!.files){const path=await this.path(s,releaseRoot,file),st=await s.stat(path);if(st){if(digest(await s.read(path))!==digest(bytes))throw new WebsiteError('release_drift','Immutable SFTP release differs from the artifact.');}else await s.write(path,bytes);if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const shared=await this.path(s,root,file);if(!await s.stat(shared))await s.write(shared,bytes);else if(digest(await s.read(shared))!==digest(bytes))throw new WebsiteError('asset_drift','Retained SFTP asset changed.');}}return {releaseId:release};}finally{await s.close();}}
+  async prepare(c:HostingDeploymentContext){
+    if(this.mode==='in_place')return {data:{profile:'in_place'}};
+    const s=await this.session(c.target,c.connection);
+    try{
+      const root=await this.owned(s,c.target),release=c.artifact!.digest,releaseRoot=posix.join(root,'releases',release);
+      await this.path(s,root,'releases/'+release+'/placeholder');
+      for(const [file,bytes] of c.artifact!.files){
+        await c.beforeUpload?.();
+        const path=await this.path(s,releaseRoot,file),st=await s.stat(path);
+        if(st){if(digest(await s.read(path))!==digest(bytes))throw new WebsiteError('release_drift','Immutable SFTP release differs from the artifact.');}
+        else await s.write(path,bytes);
+        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){
+          const shared=await this.path(s,root,file);
+          // A release upload may outlive its writer authority; recheck before
+          // making a second copy in the retained public-asset directory.
+          if(!await s.stat(shared)){await c.beforeUpload?.();await s.write(shared,bytes);}
+          else if(digest(await s.read(shared))!==digest(bytes))throw new WebsiteError('asset_drift','Retained SFTP asset changed.');
+        }
+      }
+      await c.beforeUpload?.();return {releaseId:release};
+    }finally{await s.close();}
+  }
   async activate(c:HostingDeploymentContext):Promise<HostingOutcome>{const s=await this.session(c.target,c.connection);try{const root=await this.owned(s,c.target);
       if(this.mode==='pointer'){const current=posix.join(root,'current');if(await s.stat(current)){const previous=await s.readlink(current);if(c.target.activeReleaseId&&previous!=='releases/'+c.target.activeReleaseId)throw new WebsiteError('remote_drift','SFTP serving pointer changed outside Ubeeq.');}const temp=posix.join(root,'.current-'+digest(c.attemptId).slice(0,24));if(await s.stat(temp))await s.remove(temp);await s.symlink('releases/'+c.artifact!.digest,temp);await c.beforeActivation();await s.rename(temp,current,true);}
       else{const entries=[...c.artifact!.files].sort(([a],[b])=>(a==='ubeeq-release.json'?2:a.startsWith('assets/')?0:1)-(b==='ubeeq-release.json'?2:b.startsWith('assets/')?0:1)||a.localeCompare(b));
