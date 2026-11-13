@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isObjectKeyWithinPrefix } from './object-key-scope.js';
 export * from './object-key-scope.js';
 export { readBoundedBytes } from './bounded-bytes.js';
+export { writeBoundedUploadContent } from './bounded-upload-content.js';
 export { transferVerifiedObject, type VerifiedObjectTransferPorts } from './verified-transfer.js';
 
 /** Storage and delivery ports with no product-specific retention or access policy. */
