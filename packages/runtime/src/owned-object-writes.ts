@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {repositoryItems, type CellOwnedRecord, type HostRecord, type UbeeqRepositories} from '@ubeeq/persistence';
-import {cellScopedObjectKey, requireCreatorScopedObject, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation, type UploadSealResult} from '@ubeeq/storage';
+import {cellScopedObjectKey, requireCreatorScopedObject, writeBoundedUploadContent, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation, type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
@@ -187,13 +187,7 @@ export class OwnedObjectWrites {
     const recovered=await this.uploads.recoverCompletion!(completion);if(recovered)return this.commitObject(row,recovered);
     let writeError:unknown;
     try {
-      if(this.uploads.accept)await this.uploads.accept({...completion,body,operation:'upload_content'});
-      else {
-        const parts=value.provider!.parts;
-        if(parts?.length!==1 || parts[0].partNumber!==1 || new URL(parts[0].url).protocol!=='https:')throw new Error('A bounded HTTPS output upload is required.');
-        const response=await fetch(parts[0].url,{method:'PUT',headers:parts[0].headers,body:Buffer.from(body),redirect:'error',signal:AbortSignal.timeout(60_000)});
-        await response.body?.cancel();if(!response.ok)throw new Error('Output upload requires recovery.');
-      }
+      await writeBoundedUploadContent({uploads:this.uploads,upload:value.provider!,cellId:this.cellId,creatorId:input.creatorId,body});
     }catch(error){writeError=error;}
     let object:StoredObject|undefined;
     try{object=writeError ? await this.uploads.recoverCompletion!(completion) : await this.uploads.complete(completion);}
