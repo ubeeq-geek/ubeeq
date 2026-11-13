@@ -38,6 +38,10 @@
     "./website-hosting-connections": {
       "types": "./dist/website-hosting-connections.d.ts",
       "default": "./dist/website-hosting-connections.js"
+    },
+    "./owned-object-writes": {
+      "types": "./dist/owned-object-writes.d.ts",
+      "default": "./dist/owned-object-writes.js"
     }
   },
   "scripts": {
