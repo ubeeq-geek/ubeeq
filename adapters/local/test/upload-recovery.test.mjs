@@ -39,3 +39,23 @@ test('completion receipts reject foreign scope and changed facts without losing 
  await f.adapters.storage.abort(f.input);
  assert.deepEqual(await f.adapters.storage.recoverCompletion(f.input),object);
 });
+
+test('unused upload seals survive restart and reject a late body or reissued provider session',async t=>{
+ const f=await fixture(t),object={bucket:'cell',key:'cells/cell/creators/creator/uploads/unused',contentType:'text/plain',byteLength:f.body.length,checksum:f.input.checksum,scope:'private'};
+ const request={object,checksumAlgorithm:'sha256',expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:'unused'};
+ const upload=await f.adapters.storage.initiate(request),scope={uploadId:upload.uploadId,cellId:'cell',creatorId:'creator'};
+ const sealed=await f.adapters.storage.seal(scope);assert.equal(sealed.state,'sealed');
+ f.restart();assert.deepEqual(await f.adapters.storage.seal(scope),sealed);
+ await assert.rejects(f.adapters.storage.accept({...scope,operation:'upload_content',body:f.body}),/scope/);
+ await assert.rejects(f.adapters.storage.initiate(request),/permanently sealed/);
+ await assert.rejects(f.adapters.storage.seal({...scope,creatorId:'other'}),/scope/);
+});
+
+test('sealing accepted bytes recovers the original and its trusted write time instead of discarding it',async t=>{
+ const f=await fixture(t);
+ const result=await f.adapters.storage.seal(f.input);assert.equal(result.state,'completed');
+ assert.match(result.object.writtenAt,/^\d{4}-\d{2}-\d{2}T/);assert.equal(result.object.byteLength,f.body.length);
+ f.restart();assert.deepEqual(await f.adapters.storage.seal(f.input),result);
+ assert.deepEqual((await f.adapters.storage.get(result.object)).body,f.body);
+ assert.equal(f.adapters.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_seals').get().n,0);
+});

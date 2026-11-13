@@ -16,7 +16,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, repositoryItems, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
-import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
 import { PasswordAuthenticationError, type AuthenticatedSession, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
@@ -360,11 +360,38 @@ export class S3DirectUploadAdapter implements UploadAdapter {
     if (requested.bucket !== this.bucket || requested.byteLength !== input.byteLength || requested.checksum !== input.checksum) throw new Error('AWS upload completion differs from the issued request.');
     const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key, ChecksumMode: 'ENABLED' }));
     if (!response.VersionId || response.ContentLength !== requested.byteLength || response.ContentType !== requested.contentType || response.Metadata?.checksum !== requested.checksum || response.Metadata?.scope !== requested.scope || response.Metadata?.bytelength !== String(requested.byteLength) || response.ChecksumSHA256 !== checksumBase64(input.checksum)) throw new Error("AWS upload completion did not match the signed object checksum, size, type, scope, or version.");
-    return { ...requested, versionId: response.VersionId };
+    const {writtenAt:_untrusted,...object}=requested;
+    return { ...object, versionId: response.VersionId, ...(response.LastModified ? {writtenAt:response.LastModified.toISOString()} : {}) };
   }
   async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
     try { return await this.complete(input); }
     catch (error) { if ((error as { name?: string }).name === 'NotFound' || (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return undefined; throw error; }
+  }
+  async seal(input: UploadSealInput): Promise<UploadSealResult> {
+    const requested=objectForDirectUpload(input.uploadId);
+    requireCreatorScopedObject(requested.key,input);if(this.cellId)requireCellScopedObject(requested.key,this.cellId);
+    if(requested.bucket!==this.bucket || !requested.checksum || !Number.isSafeInteger(requested.byteLength) || requested.byteLength<0)throw new Error('Upload sealing requires the exact issued object.');
+    const sealHash=createHash('sha256').update(JSON.stringify([requested.bucket,requested.key,requested.byteLength,requested.checksum,requested.contentType,requested.scope])).digest('hex');
+    const emptyChecksum=createHash('sha256').update(new Uint8Array()).digest('hex');
+    let lastError:unknown;
+    for(let attempt=0;attempt<3;attempt++){
+      let head;
+      try{head=await this.s3.send(new HeadObjectCommand({Bucket:this.bucket,Key:requested.key,ChecksumMode:'ENABLED'}));}
+      catch(error){if((error as {name?:string}).name!=='NotFound' && (error as {$metadata?:{httpStatusCode?:number}}).$metadata?.httpStatusCode!==404)throw error;}
+      if(head){
+        if(head.Metadata?.['ubeeq-upload-seal']){
+          if(head.Metadata['ubeeq-upload-seal']!==sealHash || head.ContentLength!==0 || head.ContentType!=='application/octet-stream' || head.Metadata.scope!=='private' || head.ChecksumSHA256!==checksumBase64(emptyChecksum) || !head.VersionId || !head.LastModified)throw new Error('Physical upload seal requires reconciliation.');
+          const closedAt=head.LastModified.toISOString(),proofId=createHash('sha256').update(JSON.stringify([this.bucket,requested.key,head.VersionId,sealHash])).digest('hex');
+          return {state:'sealed',proofId,closedAt,retainedFence:{bucket:this.bucket,key:requested.key,versionId:head.VersionId,contentType:'application/octet-stream',byteLength:0,checksum:emptyChecksum,scope:'private',writtenAt:closedAt}};
+        }
+        return {state:'completed',object:await this.complete({uploadId:input.uploadId,cellId:input.cellId,creatorId:input.creatorId,checksum:requested.checksum,byteLength:requested.byteLength})};
+      }
+      // Keep this current version: deleting it (or adding a delete marker) would
+      // reopen a still-valid conditional PUT, including one already in flight.
+      try{await this.s3.send(new PutObjectCommand({Bucket:this.bucket,Key:requested.key,IfNoneMatch:'*',Body:new Uint8Array(),ContentLength:0,ContentType:'application/octet-stream',ChecksumSHA256:checksumBase64(emptyChecksum),Metadata:{'ubeeq-upload-seal':sealHash,scope:'private',checksum:emptyChecksum,bytelength:'0'}}));}
+      catch(error){lastError=error;if((error as {$metadata?:{httpStatusCode?:number}}).$metadata?.httpStatusCode===403)throw error;}
+    }
+    throw lastError ?? new Error('Physical upload seal could not be verified.');
   }
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });

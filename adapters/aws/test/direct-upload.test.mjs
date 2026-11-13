@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { S3Client } from '@aws-sdk/client-s3';
+import {createHash} from 'node:crypto';
 import { S3DirectUploadAdapter } from '../dist/index.js';
 const checksum = 'a'.repeat(64);
 const object = { bucket: 'objects', key: 'cells/cell/creators/creator/uploads/owned', contentType: 'image/png', byteLength: 4, checksum, scope: 'private' };
@@ -54,4 +55,37 @@ test('invalid expiry, size and checksum cannot issue direct write capabilities',
   await assert.rejects(provider.initiate({ ...input, expiresAt: 'invalid' }), /expiry/);
   for (const byteLength of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) await assert.rejects(provider.initiate({ ...input, object: { ...object, byteLength } }), /byte length/);
   await assert.rejects(provider.initiate({ ...input, object: { ...object, checksum: 'not-sha256' } }), /checksum/);
+});
+
+test('a lost conditional seal reply recovers one retained fence with stable provider time and proof',async()=>{
+ let current,puts=0;
+ const provider=new S3DirectUploadAdapter({send:async command=>{
+   if(command.constructor.name==='HeadObjectCommand'){
+     if(!current)throw Object.assign(Error('not found'),{name:'NotFound'});return current;
+   }
+   assert.equal(command.constructor.name,'PutObjectCommand');puts++;
+   assert.equal(command.input.IfNoneMatch,'*');assert.equal(command.input.ContentLength,0);
+   assert.equal(command.input.ChecksumSHA256,createHash('sha256').update('').digest('base64'));
+   current={VersionId:'fence-version',LastModified:new Date('2026-11-12T01:02:03.000Z'),ContentLength:0,ContentType:command.input.ContentType,ChecksumSHA256:command.input.ChecksumSHA256,Metadata:command.input.Metadata};
+   throw Error('Lost seal reply');
+ }},'objects','cell');
+ const sealed=await provider.seal(completion);assert.equal(sealed.state,'sealed');assert.equal(sealed.closedAt,'2026-11-12T01:02:03.000Z');
+ assert.equal(sealed.retainedFence.versionId,'fence-version');assert.equal(sealed.retainedFence.byteLength,0);
+ assert.deepEqual(await provider.seal(completion),sealed);assert.equal(puts,1);
+ current.Metadata['ubeeq-upload-seal']='another-upload';await assert.rejects(provider.seal(completion),/reconciliation/);
+});
+
+test('sealing an accepted direct original returns its actual version and timestamp without a fence write',async()=>{
+ let puts=0;const response={...head(),LastModified:new Date('2026-11-12T01:02:03.000Z')};
+ const provider=new S3DirectUploadAdapter({send:async command=>{
+   if(command.constructor.name!=='HeadObjectCommand')puts++;return response;
+ }},'objects','cell');
+ const result=await provider.seal(completion);assert.equal(result.state,'completed');assert.equal(result.object.byteLength,4);
+ assert.equal(result.object.writtenAt,response.LastModified.toISOString());assert.equal(puts,0);
+});
+
+test('denied seal reads do not write a fence or turn unknown storage into empty storage',async()=>{
+ let writes=0;const denied=Object.assign(Error('denied'),{$metadata:{httpStatusCode:403}});
+ const provider=new S3DirectUploadAdapter({send:async command=>{if(command.constructor.name!=='HeadObjectCommand')writes++;throw denied;}},'objects','cell');
+ await assert.rejects(provider.seal(completion),error=>error===denied);assert.equal(writes,0);
 });

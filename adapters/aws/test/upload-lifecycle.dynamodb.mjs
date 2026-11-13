@@ -10,6 +10,8 @@ import { createDynamoRepositories,AwsJobQueue,DynamoRevisionedRepository } from 
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 import { UploadLifecycle } from '../../../packages/runtime/dist/upload-lifecycle.js';
 import { createIntakeWork } from '../../../packages/runtime/dist/work-intake.js';
+import {UsageSettlementOutbox} from '../../../packages/runtime/dist/usage-settlement-outbox.js';
+import {StorageClosureOutbox} from '../../../packages/runtime/dist/storage-closure-outbox.js';
 const endpoint=process.env.TEST_DYNAMODB_ENDPOINT;
 if(!endpoint || !/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(endpoint))throw Error('An explicit loopback DynamoDB test endpoint is required.');
 test('actual DynamoDB upload/asset transaction and independent queue acknowledgement recover without duplication',async()=>{
@@ -32,7 +34,22 @@ test('actual DynamoDB upload/asset transaction and independent queue acknowledge
    const result=await enqueue(input);if(loseQueueReply){loseQueueReply=false;throw Error('Lost queue acknowledgement after durable enqueue');}return result;
   };
   local=createLocalAdapterSet({databasePath:join(directory,'provider.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
-  const journal=()=>new UploadLifecycle(createDynamoRepositories(document,configuration),local.storage,jobs,'instance','cell','http://localhost');
+  const settled=new Map(),closed=new Map();let loseClosureReply=true;
+  const quota={async checkAndReserveQuota(){return {allowed:true};},async recordUsageSettlement(input){
+    if(settled.has(input.idempotencyKey))assert.deepEqual(settled.get(input.idempotencyKey),input);
+    settled.set(input.idempotencyKey,input);
+  },async closeStorageReservation(input){
+    const rows=(await document.send(new ScanCommand({TableName:table}))).Items;
+    const committed=rows.find(row=>row.value?.namespace==='runtime-upload' && row.value.value?.accounting?.key===input.idempotencyKey);
+    assert.equal(committed?.value.value.phase,'sealed','the closure journal must commit before quota release');
+    assert.equal(committed.value.value.seal.proofId,input.proofId);
+    const intent=rows.find(row=>row.value?.namespace==='runtime-storage-closure' && row.value.key===input.idempotencyKey);
+    assert.ok(intent,'the closure outbox must have its own durable record');
+    if(closed.has(input.idempotencyKey))assert.deepEqual(closed.get(input.idempotencyKey),input);
+    closed.set(input.idempotencyKey,input);
+    if(loseClosureReply){loseClosureReply=false;throw Error('Lost closure acknowledgement');}
+  }};
+  const journal=()=>{const repo=createDynamoRepositories(document,configuration);return new UploadLifecycle(repo,local.storage,jobs,'instance','cell','http://localhost',{quota,usageOutbox:new UsageSettlementOutbox(repo,quota,'instance','cell'),closureOutbox:new StorageClosureOutbox(repo,quota,'instance','cell')});};
   const work=await repositories.works.create({id:'work',creatorId:'creator',instanceId:'instance',title:'Synthetic Work',status:'draft',homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1});
   const body=Buffer.from('Synthetic original body'),checksum=createHash('sha256').update(body).digest('hex');
   const upload=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'same-file');
@@ -48,7 +65,15 @@ test('actual DynamoDB upload/asset transaction and independent queue acknowledge
   const secondUpload=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'concurrent-file');await journal().accept(secondUpload.uploadId,'creator',body);
   const concurrent=await Promise.all([journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length}),journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length})]);
   assert.equal(concurrent[0].asset.id,concurrent[1].asset.id);assert.equal(concurrent[0].job.id,concurrent[1].job.id);
-  console.log('Verified actual DynamoDB atomic Work intake receipts, asset/evidence/audit/upload receipts, unordered maps, concurrent completion and lost independent queue acknowledgement.');
+  assert.equal(settled.size,2);assert.equal([...settled.values()].every(input=>input.storageBytesDelta===body.length && input.observedAt),true);
+  const unused=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'unused-file');
+  const row=(await repositories.hostRecords.list({limit:100})).items.find(row=>row.namespace==='runtime-upload' && row.value.uploadId===unused.uploadId);
+  await repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,expiresAt:'2000-01-01T00:00:00.000Z'}});
+  await journal().repair();await journal().repair();
+  const sealed=await repositories.hostRecords.get(row.id);assert.equal(sealed.value.phase,'sealed');assert.equal(closed.size,1);
+  const intent=await repositories.hostRecords.get(sealed.value.closureIntentId);assert.equal(intent.namespace,'runtime-storage-closure');assert.equal(intent.value.state,'closed');
+  await assert.rejects(journal().accept(unused.uploadId,'creator',body),error=>error.code==='upload_closed');
+  console.log('Verified actual DynamoDB atomic Work/asset/evidence/audit/upload/usage receipts, unordered maps, concurrent completion, lost queue acknowledgement, and physical closure/outbox commit before replayable quota release.');
  }finally{
   if(local)local.database.close();await rm(directory,{recursive:true,force:true});if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();
  }

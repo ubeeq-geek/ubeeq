@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 import { createCoreRuntime } from '../dist/index.js';
-async function fixture(t) {
+import {createDefaultOpenCorePorts,createSingleOperatorTenancyPort} from '@ubeeq/extension-sdk';
+async function fixture(t,quota) {
  const directory=await mkdtemp(join(tmpdir(),'durable-upload-'));
  const config={databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://127.0.0.1'};
  let local,runtime,providerCalls=0,processCalls=0,loseReply=false,failAsset=false,queueUnavailable=false,verifyCommitted=false;
@@ -20,7 +21,8 @@ async function fixture(t) {
    if(verifyCommitted){const observer=createLocalAdapterSet(config);try{assert.ok(await observer.repositories.assets.get(input.payload.assetId),'queue dispatch must observe an already committed asset from another connection');}finally{observer.database.close();}}
    return enqueue(input);
   };
-  runtime=createCoreRuntime({instanceId:'instance',...config,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity},mediaProcessor:{async process(){processCalls++;return {metadata:{processed:true},renditions:[],measuredUnits:1};}}});
+  const creators=async()=>(await local.repositories.creators.list({limit:100})).items;
+  runtime=createCoreRuntime({instanceId:'instance',...config,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity},...(quota ? {requireUploadAccounting:true,hostPorts:createDefaultOpenCorePorts({usageQuota:quota,tenancyAndAccess:createSingleOperatorTenancyPort({getOperatorUserId:async()=>(await creators())[0]?.subjectId??null,listOperatorCreatorIds:async actor=>(await creators()).filter(c=>c.subjectId===actor).map(c=>c.id)})})} : {}),mediaProcessor:{async process(){processCalls++;return {metadata:{processed:true},renditions:[],measuredUnits:1};}}});
   await new Promise(resolve=>runtime.server.listen(0,'127.0.0.1',resolve));
  };
  const stop=async()=>{await runtime.close();local.database.close();};await start();
@@ -49,6 +51,43 @@ test('owned upload initiation and completion replay after restart retain one pro
  await f.restart();const again=await f.finish(upload);assert.equal(again.status,202);assert.equal(again.body.asset.id,first.body.asset.id);assert.equal(again.body.asset.objectVersion,first.body.asset.objectVersion);assert.equal(again.body.job.id,first.body.job.id);assert.equal(again.body.job.correlationId,first.body.requestId);assert.equal(f.providerCalls,1);
  assert.equal((await f.local.repositories.assets.list({limit:100})).items.length,1);
  const audits=(await f.local.repositories.auditEvents.list({limit:100})).items.filter(r=>r.action==='asset.upload_completed');assert.equal(audits.length,1);
+});
+
+test('the HTTP upload use site reserves storage before issuing a provider session and settles its physical write time',async t=>{
+ const calls=[];const quota={async checkAndReserveQuota(input){calls.push(['reserve',input]);return {allowed:true};},async recordUsageSettlement(input){calls.push(['settle',input]);},async closeStorageReservation(input){calls.push(['close',input]);}};
+ const f=await fixture(t,quota),upload=await f.upload();
+ assert.equal(calls[0][0],'reserve');assert.equal(calls[0][1].storageBytesDelta,f.init.byteLength);assert.equal(calls[0][1].processingCreditsDelta,undefined);
+ await f.content(upload);const completed=await f.finish(upload);assert.equal(completed.status,202);
+ const settlement=calls.find(([kind])=>kind==='settle')[1];assert.equal(settlement.storageBytesDelta,f.init.byteLength);assert.equal(settlement.observedAt,completed.body.asset.storage.writtenAt);
+ assert.equal(settlement.idempotencyKey,calls[0][1].idempotencyKey);assert.equal(settlement.operation,'upload.original');
+});
+
+test('a current admission denial after reserve closes the unused grant before any provider session is issued',async t=>{
+ const closed=[];const quota={async checkAndReserveQuota(){return {allowed:true};},async checkCurrentAdmission(){return {allowed:false,reasonCode:'ACCOUNT_SUSPENDED'};},async recordUsageSettlement(){throw Error('No physical body was accepted');},async closeStorageReservation(input){closed.push(input);}};
+ const f=await fixture(t,quota),result=await f.request('/v1/uploads',f.init);
+ assert.equal(result.status,403);assert.equal(result.body.error.code,'ACCOUNT_SUSPENDED');
+ assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_uploads').get().n,0);
+ assert.equal(closed.length,1);assert.equal(closed[0].reservedBytes,f.init.byteLength);
+ const journal=(await f.local.repositories.hostRecords.list({limit:100})).items.find(row=>row.namespace==='runtime-upload');
+ assert.equal(journal.value.phase,'sealed');assert.equal(journal.value.provider,undefined);
+});
+
+test('expired unused uploads persist their closure proof and outbox before releasing the reservation',async t=>{
+ const closes=[];const quota={async checkAndReserveQuota(){return {allowed:true};},async recordUsageSettlement(){throw Error('No physical body should be charged');},async closeStorageReservation(input){closes.push(input);}};
+ const f=await fixture(t,quota),upload=await f.upload();
+ const row=(await f.local.repositories.hostRecords.list({limit:100})).items.find(r=>r.namespace==='runtime-upload');
+ await f.local.repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,expiresAt:'2000-01-01T00:00:00.000Z'}});
+ await f.runtime.runNextJob('sealer');const saved=await f.local.repositories.hostRecords.get(row.id);
+ assert.equal(saved.value.phase,'sealed');assert.ok(saved.value.closureIntentId);assert.equal(closes[0].proofId,saved.value.seal.proofId);
+ assert.equal(closes[0].reservedBytes,f.init.byteLength);assert.equal((await f.content(upload)).body.error.code,'upload_closed');
+ assert.equal((await f.request('/v1/uploads',f.init)).body.error.code,'upload_closed');
+});
+
+test('required upload accounting rejects an adapter without physical closure before serving requests',async t=>{
+ const directory=await mkdtemp(join(tmpdir(),'upload-required-')),local=createLocalAdapterSet({databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
+ t.after(async()=>{local.database.close();await rm(directory,{recursive:true,force:true});});
+ local.storage.seal=undefined;
+ assert.throws(()=>createCoreRuntime({instanceId:'instance',cellId:'cell',publicBaseUrl:'http://localhost',requireUploadAccounting:true,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity}}),/Physical upload closure/);
 });
 test('failed asset transaction recovers the already written original without consuming the upload twice',async t=>{
  const f=await fixture(t),upload=await f.upload();await f.content(upload);f.failAsset();
