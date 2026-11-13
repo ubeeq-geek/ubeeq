@@ -101,3 +101,29 @@ retained-version inventory, physical removal receipts, retention/restore behavio
 and actual delivered-byte ingestion. Removing an owned payload through the plain
 storage API is not an accounting release and can reopen a conditional key; use a
 future verified physical-removal protocol that preserves the required write fence.
+
+## Website image caches
+
+Website image prewarming and cold-cache resolution use the approved public
+rendition's immutable reference and checksum. They preserve its crop and visible
+watermark while stripping embedded metadata. They never substitute private
+original pixels to resolve a public-rendition checksum mismatch.
+
+New accounted cache objects use owned writes with the `website.rendition`
+operation, a recipe pinned to the public version/checksum, and a private scope.
+Their actual byte length and provider write time settle independently of the
+website build. No second SQLite BLOB copy is created. Cache reads verify the
+saved physical version, metadata and body checksum; corruption requires recovery
+rather than silently replacing a charged version. Quota or settlement outages
+retain the normal owned-write journal and outbox recovery behavior.
+
+Retained SQLite caches require the cutover inventory baseline. A legacy cache
+based on original bytes is reusable only when those bytes are also the current
+approved public input. Otherwise it stays retained for reconciliation and a new
+cache is generated from the approved variant. Unmetered installations without
+owned-write capabilities retain the version-pinned SQLite cache path.
+
+This covers clean image caches in the local reference composition, including a
+commercial host using that composition. Website images, snapshots, build files,
+ZIP archives and managed website persistence still require their own integration
+and accounting before the full website release gate can pass.
