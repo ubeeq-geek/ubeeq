@@ -21,7 +21,7 @@ const page = `<!doctype html>
 <script>
 let token=localStorage.getItem('ubeeq.reference.token')||'',workId=localStorage.getItem('ubeeq.reference.work')||'';
 const $=id=>document.getElementById(id),out=value=>{$('output').textContent=typeof value==='string'?value:JSON.stringify(value,null,2)},auth=()=>token?{authorization:'Bearer '+token}:{};
-const api=async(path,method='GET',body)=>{const response=await fetch('/api'+path,{method,headers:{'content-type':'application/json',...auth()},body:body?JSON.stringify(body):undefined});const value=response.status===204?null:await response.json();if(!response.ok)throw new Error(value.error?.message||'Request failed');return value};
+const api=async(path,method='GET',body)=>{const response=await fetch('/api'+path,{method,headers:{'content-type':'application/json',...auth()},body:body?JSON.stringify(body):undefined});const value=response.status===204?null:await response.json();if(!response.ok)throw Object.assign(new Error(value.error?.message||'Request failed'),{code:value.error?.code});return value};
 const account=()=>({email:$('email').value,password:$('password').value});
 $('signup').onclick=async()=>{try{out(await api('/v1/auth/sign-up','POST',account()))}catch(e){out(e.message)}};
 $('signin').onclick=async()=>{try{const result=await api('/v1/auth/sign-in','POST',account());token=result.token;localStorage.setItem('ubeeq.reference.token',token);$('identity').textContent='Signed in.';out(result)}catch(e){out(e.message)}};
@@ -35,8 +35,9 @@ $('uploadFile').onclick=async()=>{
     if(!workId)throw new Error('Create a Work first.');
     const file=$('file').files[0];if(!file)throw new Error('Choose an image file.');
     let intents=uploadIntents.get(file);if(!intents){intents=new Map();uploadIntents.set(file,intents)}
-    const key=intents.get(workId)||crypto.randomUUID();intents.set(workId,key);
+    let key=intents.get(workId)||crypto.randomUUID();intents.set(workId,key);
     const bytes=new Uint8Array(await file.arrayBuffer()),digestBytes=new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),hash=Array.from(digestBytes).map(b=>b.toString(16).padStart(2,'0')).join(''),checksumBase64=btoa(String.fromCharCode(...digestBytes));
+    for(let attempt=0;attempt<2;attempt++){try{
     const {upload}=await api('/v1/uploads','POST',{workId,mimeType:file.type||'application/octet-stream',byteLength:file.size,checksum:hash,idempotencyKey:key});
     const part=upload.parts?.[0];let writeError;
     if(!upload.completed&&part){
@@ -50,9 +51,10 @@ $('uploadFile').onclick=async()=>{
       await api('/v1/uploads/'+upload.uploadId+'/content','PUT',{base64:btoa(binary)});
     }
     let complete;
-    try{complete=await api('/v1/uploads/'+upload.uploadId+'/complete','POST',{workId,checksum:hash,byteLength:file.size})}catch(error){throw writeError||error}
+    try{complete=await api('/v1/uploads/'+upload.uploadId+'/complete','POST',{workId,checksum:hash,byteLength:file.size})}catch(error){if(error.code==='upload_closed')throw error;throw writeError||error}
     intents.delete(workId);
-    $('uploadStatus').textContent=complete.queuePending?'Upload accepted; processing is waiting for the queue.':'Queued for processing.';out(complete);
+    $('uploadStatus').textContent=complete.queuePending?'Upload accepted; processing is waiting for the queue.':'Queued for processing.';out(complete);return;
+    }catch(error){if(error.code!=='upload_closed'||attempt>0)throw error;key=crypto.randomUUID();intents.set(workId,key)}}
   }catch(e){out(e.message)}finally{$('uploadFile').disabled=false}
 };
 $('process').onclick=async()=>{try{out(await api('/v1/operations/jobs/run-next','POST',{}))}catch(e){out(e.message)}};

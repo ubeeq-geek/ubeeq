@@ -3,7 +3,7 @@ export { SqliteCommerceStore } from './commerce.js';
 export { SqliteWebsiteStore } from './websites.js';
 export * from './website-hosting.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -23,7 +23,7 @@ import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationChec
 import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
-import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
@@ -250,6 +250,7 @@ export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqReposi
 export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
   constructor(private readonly local: LocalSqliteDatabase) {
     this.local.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_upload_completions (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, object_payload TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','completed')))");
+    this.local.database.exec('CREATE TABLE IF NOT EXISTS ubeeq_upload_seals (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, proof_id TEXT NOT NULL, closed_at TEXT NOT NULL)');
   }
   private sameUploadObject(a:StoredObject,b:StoredObject):boolean {
     const facts=(o:StoredObject)=>[o.bucket,o.key,o.versionId??null,o.contentType,o.byteLength,o.checksum??null,o.scope];
@@ -287,6 +288,7 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation> {
     const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
     const uploadId = input.idempotencyKey ? digest(JSON.stringify([match[1],input.object.key,input.idempotencyKey])) : randomUUID();
+    if(this.local.database.prepare('SELECT id FROM ubeeq_upload_seals WHERE id=?').get(uploadId))throw new Error('Upload is permanently sealed.');
     if(this.local.database.prepare("SELECT id FROM ubeeq_upload_completions WHERE id=?").get(uploadId)) throw new Error("Upload operation already has a completion intent.");
     this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
     const saved = this.local.database.prepare("SELECT object_payload, expires_at FROM ubeeq_uploads WHERE id=?").get(uploadId) as {object_payload:string;expires_at:string};
@@ -311,20 +313,24 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
     if (!object.versionId || object.checksum !== input.checksum || object.byteLength !== input.byteLength || !['prepared','completed'].includes(row.state)) throw new Error("Upload completion evidence conflicts.");
     return {object,state:row.state};
   }
-  private finishCompletion(input: UploadCompletion, object: StoredObject): void {
+  private finishCompletion(input: UploadCompletion, object: StoredObject): StoredObject {
     const path = this.objectPath(object), body = readFileSync(path);
     if (body.byteLength !== object.byteLength || digest(body) !== object.checksum) throw new Error("Physical upload completion requires reconciliation.");
-    try { writeFileSync(`${path}.json`,json(object),{flag:'wx',mode:0o600}); }
+    const writtenAt=statSync(path).mtime.toISOString(),completed={...object,writtenAt};
+    if(object.writtenAt && object.writtenAt!==writtenAt)throw new Error('Physical upload write time requires reconciliation.');
+    try { writeFileSync(`${path}.json`,json(completed),{flag:'wx',mode:0o600}); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    if (!this.sameUploadObject(parse<StoredObject>(readFileSync(`${path}.json`,'utf8')),object)) throw new Error("Physical upload metadata conflicts.");
+    const metadata=parse<StoredObject>(readFileSync(`${path}.json`,'utf8'));
+    if (!this.sameUploadObject(metadata,object) || metadata.writtenAt && metadata.writtenAt!==writtenAt) throw new Error("Physical upload metadata conflicts.");
     this.local.database.exec('BEGIN IMMEDIATE');
     try {
       const current = this.completion(input);
       if (!current || !this.sameUploadObject(current.object,object)) throw new Error("Upload completion receipt disappeared.");
-      this.local.database.prepare("UPDATE ubeeq_upload_completions SET state='completed' WHERE id=? AND cell_id=? AND creator_id=?").run(input.uploadId,input.cellId,input.creatorId);
+      this.local.database.prepare("UPDATE ubeeq_upload_completions SET state='completed',object_payload=? WHERE id=? AND cell_id=? AND creator_id=?").run(json(completed),input.uploadId,input.cellId,input.creatorId);
       this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id=? AND cell_id=? AND creator_id=?").run(input.uploadId,input.cellId,input.creatorId);
       this.local.database.exec('COMMIT');
     } catch (error) { this.local.database.exec('ROLLBACK'); throw error; }
+    return completed;
   }
   async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
     const saved = this.completion(input);
@@ -332,8 +338,7 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
     const path = this.objectPath(saved.object);
     try { readFileSync(path); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' && saved.state === 'prepared') return undefined; throw error; }
-    this.finishCompletion(input,saved.object);
-    return structuredClone(saved.object);
+    return this.finishCompletion(input,saved.object);
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     if (this.completion(input)?.state === 'completed') throw new Error("Upload content has already completed; recover its receipt instead.");
@@ -342,15 +347,46 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
     const requested = parse<StoredObject>(row.object_payload);
     requireCreatorScopedObject(requested.key,input);
     if (row.cell_id !== input.cellId || row.creator_id !== input.creatorId || input.cellId !== this.local.configuration.cellId || row.body.byteLength !== input.byteLength || digest(row.body) !== input.checksum) throw new Error("Upload scope, checksum or length does not match.");
-    const object = {...requested,checksum:input.checksum,byteLength:input.byteLength,versionId:`upload-${input.uploadId}`};
+    const {writtenAt:_untrusted,...source}=requested;
+    const object = {...source,checksum:input.checksum,byteLength:input.byteLength,versionId:`upload-${input.uploadId}`};
     this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_upload_completions(id,cell_id,creator_id,object_payload,state) VALUES(?,?,?,?,'prepared')").run(input.uploadId,input.cellId,input.creatorId,json(object));
     const saved = this.completion(input);
     if (!saved || !this.sameUploadObject(saved.object,object)) throw new Error("Upload completion intent conflicts.");
     const path = this.objectPath(object); mkdirSync(resolve(path,'..'),{recursive:true});
     try { writeFileSync(path,row.body,{flag:'wx',mode:0o600}); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    this.finishCompletion(input,object);
-    return object;
+    return this.finishCompletion(input,object);
+  }
+  async seal(input: UploadSealInput): Promise<UploadSealResult> {
+    if(input.cellId!==this.local.configuration.cellId)throw new Error('Upload seal is not scoped to this cell.');
+    for(let attempt=0;attempt<3;attempt++){
+      const sealed=this.local.database.prepare('SELECT cell_id,creator_id,proof_id,closed_at FROM ubeeq_upload_seals WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;proof_id:string;closed_at:string} | undefined;
+      if(sealed){
+        if(sealed.cell_id!==input.cellId || sealed.creator_id!==input.creatorId)throw new Error('Upload seal scope does not match.');
+        return {state:'sealed',proofId:sealed.proof_id,closedAt:sealed.closed_at};
+      }
+      const receipt=this.local.database.prepare('SELECT cell_id,creator_id,object_payload FROM ubeeq_upload_completions WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;object_payload:string} | undefined;
+      if(receipt){
+        if(receipt.cell_id!==input.cellId || receipt.creator_id!==input.creatorId)throw new Error('Upload seal scope does not match.');
+        const object=parse<StoredObject>(receipt.object_payload),completion={...input,checksum:object.checksum!,byteLength:object.byteLength};
+        const recovered=await this.recoverCompletion(completion);
+        return {state:'completed',object:recovered ?? await this.complete(completion)};
+      }
+      const row=this.local.database.prepare('SELECT cell_id,creator_id,body FROM ubeeq_uploads WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;body:Uint8Array|null} | undefined;
+      if(!row || row.cell_id!==input.cellId || row.creator_id!==input.creatorId)throw new Error('Upload seal requires its owned provider session.');
+      if(row.body)return {state:'completed',object:await this.complete({...input,checksum:digest(row.body),byteLength:row.body.byteLength})};
+      const closed=this.local.transactionSync(()=>{
+        if(this.local.database.prepare('SELECT id FROM ubeeq_upload_completions WHERE id=?').get(input.uploadId))return undefined;
+        const current=this.local.database.prepare('SELECT body,cell_id,creator_id FROM ubeeq_uploads WHERE id=?').get(input.uploadId) as typeof row;
+        if(!current || current.body || current.cell_id!==input.cellId || current.creator_id!==input.creatorId)return undefined;
+        const closedAt=now(),proofId=digest(json([input.cellId,input.creatorId,input.uploadId,closedAt]));
+        this.local.database.prepare('INSERT INTO ubeeq_upload_seals(id,cell_id,creator_id,proof_id,closed_at) VALUES(?,?,?,?,?)').run(input.uploadId,input.cellId,input.creatorId,proofId,closedAt);
+        this.local.database.prepare('DELETE FROM ubeeq_uploads WHERE id=? AND cell_id=? AND creator_id=?').run(input.uploadId,input.cellId,input.creatorId);
+        return {state:'sealed' as const,proofId,closedAt};
+      });
+      if(closed)return closed;
+    }
+    throw new Error('Upload seal requires reconciliation.');
   }
   async issue(request: { object: Pick<StoredObject, "bucket" | "key" | "versionId" | "scope">; expiresAt: string; disposition?: "inline" | "attachment" }): Promise<{ url: string; expiresAt: string }> {
     const match = request.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match || match[1] !== this.local.configuration.cellId) throw new Error("Delivery object is not scoped to this cell.");

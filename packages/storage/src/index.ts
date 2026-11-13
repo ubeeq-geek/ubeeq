@@ -15,6 +15,8 @@ export interface StoredObject {
   byteLength: number;
   checksum?: string;
   scope: ObjectAccessScope;
+  /** Trusted provider write time of this physical version, never a client timestamp. */
+  writtenAt?: string;
 }
 
 export interface ObjectStorage {
@@ -53,6 +55,8 @@ export interface UploadCompletion {
   parts?: readonly { partNumber: number; checksum?: string }[];
 }
 export interface UploadAcceptance { uploadId: string; cellId: string; creatorId: string; body: Uint8Array; operation: "upload_content"; }
+export interface UploadSealInput { uploadId: string; cellId: string; creatorId: string; }
+export type UploadSealResult = { state:'completed'; object:StoredObject } | { state:'sealed'; proofId:string; closedAt:string; retainedFence?:StoredObject };
 
 export const requireCreatorScopedObject = (key: string, input: { cellId: string; creatorId: string }): void => {
   const prefix = `cells/${input.cellId}/creators/${input.creatorId}/`;
@@ -72,6 +76,9 @@ export interface UploadAdapter {
   complete(input: UploadCompletion): Promise<StoredObject>;
   /** Recover the exact completed provider effect after a lost reply; never create a new version. */
   recoverCompletion?(input: UploadCompletion): Promise<StoredObject | undefined>;
+  /** Prevent all later writes, including already-started writes. Retain an owned
+   * provider fence where needed. Accepted bytes must be returned, never discarded. */
+  seal?(input: UploadSealInput): Promise<UploadSealResult>;
   abort?(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void>;
 }
 

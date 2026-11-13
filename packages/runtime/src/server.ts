@@ -2,6 +2,7 @@ import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
+import {StorageClosureOutbox} from './storage-closure-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
@@ -86,6 +87,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   regionalControlPlane?: RegionalControlPlane;
   tenancy?: TenancyAndAccessPort;
   hostPorts?: HostExtensionRuntimePorts | ((adapters: ReferenceAdapterSet) => HostExtensionRuntimePorts);
+  /** Commercial hosts require bounded physical closure and durable quota fencing. */
+  requireUploadAccounting?:boolean;
   tenancyMode?: "single_operator" | "multi_tenant_saas";
   /** Product/deployment supplies this requirement; the neutral reference defines no operator role hierarchy. */
   operatorAuthorization?: AuthorizationRequirement;
@@ -219,7 +222,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
   const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
-  const uploadLifecycle = repositories.hostRecords ? new UploadLifecycle(repositories,adapters.uploads,adapters.jobs,configuration.instanceId ?? 'local-reference',cellId,configuration.publicBaseUrl) : undefined;
+  const uploadAccountingAvailable=Boolean(repositories.hostRecords && adapters.uploads.seal && hostPorts.usageQuota.closeStorageReservation);
+  if(configuration.requireUploadAccounting && !uploadAccountingAvailable){localAdapters?.database.close();throw new Error('Physical upload closure and terminal storage quota reservations are required.');}
+  const uploadAccounting=uploadAccountingAvailable ? {quota:hostPorts.usageQuota,usageOutbox:usageOutbox!,closureOutbox:new StorageClosureOutbox(repositories,hostPorts.usageQuota,configuration.instanceId??'local-reference',cellId)} : undefined;
+  const uploadLifecycle = repositories.hostRecords ? new UploadLifecycle(repositories,adapters.uploads,adapters.jobs,configuration.instanceId ?? 'local-reference',cellId,configuration.publicBaseUrl,uploadAccounting) : undefined;
   const processingUsageKey = (asset: AssetRecord) => (asset as AssetRecord & { processingUsageKey?: string }).processingUsageKey ?? `asset-processing:${asset.id}:${asset.objectVersion}`;
   const deferUsage = async (intent: import('@ubeeq/persistence').HostRecord) => {
     try { await usageOutbox!.deliver(intent); }

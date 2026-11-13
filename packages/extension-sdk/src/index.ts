@@ -227,12 +227,24 @@ export interface UsageSettlementInput {
   idempotencyKey: string;
 }
 
+/** Trusted proof that the upload can no longer accept bytes. Closing must fence
+ * a same-key reservation even when its initial reserve reply is still in flight. */
+export interface StorageReservationClosure {
+  creatorId: string;
+  operation: string;
+  idempotencyKey: string;
+  reservedBytes: number;
+  proofId: string;
+  observedAt: string;
+}
+
 export interface UsageQuotaPort {
   checkAndReserveQuota(input: UsageQuotaReservationInput): Promise<UsageQuotaReservationResult>;
   /** Recheck current execution eligibility separately from an idempotent reservation receipt.
    * Recovery must still settle old reservations when new execution is no longer allowed. */
   checkCurrentAdmission?(input: Pick<UsageSettlementInput, 'creatorId' | 'operation' | 'idempotencyKey'>): Promise<UsageQuotaReservationResult>;
   recordUsageSettlement(input: UsageSettlementInput): Promise<void>;
+  closeStorageReservation?(input: StorageReservationClosure): Promise<void>;
 }
 
 export type ConnectorCredentialSource = "operator_env" | "creator_secret" | "platform_managed";
@@ -347,6 +359,9 @@ export const createUnmeteredUsageQuotaPort = (): UsageQuotaPort => ({
   },
   async recordUsageSettlement() {
     // Self-hosted open-core instances do not meter SaaS platform plans or credits.
+  },
+  async closeStorageReservation() {
+    // The upload journal still retains its physical closure proof on unmetered hosts.
   }
 });
 

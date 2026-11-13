@@ -32,8 +32,38 @@ do not treat URL expiry or a missing HEAD response as proof of physical closure.
 
 A disposable AWS experiment verified that a zero-byte conditional fence at an
 unused key rejected both an earlier unfinished conditional PUT and a later replay.
-The fixture was removed completely after the check. That experiment establishes
-provider behavior, not a production closure/deletion protocol. A durable closure
-journal, ownership-verified fence retention, exact version inventory, physical
-removal receipts and quota settlement remain required before releasing reserved
-storage for unfinished uploads. Existing retained objects still consume storage.
+The implemented S3 `seal` method retains such a fence, verifies its current version,
+actual empty-body checksum and provider write time, and returns a stable closure
+proof. If the original won the race, sealing returns those accepted bytes instead.
+The local provider atomically seals an unused session or recovers its accepted
+original. Never garbage-collect a current fence while an old write can complete.
+
+## Original storage reservations
+
+The runtime reserves original bytes before issuing the provider session. Completion
+commits the physical write time and a storage settlement intent with the asset.
+Settlement delivery is independently replayable after a lost reply or restart.
+Expired sessions enter `closing` before provider sealing. Accepted originals are
+recovered into the Work, or retained for reconciliation if the Work was deleted or
+its completion facts conflict. Retained originals still consume storage.
+
+An empty closure commits its proof and an outbox intent before releasing capacity.
+`UsageQuotaPort.closeStorageReservation` must permanently fence the same request
+key even if its first reserve is still in flight. Commercial adapters close that
+key atomically with releasing any matching storage hold. This does not refund
+processing credits, delivery, or consumed storage. A never-issued provider
+capability can close only after the journal prevents its late publication.
+
+Commercial composition requires `requireUploadAccounting: true` and fails startup
+without physical sealing and terminal storage reservations. Unmetered open-core
+hosts retain their existing optional adapter support. Earlier unfinished sessions
+without accounting evidence must drain through the previous writer; existing
+completed assets require their authoritative inventory baseline at cutover.
+
+The shared client replaces a request key only after the owned API confirms that
+the prior upload was empty and sealed. Unknown outcomes and retained originals
+keep their request identity. Replacement keys also survive retries in that intake.
+
+This covers original uploads. Full accounting still requires every derivative,
+creator-tool and website output, exact retained-version inventory, physical removal
+receipts, retention/restore behavior, and actual delivered-byte ingestion.
