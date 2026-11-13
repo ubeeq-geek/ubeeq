@@ -45,8 +45,8 @@ test('owned upload initiation and completion replay after restart retain one pro
  assert.equal((await f.upload()).uploadId,upload.uploadId);
  assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_uploads').get().n,1);
  assert.equal((await f.content(upload)).status,204);f.loseReply();f.verifyCommitted();
- const first=await f.finish(upload);assert.equal(first.status,202);assert.ok(first.body.job.id);assert.equal(first.body.queuePending,false);
- await f.restart();const again=await f.finish(upload);assert.equal(again.status,202);assert.equal(again.body.asset.id,first.body.asset.id);assert.equal(again.body.asset.objectVersion,first.body.asset.objectVersion);assert.equal(again.body.job.id,first.body.job.id);assert.equal(f.providerCalls,1);
+ const first=await f.finish(upload);assert.equal(first.status,202);assert.ok(first.body.job.id);assert.equal(first.body.queuePending,false);assert.equal(first.body.job.correlationId,first.body.requestId);
+ await f.restart();const again=await f.finish(upload);assert.equal(again.status,202);assert.equal(again.body.asset.id,first.body.asset.id);assert.equal(again.body.asset.objectVersion,first.body.asset.objectVersion);assert.equal(again.body.job.id,first.body.job.id);assert.equal(again.body.job.correlationId,first.body.requestId);assert.equal(f.providerCalls,1);
  assert.equal((await f.local.repositories.assets.list({limit:100})).items.length,1);
  const audits=(await f.local.repositories.auditEvents.list({limit:100})).items.filter(r=>r.action==='asset.upload_completed');assert.equal(audits.length,1);
 });
@@ -62,7 +62,7 @@ test('queue outage commits a recoverable upload intent and restart repairs it be
  assert.equal((await f.local.repositories.assets.get(accepted.body.asset.id)).status,'pending');
  f.queueUnavailable(false);f.verifyCommitted();await f.restart();await f.runtime.runNextJob('recovered-worker');await f.runtime.runNextJob('idle-worker');
  assert.equal((await f.local.repositories.assets.get(accepted.body.asset.id)).status,'ready');assert.equal(f.processCalls,1);
- const repeated=await f.finish(upload);assert.equal(repeated.body.asset.id,accepted.body.asset.id);assert.equal(repeated.body.queuePending,false);
+ const repeated=await f.finish(upload);assert.equal(repeated.body.asset.id,accepted.body.asset.id);assert.equal(repeated.body.queuePending,false);assert.equal(repeated.body.job.correlationId,accepted.body.requestId);
 });
 test('changed initiation/completion and a different Work cannot retarget an owned upload',async t=>{
  const f=await fixture(t),upload=await f.upload();await f.content(upload);

@@ -24,7 +24,7 @@ interface UploadIntent {
   expected: { mimeType: string; byteLength: number; checksum?: string }; requestHash: string;
   expiresAt: string; object: StoredObject; provider?: UploadInitiation; completion?: Completion;
   phase: 'prepared' | 'issued' | 'completed'; assetId: string; completedObject?: StoredObject;
-  queueState: 'pending' | 'queued'; jobId?: string;
+  queueState: 'pending' | 'queued'; jobId?: string; correlationId?: string;
 }
 export class UploadLifecycle {
   private readonly records: NonNullable<UbeeqRepositories['hostRecords']>;
@@ -95,7 +95,7 @@ export class UploadLifecycle {
     if (!object.versionId || object.key !== value.provider!.object.key || object.bucket !== value.provider!.object.bucket || object.scope !== 'private' || object.contentType !== value.expected.mimeType || object.checksum !== completion.checksum || object.byteLength !== completion.byteLength) throw new Error('Completed object differs from the owned upload.');
     requireCreatorScopedObject(object.key,{cellId:this.cellId,creatorId:value.creatorId});
   }
-  async complete(uploadId: string, work: WorkRecord, actorId: string, input: Completion): Promise<{asset:AssetRecord;job:DurableJob | null;queuePending:boolean}> {
+  async complete(uploadId: string, work: WorkRecord, actorId: string, input: Completion, correlationId?: string): Promise<{asset:AssetRecord;job:DurableJob | null;queuePending:boolean}> {
     if (!/^[a-f0-9]{64}$/.test(input.checksum) || !Number.isSafeInteger(input.byteLength) || input.byteLength<0) throw new UploadLifecycleError('invalid_upload_completion',400,'An exact checksum and byte length are required.');
     let row = await this.read(uploadId,work), value = this.value(row);
     if (!value.provider) throw new UploadLifecycleError('upload_not_issued',409,'Upload initiation must finish first.');
@@ -130,7 +130,7 @@ export class UploadLifecycle {
           await this.repositories.assets.create({id:saved.assetId,instanceId:this.instanceId,...home,creatorId:value.creatorId,workId:work.id,mimeType:object!.contentType,checksum:object!.checksum!,objectVersion:object!.versionId!,status:'pending',storage:object,uploadId} as AssetRecord & {storage:StoredObject;uploadId:string},{transaction});
           await this.repositories.moderationEvidence.create({id:`upload-evidence-${uploadId}`,instanceId:this.instanceId,...home,subjectType:'asset',subjectId:saved.assetId,source:'reference.upload',payload:{checksum:object!.checksum,byteLength:object!.byteLength}},{transaction});
           await this.repositories.auditEvents.create({id:`upload-audit-${uploadId}`,instanceId:this.instanceId,...home,action:'asset.upload_completed',actorId,subjectId:saved.assetId,payload:{workId:work.id,uploadId}},{transaction});
-          await this.records.update(current.id,current.revision,{value:{...current.value,completedObject:object,phase:'completed',completedAt:new Date().toISOString()}},{transaction});
+          await this.records.update(current.id,current.revision,{value:{...current.value,completedObject:object,phase:'completed',completedAt:new Date().toISOString(),...(correlationId ? {correlationId} : {})}},{transaction});
         }); break; }
         catch (error) { row = await this.read(uploadId,work); if (this.value(row).phase==='completed') break; if (!conflict(error) || attempt===4) throw error; }
       }
@@ -151,7 +151,7 @@ export class UploadLifecycle {
     if (value.queueState==='queued') { const job=value.jobId ? await this.jobs.get(value.jobId) : undefined; if(job)this.proveJob(value,job); return job??null; }
     const asset = await this.repositories.assets.get(value.assetId);
     if (!asset || asset.instanceId !== this.instanceId || asset.creatorId !== value.creatorId || asset.homeCellId !== this.cellId) throw new Error('Upload processing intent requires its owned asset.');
-    const job = await this.jobs.enqueue({cellId:this.cellId,type:'asset.process',payload:{assetId:asset.id},idempotencyKey:`asset-process:${asset.id}:${asset.objectVersion}`,maxAttempts:3});
+    const job = await this.jobs.enqueue({cellId:this.cellId,type:'asset.process',payload:{assetId:asset.id},idempotencyKey:`asset-process:${asset.id}:${asset.objectVersion}`,maxAttempts:3,...(value.correlationId ? {correlationId:value.correlationId} : {})});
     this.proveJob(value,job);
     for (let attempt=0;attempt<5;attempt++) {
       const current = await this.read(value.uploadId), saved = this.value(current);

@@ -863,7 +863,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === 'POST' && completeMatch) {
         const identity = await session(request), body = await parseBody(request), work = await ownedWork(requireString(body.workId,'workId'),identity.subject.id);
         if (!uploadLifecycle) throw new HttpError(503,'durable_uploads_unavailable','Durable upload storage is not configured.');
-        const result = await uploadLifecycle.complete(completeMatch[1],work,identity.subject.id,{checksum:requireString(body.checksum,'checksum').toLowerCase(),byteLength:Number(body.byteLength)});
+        const result = await uploadLifecycle.complete(completeMatch[1],work,identity.subject.id,{checksum:requireString(body.checksum,'checksum').toLowerCase(),byteLength:Number(body.byteLength)},requestId);
         return json(response,202,{...result,requestId},requestId);
       }
 
