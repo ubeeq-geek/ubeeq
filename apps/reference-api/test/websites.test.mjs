@@ -34,6 +34,14 @@ test('personal website API persists pages, queues builds, isolates previews and 
   const headers={authorization:'Bearer '+token};
   const preview=await fetch(origin+'/v1/websites/builds/'+id+'/preview?inline=1',{headers});assert.equal(preview.status,200);assert.match(preview.headers.get('content-security-policy'),/^sandbox;/);assert.match(preview.headers.get('cache-control'),/no-store/);assert.match(await preview.text(),/<style>/);
   const download=await fetch(origin+'/v1/websites/builds/'+id+'/export',{headers});assert.equal(download.status,200);assert.equal(download.headers.get('content-type'),'application/zip');const bytes=Buffer.from(await download.arrayBuffer());assert.equal(bytes.readUInt32LE(0),0x04034b50);
+  const physical=new DatabaseSync(join(dir,'websites.sqlite'));
+  assert.equal(physical.prepare('SELECT sum(length(bytes)) AS n FROM website_blobs').get().n,0,'normal builds keep owned file bytes out of SQL');
+  assert.equal(physical.prepare('SELECT sum(length(zip)) AS n FROM website_archives').get().n,0,'authorized ZIP bytes use the owned backend');physical.close();
+  const receipts=new DatabaseSync(join(dir,'state.sqlite'));
+  const owned=receipts.prepare("SELECT payload FROM ubeeq_records WHERE repository='hostRecords'").all().map(row=>JSON.parse(row.payload));receipts.close();
+  const archive=owned.find(row=>row.namespace==='runtime-website-blob'&&row.scopeId===creator.id&&row.key===createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(archive.value.byteLength,bytes.length);assert.ok(archive.value.chunkCount>0);assert.ok(Buffer.byteLength(JSON.stringify(archive.value))<1024,'blob manifests stay small independently of website capacity');
+  for(const output of owned.filter(row=>row.namespace==='runtime-owned-object'&&row.value.operation==='website.blob'&&row.value.phase==='completed')){const usage=owned.find(row=>row.id===output.value.usageIntentId);assert.equal(usage.value.input.storageBytesDelta,output.value.completedObject.byteLength);assert.equal(usage.value.state,'settled');}
   assert.equal((await fetch(origin+'/v1/websites/builds/'+id+'/preview')).status,401);
   assert.equal((await call('/v1/websites/builds/'+id+'/preview?file=../state.sqlite')).status,400);
   const savedToken=token;

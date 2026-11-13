@@ -1,4 +1,11 @@
 import type { Website, WebsiteDocument, WebsiteDependency } from '@ubeeq/core';
+/** Immutable, workspace-scoped bytes. Implementations own receipts and accounting;
+ * logical retention cleanup must not silently refund or remove physical versions. */
+export interface WebsiteBlobStore {
+  put(workspaceId:string,checksum:string,bytes:Uint8Array):Promise<void>;
+  get(workspaceId:string,checksum:string):Promise<Uint8Array|undefined>;
+  getRange(workspaceId:string,checksum:string,start:number,end:number):Promise<Uint8Array|undefined>;
+}
 export interface WebsiteImageRecord {
   id:string;workspaceId:string;revision:number;title:string;mimeType:'image/webp';
   checksum:string;sizeBytes:number;width:number;height:number;
