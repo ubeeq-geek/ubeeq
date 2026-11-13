@@ -66,8 +66,10 @@ export interface ObjectLifecycleSignal {
 
 /** Direct/multipart upload is optional so simple object stores can implement ObjectStorage alone. */
 export interface UploadAdapter {
-  initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation>;
+  initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation>;
   complete(input: UploadCompletion): Promise<StoredObject>;
+  /** Recover the exact completed provider effect after a lost reply; never create a new version. */
+  recoverCompletion?(input: UploadCompletion): Promise<StoredObject | undefined>;
   abort?(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void>;
 }
 

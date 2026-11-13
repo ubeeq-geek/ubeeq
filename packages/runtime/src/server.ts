@@ -1,4 +1,5 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
+import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
@@ -217,6 +218,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
   const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
+  const uploadLifecycle = repositories.hostRecords ? new UploadLifecycle(repositories,adapters.uploads,adapters.jobs,configuration.instanceId ?? 'local-reference',cellId,configuration.publicBaseUrl) : undefined;
   const processingUsageKey = (asset: AssetRecord) => (asset as AssetRecord & { processingUsageKey?: string }).processingUsageKey ?? `asset-processing:${asset.id}:${asset.objectVersion}`;
   const deferUsage = async (intent: import('@ubeeq/persistence').HostRecord) => {
     try { await usageOutbox!.deliver(intent); }
@@ -434,6 +436,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   let lastWebsitePolicyScan=0;
   let commerceTurn=true;
   const runNextJob = async (workerId: string) => {
+    if (uploadLifecycle) try { await uploadLifecycle.repair(); } catch { await audit({ action:'upload.queue_repair_deferred',subjectId:cellId }); }
     if (usageOutbox) try { await usageOutbox.recoverTerminal(adapters.jobs); await usageOutbox.drain(); } catch { await audit({ action: 'usage.settlement_retry_deferred', subjectId: cellId }); }
     if (commerce && commerceTurn) { commerceTurn=false; const job = await commerce.runNextJob(workerId); if (job) return job; }
     commerceTurn=true;
@@ -835,11 +838,34 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         return json(response, 201, { collection, requestId }, requestId);
       }
 
-      if (method === "POST" && url.pathname === "/v1/uploads") { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); requireHomeCell({ cellId }, work); const byteLength = Number(body.byteLength); if (!Number.isSafeInteger(byteLength) || byteLength < 0) throw new HttpError(400, "invalid_request", "byteLength must be a non-negative integer"); const checksum = typeof body.checksum === "string" && /^[a-f0-9]{64}$/i.test(body.checksum) ? body.checksum.toLowerCase() : undefined; const object = { bucket: cellId, key: cellScopedObjectKey({ cellId, creatorId: work.creatorId, kind: "uploads", objectId: randomUUID() }), contentType: requireString(body.mimeType, "mimeType"), byteLength, checksum, scope: "private" as const }; const upload = await adapters.uploads.initiate({ object, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() }); return json(response, 201, { upload, requestId }, requestId); }
+      if (method === 'POST' && url.pathname === '/v1/uploads') {
+        const identity = await session(request), body = await parseBody(request);
+        const work = await ownedWork(requireString(body.workId,'workId'),identity.subject.id); requireHomeCell({cellId},work);
+        if (!uploadLifecycle) throw new HttpError(503,'durable_uploads_unavailable','Durable upload storage is not configured.');
+        const byteLength = Number(body.byteLength);
+        const checksum = typeof body.checksum === 'string' && /^[a-f0-9]{64}$/i.test(body.checksum) ? body.checksum.toLowerCase() : undefined;
+        if (body.checksum !== undefined && !checksum) throw new HttpError(400,'invalid_request','checksum must be a SHA-256 digest.');
+        const upload = await uploadLifecycle.initiate(work,identity.subject.id,{mimeType:requireString(body.mimeType,'mimeType'),byteLength,...(checksum ? {checksum} : {})},body.idempotencyKey as string | undefined);
+        return json(response,201,{upload,requestId},requestId);
+      }
       const contentMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/content$/);
-      if (method === "PUT" && contentMatch) { const identity = await session(request); if (!adapters.uploads.accept) throw new HttpError(405, "direct_upload_required", "Upload content must be sent to the issued direct-upload URL"); const creator = await creatorFor(identity.subject.id, resolveRequestCreatorId(request, url)); await requireCreatorWritable(creator); const role = await tenancy.resolveCreatorRole(identity.subject.id, creator.id); if (!role || !["owner", "admin", "editor"].includes(role)) throw new HttpError(403, "asset_edit_denied", "Asset editing access is required."); const body = await parseBody(request); const base64 = requireString(body.base64, "base64"); await adapters.uploads.accept({ uploadId: contentMatch[1], cellId, creatorId: creator.id, body: Buffer.from(base64, "base64"), operation: "upload_content" }); return json(response, 204, undefined, requestId); }
+      if (method === 'PUT' && contentMatch) {
+        const identity = await session(request), creator = await creatorFor(identity.subject.id,resolveRequestCreatorId(request,url));
+        await requireCreatorWritable(creator);
+        const role = await tenancy.resolveCreatorRole(identity.subject.id,creator.id);
+        if (!role || !['owner','admin','editor'].includes(role)) throw new HttpError(403,'asset_edit_denied','Asset editing access is required.');
+        if (!uploadLifecycle) throw new HttpError(503,'durable_uploads_unavailable','Durable upload storage is not configured.');
+        const body = await parseBody(request);
+        await uploadLifecycle.accept(contentMatch[1],creator.id,Buffer.from(requireString(body.base64,'base64'),'base64'));
+        return json(response,204,undefined,requestId);
+      }
       const completeMatch = url.pathname.match(/^\/v1\/uploads\/([^/]+)\/complete$/);
-      if (method === "POST" && completeMatch) { const identity = await session(request); const body = await parseBody(request); const work = await ownedWork(requireString(body.workId, "workId"), identity.subject.id); const object = await adapters.uploads.complete({ uploadId: completeMatch[1], cellId, creatorId: work.creatorId, checksum: requireString(body.checksum, "checksum"), byteLength: Number(body.byteLength) }); const result = await repositories.transaction(async (transaction) => { const asset = await repositories.assets.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), creatorId: work.creatorId, workId: work.id, mimeType: object.contentType, checksum: object.checksum!, objectVersion: object.versionId!, status: "pending", storage: object } as AssetRecord & { storage: typeof object }, { transaction }); await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), subjectType: "asset", subjectId: asset.id, source: "reference.upload", payload: { checksum: object.checksum, byteLength: object.byteLength } }, { transaction }); await repositories.auditEvents.create({ id: randomUUID(), instanceId: work.instanceId, ...dataHomeOf(work), action: "asset.upload_completed", actorId: identity.subject.id, subjectId: asset.id, payload: { workId: work.id } }, { transaction }); const job = await adapters.jobs.enqueue({ cellId, type: "asset.process", payload: { assetId: asset.id }, idempotencyKey: `asset-process:${asset.id}:${asset.objectVersion}`, maxAttempts: 3, correlationId: requestId }); return { asset, job }; }); return json(response, 202, { ...result, requestId }, requestId); }
+      if (method === 'POST' && completeMatch) {
+        const identity = await session(request), body = await parseBody(request), work = await ownedWork(requireString(body.workId,'workId'),identity.subject.id);
+        if (!uploadLifecycle) throw new HttpError(503,'durable_uploads_unavailable','Durable upload storage is not configured.');
+        const result = await uploadLifecycle.complete(completeMatch[1],work,identity.subject.id,{checksum:requireString(body.checksum,'checksum').toLowerCase(),byteLength:Number(body.byteLength)});
+        return json(response,202,{...result,requestId},requestId);
+      }
 
       if (method === "POST" && url.pathname === "/v1/operations/jobs/run-next") { await session(request); const body = await parseBody(request); const result = await runNextJob(typeof body.workerId === "string" && body.workerId.trim() ? body.workerId.trim() : "local-reference-worker"); return json(response, 200, { result: result ?? null, requestId }, requestId); }
       if (method === "GET" && url.pathname === "/v1/operations/jobs") { await session(request); const states = url.searchParams.getAll("state").filter((state): state is import("@ubeeq/jobs").JobState => ["queued", "leased", "completed", "retry_scheduled", "dead_lettered", "cancelled"].includes(state)); return json(response, 200, { jobs: await adapters.jobs.list({ cellId, states, limit: Number(url.searchParams.get("limit") ?? 50) }), requestId }, requestId); }
@@ -1027,6 +1053,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (error instanceof FeatureDisabledInSingleOperatorModeError || (error as any)?.code === "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE") {
         return json(response, 403, { error: { code: "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE", message: (error as Error).message, requestId } }, requestId);
       }
+      if (error instanceof UploadLifecycleError) return json(response,error.status,{error:{code:error.code,message:error.message,requestId}},requestId);
       if (error instanceof PasswordAuthenticationError) return json(response, error.code === 'invalid_credentials' ? 401 : error.code === 'authentication_challenge_required' ? 409 : 503, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof WebsiteError) return json(response, error.code === 'preview_file_too_large' ? 413 : error.code === 'authorization_denied' ? 403 : error.code.endsWith('not_found') ? 404 : error.code.includes('conflict') ? 409 : 400, { error: { code: error.code, message: error.message, requestId } }, requestId);
       if (error instanceof JobRecoveryError) return json(response, 409, { error: { code: error.code, message: error.message, requestId } }, requestId);
