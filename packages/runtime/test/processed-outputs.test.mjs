@@ -28,7 +28,7 @@ test('the runtime delivers declared processed audio bytes and preserves the orig
  assert.deepEqual(Array.from((await local.storage.get(ready.originalStorage)).body),Array.from(source));
 });
 
-async function fixture(t,process){
+async function fixture(t,process,options={}){
  const directory=await mkdtemp(join(tmpdir(),'processed-output-recovery-'));
  const config={databasePath:join(directory,'state.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'};
  let local,runtime,calls=0,writes=0,failReady=false,failJournal=false;
@@ -41,7 +41,7 @@ async function fixture(t,process){
   local.repositories.assets.update=async(...args)=>{if(failReady&&args[2]?.status==='ready'){failReady=false;throw Error('Ready commit unavailable');}return update(...args);};
   local.storage.complete=async input=>{writes++;return complete(input);};
   local.repositories.hostRecords.update=async(...args)=>{const row=await local.repositories.hostRecords.get(args[0]);if(failJournal&&row?.namespace==='runtime-processed-outputs'&&Object.keys(args[2]?.value?.objects??{}).length){failJournal=false;throw Error('Output journal commit unavailable');}return save(...args);};
-  runtime=createCoreRuntime({instanceId:'instance',...config,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity},
+  runtime=createCoreRuntime({instanceId:'instance',...config,...options,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity},
    requireUploadAccounting:true,hostPorts:createDefaultOpenCorePorts({usageQuota:quota}),mediaProcessor:{async process(input){calls++;return process(input);}}});
  };
  start();const stop=async()=>{await runtime.close();local.database.close();};
@@ -110,4 +110,13 @@ test('multiple previews preserve the full source delivery unless a primary is ex
  const asset=await f.local.repositories.assets.get('asset');assert.equal(asset.deliveryMimeType,'audio/wav');assert.equal(f.writes,3);
  assert.deepEqual(Array.from((await f.local.storage.get(asset.storage)).body),Array.from(f.source));
  assert.ok(asset.processedRenditions.every(value=>value.storage.scope==='private'));
+});
+for(const seconds of [60,180])test(`bounded native processing uses the configured ${seconds}-second lease`,async t=>{
+ t.mock.timers.enable({apis:['Date'],now:Date.now()});
+ const f=await fixture(t,input=>{t.mock.timers.tick(65_000);return result([output(input,'audio','encoded')]);},{processingLeaseSeconds:seconds});
+ if(seconds===60){await assert.rejects(()=>f.runtime.runNextJob('worker'),/no longer current|lease is no longer valid/);assert.equal(f.writes,0);}
+ else{await f.runtime.runNextJob('worker');assert.equal((await f.local.repositories.assets.get('asset')).status,'ready');assert.equal(f.writes,1);}
+});
+test('invalid processing leases reject before constructing a local database',()=>{
+ for(const value of [0,29,901,1.5,NaN,Infinity,'180'])assert.throws(()=>createCoreRuntime({publicBaseUrl:'http://localhost',processingLeaseSeconds:value}),/Processing leases/);
 });

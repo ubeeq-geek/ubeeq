@@ -29,7 +29,10 @@ than replacing an accepted version. Missing new journals cannot be treated as
 legacy single-output receipts. Actual legacy receipts remain recoverable.
 
 The worker checks current asset and lease evidence before writing and attaching
-outputs. Failed attachment does not erase accounting for retained files. Output
+outputs. Hosts can select a bounded `processingLeaseSeconds` from 30 to 900
+seconds for installed native processors; the existing default remains 60.
+Their worker execution budget must accommodate that processing work.
+Failed attachment does not erase accounting for retained files. Output
 bodies never enter asset, job or journal JSON. Portable inventories include actual
 output hashes, originals and aliases; ordinary metadata imports discard storage
 capabilities. Explicit regional migration transfers each distinct physical file,

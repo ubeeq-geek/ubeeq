@@ -104,6 +104,8 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   federationPolicy?: FederationPolicy;
   federationVerifier?: FederationSignatureVerifier;
   mediaProcessor?: MediaProcessor;
+  /** Host-selected lease for bounded native decoding; defaults to 60 seconds. */
+  processingLeaseSeconds?: number;
   adapters?: ReferenceAdapterSet;
   regionalControlPlane?: RegionalControlPlane;
   tenancy?: TenancyAndAccessPort;
@@ -149,6 +151,8 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
   const cellId = configuration.cellId ?? "local-single-cell";
   const region = configuration.region ?? "local";
+  const processingLeaseSeconds=configuration.processingLeaseSeconds??60;
+  if(!Number.isSafeInteger(processingLeaseSeconds)||processingLeaseSeconds<30||processingLeaseSeconds>900)throw new Error('Processing leases must be between 30 and 900 seconds.');
   const cellOwned = { homeCellId: cellId, dataHomeRegion: region, dataHomeAssignedAt: new Date().toISOString(), routingRevision: 1 };
   const dataHomeOf = (record: Pick<CreatorRecord, "homeCellId" | "dataHomeRegion" | "dataHomeAssignedAt" | "routingRevision">) => ({ homeCellId: record.homeCellId, dataHomeRegion: record.dataHomeRegion, dataHomeAssignedAt: record.dataHomeAssignedAt, routingRevision: record.routingRevision });
   const localConfiguration: LocalAdapterConfiguration = {
@@ -531,7 +535,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
     }
 
-    const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: 60, workerId });
+    const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: processingLeaseSeconds, workerId });
     if (!lease) return commerce?.runNextJob(workerId);
     let reservedUsageKey: string | undefined;
     try {
