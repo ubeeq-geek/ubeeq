@@ -169,7 +169,7 @@ test("moves original objects only through an explicit migration executor, never 
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });
 
-test("migrates a creator through real source and destination cell endpoints", async () => {
+for(const encoded of [false,true])test(`migrates a creator through real source and destination cell endpoints${encoded?" including all encoded outputs":""}`, async () => {
   const sourceDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-source-"));
   const destinationDirectory = mkdtempSync(join(tmpdir(), "ubeeq-migration-destination-"));
   const source = createLocalAdapterSet({ databasePath: join(sourceDirectory, "state.sqlite"), dataDirectory: sourceDirectory, publicBaseUrl: "https://cell-a.example", cellId: "cell-a" });
@@ -180,13 +180,19 @@ test("migrates a creator through real source and destination cell endpoints", as
   const checksum = createHash("sha256").update(bytes).digest("hex");
   const original = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/originals/asset-1", versionId: "source-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "private" };
   const rendition = { bucket: "cell-a", key: "cells/cell-a/creators/creator-1/renditions/asset-1", versionId: "rendition-version", contentType: "image/png", byteLength: bytes.length, checksum, scope: "public" };
+  const encodedBytes=Buffer.from('distinct encoded MP3 bytes'),posterBytes=Buffer.from('private poster bytes');
+  const playback=encoded?{...rendition,contentType:'audio/mpeg',byteLength:encodedBytes.length,checksum:createHash('sha256').update(encodedBytes).digest('hex')}:rendition;
+  const poster={...rendition,key:rendition.key+'-poster',versionId:'poster-version',contentType:'image/png',byteLength:posterBytes.length,checksum:createHash('sha256').update(posterBytes).digest('hex'),scope:'private'};
+  const latest=new Map(),destinationGet=destination.storage.get.bind(destination.storage);
+  if(encoded)destination.storage.get=async location=>destinationGet(location.versionId?location:{...location,versionId:latest.get(location.key)});
   let clock = Date.parse(assignedAt);
   try {
     await source.repositories.creators.create({ id: "creator-1", instanceId: "source", ...dataHome, handle: "migrating", displayName: "Migrating creator", subjectId: "subject-1" });
     await source.repositories.works.create({ id: "work-1", instanceId: "source", ...dataHome, creatorId: "creator-1", title: "Migrating work", status: "ready" });
     await source.storage.put({ object: original, body: bytes });
-    await source.storage.put({ object: rendition, body: bytes });
-    await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: rendition, originalStorage: original });
+    await source.storage.put({ object: playback, body: encoded?encodedBytes:bytes });
+    if(encoded)await source.storage.put({object:poster,body:posterBytes});
+    await source.repositories.assets.create({ id: "asset-1", instanceId: "source", ...dataHome, creatorId: "creator-1", workId: "work-1", mimeType: "image/png", checksum, objectVersion: original.versionId, status: "ready", storage: playback, originalStorage: original,...(encoded?{deliveryMimeType:playback.contentType,processedRenditions:[{id:"playback",role:"preview",sourceVersionId:original.versionId,storage:playback},{id:"poster",role:"poster",sourceVersionId:original.versionId,storage:poster},{id:"poster-alias",role:"poster",sourceVersionId:original.versionId,storage:poster}]}:{}) });
     await source.repositories.integrationAccounts.create({ id: "integration-1", instanceId: "source", ...dataHome, creatorId: "creator-1", connectorId: "reference", health: "healthy", credentialReference: "must-not-migrate" });
     await source.routingDirectory.create({ creatorId: "creator-1", homeCellId: "cell-a", homeRegion: "region-a", endpoint: "https://cell-a.example/", routingRevision: 1, state: "active", updatedAt: assignedAt });
     const sourceEndpoint = createMigrationCellEndpoint({ cellId: "cell-a", region: "region-a", instanceId: "source", repositories: source.repositories, storage: source.storage });
@@ -195,7 +201,9 @@ test("migrates a creator through real source and destination cell endpoints", as
       transfer: async (_checkpoint, inventory) => {
         for (const entry of inventory) {
           const stored = await source.storage.get(entry.source);
-          await destination.storage.put({ object: { ...stored.object, bucket: entry.destination.bucket, key: entry.destination.key, versionId: undefined }, body: stored.body });
+          const versionId=encoded?'destination-'+entry.id:undefined;
+          latest.set(entry.destination.key,versionId);
+          await destination.storage.put({ object: { ...stored.object, bucket: entry.destination.bucket, key: entry.destination.key, versionId }, body: stored.body });
         }
       },
       verify: async (_checkpoint, inventory) => {
@@ -222,7 +230,22 @@ test("migrates a creator through real source and destination cell endpoints", as
     assert.equal(importedAsset?.originalStorage.key, "cells/cell-b/creators/creator-1/originals/asset-1");
     assert.equal(importedIntegration?.health, "blocked"); assert.equal(importedIntegration?.credentialReference, undefined);
     assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/originals/asset-1" })).body), bytes);
-    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), bytes);
+    assert.deepEqual(Buffer.from((await destination.storage.get({ bucket: "cell-b", key: "cells/cell-b/creators/creator-1/renditions/asset-1" })).body), encoded?encodedBytes:bytes);
+    if(encoded){
+      assert.equal(cutOver.objectInventory.length,4,'manifest, active, original and one deduplicated poster');
+      assert.equal(importedAsset.deliveryMimeType,'audio/mpeg');assert.equal(importedAsset.checksum,checksum);assert.equal(importedAsset.objectVersion,original.versionId);
+      assert.equal(importedAsset.storage.versionId,'destination-asset-1');assert.equal(importedAsset.originalStorage.versionId,'destination-asset-1:original');
+      assert.equal(importedAsset.processedRenditions.length,3);assert.deepEqual(importedAsset.processedRenditions[1].storage,importedAsset.processedRenditions[2].storage);
+      assert.deepEqual(Buffer.from((await destination.storage.get(importedAsset.processedRenditions[1].storage)).body),posterBytes);
+      assert.equal(importedAsset.processedRenditions[1].storage.scope,'private');
+      const get=destination.storage.get;
+      try{
+        for(const change of [{bucket:'foreign-bucket'},{key:'foreign-key'},{checksum:'f'.repeat(64)},{versionId:undefined}]){
+          destination.storage.get=async location=>{const found=await get(location);return location.key===importedAsset.storage.key?{...found,object:{...found.object,...change}}:found;};
+          await assert.rejects(()=>destinationEndpoint.execute({operation:'import',checkpoint:cutOver}),/physical receipt conflicts/);
+        }
+      }finally{destination.storage.get=get;}
+    }
     const rolledBack = await migration.rollback(requested.id);
     assert.equal(rolledBack.state, "rolled_back"); assert.equal((await source.routingDirectory.get("creator-1"))?.homeCellId, "cell-a");
     const second = await migration.request({ id: "migration-2", creatorId: "creator-1", destination: { cellId: "cell-b", region: "region-b", endpoint: "https://cell-b.example/" } });
@@ -233,6 +256,7 @@ test("migrates a creator through real source and destination cell endpoints", as
     assert.equal(await source.repositories.creators.get("creator-1"), undefined);
     assert.equal(await source.repositories.assets.get("asset-1"), undefined);
     await assert.rejects(() => source.storage.get(original));
+    if(encoded)await assert.rejects(()=>source.storage.get(poster));
     assert.equal((await source.repositories.auditEvents.get("regional_migration.source_retired:migration-2"))?.action, "regional_migration.source_retired");
   } finally { rmSync(sourceDirectory, { recursive: true, force: true }); rmSync(destinationDirectory, { recursive: true, force: true }); }
 });

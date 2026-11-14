@@ -1,8 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createCreatorExport, exportChecksum, planCreatorImport, remapCreatorExportForImport, validateCreatorExport } from "../dist/index.js";
+import { createCreatorExport, creatorAssetObjectInventory, exportChecksum, planCreatorImport, remapCreatorExportForImport, validateCreatorExport } from "../dist/index.js";
 
 const creator = { id: "creator-1", instanceId: "source", homeCellId: "cell-a", dataHomeRegion: "eu-west", dataHomeAssignedAt: "2026-01-01T00:00:00.000Z", routingRevision: 1, handle: "source", displayName: "Source", revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" };
+test('encoded output inventory retains actual hashes, every alias and immutable originals through remapping',()=>{
+  const location=(name,checksum,scope='private')=>({bucket:'source-bucket',key:`cells/cell-a/creators/${creator.id}/${name}`,versionId:name+'-physical-version',checksum:checksum.repeat(64),byteLength:20,contentType:'audio/mpeg',scope});
+  const original=location('original','a'),storage=location('playback','b','public'),poster=location('poster','c');
+  const asset={...creator,id:'asset',creatorId:creator.id,mimeType:'audio/wav',deliveryMimeType:'audio/mpeg',checksum:original.checksum,objectVersion:'logical-source',status:'ready',storage,originalStorage:original,
+    processedRenditions:[{id:'playback',sourceVersionId:'logical-source',role:'preview',storage},{id:'poster',sourceVersionId:'logical-source',role:'poster',storage:poster},{id:'alias',sourceVersionId:'logical-source',role:'poster',storage:poster}]};
+  const inventory=creatorAssetObjectInventory(asset);assert.equal(inventory.checksum,storage.checksum);assert.equal(inventory.objects.length,4);
+  const manifest=createCreatorExport({exportedAt:creator.createdAt,creator,works:[],assets:[asset],collections:[],publications:[],publicationIntents:[],processing:[],moderationEvidence:[],moderationHolds:[],reviewCases:[],auditEvents:[],usageEvents:[],integrationAccounts:[],exportCheckpoints:[],importCheckpoints:[],objectInventory:[inventory]});
+  assert.equal(validateCreatorExport(manifest).checksum,manifest.checksum);
+  const mapped=remapCreatorExportForImport(manifest,{targetCreatorId:'target'}).manifest;
+  assert.equal(validateCreatorExport(mapped).checksum,mapped.checksum);assert.ok(mapped.objectInventory[0].objects.every(value=>value.key.includes('/creators/target/')));
+  const resign=value=>{const {checksum,...unsigned}=value;return {...unsigned,checksum:exportChecksum(unsigned)};};
+  for(const objects of [undefined,inventory.objects.slice(0,2),inventory.objects.map(value=>({...value,checksum:asset.checksum}))])
+    assert.throws(()=>validateCreatorExport(resign({...manifest,objectInventory:[{...inventory,objects}]})),/output inventory/);
+});
 test("validates portable exports and reports deterministic import conflicts", () => {
   const manifest = createCreatorExport({ exportedAt: "2026-01-01T00:00:00.000Z", creator, works: [{ id: "work-1", instanceId: "source", homeCellId: "cell-a", dataHomeRegion: "eu-west", dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: 1, creatorId: creator.id, title: "Work", status: "draft", revision: 1, createdAt: creator.createdAt, updatedAt: creator.updatedAt }], assets: [], collections: [], publications: [], publicationIntents: [], processing: [], moderationEvidence: [], moderationHolds: [], reviewCases: [], auditEvents: [], usageEvents: [], integrationAccounts: [], exportCheckpoints: [], importCheckpoints: [], objectInventory: [] });
   assert.equal(validateCreatorExport(manifest).checksum, manifest.checksum);
