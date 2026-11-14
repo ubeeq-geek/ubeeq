@@ -102,6 +102,12 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   collectionAuthorization?: {
     authorizeMutation(input:{creator:Readonly<CreatorRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:import('@ubeeq/persistence').PersistenceTransaction}):Promise<void>;
   };
+  /** Current actor authority must join the actual Work transaction, including
+   * receipt recovery. A true result retains Creator and membership guards until
+   * commit. Without a host adapter, only the current Creator owner can write. */
+  workAuthorization?: {
+    authorizeMutation(input:{creator:Readonly<CreatorRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:import('@ubeeq/persistence').PersistenceTransaction}):Promise<boolean>;
+  };
 
   publicBaseUrl: string;
   instanceId?: string;
@@ -312,6 +318,20 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   const requireCreatorWritable = async (creator: CreatorRecord): Promise<void> => {
     const hold = (await repositories.moderationHolds.list({ limit: 100 })).items.find((value) => value.subjectId === creator.id && value.state === "active" && value.reason?.startsWith("migration:"));
     if (hold) throw new HttpError(409, "migration_source_held", "Creator writes are paused while a regional migration is in progress");
+  };
+  const authorizeWorkMutation=async(creatorId:string,actorUserId:string,expected:Pick<CreatorRecord,'instanceId'|'homeCellId'|'dataHomeRegion'|'dataHomeAssignedAt'|'routingRevision'>,transaction:import('@ubeeq/persistence').PersistenceTransaction):Promise<void>=>{
+    const current=await repositories.creators.get(creatorId,{transaction});
+    if(!current||current.instanceId!==(configuration.instanceId??'local-reference')||current.instanceId!==expected.instanceId
+      ||current.homeCellId!==cellId||current.homeCellId!==expected.homeCellId||current.dataHomeRegion!==region||current.dataHomeRegion!==expected.dataHomeRegion
+      ||current.routingRevision!==expected.routingRevision||current.dataHomeAssignedAt!==expected.dataHomeAssignedAt
+      ||'deletion' in current&&current.deletion||'status' in current&&current.status!==undefined&&current.status!=='active')throw new HttpError(403,'work_edit_denied','Current Work editing access is required.');
+    if(configuration.workAuthorization){
+      if(!await configuration.workAuthorization.authorizeMutation({creator:Object.freeze({...current}),actorUserId,repositories,transaction}))throw new HttpError(403,'work_edit_denied','Current Work editing access is required.');
+    }else{
+      if(current.subjectId!==actorUserId)throw new HttpError(403,'work_edit_denied','Current Work editing access is required.');
+      if(!repositories.creators.checkRevision)throw new Error('Work mutations require commit-time authority guards.');
+      await repositories.creators.checkRevision(current.id,current.revision,{transaction});
+    }
   };
   const audit = async (input: { action: string; actorId?: string; subjectId?: string; payload?: Record<string, unknown> }): Promise<void> => {
     await repositories.auditEvents.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, action: input.action, actorId: input.actorId, subjectId: input.subjectId, payload: input.payload ?? {} });
@@ -951,10 +971,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         if (body.revision !== work.revision) throw new HttpError(409, 'revision_conflict', 'Reload the work before saving changes.');
         if (method === 'DELETE' && work.status === 'published') throw new HttpError(409, 'work_is_published', 'Unpublish the work before deleting it.');
         const changes: Partial<WorkRecord> = method === 'DELETE' ? { status: 'deleted' } : { title: requireString(body.title ?? work.title, 'title') };
-        const updated = method==='DELETE'
-          ? await withCollectionWorkLifecycleFence(repositories,{instanceId:configuration.instanceId??'local-reference',cellId,region},work.creatorId,
+        const updated = await repositories.transaction(async transaction=>{
+          await authorizeWorkMutation(work.creatorId,identity.subject.id,work,transaction);
+          return method==='DELETE'
+          ? withCollectionWorkLifecycleFence(repositories,{instanceId:configuration.instanceId??'local-reference',cellId,region},work.creatorId,
               transaction=>repositories.works.update(work.id,work.revision,changes,{transaction}))
-          : await repositories.works.update(work.id, work.revision, changes);
+          : repositories.works.update(work.id, work.revision, changes,{transaction});
+        });
         return json(response, 200, { work: updated, requestId }, requestId);
       }
       if (method === "POST" && url.pathname === "/v1/works") {
@@ -966,7 +989,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const role = await tenancy.resolveCreatorRole(identity.subject.id, creator.id);
         if (!role || !['owner', 'admin', 'editor'].includes(role)) throw new HttpError(403, 'work_edit_denied', 'Work editing access is required.');
         const body = await parseBody(request);
-        const work = await createIntakeWork(repositories,creator,identity.subject.id,requireString(body.title,'title'),body.idempotencyKey as string | undefined);
+        const work = await createIntakeWork(repositories,creator,identity.subject.id,requireString(body.title,'title'),body.idempotencyKey as string | undefined,
+          transaction=>authorizeWorkMutation(creator.id,identity.subject.id,creator,transaction));
         return json(response, 201, { work, requestId }, requestId);
       }
       if (method === "POST" && url.pathname === "/v1/collections") {
