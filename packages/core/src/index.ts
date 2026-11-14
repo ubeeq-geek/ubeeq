@@ -369,3 +369,5 @@ export * from './announcement-layout.js';
 export * from './content-workflows.js';
 
 export * as collectionMetadata from './collection-metadata.js';
+
+export * as collectionMetadataService from './collection-metadata-service.js';
