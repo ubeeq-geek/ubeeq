@@ -6,10 +6,14 @@ export class WorkIntakeError extends Error {
 }
 
 /** Commit the draft and its request receipt together; an uncertain reply never creates a second draft. */
-export async function createIntakeWork(repositories: UbeeqRepositories, creator: CreatorRecord, actorId: string, title: string, idempotencyKey?: string): Promise<WorkRecord> {
+export async function createIntakeWork(repositories: UbeeqRepositories, creator: CreatorRecord, actorId: string, title: string, idempotencyKey?: string,
+  authorizeMutation?: (transaction: PersistenceTransaction) => Promise<void>): Promise<WorkRecord> {
   const home = { homeCellId:creator.homeCellId, dataHomeRegion:creator.dataHomeRegion, dataHomeAssignedAt:creator.dataHomeAssignedAt, routingRevision:creator.routingRevision };
   const draft = (id: string) => ({ id, instanceId:creator.instanceId, ...home, creatorId:creator.id, title, status:'draft' as const });
-  if (idempotencyKey === undefined) return repositories.works.create(draft(randomUUID()));
+  if (idempotencyKey === undefined) return repositories.transaction(async transaction=>{
+    await authorizeMutation?.(transaction);
+    return repositories.works.create(draft(randomUUID()),{transaction});
+  });
   if (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyKey)) throw new WorkIntakeError(400,'invalid_work_intent','Work request identity is invalid.');
   const records = repositories.hostRecords;
   if (!records) throw new WorkIntakeError(503,'work_intake_unavailable','Durable Work request receipts are required.');
@@ -26,13 +30,14 @@ export async function createIntakeWork(repositories: UbeeqRepositories, creator:
   };
   try {
     return await repositories.transaction(async transaction => {
+      await authorizeMutation?.(transaction);
       const existing = await recover(transaction); if (existing) return existing;
       const work = await repositories.works.create(draft(workId),{transaction});
       await records.create({id:receiptId,instanceId:creator.instanceId,...home,namespace:'runtime-work-intake',scopeId:creator.id,key,value:{schemaVersion:1,actorId,title,workId}},{transaction});
       return work;
     });
   } catch (error) {
-    const recovered = await repositories.transaction(transaction=>recover(transaction)); if (recovered) return recovered;
+    const recovered = await repositories.transaction(async transaction=>{await authorizeMutation?.(transaction);return recover(transaction);}); if (recovered) return recovered;
     throw error;
   }
 }

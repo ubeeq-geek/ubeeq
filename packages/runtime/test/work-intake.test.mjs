@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp,rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { request as httpRequest } from 'node:http';
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 import { createCoreRuntime } from '../dist/index.js';
 import { createIntakeWork } from '../dist/work-intake.js';
@@ -61,4 +62,31 @@ test('the authenticated Work API preserves a keyed draft on retry and rejects ch
  const repeated=await request('/v1/works',body);assert.equal(repeated.status,201);assert.equal((await repeated.json()).work.id,saved.id);
  assert.equal((await request('/v1/works',{...body,title:'Changed'})).status,409);
  assert.equal((await request('/v1/works',body,'invalid-session')).status,401);
+});
+
+test('host authorization guards unkeyed creation, keyed creation and saved receipt recovery',async t=>{
+ const {local,creator}=await fixture(t);let allowed=false,checks=0;
+ const authorize=async transaction=>{assert.ok(transaction.id);checks++;if(!allowed)throw Error('Current editor access revoked');};
+ for(const key of [undefined,'guarded'])await assert.rejects(createIntakeWork(local.repositories,creator,'actor','Title',key,authorize),/Current editor access revoked/);
+ assert.equal((await local.repositories.works.list({limit:100})).items.length,0);
+ allowed=true;const work=await createIntakeWork(local.repositories,creator,'actor','Title','guarded',authorize);
+ allowed=false;await assert.rejects(createIntakeWork(local.repositories,creator,'actor','Title','guarded',authorize),/Current editor access revoked/);
+ assert.ok(checks>=4);assert.equal((await local.repositories.works.list({limit:100})).items.length,1);assert.equal((await local.repositories.works.get(work.id)).title,'Title');
+});
+
+test('the open-core Work API rejects a previous owner after request preflight',async t=>{
+ const {local,creator,config}=await fixture(t),account=await local.identity.register({email:'owner-race@example.test',password:'Synthetic password 123!'});
+ const {token}=await local.identity.authenticate({email:'owner-race@example.test',password:'Synthetic password 123!'});
+ await local.repositories.creators.update(creator.id,creator.revision,{subjectId:account.subjectId});
+ let reached;const preflight=new Promise(resolve=>{reached=resolve;});
+ const tenancy={mode:'single_operator',assertCanCreateCreatorUser:async()=>{},assertCanCreateCustomerAccount:async()=>{},listAccessibleCreatorIds:async()=>[creator.id],resolveCreatorRole:async()=>{reached();return 'owner';},isContributorManagementEnabled:()=>false,isOrganizationManagementEnabled:()=>false};
+ const runtime=createCoreRuntime({instanceId:'instance',...config,tenancy,adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity}});
+ await new Promise(resolve=>runtime.server.listen(0,'127.0.0.1',resolve));t.after(()=>runtime.close());
+ const body=JSON.stringify({title:'Stale owner Work'});let request;
+ const response=new Promise((resolve,reject)=>{
+  request=httpRequest('http://127.0.0.1:'+runtime.server.address().port+'/v1/works',{method:'POST',headers:{authorization:'Bearer '+token,'x-creator-id':creator.id,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode));});request.on('error',reject);request.write('{');
+ });
+ let timer;try{await Promise.race([preflight,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Work preflight was not reached')),10000);})]);}finally{clearTimeout(timer);}
+ const current=await local.repositories.creators.get(creator.id);await local.repositories.creators.update(current.id,current.revision,{subjectId:'new-owner'});
+ request.end(body.slice(1));assert.equal(await response,403);assert.equal((await local.repositories.works.list({limit:100})).items.length,0);
 });
