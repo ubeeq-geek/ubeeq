@@ -66,6 +66,8 @@ test('HTTP lifecycle prevents client-forged history, preserves archive history a
 });
 test('imported and legacy collections remain visible and opaque data survives without automatic adoption',async t=>{
  const f=await fixture(t),managed=await f.create(),creator=await f.local.repositories.creators.get(f.creatorId),home={homeCellId:creator.homeCellId,dataHomeRegion:creator.dataHomeRegion,dataHomeAssignedAt:creator.dataHomeAssignedAt,routingRevision:creator.routingRevision};
+ const work=(await f.request('/v1/works','POST',{title:'Retained member'})).body.work;
+ assert.equal((await f.request('/v1/collections/'+managed.id+'/works','PUT',{revision:managed.revision,workIds:[work.id],expectedWorkIds:[]})).status,200);
  await f.local.repositories.collections.create({id:'untracked',instanceId:'instance',...home,creatorId:creator.id,title:'Legacy',visibility:'private',remoteConfiguration:{retain:true}});
  let rows=(await f.request('/v1/collections')).body.collections;assert.equal(rows.length,2);assert.equal(rows.find(c=>c.id==='untracked').managementReady,false);
  await f.local.repositories.transaction(async transaction=>{
@@ -73,6 +75,7 @@ test('imported and legacy collections remain visible and opaque data survives wi
   await invalidateCollectionDirectoryForImport(f.local.repositories,creator,['imported'],transaction);
  });
  const listing=(await f.request('/v1/collections')).body;rows=listing.collections;assert.equal(rows.length,3);assert.ok(rows.every(c=>c.managementReady===false&&c.permissions.canEdit===false));assert.equal(listing.capabilities.canCreate,false);
+ assert.deepEqual(rows.find(c=>c.id===managed.id).workIds,[work.id]);assert.deepEqual((await f.request('/v1/collections/'+managed.id)).body.collection.workIds,[work.id]);
  assert.equal((await f.request('/v1/collections/'+managed.id,'PATCH',{revision:managed.revision,title:'Unsafe'})).body.error.code,'collection_migration_required');
  assert.deepEqual((await f.local.repositories.collections.get('untracked')).remoteConfiguration,{retain:true});
 });

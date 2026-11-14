@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createLocalAdapterSet} from '@ubeeq/adapter-local';
 import {CreatorCollectionService} from '@ubeeq/core';
-import {RepositoryCreatorCollectionStore,prepareNewCreatorCollectionDirectory,withCollectionWorkLifecycleFence} from '../dist/creator-collections.js';
+import {RepositoryCreatorCollectionStore,prepareNewCreatorCollectionDirectory,withCollectionWorkLifecycleFence,invalidateCollectionDirectoryForImport} from '../dist/creator-collections.js';
 
 async function fixture(t){
  const directory=await mkdtemp(join(tmpdir(),'runtime-collections-')),options={databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'};
@@ -78,6 +78,18 @@ test('libraries without a trusted directory remain readable and require explicit
  const f=await fixture(t);await f.local.repositories.collections.create({id:'legacy',instanceId:'instance',...f.home,creatorId:'other',title:'Legacy',visibility:'private',opaqueAdvancedField:{retain:true}});
  const old=await f.connect('outsider').service.get('instance','legacy');assert.equal(old.managementReady,false);assert.deepEqual(old.opaqueAdvancedField,{retain:true});
  await assert.rejects(f.connect('outsider').store.updateCreatorCollection({...old,title:'Unreviewed'},undefined,old.revision),e=>e.code==='collection_migration_required');
+});
+test('import migration fences retain read-only membership order without exposing foreign or missing Works',async t=>{
+ const f=await fixture(t);await f.service.create(f.collection('existing'));await f.work('a');await f.work('b');await f.work('foreign','other');
+ await f.service.replaceWorks('instance','existing',['b','a'],[]);const original=await f.store.listCollectionWorks('instance','existing'),creator=await f.local.repositories.creators.get('creator'),addedAt=new Date().toISOString();
+ await f.local.repositories.transaction(async transaction=>{
+  await f.local.repositories.collections.create({id:'incoming',instanceId:'instance',...f.home,creatorId:'creator',title:'Imported',visibility:'private',collectionManagement:{schemaVersion:1,members:['a','foreign','missing'].map((workId,position)=>({collectionId:'incoming',workId,position,addedAt}))}},{transaction});
+  await invalidateCollectionDirectoryForImport(f.local.repositories,creator,['incoming'],transaction);
+ });
+ const rows=await f.service.list({tenantId:'instance',creatorId:'creator'});assert.ok(rows.every(c=>!c.managementReady));
+ assert.deepEqual(rows.find(c=>c.id==='existing').workIds,['b','a']);assert.deepEqual(rows.find(c=>c.id==='incoming').workIds,['a']);
+ assert.deepEqual(await f.store.listCollectionWorks('instance','existing'),original);
+ await assert.rejects(f.service.replaceWorks('instance','existing',['a'],['b','a']),e=>e.code==='collection_migration_required');
 });
 test('ordering over 100 members is one aggregate change and deletion participates in the same library fence',async t=>{
  const f=await fixture(t);await f.service.create(f.collection('many'));const ids=Array.from({length:120},(_,i)=>'work-'+i);

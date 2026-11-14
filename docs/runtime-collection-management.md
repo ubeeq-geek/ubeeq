@@ -85,6 +85,12 @@ so index lag cannot hide them. Imported `collectionManagement` values cannot
 grant authority or enable writes. Replaying an existing Creator creation request
 does not initialize a missing legacy directory.
 
+A valid saved aggregate remains readable in its original order while migration
+is pending, including collections already present before an import. Untrusted
+imported membership references are point-read and filtered to this Creator's
+actual Works. This read-only projection neither adopts the imported aggregate
+nor enables mutations.
+
 ## Verification
 
 Build the repository before running its Node tests. The runtime SQLite and HTTP

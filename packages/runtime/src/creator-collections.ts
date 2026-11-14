@@ -243,6 +243,21 @@ export class RepositoryCreatorCollectionStore implements CreatorCollectionPort<R
   async listCollectionWorks(tenantId:string,id:string){
     const c=await this.getCreatorCollection(tenantId,id);if(!c)throw new CreatorCollectionError('not_found','Collection not found.');
     if(c.managementReady)return structuredClone((c as unknown as ManagedCollection).collectionManagement.members);
+    const aggregate=(c as unknown as ManagedCollection).collectionManagement;
+    if(aggregate?.schemaVersion===1&&validMembers(aggregate.members,id)){
+      // Migration gates writes, not visibility of saved ordering. Imported
+      // aggregates remain untrusted: show only point-read Works still owned by
+      // this Creator, without adopting the aggregate or its directory authority.
+      const members:CreatorCollectionMembership[]=[];
+      for(let start=0;start<aggregate.members.length;start+=8){
+        const reads=await Promise.allSettled(aggregate.members.slice(start,start+8).map(async member=>{
+          const work=await this.repositories.works.get(member.workId);
+          return this.local(work)&&work!.creatorId===c.creatorId?structuredClone(member):undefined;
+        }));
+        for(const result of reads){if(result.status==='rejected')throw result.reason;if(result.value)members.push(result.value);}
+      }
+      return members;
+    }
     const members:CreatorCollectionMembership[]=[];
     for await(const m of repositoryItems(request=>this.repositories.workMemberships.list(request)))if(this.local(m)&&m.collectionId===id){
       const work=await this.repositories.works.get(m.workId);if(this.local(work)&&work!.creatorId===c.creatorId)members.push({collectionId:id,workId:m.workId,position:m.position,addedAt:m.createdAt});

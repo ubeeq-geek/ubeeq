@@ -93,13 +93,16 @@ test('concurrent collection creation retries recover one durable record across i
 });
 test('import fencing atomically exposes incoming IDs and prevents imported management metadata from granting write authority',async t=>{
  const f=await fixture(t);await f.service.create(f.collection('one'));const creator=await f.repositories.creators.get('creator');
+ await f.work('a');await f.work('b');await f.repositories.works.create({id:'foreign',instanceId:'instance',...f.home,creatorId:'other',title:'Foreign',status:'draft'});
+ await f.service.replaceWorks('instance','one',['b','a'],[],1);
  await f.repositories.transaction(async transaction=>{
-  await f.repositories.collections.create({id:'imported',instanceId:'instance',...f.home,creatorId:'creator',title:'Imported',visibility:'private',opaque:{retain:true},collectionManagement:{schemaVersion:1,members:[]}},{transaction});
+  await f.repositories.collections.create({id:'imported',instanceId:'instance',...f.home,creatorId:'creator',title:'Imported',visibility:'private',opaque:{retain:true},collectionManagement:{schemaVersion:1,members:['a','foreign'].map((workId,position)=>({collectionId:'imported',workId,position,addedAt:new Date().toISOString()}))}},{transaction});
   await invalidateCollectionDirectoryForImport(f.repositories,creator,['imported'],transaction);
  });
  // Strong directory reads retain the imported ID even when the index result is
  // deliberately suppressed. This is also exercised by the actual Dynamo engine.
  const list=f.repositories.collections.list;f.repositories.collections.list=async()=>({items:[]});
  const rows=await f.store.listCreatorCollections('instance','creator');assert.equal(rows.length,2);assert.ok(rows.every(c=>!c.managementReady));assert.deepEqual(rows.find(c=>c.id==='imported').opaque,{retain:true});f.repositories.collections.list=list;
+ assert.deepEqual((await f.service.list({tenantId:'instance',creatorId:'creator'})).map(c=>[c.id,c.workIds]),[['one',['b','a']],['imported',['a']]]);
  const current=await f.service.get('instance','one');await assert.rejects(f.service.update({...current,title:'Unsafe'},undefined,current.revision),e=>e.code==='collection_migration_required');
 });
