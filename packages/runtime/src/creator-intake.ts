@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { CreatorRecord, PersistenceTransaction, UbeeqRepositories } from '@ubeeq/persistence';
+import {prepareNewCreatorCollectionDirectory} from './creator-collections.js';
 
 export class CreatorIntakeError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
@@ -14,7 +15,12 @@ export interface CreatorIntakeInput {
  */
 export async function createIntakeCreator(repositories: UbeeqRepositories, input: CreatorIntakeInput,
   create: (transaction: PersistenceTransaction, id: string) => Promise<CreatorRecord>): Promise<CreatorRecord> {
-  if (input.idempotencyKey === undefined) return repositories.transaction(transaction => create(transaction, randomUUID()));
+  const createNew=async(transaction:PersistenceTransaction,id:string)=>{
+    const creator=await create(transaction,id);
+    if(repositories.hostRecords)await prepareNewCreatorCollectionDirectory(repositories,creator,transaction);
+    return creator;
+  };
+  if (input.idempotencyKey === undefined) return repositories.transaction(transaction => createNew(transaction, randomUUID()));
   if (typeof input.idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(input.idempotencyKey)) throw new CreatorIntakeError(400, 'invalid_creator_intent', 'Creator request identity is invalid.');
   const records = repositories.hostRecords;
   if (!records) throw new CreatorIntakeError(503, 'creator_intake_unavailable', 'Durable Creator request receipts are required.');
@@ -34,7 +40,7 @@ export async function createIntakeCreator(repositories: UbeeqRepositories, input
   try {
     return await repositories.transaction(async transaction => {
       const existing = await recover(transaction); if (existing) return existing;
-      const creator = await create(transaction, creatorId);
+      const creator = await createNew(transaction, creatorId);
       await records.create({ id: receiptId, instanceId: creator.instanceId, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion,
         dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, namespace: 'runtime-creator-intake', scopeId: creatorId, key,
         value: { schemaVersion: 1, actorId: input.actorId, creatorId, handle: input.handle, displayName: input.displayName } }, { transaction });

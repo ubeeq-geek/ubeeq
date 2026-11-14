@@ -5,12 +5,13 @@ import {persistProcessedOutputs} from './processed-outputs.js';
 import { OwnedWebsiteBlobs } from './owned-website-blobs.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { createIntakeCreator, CreatorIntakeError } from './creator-intake.js';
+import {withCollectionWorkLifecycleFence,RepositoryCreatorCollectionStore,CollectionManagementError,createCollectionFromIntent,invalidateCollectionDirectoryForImport,type RuntimeCollection} from './creator-collections.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
 import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
-import { WebsiteError, normalizeContentSlug } from '@ubeeq/core';
+import { WebsiteError, normalizeContentSlug,CreatorCollectionService,CreatorCollectionError } from '@ubeeq/core';
 import { handleWebsiteHostingRequest } from './website-hosting.js';
 import { handleHostingConnectionRequest } from './website-hosting-connections.js';
 import { WebsiteHostingConnections, NetlifyWebsiteHostingAdapter, CloudflarePagesWebsiteHostingAdapter, SftpWebsiteHostingAdapter, connectWebsiteSftp } from '@ubeeq/integrations';
@@ -34,7 +35,7 @@ import { WebsiteService, websiteDigest, creatorAssetObjectInventory, createCreat
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
-import { CellOwnershipError, UniqueConstraintError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type WebsiteStore, type WebsiteHostingStore, type WebsiteBlobStore, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
+import { CellOwnershipError, UniqueConstraintError, OptimisticConcurrencyError, type AssetRecord, type CreatorRecord, type ImportCheckpointRecord, type WebsiteStore, type WebsiteHostingStore, type WebsiteBlobStore, type UbeeqRepositories, type WorkRecord } from "@ubeeq/persistence";
 import { cellScopedObjectKey, requireCreatorScopedObject, type StoredObject, type DeliveryAdapter, type ObjectStorage, type UploadAdapter, type UploadContentAdapter } from "@ubeeq/storage";
 import { routeToHomeCell, type MigrationCheckpointStore, type MigrationOrchestrator, type RoutingDirectory } from "@ubeeq/deployment-platform";
 
@@ -94,6 +95,12 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   creatorLifecycle?: {
     prepare(input: { creator: Readonly<CreatorRecord>; actorUserId: string; repositories: UbeeqRepositories; transaction: import('@ubeeq/persistence').PersistenceTransaction }): Promise<void>;
     activate?(input: { creator: Readonly<CreatorRecord>; actorUserId: string }): Promise<{ state: 'ready' | 'pending' }>;
+  };
+  /** Trusted hosts must recheck current member authority with commit-time guards
+   * in this transaction. Without an adapter, only the Creator's current owner
+   * can mutate collections; an earlier role lookup cannot authorize a commit. */
+  collectionAuthorization?: {
+    authorizeMutation(input:{creator:Readonly<CreatorRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:import('@ubeeq/persistence').PersistenceTransaction}):Promise<void>;
   };
 
   publicBaseUrl: string;
@@ -316,6 +323,42 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (hold.state === 'active' && subjects.has(hold.subjectId)) holds.push({ id: hold.id, cellId: hold.homeCellId, subjectId: hold.subjectId, active: true, sourceId: hold.id, reasonCode: hold.reason ?? 'review_hold', createdAt: hold.createdAt });
     }
     requireAdmission(subjectIds.map((subjectId) => ({ subjectId })), holds, operation);
+  };
+  const collectionContext=async(actorId:string,creator:CreatorRecord,write=false)=>{
+    requireHomeCell({cellId},creator);
+    if(creator.instanceId!==(configuration.instanceId??'local-reference')||creator.dataHomeRegion!==region)throw new HttpError(404,'creator_not_found','Creator not found.');
+    const role=await tenancy.resolveCreatorRole(actorId,creator.id);
+    if(!role||write&&!['owner','admin','editor'].includes(role))throw new HttpError(403,'collection_edit_denied','Current collection access is required.');
+    if(write)await requireCreatorWritable(creator);
+    if(!repositories.hostRecords)throw new HttpError(503,'collection_management_unavailable','Durable collection storage is required.');
+    const scope={instanceId:creator.instanceId,cellId,region};
+    const store=new RepositoryCreatorCollectionStore(repositories,scope,async(current,transaction)=>{
+      if(configuration.collectionAuthorization)await configuration.collectionAuthorization.authorizeMutation({creator:Object.freeze({...current}),actorUserId:actorId,repositories,transaction});
+      else{
+        if(current.subjectId!==actorId)throw new CreatorCollectionError('access_denied','Current owner authority is required.');
+        if(!repositories.creators.checkRevision)throw new Error('Collection mutations require commit-time authority guards.');
+        await repositories.creators.checkRevision(current.id,current.revision,{transaction});
+      }
+    });
+    return{store,canEdit:['owner','admin','editor'].includes(role)&&Boolean(configuration.collectionAuthorization||creator.subjectId===actorId),service:new CreatorCollectionService(store,async requested=>requested.tenantId===creator.instanceId&&requested.creatorId===creator.id)};
+  };
+  const collectionFields=(body:Record<string,unknown>,allowed:readonly string[])=>{
+    if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(key=>!allowed.includes(key)))throw new HttpError(400,'invalid_request','Collection request contains unsupported fields.');
+  };
+  const collectionRevision=(body:Record<string,unknown>)=>{
+    if(!body||!Number.isSafeInteger(body.revision)||(body.revision as number)<1)throw new HttpError(400,'invalid_request','A current collection revision is required.');
+    return body.revision as number;
+  };
+  const collectionView=(collection:RuntimeCollection,workIds:readonly string[])=>{
+    // Keep opaque legacy fields in persistence; only documented editing fields
+    // are returned from this management endpoint.
+    const {id:recordId,creatorId:owner,title,description,type,visibility,slug,slugHistory,status,coverAssetId,createdAt,updatedAt,revision,managementReady,archivedAt,deletedAt,workPublicationHistoryAt}=collection;
+    return{id:recordId,creatorId:owner,title,description,type,visibility,slug,slugHistory,status,coverAssetId,createdAt,updatedAt,revision,managementReady,archivedAt,deletedAt,workPublicationHistoryAt,workIds};
+  };
+  const collectionResult=async(context:Awaited<ReturnType<typeof collectionContext>>,creatorId:string,id:string)=>{
+    const collection=await context.service.get(configuration.instanceId??'local-reference',id);
+    if(collection.creatorId!==creatorId)throw new HttpError(404,'collection_not_found','Collection not found.');
+    return{...collectionView(collection,(await context.store.listCollectionWorks(collection.tenantId,id)).map(m=>m.workId)),permissions:{canEdit:context.canEdit&&collection.managementReady&&collection.status!=='deleted'}};
   };
   const existingImportIds = async () => ({ publication: (await allRecords(repositories.publications)).map(({ id }) => id), publicationIntent: (await allRecords(repositories.publicationIntents)).map(({ id }) => id), moderationEvidence: (await allRecords(repositories.moderationEvidence)).map(({ id }) => id), moderationHold: (await allRecords(repositories.moderationHolds)).map(({ id }) => id), reviewCase: (await allRecords(repositories.reviewCases)).map(({ id }) => id), auditEvent: (await allRecords(repositories.auditEvents)).map(({ id }) => id), usageEvent: (await allRecords(repositories.usageEvents)).map(({ id }) => id), integrationAccount: (await allRecords(repositories.integrationAccounts)).map(({ id }) => id) });
   const currentPublicWork = async (workId: string) => {
@@ -857,8 +900,41 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           const works = (await allRecords(repositories.works)).filter(work => work.creatorId === creator.id && work.status !== 'deleted');
           return json(response, 200, { works, requestId }, requestId);
         }
-        const collections = (await allRecords(repositories.collections)).filter(collection => collection.creatorId === creator.id);
-        return json(response, 200, { collections, requestId }, requestId);
+        const context=await collectionContext(identity.subject.id,creator);
+        const collections=(await context.service.list({tenantId:creator.instanceId,creatorId:creator.id})).map(c=>({...collectionView(c,c.workIds),permissions:{canEdit:context.canEdit&&c.managementReady&&c.status!=='deleted'}}));
+        return json(response, 200, { collections,capabilities:{canCreate:context.canEdit&&await context.store.isManagementReady(creator.id)}, requestId }, requestId);
+      }
+      const privateCollectionMatch=url.pathname.match(/^\/v1\/collections\/([^/]+)(\/works)?$/);
+      if(privateCollectionMatch&&['GET','PATCH','DELETE','PUT'].includes(method)){
+        const [,id,worksPath]=privateCollectionMatch;
+        if(worksPath?method!=='PUT':!['GET','PATCH','DELETE'].includes(method))throw new HttpError(405,'method_not_allowed','Collection method is not supported.');
+        const identity=await session(request),record=await repositories.collections.get(id);
+        if(!record)throw new HttpError(404,'collection_not_found','Collection not found.');
+        const creator=await creatorFor(identity.subject.id,resolveRequestCreatorId(request,url)??record.creatorId);
+        if(record.creatorId!==creator.id||record.instanceId!==creator.instanceId)throw new HttpError(404,'collection_not_found','Collection not found.');
+        requireHomeCell({cellId},record);
+        if(record.dataHomeRegion!==creator.dataHomeRegion||record.routingRevision!==creator.routingRevision)throw new HttpError(409,'data_home_mismatch','Collection and Creator data homes do not match.');
+        const context=await collectionContext(identity.subject.id,creator,method!=='GET');
+        if(method==='GET')return json(response,200,{collection:await collectionResult(context,creator.id,id),requestId},requestId);
+        const body=await parseBody(request),revision=collectionRevision(body);
+        if(worksPath){
+          collectionFields(body,['revision','workIds','expectedWorkIds']);
+          if(!Array.isArray(body.workIds)||!Array.isArray(body.expectedWorkIds)||[...body.workIds,...body.expectedWorkIds].some(id=>typeof id!=='string'||!id.trim())||new Set(body.workIds).size!==body.workIds.length||new Set(body.expectedWorkIds).size!==body.expectedWorkIds.length)throw new HttpError(400,'invalid_request','Unique Work IDs and the previous order are required.');
+          if(Buffer.byteLength(JSON.stringify(body))>300*1024)throw new HttpError(413,'collection_too_large','Collection order exceeds the safe aggregate size.');
+          await context.service.replaceWorks(creator.instanceId,id,body.workIds as string[],body.expectedWorkIds as string[],revision);
+        }else if(method==='DELETE'){
+          collectionFields(body,['revision']);await context.service.remove(creator.instanceId,id,revision);
+        }else{
+          collectionFields(body,['revision','title','description','slug','type','visibility','coverAssetId','status']);
+          const current=await context.service.get(creator.instanceId,id);
+          const changes={...body};delete changes.revision;
+          if(changes.coverAssetId!==undefined&&changes.coverAssetId!==null&&(typeof changes.coverAssetId!=='string'||!changes.coverAssetId))throw new HttpError(400,'invalid_request','Cover asset ID is invalid.');
+          if(changes.title!==undefined)changes.title=requireString(changes.title,'title');
+          if(changes.slug!==undefined){const slug=requireString(changes.slug,'slug');changes.slug=normalizeContentSlug(slug,{fallback:'collection',maxLength:160});}
+          if(changes.coverAssetId===null)changes.coverAssetId=undefined;
+          await context.service.update({...current,...changes} as RuntimeCollection,undefined,revision);
+        }
+        return json(response,200,{collection:await collectionResult(context,creator.id,id),requestId},requestId);
       }
       const privateWorkMatch = url.pathname.match(/^\/v1\/works\/([^/]+)$/);
       if (privateWorkMatch && ['GET', 'PATCH', 'DELETE'].includes(method)) {
@@ -875,7 +951,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         if (body.revision !== work.revision) throw new HttpError(409, 'revision_conflict', 'Reload the work before saving changes.');
         if (method === 'DELETE' && work.status === 'published') throw new HttpError(409, 'work_is_published', 'Unpublish the work before deleting it.');
         const changes: Partial<WorkRecord> = method === 'DELETE' ? { status: 'deleted' } : { title: requireString(body.title ?? work.title, 'title') };
-        const updated = await repositories.works.update(work.id, work.revision, changes);
+        const updated = method==='DELETE'
+          ? await withCollectionWorkLifecycleFence(repositories,{instanceId:configuration.instanceId??'local-reference',cellId,region},work.creatorId,
+              transaction=>repositories.works.update(work.id,work.revision,changes,{transaction}))
+          : await repositories.works.update(work.id, work.revision, changes);
         return json(response, 200, { work: updated, requestId }, requestId);
       }
       if (method === "POST" && url.pathname === "/v1/works") {
@@ -894,20 +973,18 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const identity = await session(request);
         const requestedId = resolveRequestCreatorId(request, url);
         const creator = await creatorFor(identity.subject.id, requestedId);
-        requireHomeCell({ cellId }, creator);
-        await requireCreatorWritable(creator);
-        const role = await tenancy.resolveCreatorRole(identity.subject.id, creator.id);
-        if (!role || !['owner', 'admin', 'editor'].includes(role)) throw new HttpError(403, 'collection_edit_denied', 'Collection editing access is required.');
+        const context=await collectionContext(identity.subject.id,creator,true);
         const body = await parseBody(request);
-        const collection = await repositories.collections.create({
-          id: randomUUID(),
-          instanceId: creator.instanceId,
-          ...dataHomeOf(creator),
-          creatorId: creator.id,
-          title: requireString(body.title, "title"),
-          visibility: body.visibility === "public" || body.visibility === "unlisted" ? body.visibility : "private"
-        });
-        return json(response, 201, { collection, requestId }, requestId);
+        collectionFields(body,['title','description','slug','type','visibility','coverAssetId','idempotencyKey']);
+        const title=requireString(body.title,'title');
+        if(body.type!==undefined&&!['collection','gallery','series','playlist'].includes(body.type as string)||body.visibility!==undefined&&!['private','unlisted','public'].includes(body.visibility as string)
+          ||body.description!==undefined&&typeof body.description!=='string'||body.coverAssetId!==undefined&&body.coverAssetId!==null&&(typeof body.coverAssetId!=='string'||!body.coverAssetId))throw new HttpError(400,'invalid_request','Collection details are invalid.');
+        const details={title,description:body.description??undefined,slug:normalizeContentSlug(body.slug===undefined?title:requireString(body.slug,'slug'),{fallback:'collection',maxLength:160}),
+          type:(body.type??'collection') as RuntimeCollection['type'],visibility:(body.visibility??'private') as RuntimeCollection['visibility'],coverAssetId:(body.coverAssetId??undefined) as string|undefined};
+        const collection=await createCollectionFromIntent(repositories,context.store,{instanceId:creator.instanceId,cellId,region,creatorId:creator.id,actorId:identity.subject.id,
+          idempotencyKey:body.idempotencyKey as string|undefined,details},async id=>context.service.create({...details,id,collectionId:id,tenantId:creator.instanceId,creatorId:creator.id,
+            status:'draft',slugHistory:[],revision:1,managementReady:true,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()} as RuntimeCollection));
+        return json(response, 201, { collection:await collectionResult(context,creator.id,collection.id), requestId }, requestId);
       }
 
       if (method === 'POST' && url.pathname === '/v1/uploads') {
@@ -1088,6 +1165,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
             for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, processedRenditions: _processedRenditions, deliveryMimeType: _deliveryMimeType, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processedRenditions?:unknown;deliveryMimeType?:unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
+            await invalidateCollectionDirectoryForImport(repositories,creator,manifest.collections.map(c=>c.id),transaction);
             const publicationRestoreMaps = { publications: Object.fromEntries(manifest.publications.map(p => [p.id, p.id])),
               works: Object.fromEntries(manifest.works.map(w => [w.id, w.id])), assets: Object.fromEntries(manifest.assets.map(a => [a.id, a.id])),
               collections: Object.fromEntries(manifest.collections.map(c => [c.id, c.id])) };
@@ -1118,6 +1196,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       }
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
+      if(error instanceof OptimisticConcurrencyError)return json(response,409,{error:{code:'revision_conflict',message:'This resource changed. Reload before saving.',requestId}},requestId);
+      if(error instanceof CreatorCollectionError)return json(response,error.code==='access_denied'?403:error.code==='not_found'?404:['slug_conflict','revision_conflict'].includes(error.code)?409:400,{error:{code:error.code,message:error.message,requestId}},requestId);
+      if(error instanceof CollectionManagementError)return json(response,error.code==='invalid_collection'?400:error.code==='collection_too_large'?413:409,{error:{code:error.code,message:error.message,requestId}},requestId);
       if (error instanceof TenancyAdmissionError) return json(response, 403, { error: { code: error.reasonCode, message: error.message, requestId } }, requestId);
       if (error instanceof SingleOperatorLimitError || (error as any)?.code === "SINGLE_OPERATOR_INSTANCE_LIMIT") {
         return json(response, 403, { error: { code: "SINGLE_OPERATOR_INSTANCE_LIMIT", message: (error as Error).message, requestId } }, requestId);

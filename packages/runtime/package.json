@@ -46,6 +46,10 @@
     "./owned-website-blobs": {
       "types": "./dist/owned-website-blobs.d.ts",
       "default": "./dist/owned-website-blobs.js"
+    },
+    "./creator-collections": {
+      "types": "./dist/creator-collections.d.ts",
+      "default": "./dist/creator-collections.js"
     }
   },
   "scripts": {

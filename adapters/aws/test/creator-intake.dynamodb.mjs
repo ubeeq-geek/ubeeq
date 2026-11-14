@@ -19,10 +19,10 @@ async function fixture(t){
 test('actual Creator, host birth and request receipt commit together and recover a lost transaction response',async t=>{
  const f=await fixture(t),send=f.client.send.bind(f.client);let lost=false;
  f.client.send=async(command,...rest)=>{const result=await send(command,...rest);if(!lost&&command instanceof TransactWriteCommand&&command.input.TransactItems?.some(item=>item.Put?.Item?.repository==='creators')){lost=true;throw Error('Synthetic accepted response lost');}return result;};
- const first=await createIntakeCreator(f.repositories,f.input,f.create(f.repositories)),second=await createIntakeCreator(f.independent,f.input,f.create(f.independent));assert.equal(lost,true);assert.equal(first.id,second.id);assert.equal((await f.rows()).length,3);
+ const first=await createIntakeCreator(f.repositories,f.input,f.create(f.repositories)),second=await createIntakeCreator(f.independent,f.input,f.create(f.independent));assert.equal(lost,true);assert.equal(first.id,second.id);assert.equal((await f.rows()).length,4);
 });
 test('actual concurrent Creator receipts converge and failed preparation leaves no partial records',async t=>{
  const f=await fixture(t);
  await assert.rejects(createIntakeCreator(f.repositories,f.input,async(transaction,id)=>{await f.create(f.repositories)(transaction,id);throw Error('Host preparation failed');}),/Host preparation failed/);assert.deepEqual(await f.rows(),[]);
- const results=await Promise.all([createIntakeCreator(f.repositories,f.input,f.create(f.repositories)),createIntakeCreator(f.independent,f.input,f.create(f.independent))]);assert.equal(results[0].id,results[1].id);assert.equal((await f.rows()).length,3);
+ const results=await Promise.all([createIntakeCreator(f.repositories,f.input,f.create(f.repositories)),createIntakeCreator(f.independent,f.input,f.create(f.independent))]);assert.equal(results[0].id,results[1].id);assert.equal((await f.rows()).length,4);
 });
