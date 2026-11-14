@@ -1,3 +1,4 @@
+import type { ContentPreparationStore as ConditionalPreparationStore } from '@ubeeq/persistence';
 import type {
   AssetKind, AssetStatus, CollectionStatus, CollectionType, ContentMetadataDefaults,
   ContentMetadataValues, ContentPreparationSettings, CreatorWorkPort, CreatorWorkRecord,
@@ -53,13 +54,7 @@ export interface PreparationOrganizationState { revision: number }
  * in one durable conditional transaction. A process-local mutex is insufficient.
  * Stored JSON belongs to this authority and is decoded by the workflow domain.
  */
-export interface PreparationAtomic {
-  readonly supportsConditionalTransactions?: boolean;
-  run<T>(operation: (transaction: { id: string }) => Promise<T>): Promise<T>;
-  get(kind: string, id: string): Promise<any>;
-  list(kind: string): Promise<any[]>;
-  put(kind: string, id: string, value: unknown): Promise<void>;
-}
+export type PreparationAtomic = ConditionalPreparationStore;
 export interface ContentPreparationStore<S extends PreparationOrganizationState> extends CreatorWorkPort<PreparationWork> {
   readonly publicationAtomic?: PreparationAtomic;
   getCreatorById(creatorId: string): Promise<PreparationCreator | null>;
