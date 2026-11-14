@@ -625,3 +625,4 @@ export {DynamoCommerceStore} from './commerce.js';
 
 export {DynamoWebsiteStore,type DynamoWebsiteConfiguration} from './websites.js';
 export {DynamoWebsiteHostingStore} from './website-hosting-store.js';
+export {DynamoCollectionMetadataStore,assertCollectionMetadataTransactionBudget,type DynamoCollectionMetadataConfiguration,type CollectionMetadataTransactionItems} from './collection-metadata-store.js';

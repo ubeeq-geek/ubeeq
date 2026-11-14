@@ -12,6 +12,7 @@
     "apps/*"
   ],
   "scripts": {
+    "test:managed-collection-metadata": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/collection-metadata-store.dynamodb.mjs",
     "test:managed-processed-outputs": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/processed-outputs.dynamodb.mjs",
     "test:managed-creator-intake": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/creator-intake.dynamodb.mjs",
     "test:managed-creator-collections": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/creator-collections.dynamodb.mjs",
