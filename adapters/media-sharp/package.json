@@ -10,6 +10,6 @@
   "dependencies": {
     "@ubeeq/extension-sdk": "^0.1.0",
     "@ubeeq/processing": "^0.1.0",
-    "sharp": "^0.35.4"
+    "sharp": "^0.35.5"
   }
 }
