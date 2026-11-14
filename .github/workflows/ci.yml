@@ -41,3 +41,4 @@ jobs:
       - run: npm test
       - run: npm run test:managed-websites
       - run: npm run test:managed-creator-intake
+      - run: npm run test:managed-processed-outputs

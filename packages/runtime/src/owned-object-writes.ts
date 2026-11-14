@@ -13,7 +13,8 @@ const canonical = (value: unknown): unknown => {
   if (value && typeof value === 'object' && [Object.prototype, null].includes(Object.getPrototypeOf(value))) return Object.fromEntries(Object.entries(value).filter(([,v]) => v !== undefined).sort(([a],[b]) => a < b ? -1 : a > b ? 1 : 0).map(([k,v]) => [k,canonical(v)]));
   throw new Error('Owned object evidence must contain plain JSON facts.');
 };
-const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+export const ownedEvidenceHash = (value: unknown) => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
+const hash = ownedEvidenceHash;
 const conflict = (error: unknown) => /conflict|revision|conditional|already exists|transaction.*cancel/i.test(String(error));
 /** A host quota decision is distinct from an uncertain provider write. */
 export class OwnedObjectQuotaError extends Error {

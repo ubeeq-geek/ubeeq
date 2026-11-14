@@ -33,7 +33,10 @@ export interface ProcessedRendition { id: string; sourceVersionId: string; conte
 export interface MediaProcessor { process(input: { assetId: string; contentType: string; source: Uint8Array; sourceVersionId: string;
   /** Admitted source-pixel square crop; callers must select a crop-capable image processor. */
   squareCrop?: import('./image-crops.js').SquareCropInput
-}): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number }>; }
+}): Promise<{ metadata: Record<string, string | number | boolean>; renditions: readonly ProcessedRendition[]; measuredUnits: number;
+  /** Optional explicit delivery choice when a processor emits several previews. */
+  primaryRenditionId?: string
+}>; }
 
 /** Selects product-installed processors without teaching the application about vendors or codecs. */
 export class MediaProcessorRegistry implements MediaProcessor {

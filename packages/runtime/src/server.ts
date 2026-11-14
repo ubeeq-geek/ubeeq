@@ -1,6 +1,7 @@
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { OwnedObjectWrites } from './owned-object-writes.js';
+import {persistProcessedOutputs} from './processed-outputs.js';
 import { OwnedWebsiteBlobs } from './owned-website-blobs.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
 import { createIntakeCreator, CreatorIntakeError } from './creator-intake.js';
@@ -29,7 +30,7 @@ import type { JobQueue } from "@ubeeq/jobs";
 import { JobRecoveryError, requireRecoverableJob } from "@ubeeq/jobs";
 import { repositoryItems, type Page, type PageRequest } from "@ubeeq/persistence";
 import { AdmissionBlockedError, requireAdmission, type ReviewHold } from "@ubeeq/moderation";
-import { WebsiteService, websiteDigest, createCreatorExport, planCreatorImport, validateCreatorExport, restorePublicationImageRecord } from "@ubeeq/portability";
+import { WebsiteService, websiteDigest, creatorAssetObjectInventory, createCreatorExport, planCreatorImport, validateCreatorExport, restorePublicationImageRecord } from "@ubeeq/portability";
 import { LocalImageProcessor, type MediaProcessor } from "@ubeeq/processing";
 import { validateRemotePublicationEvent, verifyFederationEnvelope, type FederationReplayStore, type FederationSignatureVerifier } from "@ubeeq/federation";
 import type { FederationPolicy } from "@ubeeq/extension-sdk";
@@ -557,32 +558,27 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (!storage) throw new Error("Processing asset has no source object.");
       const processing = await repositories.assets.update(asset.id, asset.revision, { status: "processing" });
       const source = await adapters.storage.get(storage);
-      if (source.object.checksum !== processing.checksum || source.object.byteLength <= 0) throw new Error("Processing source object failed checksum or metadata verification.");
+      if (source.object.checksum !== processing.checksum || source.object.byteLength <= 0 || source.body.byteLength !== source.object.byteLength || createHash('sha256').update(source.body).digest('hex') !== processing.checksum) throw new Error("Processing source object failed checksum or metadata verification.");
       if (hostPorts.usageQuota.checkCurrentAdmission) {
         const currentQuota = await hostPorts.usageQuota.checkCurrentAdmission({ creatorId: asset.creatorId, operation: reservationInput.operation, idempotencyKey: usageKey });
         if (currentQuota?.allowed !== true) throw new Error(currentQuota?.reasonCode ?? 'Processing admission is no longer available.');
       }
-      const outputIdentity = {creatorId:processing.creatorId,operation:'asset.rendition',idempotencyKey:usageKey};
-      const recoveredOutput = await ownedObjectWrites?.recover(outputIdentity);
-      const result = recoveredOutput ? recoveredOutput.metadata.processingResult as Awaited<ReturnType<typeof processor.process>> : await processor.process({ assetId: processing.id, contentType: processing.mimeType, source: source.body, sourceVersionId: processing.objectVersion });
-      const processingResult = result && {...result,renditions:result.renditions?.map(value=>{const {body:_body,...rendition}=value as import('@ubeeq/processing').ProcessedRendition;return rendition;})};
-      if (!processingResult || !Array.isArray(processingResult.renditions) || !processingResult.metadata) throw new Error('Recovered processing evidence requires reconciliation.');
-      // Keep the physical object-store location from the verified source. For a
-      // local cell this is its logical cell store; for S3 it is the actual
-      // regional bucket required by the explicit migration transfer adapter.
-      let rendition = recoveredOutput?.object;
-      if (!rendition) {
-        const transformed = processing.mimeType.startsWith('image/')
-          ? await hostPorts.watermarkAndTransform.applyDerivativeTransform({ sourceBytes: source.body, mimeType: processing.mimeType, creatorId: processing.creatorId })
-          : { bytes: source.body, mimeType: processing.mimeType };
-        if (ownedObjectWrites) rendition = (await ownedObjectWrites.write({...outputIdentity,home:dataHomeOf(processing),bucket:source.object.bucket,kind:'renditions',scope:'public',contentType:transformed.mimeType,body:transformed.bytes,metadata:{processingResult}})).object;
-        else {
-          rendition = {bucket:source.object.bucket,key:cellScopedObjectKey({cellId,creatorId:processing.creatorId,kind:'renditions',objectId:processing.id}),versionId:randomUUID(),contentType:transformed.mimeType,byteLength:transformed.bytes.byteLength,checksum:createHash('sha256').update(transformed.bytes).digest('hex'),scope:'public'};
-          await adapters.storage.put({object:rendition,body:transformed.bytes});
-        }
-      }
+      const assertCurrent = async () => {
+        const current=await repositories.assets.get(processing.id), job=await adapters.jobs.get(lease.job.id);
+        if(!current || current.revision!==processing.revision || current.status!=='processing' || current.creatorId!==processing.creatorId
+          || current.instanceId!==processing.instanceId || current.homeCellId!==cellId || current.objectVersion!==processing.objectVersion
+          || current.checksum!==processing.checksum || !job || job.state!=='leased' || job.attempt!==lease.job.attempt
+          || !job.leaseExpiresAt || Date.parse(job.leaseExpiresAt)<=Date.now())throw new Error('Processing asset or lease is no longer current.');
+      };
+      const transform = async(bytes:Uint8Array,mimeType:string) => mimeType.startsWith('image/')
+        ? hostPorts.watermarkAndTransform.applyDerivativeTransform({sourceBytes:bytes,mimeType,creatorId:processing.creatorId})
+        : {bytes,mimeType};
+      const outputs=await persistProcessedOutputs({repositories,storage:adapters.storage,owned:ownedObjectWrites,asset:processing,source:source.object,usageKey,assertCurrent,transform,
+        produce:async()=>({result:await processor.process({assetId:processing.id,contentType:processing.mimeType,source:Uint8Array.from(source.body),sourceVersionId:processing.objectVersion}),
+          fallback:()=>transform(Uint8Array.from(source.body),processing.mimeType)})});
+      const processingResult=outputs.result, rendition=outputs.storage;
       const completed = await repositories.transaction(async (transaction) => {
-        const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready", storage: rendition, originalStorage: storage } as Partial<AssetRecord>, { transaction });
+        const ready = await repositories.assets.update(processing.id, processing.revision, { status: "ready", storage: rendition, originalStorage: storage, deliveryMimeType: rendition.contentType, processedRenditions: outputs.renditions } as Partial<AssetRecord>, { transaction });
         await repositories.moderationEvidence.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), subjectType: "asset", subjectId: processing.id, source: "local.processing", payload: { checksum: processing.checksum, sourceVersionId: processing.objectVersion, ...processingResult.metadata, renditions: processingResult.renditions, outputLineage: processingResult.renditions.map((rendition) => ({ outputId: rendition.id, sourceVersionId: rendition.sourceVersionId, role: rendition.role })) } }, { transaction });
         await repositories.usageEvents.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), accountId: processing.creatorId, meter: "processing_units", quantity: 1, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` }, { transaction, idempotencyKey: `asset-processing:${processing.id}:${processing.objectVersion}` });
         await repositories.auditEvents.create({ id: randomUUID(), instanceId: processing.instanceId, ...dataHomeOf(processing), action: "asset.processing_completed", subjectId: processing.id, payload: { jobId: lease.job.id, sourceVersionId: processing.objectVersion } }, { transaction });
@@ -1023,7 +1019,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const { work, assets, publications } = await currentPublicWork(publicMatch[1]);
         const delivered = await Promise.all(assets.map(async asset => {
           const storage = (asset as AssetRecord & { storage: { key: string; versionId?: string } }).storage;
-          return { ...asset, delivery: await adapters.delivery.issue({ object: { bucket: cellId, key: storage.key, versionId: storage.versionId, scope: 'public' }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) };
+          return { ...asset, deliveryMimeType: (asset as AssetRecord & {deliveryMimeType?:string}).deliveryMimeType ?? asset.mimeType, delivery: await adapters.delivery.issue({ object: { bucket: (storage as {bucket?:string}).bucket ?? cellId, key: storage.key, versionId: storage.versionId, scope: 'public' }, expiresAt: new Date(Date.now() + 3_600_000).toISOString() }) };
         }));
         return json(response, 200, { work, assets: delivered, publications, requestId }, requestId);
       }
@@ -1059,7 +1055,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const publications = (await allRecords(repositories.publications)).filter((record) => workIds.has(record.workId)); const publicationIntents = (await allRecords(repositories.publicationIntents)).filter((record) => workIds.has(record.workId));
         const subjectIds = new Set([creator.id, ...works.map(({ id }) => id), ...assets.map(({ id }) => id)]); const moderationEvidence = (await allRecords(repositories.moderationEvidence)).filter((record) => subjectIds.has(record.subjectId)); const moderationHolds = (await allRecords(repositories.moderationHolds)).filter((record) => subjectIds.has(record.subjectId)); const reviewCases = (await allRecords(repositories.reviewCases)).filter((record) => subjectIds.has(record.subjectId)); const auditEvents = (await allRecords(repositories.auditEvents)).filter((record) => Boolean(record.subjectId && subjectIds.has(record.subjectId))); const usageEvents = (await allRecords(repositories.usageEvents)).filter((record) => record.accountId === creator.id);
         const integrationAccounts = (await allRecords(repositories.integrationAccounts)).filter((record) => record.creatorId === creator.id).map(({ credentialReference: _credentialReference, ...record }) => ({ ...record, credentialExcluded: true as const })); const exportCheckpoints = (await allRecords(repositories.exportManifests)).filter((record) => record.creatorId === creator.id); const importCheckpoints = (await allRecords(repositories.importCheckpoints)).filter((record) => record.creatorId === creator.id);
-        const objectInventory = assets.map((asset) => { const storage = (asset as AssetRecord & { storage?: { key?: string; versionId?: string; byteLength?: number } }).storage; return { assetId: asset.id, key: storage?.key, versionId: storage?.versionId ?? asset.objectVersion, checksum: asset.checksum, byteLength: storage?.byteLength, transferState: "manifest_only" as const }; }); const processing = assets.map((asset) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, ...dataHomeOf(asset), state: asset.status }));
+        const objectInventory = assets.map(creatorAssetObjectInventory); const processing = assets.map((asset) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, ...dataHomeOf(asset), state: asset.status }));
         const manifest = createCreatorExport({ exportedAt: new Date().toISOString(), creator, works, assets, collections, publications, publicationIntents, processing, moderationEvidence, moderationHolds, reviewCases, auditEvents, usageEvents, integrationAccounts, exportCheckpoints, importCheckpoints, objectInventory }); await repositories.exportManifests.create({ id: `export-${manifest.checksum}`, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, schemaVersion: manifest.schemaVersion, checksum: manifest.checksum, objectReference: `inline:${manifest.checksum}` }, { idempotencyKey: `export:${manifest.checksum}` }); await audit({ action: "creator.export_generated", actorId: identity.subject.id, subjectId: creator.id, payload: { checksum: manifest.checksum } }); return json(response, 200, { ...manifest, requestId }, requestId);
       }
       if (method === "POST" && url.pathname === "/v1/imports/validate") { await session(request); const body = await parseBody(request); let manifest; try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); } const plan = planCreatorImport(manifest, { targetCreatorId: "validation", existingWorkIds: (await allRecords(repositories.works)).map(({ id }) => id), existingAssetIds: (await allRecords(repositories.assets)).map(({ id }) => id), existingCollectionIds: (await allRecords(repositories.collections)).map(({ id }) => id), existingIds: await existingImportIds() }); return json(response, 200, { plan, requestId }, requestId); }
@@ -1086,7 +1082,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         try {
           const completed = await repositories.transaction(async (transaction) => {
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
-            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
+            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, processedRenditions: _processedRenditions, deliveryMimeType: _deliveryMimeType, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processedRenditions?:unknown;deliveryMimeType?:unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
             const publicationRestoreMaps = { publications: Object.fromEntries(manifest.publications.map(p => [p.id, p.id])),
               works: Object.fromEntries(manifest.works.map(w => [w.id, w.id])), assets: Object.fromEntries(manifest.assets.map(a => [a.id, a.id])),

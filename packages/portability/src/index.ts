@@ -14,7 +14,24 @@ export { findCreatorContentSlugConflicts, ImportSlugPreflightError, type ImportS
 import type { AssetRecord, AuditEventRecord, CollectionRecord, CreatorRecord, ExportManifestRecord, ImportCheckpointRecord, IntegrationAccountRecord, ModerationEvidenceRecord, ModerationHoldRecord, PublicationIntentRecord, PublicationRecord, ReviewCaseRecord, UsageEventRecord, WorkRecord } from "@ubeeq/persistence";
 
 export const CREATOR_EXPORT_SCHEMA_VERSION = "2" as const;
-export interface ExportObjectInventory { assetId: string; key?: string; versionId: string; checksum: string; byteLength?: number; transferState: "manifest_only"; }
+export interface ExportObjectReference { id:string; role:'original'|'rendition'; key:string; versionId:string; checksum:string; byteLength:number; }
+export interface ExportObjectInventory { assetId: string; key?: string; versionId: string; checksum: string; byteLength?: number; transferState: "manifest_only"; objects?:readonly ExportObjectReference[]; }
+/** Includes originals and every output alias. Bytes remain an explicit transfer,
+ * and the source checksum is never substituted for an encoded object's hash. */
+export function creatorAssetObjectInventory(asset:AssetRecord):ExportObjectInventory {
+  type Location={key?:string;versionId?:string;checksum?:string;byteLength?:number};
+  const stored=asset as AssetRecord & {storage?:Location;originalStorage?:Location;processedRenditions?:readonly {id:string;storage:Location}[]};
+  const objects:ExportObjectReference[]=[];
+  const add=(id:string,role:ExportObjectReference['role'],location:Location)=>{
+    if(!location.key||!location.versionId||!location.checksum||!Number.isSafeInteger(location.byteLength))throw new Error('Asset output inventory requires immutable physical references.');
+    objects.push({id,role,key:location.key,versionId:location.versionId,checksum:location.checksum,byteLength:location.byteLength!});
+  };
+  if(stored.processedRenditions?.length){
+    if(stored.originalStorage)add('original','original',stored.originalStorage);
+    for(const value of stored.processedRenditions)add(`rendition:${value.id}`,'rendition',value.storage);
+  }
+  return {assetId:asset.id,key:stored.storage?.key,versionId:stored.storage?.versionId??asset.objectVersion,checksum:stored.storage?.checksum??asset.checksum,byteLength:stored.storage?.byteLength,transferState:'manifest_only',...(objects.length?{objects}: {})};
+}
 export interface PortableProcessingState { id: string; assetId: string; homeCellId: string; dataHomeRegion: string; dataHomeAssignedAt: string; routingRevision: number; state: string; }
 export type SanitizedIntegrationAccount = Omit<IntegrationAccountRecord, "credentialReference"> & { credentialExcluded: true };
 
@@ -93,6 +110,14 @@ export const validateCreatorExport = (value: unknown): CreatorExportManifest => 
   const workIds = new Set(manifest.works.map(({ id }) => id)); const assetIds = new Set(manifest.assets.map(({ id }) => id)); const subjectIds = new Set([creatorId, ...workIds, ...assetIds]);
   if (manifest.publications.some(({ workId }) => !workIds.has(workId)) || manifest.publicationIntents.some(({ workId }) => !workIds.has(workId)) || manifest.processing.some(({ assetId }) => !assetIds.has(assetId)) || [...manifest.moderationEvidence, ...manifest.moderationHolds, ...manifest.reviewCases].some(({ subjectId }) => !subjectIds.has(subjectId))) throw new Error("Export manifest contains a dangling creator-owned relationship.");
   if (manifest.objectInventory.length !== manifest.assets.length || manifest.objectInventory.some((object) => !assetIds.has(object.assetId) || !object.versionId || !/^[a-f0-9]{64}$/i.test(object.checksum) || (object.byteLength !== undefined && (!Number.isSafeInteger(object.byteLength) || object.byteLength < 0)) || (object.key !== undefined && !object.key.startsWith(`cells/${manifest.creator.homeCellId}/creators/${creatorId}/`)))) throw new Error("Export object inventory is incomplete or invalid.");
+  for(const entry of manifest.objectInventory)if(entry.objects!==undefined){
+    if(!Array.isArray(entry.objects)||entry.objects.length>65||new Set(entry.objects.map(object=>object.id)).size!==entry.objects.length)throw new Error('Export output inventory is invalid.');
+    for(const object of entry.objects as readonly ExportObjectReference[])if(typeof object.id!=='string'||!object.id||!['original','rendition'].includes(object.role)||typeof object.versionId!=='string'||!object.versionId||! /^[a-f0-9]{64}$/.test(object.checksum)||!Number.isSafeInteger(object.byteLength)||object.byteLength<=0||typeof object.key!=='string'||!object.key.startsWith(`cells/${manifest.creator.homeCellId}/creators/${creatorId}/`)||object.key.split('/').some(part=>part==='.'||part==='..'))throw new Error('Export output inventory is invalid.');
+  }
+  for(const asset of manifest.assets){
+    const expected=creatorAssetObjectInventory(asset);
+    if(expected.objects&&stableJson(expected)!==stableJson(manifest.objectInventory.find(entry=>entry.assetId===asset.id)))throw new Error('Export output inventory does not cover the asset immutable references.');
+  }
   const owned = [...manifest.works, ...manifest.assets, ...manifest.collections, ...manifest.publications, ...manifest.publicationIntents, ...manifest.processing, ...manifest.moderationEvidence, ...manifest.moderationHolds, ...manifest.reviewCases, ...manifest.auditEvents, ...manifest.usageEvents, ...manifest.integrationAccounts, ...manifest.exportCheckpoints, ...manifest.importCheckpoints];
   const foreign = owned.some((record) => record.homeCellId !== manifest.creator.homeCellId || record.dataHomeRegion !== manifest.creator.dataHomeRegion || record.dataHomeAssignedAt !== manifest.creator.dataHomeAssignedAt || record.routingRevision !== manifest.creator.routingRevision);
   if (foreign) throw new Error("Export manifest contains records from another data home.");
@@ -156,7 +181,13 @@ export const remapCreatorExportForImport = (
   const map = (table: Readonly<Record<string, string>>, id: string): string => table[id] ?? id;
   const creator = { ...sourceManifest.creator, id: input.targetCreatorId };
   const works = sourceManifest.works.map((item) => ({ ...item, id: map(idMap.works, item.id), creatorId: input.targetCreatorId }));
-  const assets = sourceManifest.assets.map((item) => ({ ...item, id: map(idMap.assets, item.id), creatorId: input.targetCreatorId, workId: item.workId ? map(idMap.works, item.workId) : undefined }));
+  const assets = sourceManifest.assets.map((item) => {
+    type Location={key:string};
+    const stored=item as AssetRecord & {storage?:Location;originalStorage?:Location;processedRenditions?:readonly {id:string;storage:Location}[]};
+    const location=(value:Location)=>({...value,key:value.key.replace(`/creators/${sourceManifest.creator.id}/`,`/creators/${input.targetCreatorId}/`)});
+    return {...item,id:map(idMap.assets,item.id),creatorId:input.targetCreatorId,workId:item.workId?map(idMap.works,item.workId):undefined,
+      ...(stored.processedRenditions?.length?{storage:stored.storage&&location(stored.storage),originalStorage:stored.originalStorage&&location(stored.originalStorage),processedRenditions:stored.processedRenditions.map(value=>({...value,storage:location(value.storage)}))}: {})};
+  });
   const collections = sourceManifest.collections.map((item) => ({ ...item, id: map(idMap.collections, item.id), creatorId: input.targetCreatorId }));
   const publications = sourceManifest.publications.map((item) => restorePublicationImageRecord(item, idMap));
   const publicationIntents = sourceManifest.publicationIntents.map((item) => ({ ...item, id: map(idMap.publicationIntents, item.id), workId: map(idMap.works, item.workId),
@@ -170,7 +201,7 @@ export const remapCreatorExportForImport = (
   const integrationAccounts = sourceManifest.integrationAccounts.map((item) => ({ ...item, id: map(idMap.integrationAccounts, item.id), creatorId: input.targetCreatorId }));
   const exportCheckpoints = sourceManifest.exportCheckpoints.map((item) => ({ ...item, id: map(idMap.exportCheckpoints, item.id), creatorId: input.targetCreatorId }));
   const importCheckpoints = sourceManifest.importCheckpoints.map((item) => ({ ...item, id: map(idMap.importCheckpoints, item.id), creatorId: input.targetCreatorId }));
-  const objectInventory = sourceManifest.objectInventory.map((item) => ({ ...item, assetId: map(idMap.assets, item.assetId), key: item.key?.replace(`/creators/${sourceManifest.creator.id}/`, `/creators/${input.targetCreatorId}/`) }));
+  const objectInventory = sourceManifest.objectInventory.map((item) => ({ ...item, assetId: map(idMap.assets, item.assetId), key: item.key?.replace(`/creators/${sourceManifest.creator.id}/`, `/creators/${input.targetCreatorId}/`), ...(item.objects?{objects:item.objects.map(object=>({...object,key:object.key.replace(`/creators/${sourceManifest.creator.id}/`,`/creators/${input.targetCreatorId}/`)}))}: {}) }));
   const { checksum: _sourceChecksum, ...sourceUnsigned } = sourceManifest;
   const unsigned = { ...sourceUnsigned, creator, works, assets, collections, publications, publicationIntents, processing, moderationEvidence, moderationHolds, reviewCases, auditEvents, usageEvents, integrationAccounts, exportCheckpoints, importCheckpoints, objectInventory, exportedAt: input.now ?? sourceManifest.exportedAt };
   const manifest = { ...unsigned, checksum: exportChecksum(unsigned) };
