@@ -74,6 +74,10 @@
     "./content-releases": {
       "types": "./dist/content-releases.d.ts",
       "default": "./dist/content-releases.js"
+    },
+    "./retained-preparation-host": {
+      "types": "./dist/retained-preparation-host.d.ts",
+      "default": "./dist/retained-preparation-host.js"
     }
   },
   "scripts": {
@@ -118,6 +122,9 @@
       ],
       "content-releases": [
         "dist/content-releases.d.ts"
+      ],
+      "retained-preparation-host": [
+        "dist/retained-preparation-host.d.ts"
       ]
     }
   }
