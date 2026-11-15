@@ -71,6 +71,19 @@ test('cancellation survives a provider cancellation failure and recovery retries
 
 test('missing real host capabilities cannot create an accepted release service',async t=>{
  const f=await fixture(t),current=f.make(f.store);for(const name of names)assert.throws(()=>new ContentReleaseService(current.workflows,async()=>true,{...current.host,[name]:undefined},current.representations),error=>error.code==='unsupported_operation'&&error.status===503);
- assert.throws(()=>new ContentReleaseService({...current.workflows,store:{...f.store,publicationAtomic:undefined}},async()=>true,current.host,current.representations),error=>error.code==='unsupported_operation'&&error.status===503);
  assert.deepEqual(await f.store.listPublicationsByWork(tenant,'work'),[]);
+});
+
+
+test('hosts without durable release storage can initialize while release access still fails closed',async t=>{
+ const f=await fixture(t),current=f.make(f.store),base=f.store.publicationAtomic;
+ const unavailable=[undefined,{...base,supportsConditionalTransactions:false},...['run','get','list','put','savePublication','active'].map(name=>({...base,[name]:undefined}))];
+ for(const atomic of unavailable){
+  const store=Object.create(f.store);Object.defineProperty(store,'publicationAtomic',{value:atomic});
+  const service=new ContentReleaseService({...current.workflows,store},async()=>true,current.host,current.representations);
+  assert.equal((await store.getCreatorById(creatorId)).name,'Creator');
+  for(const operation of [()=>service.run(creatorId,'release'),()=>service.cancel(creatorId,'release',1)])await assert.rejects(operation,error=>error.code==='unsupported_operation'&&error.status===503);
+ }
+ assert.deepEqual(await f.store.listPublicationsByWork(tenant,'work'),[]);
+ assert.deepEqual((await base.get(kind(creatorId,'release'),'release')).completed,[]);
 });

@@ -52,8 +52,13 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
     constructor(readonly workflows: ContentReleaseWorkflow<M>, readonly allowed: (work: M['work']) => Promise<boolean>, private readonly host:ContentReleaseHost<M>, representations:ReleaseRepresentations<M>, readonly runtime?:{tick():Promise<unknown>}) {
         const required=['isNativeDestination','nativeWorkDestination','nativeCollectionDestination','nativeWorkAnnouncementBinding','nativeCollectionAnnouncementBinding','collection','announcement','contentPublishing','resolvedContentOffer','validateNativeCollectionOffer','communityActorAllowed','announcementRules','announcementDestinations','announcementKnownLinks','parseAnnouncement','validateAnnouncement','announcementDocumentForDestination','stageAnnouncementMedia','pinCollectionAnnouncementMedia','activateAnnouncementMedia','readStagedAnnouncementMedia','readAnnouncementFile','readAnnouncementImage','evaluatePublicationPolicy','nativeWorkPublication','resolvedCollectionMembers','evaluateNativeCollectionPublication','announcementPlans','captureCollectionReleaseRequirements','readOrchestrationValue'] as const;
         if(required.some(key=>typeof host?.[key]!=='function')||typeof allowed!=='function'||!representations||['full','previews','read'].some(key=>typeof representations[key as keyof ReleaseRepresentations<M>]!=='function'))throw new ContentPreparationError('unsupported_operation','Content release requires its actual authenticated publishing, announcement and private media host.',503);
-        if(!workflows.store.publicationAtomic?.supportsConditionalTransactions)throw new ContentPreparationError('unsupported_operation','Content release requires the canonical conditional transaction authority.',503);
         this.representations=representations;
+    }
+    private atomic() {
+        const atomic = this.store.publicationAtomic;
+        if (!atomic?.supportsConditionalTransactions || ['run', 'get', 'list', 'put', 'savePublication', 'active'].some(key => typeof atomic[key as keyof typeof atomic] !== 'function'))
+            throw new ContentPreparationError('unsupported_operation', 'Content release requires the canonical conditional transaction authority.', 503);
+        return atomic;
     }
     private get store() { return this.workflows.store; }
     private get config() { return this.workflows.config; }
@@ -174,8 +179,8 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         release.announcementTrigger = contentAnnouncementTrigger({ ...draft.settings.announce, mode: 'draft' }, (await this.host.announcementDestinations(creatorId)).filter(option => option.available).map(option => ({ binding: option.binding, settings: { destinationId: option.communityDestinationId } })), 'native');
         if (Buffer.byteLength(JSON.stringify(release)) > 300000)
             throw new ContentPreparationError('preparation_too_large', 'Reduce the selected announcement media before reviewing.');
-        await this.store.publicationAtomic!.run(async () => { const current = await this.workflows.get(creatorId, id); if (current.review?.id !== prepared.review.id)
-            throw new ContentPreparationError('review_stale', 'The announcement preparation changed.'); await this.store.publicationAtomic!.put(this.key(creatorId), release.id, release); });
+        await this.atomic().run(async () => { const current = await this.workflows.get(creatorId, id); if (current.review?.id !== prepared.review.id)
+            throw new ContentPreparationError('review_stale', 'The announcement preparation changed.'); await this.atomic().put(this.key(creatorId), release.id, release); });
         return { ...prepared, release: { id: release.id, purpose: release.purpose, outputs: [], announcementPreviews } };
     }
     async announcementDraft(creatorId: string, id: string, expectedRevision: number, actorId: string, releaseId?: string) {
@@ -189,11 +194,11 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         const known = await this.host.announcementKnownLinks(creatorId, subject.kind === 'work' ? subject.id : undefined, subject.kind === 'collection' ? subject.id : undefined), link = known.links[0];
         if (!releaseId && draft.settings.announce.media && draft.settings.announce.media.mode !== 'none')
             throw new ContentPreparationError('review_required', 'Review the selected announcement media before creating its authoring draft.');
-        const frozen = releaseId ? await this.store.publicationAtomic!.get(this.key(creatorId), releaseId) as PreparedRelease<M> | undefined : undefined;
+        const frozen = releaseId ? await this.atomic().get(this.key(creatorId), releaseId) as PreparedRelease<M> | undefined : undefined;
         const creator = await this.store.getCreatorById(creatorId), template = draft.settings.announce.template ?? defaultCollectionAnnouncementPreferences('Etc/UTC').initial.template;
         const document = frozen?.announcementDraftContent?.document ?? { version: 1, blocks: renderAnnouncementTemplate({ template, values: { 'collection.title': draft.title, 'collection.description': '', 'creator.name': creator?.name ?? '', 'primaryLink.url': link?.url ?? '', 'primaryLink.label': link?.label ?? 'View content', 'release.newWorkCount': draft.units.filter(u => u.kind === 'work').length } }) };
         const content = frozen?.announcementDraftContent ?? this.host.parseAnnouncement({ title: draft.title, document, url: link?.url, format: 'recommended', ...(subject.kind === 'collection' ? { sourceCollectionId: subject.id } : { sourceWorkId: subject.id }) }, draft.units.filter(u => u.kind === 'work').map(u => u.id));
-        const now = new Date().toISOString(), announcementPublicationId = publicationIdentityHash([id, releaseId ?? 'ad-hoc', 'announcement-draft']), atomic = this.store.publicationAtomic!;
+        const now = new Date().toISOString(), announcementPublicationId = publicationIdentityHash([id, releaseId ?? 'ad-hoc', 'announcement-draft']), atomic = this.atomic();
         return atomic.run(async () => {
             await this.workflows.get(creatorId, id);
             const existing = await this.store.getAnnouncementPublication(announcementPublicationId);
@@ -212,7 +217,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         const prepared = await this.representations.previews(draft, recipes);
         if (!prepared.outputs.length)
             throw new ContentPreparationError('preview_missing', 'Upload and map prepared previews, or choose a supported generated image/text recipe.');
-        const atomic = this.store.publicationAtomic!;
+        const atomic = this.atomic();
         for (const output of prepared.outputs)
             await atomic.run(async () => { await this.workflows.target(creatorId, output.subject); await atomic.put(this.workflows.kind(creatorId, 'representation'), output.id, output); });
         return atomic.run(async () => {
@@ -287,7 +292,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
                 throw new ContentPreparationError('access_unresolved', 'Individual premium/member access remains available through Work management. Bind that existing offering before releasing full content.');
             await this.host.validateNativeCollectionOffer(creatorId, draft.settings.access === 'premium' ? 'premium' : 'followers', draft.settings.offerId);
         }
-        const storedPreviews = await Promise.all(draft.previews.flatMap(p => p.representationIds ?? []).map(id => this.store.publicationAtomic!.get(this.workflows.kind(creatorId, 'representation'), id))) as PreparedContentRepresentation<M['file']>[];
+        const storedPreviews = await Promise.all(draft.previews.flatMap(p => p.representationIds ?? []).map(id => this.atomic().get(this.workflows.kind(creatorId, 'representation'), id))) as PreparedContentRepresentation<M['file']>[];
         const previews = storedPreviews.length ? { outputs: storedPreviews, relationships: draft.previews } : await this.representations.previews(draft, recipes), outputs: PreparedContentRepresentation<M['file']>[] = [], fullOutputs: PreparedContentRepresentation<M['file']>[] = [];
         for(const ref of draft.units.filter(u=>u.kind==='work'&&!previews.outputs.some(p=>p.subject.id===u.id))){const publication=(await this.store.listPublicationsByWork(this.config.tenantId,ref.id)).find(p=>this.host.isNativeDestination(p.destination)&&p.status==='live'&&['public','unlisted'].includes(p.visibility)),manifest=contentPublicationBinding<M['file']>(publication)?.manifest;if(manifest?.kind==='preview'&&manifest.subject.revision===ref.revision)previews.outputs.push(manifest);}
         for (const ref of draft.units.filter(u => u.kind === 'work')) {
@@ -312,7 +317,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         }
         if (!outputs.length && !draft.units.some(u => u.kind === 'collection'))
             throw new ContentPreparationError('content_pending', 'No complete Work representation is ready.');
-        const atomic = this.store.publicationAtomic!;
+        const atomic = this.atomic();
         await atomic.run(async () => {
             const current = await this.workflows.get(creatorId, id);
             if (current.revision !== draft.revision)
@@ -400,10 +405,10 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
     async accept(creatorId: string, id: string, expectedRevision: number, operationId: string, reviewId: string, fingerprint: string) {
         if (!/^[A-Za-z0-9_-]{1,100}$/.test(operationId))
             throw new ContentPreparationError('invalid_input', 'Use a stable release operation identity.', 400);
-        const pending = await this.store.publicationAtomic!.get(this.key(creatorId), reviewId) as PreparedRelease<M> | undefined;
+        const pending = await this.atomic().get(this.key(creatorId), reviewId) as PreparedRelease<M> | undefined;
         if (pending?.state === 'prepared' && pending.connected?.length)
             await this.host.contentPublishing()!.validate(pending.connected, pending.actorId);
-        const atomic = this.store.publicationAtomic!;
+        const atomic = this.atomic();
         const release = await atomic.run(async () => {
             const digest = publicationIdentityHash([id, expectedRevision, reviewId, fingerprint]), previousReceipt = await atomic.get(this.workflows.kind(creatorId, 'release-receipt'), operationId);
             if (previousReceipt && previousReceipt.digest !== digest)
@@ -443,7 +448,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         return this.status(creatorId, release.id);
     }
     async reviewMedia(creatorId: string, draftId: string, reviewId: string, representationId: string, componentId: string) {
-        const draft = await this.workflows.get(creatorId, draftId), release = await this.store.publicationAtomic!.get(this.key(creatorId), reviewId) as PreparedRelease<M> | undefined;
+        const draft = await this.workflows.get(creatorId, draftId), release = await this.atomic().get(this.key(creatorId), reviewId) as PreparedRelease<M> | undefined;
         if (!release || release.draftId !== draftId || draft.review?.id !== reviewId || Date.parse(draft.review.expiresAt) <= Date.now())
             throw new ContentPreparationError('review_stale', 'Prepare the current exact release to inspect this media.', 404);
         if (representationId.startsWith('connected-'))
@@ -482,13 +487,13 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
     }
     async status(creatorId: string, id: string) {
         await this.workflows.list(creatorId);
-        const release = await this.store.publicationAtomic!.get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
+        const release = await this.atomic().get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
         if (!release)
             throw new ContentPreparationError('not_found', 'Release not found.', 404);
         return { id: release.id, state: release.state, completed: release.completed.length, total: release.outputs.length, scheduledAt: release.scheduledAt, error: release.error, announcementReleaseId: release.announcementReleaseId, draft: await this.workflows.get(creatorId, release.draftId) };
     }
     async cancel(creatorId: string, id: string, expectedRevision: number) {
-        const atomic = this.store.publicationAtomic!;
+        const atomic = this.atomic();
         const draft = await atomic.run(async () => {
             const release = await atomic.get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
             if (!release)
@@ -514,7 +519,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         return draft;
     }
     private async cancelConnected(creatorId: string, id: string) {
-        const atomic = this.store.publicationAtomic!, release = await atomic.get(this.key(creatorId), id) as PreparedRelease<M>;
+        const atomic = this.atomic(), release = await atomic.get(this.key(creatorId), id) as PreparedRelease<M>;
         if (release.state !== 'cancelled' || !release.cancellationPending)
             return;
         await this.host.contentPublishing()?.cancel(id, release.actorId, release.connected ?? []);
@@ -522,7 +527,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             await atomic.put(this.key(creatorId), id, { ...current, cancellationPending: false }); });
     }
     async run(creatorId: string, id: string) {
-        const atomic = this.store.publicationAtomic!, initial = await atomic.get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
+        const atomic = this.atomic(), initial = await atomic.get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
         if (initial?.state === 'accepted' && initial.purpose === 'announcement_draft') {
             try {
                 await this.finishAnnouncementDraft(creatorId, initial);
@@ -624,12 +629,12 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             throw new ContentPreparationError('review_stale', 'Creator settings or announcement rules changed.');
         await this.checkAnnouncementBindings(creatorId, release);
         await this.checkPreparedAnnouncementMedia(creatorId, release);
-        await this.store.publicationAtomic!.run(async () => { const current = await this.store.publicationAtomic!.get(this.key(creatorId), release.id) as PreparedRelease<M>; if (current.state !== 'accepted')
-            return; await this.announcementDraft(creatorId, draft.id, draft.revision, release.actorId, release.id); const now = new Date().toISOString(); await this.store.publicationAtomic!.put(this.key(creatorId), release.id, { ...current, state: 'completed', completedAt: now }); await this.store.publicationAtomic!.put(this.workflows.kind(creatorId), draft.id, { ...draft, state: 'completed', review: undefined, updatedAt: now }); });
+        await this.atomic().run(async () => { const current = await this.atomic().get(this.key(creatorId), release.id) as PreparedRelease<M>; if (current.state !== 'accepted')
+            return; await this.announcementDraft(creatorId, draft.id, draft.revision, release.actorId, release.id); const now = new Date().toISOString(); await this.atomic().put(this.key(creatorId), release.id, { ...current, state: 'completed', completedAt: now }); await this.atomic().put(this.workflows.kind(creatorId), draft.id, { ...draft, state: 'completed', review: undefined, updatedAt: now }); });
     }
     /** Each gallery commits independently with its receipt; one announcement activates only after all results. */
     private async finishCollection(creatorId: string, id: string, collectionId: string, preview: boolean) {
-        const atomic = this.store.publicationAtomic!;
+        const atomic = this.atomic();
         await atomic.run(async () => {
             const release = await atomic.get(this.key(creatorId), id) as PreparedRelease<M>;
             if (release.state !== 'accepted' || release.collectionsCompleted?.includes(collectionId))
@@ -669,7 +674,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         });
     }
     private async finish(creatorId: string, id: string) {
-        const atomic = this.store.publicationAtomic!, initial = await atomic.get(this.key(creatorId), id) as PreparedRelease<M>;
+        const atomic = this.atomic(), initial = await atomic.get(this.key(creatorId), id) as PreparedRelease<M>;
         if (initial.state !== 'accepted' || initial.completed.length !== initial.outputs.length)
             return;
         const initialDraft = await this.workflows.get(creatorId, initial.draftId), previewId = initialDraft.previews.find(p => p.previewCollectionId)?.previewCollectionId;
@@ -741,7 +746,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         for (const creator of await this.store.listCreators()) {
             if (creator.status !== 'active' || creator.deletion)
                 continue;
-            const rows = await this.store.publicationAtomic?.list(this.key(creator.creatorId)) as PreparedRelease<M>[] | undefined;
+            const rows = this.store.publicationAtomic ? await this.atomic().list(this.key(creator.creatorId)) as PreparedRelease<M>[] : undefined;
             for (const row of rows ?? [])
                 if (row.state === 'cancelled' && row.cancellationPending)
                     await this.cancelConnected(creator.creatorId, row.id);
