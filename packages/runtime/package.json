@@ -106,6 +106,10 @@
     "./creator-intake": {
       "types": "./dist/creator-intake.d.ts",
       "default": "./dist/creator-intake.js"
+    },
+    "./usage-settlement-outbox": {
+      "types": "./dist/usage-settlement-outbox.d.ts",
+      "default": "./dist/usage-settlement-outbox.js"
     }
   },
   "scripts": {
@@ -174,6 +178,9 @@
       ],
       "creator-intake": [
         "dist/creator-intake.d.ts"
+      ],
+      "usage-settlement-outbox": [
+        "dist/usage-settlement-outbox.d.ts"
       ]
     }
   }

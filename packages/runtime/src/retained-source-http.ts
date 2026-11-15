@@ -17,12 +17,18 @@ export type RetainedSourceOperation='list'|'upload'|'complete'|'cancel'|'downloa
 export interface RetainedSourceHttpContext<M extends RetainedCreatorContentModels=RetainedCreatorContentModels,F extends RetainedSourceFile=RetainedSourceFile>{
  files:RepositoryRetainedSourceFiles<M,F>;uploads:SourceFileUploads<M,F>;storage:StreamingObjectStorage;
  bucket:string;maximumUploadBytes:number;
+ /** Actual Local host storage configuration. Omitted uses the managed
+  * single-PUT allowance. This is never populated from request JSON. */
+ localMediaDirectory?:string;
  /** Retain the host's complete JSON model, including its original opaque fields. */
  file(value:RetainedIntakeFile):F;
  /** Managed providers may issue an exact-version URL instead of proxying bytes. */
  delivery?:DeliveryAdapter;
 }
 export interface RetainedSourceHttpBindings<M extends RetainedCreatorContentModels=RetainedCreatorContentModels,F extends RetainedSourceFile=RetainedSourceFile>{
+ /** Fixed host allowance for streamed proxy transfers. The per-Creator actual
+  * maximumUploadBytes is also enforced. Omitted preserves the 64 MiB default. */
+ maximumProxyUploadBytes?:number;
  resolve(request:RetainedSourceHttpRequest,target:{creatorId:string}|{fileId:string}):Promise<RetainedSourceHttpContext<M,F>>;
  listCreators(request:RetainedSourceHttpRequest):Promise<Array<RetainedSourceHttpContext<M,F>>>;
  /** Actual fixed-bucket/private-storage configuration, never a no-op presigner. */
@@ -36,7 +42,7 @@ export interface RetainedSourceHttpBindings<M extends RetainedCreatorContentMode
 const fail=(code:string,status:number,message:string):never=>{throw new SourceFileUploadError(code,status,message);};
 const string=(value:unknown,field:string)=>typeof value==='string'&&value?value:fail('invalid_input',400,`${field} is required.`);
 function contextValid<M extends RetainedCreatorContentModels,F extends RetainedSourceFile>(context:RetainedSourceHttpContext<M,F>){
- if(!context?.files||!context.uploads||typeof context.storage?.openReadStream!=='function'||!context.bucket||typeof context.file!=='function'||!Number.isSafeInteger(context.maximumUploadBytes)||context.maximumUploadBytes<1||context.maximumUploadBytes>5*1024**3)throw Error('Retained source HTTP requires actual scoped files, owned uploads, versioned streams and a bounded byte allowance.');
+ if(!context?.files||!context.uploads||typeof context.storage?.openReadStream!=='function'||!context.bucket||typeof context.file!=='function'||!Number.isSafeInteger(context.maximumUploadBytes)||context.maximumUploadBytes<1||context.localMediaDirectory!==undefined&&(typeof context.localMediaDirectory!=='string'||!context.localMediaDirectory.trim())||!context.localMediaDirectory&&context.maximumUploadBytes>5*1024**3)throw Error('Retained source HTTP requires actual scoped files, owned uploads, versioned streams and a bounded byte allowance.');
  if(Object.entries(context.files.scope).some(([name,value])=>(context.uploads.scope as unknown as Record<string,string>)[name]!==value))throw Error('Original metadata and upload journal scopes must match.');
 }
 /** Metadata-only intake. Safe inside stageUpload's accepting transaction: this
@@ -45,7 +51,7 @@ export async function prepareRetainedSourceFile<M extends RetainedCreatorContent
  contextValid(context);const checksum=string(input.checksumSha256,'checksumSha256');
  if(!/^[a-f0-9]{64}$/.test(checksum)||!Number.isSafeInteger(input.sizeBytes)||Number(input.sizeBytes)<1||Number(input.sizeBytes)>context.maximumUploadBytes)fail('invalid_input',400,'Choose a bounded original and its exact SHA-256 checksum.');
  const actor=request.session.subject.id,scope=context.files.scope;
- return prepareSourceFileIntake(context.files,{tenantId:scope.tenantId,externalContentMaxBytes:context.maximumUploadBytes},{creatorId:scope.creatorId,originalFilename:input.originalFilename,mimeType:input.mimeType,sizeBytes:input.sizeBytes,checksumSha256:checksum,...(typeof input.publishingWorkId==='string'?{publishingWorkId:input.publishingWorkId}:{}),fileId},await context.files.captureSourceAccess(actor),async()=>{throw Error('Metadata-only original staging cannot query physical storage.');},{originalCreatorPrefix:()=>sourceFileOriginalCreatorPrefix(scope),file:value=>context.file(value)});
+ return prepareSourceFileIntake(context.files,{tenantId:scope.tenantId,externalContentMaxBytes:context.maximumUploadBytes,...(context.localMediaDirectory?{localMediaDirectory:context.localMediaDirectory}:{})},{creatorId:scope.creatorId,originalFilename:input.originalFilename,mimeType:input.mimeType,sizeBytes:input.sizeBytes,checksumSha256:checksum,...(typeof input.publishingWorkId==='string'?{publishingWorkId:input.publishingWorkId}:{}),fileId},await context.files.captureSourceAccess(actor),async()=>{throw Error('Metadata-only original staging cannot query physical storage.');},{originalCreatorPrefix:()=>sourceFileOriginalCreatorPrefix(scope),file:value=>context.file(value)});
 }
 /** Call only after the source/workflow transaction has committed. The actual
  * upload journal then fences quota, provider capability, actor and source. */
@@ -79,8 +85,8 @@ function matchReceipt(file:RetainedSourceFile,object:StoredObject,bucket:string)
 export function createRetainedSourceFileNodeHandler<M extends RetainedCreatorContentModels,F extends RetainedSourceFile>(bindings:RetainedSourceHttpBindings<M,F>,authenticate:(request:IncomingMessage)=>Promise<AuthenticatedSession>,options:{publicBaseUrl:string;maxJsonBodyBytes?:number;maxProxyUploadBytes?:number}){
  for(const name of ['resolve','listCreators','verifyStorage','checkAccess'] as const)if(typeof bindings?.[name]!=='function')throw Error('Retained source HTTP requires actual authority, safety and storage bindings.');
  if(typeof authenticate!=='function')throw Error('Retained source HTTP requires verified sessions.');
- const maximumJson=options.maxJsonBodyBytes??32*1024,maximumProxy=options.maxProxyUploadBytes??64*1024*1024;
- if(!Number.isSafeInteger(maximumJson)||maximumJson<1||maximumJson>1024*1024||!Number.isSafeInteger(maximumProxy)||maximumProxy<1||maximumProxy>128*1024*1024)throw Error('Retained source HTTP requires bounded JSON and local transfer sizes.');
+ const maximumJson=options.maxJsonBodyBytes??32*1024,maximumProxy=options.maxProxyUploadBytes??bindings.maximumProxyUploadBytes??64*1024*1024;
+ if(!Number.isSafeInteger(maximumJson)||maximumJson<1||maximumJson>1024*1024||!Number.isSafeInteger(maximumProxy)||maximumProxy<1)throw Error('Retained source HTTP requires bounded JSON and local transfer sizes.');
  const access=async(request:RetainedSourceHttpRequest,context:RetainedSourceHttpContext<M,F>,operation:RetainedSourceOperation,file?:F)=>{
   contextValid(context);if(!await context.files.authorizeActor(request.session.subject.id,operation==='list'||operation==='download'?'read':'edit'))fail('creator_access_denied',403,'Current Creator access is required.');
   await bindings.checkAccess(request,{context,operation,file});
@@ -126,9 +132,9 @@ export function createRetainedSourceFileNodeHandler<M extends RetainedCreatorCon
    }
    if(action==='local-upload'){
     if(incoming.headers['content-type']?.split(';')[0]!=='application/octet-stream')fail('invalid_upload_type',415,'The local original transfer requires application/octet-stream.');
-    if(!file!.sizeBytes||file!.sizeBytes>maximumProxy)fail('direct_upload_required',413,'This original requires a direct storage upload.');
+    if(!file!.sizeBytes||file!.sizeBytes>Math.min(maximumProxy,context.maximumUploadBytes))fail('direct_upload_required',413,'This original exceeds the configured local transfer allowance.');
     if(incoming.headers['content-length']!==undefined&&Number(incoming.headers['content-length'])!==file!.sizeBytes)fail('upload_content_conflict',409,'Original transfer size differs from the prepared upload.');
-    await context.uploads.accept({actorId:session.subject.id,fileId:fileId!,body:await bodyBytes(incoming,file!.sizeBytes!)});response.statusCode=204;response.end();return true;
+    await context.uploads.acceptStream({actorId:session.subject.id,fileId:fileId!,body:incoming});response.statusCode=204;response.end();return true;
    }
    if(action==='complete'){
     const result=await context.uploads.complete({actorId:session.subject.id,fileId:fileId!});

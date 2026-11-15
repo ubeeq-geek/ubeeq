@@ -1,4 +1,7 @@
+import {removeOwnedLocalVersion} from './owned-version-removal.js';
+import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
 import {LocalCustomerIdentities} from './customer-identities.js';
+import {LocalUploadStreamCustody} from './upload-stream-custody.js';
 import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
@@ -26,7 +29,7 @@ import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationChec
 import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type RepositorySnapshot, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
-import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
+import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadContentStreamAdapter, type UploadStreamAcceptance, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
@@ -41,6 +44,7 @@ export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
   private readonly transactionContext = new AsyncLocalStorage<LocalTransactionState>();
   private owner?: LocalTransactionState;
+  private synchronousTransaction=false;
   private transactionTail: Promise<void> = Promise.resolve();
 
   close(): void { this.database.close(); }
@@ -83,7 +87,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "023-customer-password-effects"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "022-upload-stream-custody", "023-customer-password-effects"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -117,6 +121,11 @@ export class LocalSqliteDatabase {
     if(context.guards.has(key)){context.rollbackOnly=true;throw new Error('A transaction cannot write a guarded item.');}
     context.writes.add(key);
   }
+  /** Physical provider effects cannot borrow a domain/Raw transaction whose
+   * rollback could erase their permanent custody/removal fence. */
+  assertOutsideProviderTransaction():void {
+    if(this.transactionContext.getStore()||this.owner||this.synchronousTransaction)throw new Error('Physical provider effects must run outside an active Local transaction.');
+  }
   transactionSync<T>(operation: () => T): T {
     const inherited = this.transactionContext.getStore();
     if (inherited) {
@@ -124,13 +133,14 @@ export class LocalSqliteDatabase {
       try { return operation(); }
       catch (error) { inherited.rollbackOnly = true; throw error; }
     }
-    if (this.owner) throw new Error('SQLite connection is owned by another transaction.');
-    this.database.exec('BEGIN IMMEDIATE');
+    if (this.owner||this.synchronousTransaction) throw new Error('SQLite connection is owned by another transaction.');
+    this.database.exec('BEGIN IMMEDIATE');this.synchronousTransaction=true;
     try {
       const result = operation();
       this.database.exec('COMMIT');
       return result;
     } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+    finally{this.synchronousTransaction=false;}
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
@@ -310,10 +320,13 @@ export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqReposi
   integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), instanceOperators: repository(local, "instanceOperators"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
 });
 
-export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
+export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, UploadContentStreamAdapter, DeliveryAdapter {
+  removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedLocalVersion(this.local,input);}
+  private readonly uploadCustody:LocalUploadStreamCustody;
   constructor(private readonly local: LocalSqliteDatabase) {
     this.local.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_upload_completions (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, object_payload TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','completed')))");
     this.local.database.exec('CREATE TABLE IF NOT EXISTS ubeeq_upload_seals (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, proof_id TEXT NOT NULL, closed_at TEXT NOT NULL)');
+    this.uploadCustody=new LocalUploadStreamCustody(local);
   }
   private sameUploadObject(a:StoredObject,b:StoredObject):boolean {
     const facts=(o:StoredObject)=>[o.bucket,o.key,o.versionId??null,o.contentType,o.byteLength,o.checksum??null,o.scope];
@@ -348,7 +361,7 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
     const path = this.objectPath(input); return { object: parse<StoredObject>(readFileSync(`${path}.json`, "utf8")), body: readFileSync(path) };
   }
   async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
-    if(input.bucket!==this.local.configuration.cellId||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(input.versionId??''))throw Error('An exact local object version is required.');
+    if(!input.bucket||Buffer.byteLength(input.bucket)>255||/[\\/\r\n\u0000]/.test(input.bucket)||['.','..'].includes(input.bucket)||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(input.versionId??''))throw Error('An exact local object bucket/version is required.');
     const match=input.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//);if(!match||match[1]!==this.local.configuration.cellId)throw Error('Original stream is outside its cell.');
     requireCreatorScopedObject(input.key,{cellId:match[1],creatorId:match[2]});
     const root=realpathSync(resolve(this.local.configuration.dataDirectory,'objects',input.bucket)),path=resolve(root,input.key,input.versionId);
@@ -374,99 +387,16 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
     if(!this.sameUploadObject(parse<StoredObject>(saved.object_payload),input.object) || saved.expires_at !== input.expiresAt) throw new Error("Upload initiation idempotency conflict.");
     return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
   }
-  async accept(input: UploadAcceptance): Promise<void> { const row = this.local.database.prepare("SELECT cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { cell_id: string; creator_id: string; expires_at: string; expected_checksum?: string; expected_byte_length: number; operation: string } | undefined; if (!row || row.cell_id !== input.cellId || row.creator_id !== input.creatorId || row.operation !== input.operation) throw new Error("Upload scope does not match the authenticated creator and cell."); if (Date.parse(row.expires_at) <= Date.now()) throw new Error("Upload session has expired."); if (input.body.byteLength !== row.expected_byte_length || (row.expected_checksum && digest(input.body) !== row.expected_checksum)) throw new Error("Upload content does not match the declared size or checksum."); this.local.database.prepare("UPDATE ubeeq_uploads SET body = ? WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.body, input.uploadId, input.cellId, input.creatorId); }
-  async abort(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void> {
-    const completion = this.local.database.prepare("SELECT cell_id, creator_id, state FROM ubeeq_upload_completions WHERE id=?").get(input.uploadId) as { cell_id:string; creator_id:string; state:string } | undefined;
-    if (completion?.cell_id === input.cellId && completion.creator_id === input.creatorId) {
-      if (completion.state === 'completed') return;
-      throw new Error("A prepared physical upload requires reconciliation before abort.");
-    }
-    this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.uploadId, input.cellId, input.creatorId);
+  async accept(input:UploadAcceptance):Promise<void>{
+    // Byte callers share the same custody/receipt path; new content is never
+    // duplicated into SQLite BLOBs. The exact stream verifier remains mandatory.
+    await this.acceptStream({...input,body:(async function*(){yield input.body;})()});
   }
-  private completion(input: UploadCompletion): { object:StoredObject; state:string } | undefined {
-    const row = this.local.database.prepare("SELECT cell_id, creator_id, object_payload, state FROM ubeeq_upload_completions WHERE id=?").get(input.uploadId) as { cell_id:string; creator_id:string; object_payload:string; state:string } | undefined;
-    if (!row) return undefined;
-    if (row.cell_id !== input.cellId || row.creator_id !== input.creatorId || input.cellId !== this.local.configuration.cellId) throw new Error("Upload completion scope does not match.");
-    const object = parse<StoredObject>(row.object_payload);
-    requireCreatorScopedObject(object.key,input);
-    if (!object.versionId || object.checksum !== input.checksum || object.byteLength !== input.byteLength || !['prepared','completed'].includes(row.state)) throw new Error("Upload completion evidence conflicts.");
-    return {object,state:row.state};
-  }
-  private finishCompletion(input: UploadCompletion, object: StoredObject): StoredObject {
-    const path = this.objectPath(object), body = readFileSync(path);
-    if (body.byteLength !== object.byteLength || digest(body) !== object.checksum) throw new Error("Physical upload completion requires reconciliation.");
-    const writtenAt=statSync(path).mtime.toISOString(),completed={...object,writtenAt};
-    if(object.writtenAt && object.writtenAt!==writtenAt)throw new Error('Physical upload write time requires reconciliation.');
-    try { writeFileSync(`${path}.json`,json(completed),{flag:'wx',mode:0o600}); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    const metadata=parse<StoredObject>(readFileSync(`${path}.json`,'utf8'));
-    if (!this.sameUploadObject(metadata,object) || metadata.writtenAt && metadata.writtenAt!==writtenAt) throw new Error("Physical upload metadata conflicts.");
-    this.local.database.exec('BEGIN IMMEDIATE');
-    try {
-      const current = this.completion(input);
-      if (!current || !this.sameUploadObject(current.object,object)) throw new Error("Upload completion receipt disappeared.");
-      this.local.database.prepare("UPDATE ubeeq_upload_completions SET state='completed',object_payload=? WHERE id=? AND cell_id=? AND creator_id=?").run(json(completed),input.uploadId,input.cellId,input.creatorId);
-      this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id=? AND cell_id=? AND creator_id=?").run(input.uploadId,input.cellId,input.creatorId);
-      this.local.database.exec('COMMIT');
-    } catch (error) { this.local.database.exec('ROLLBACK'); throw error; }
-    return completed;
-  }
-  async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
-    const saved = this.completion(input);
-    if (!saved) return undefined;
-    const path = this.objectPath(saved.object);
-    try { readFileSync(path); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' && saved.state === 'prepared') return undefined; throw error; }
-    return this.finishCompletion(input,saved.object);
-  }
-  async complete(input: UploadCompletion): Promise<StoredObject> {
-    if (this.completion(input)?.state === 'completed') throw new Error("Upload content has already completed; recover its receipt instead.");
-    const row = this.local.database.prepare("SELECT object_payload, body, cell_id, creator_id FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { object_payload?:string; body?:Uint8Array; cell_id:string; creator_id:string } | undefined;
-    if (!row?.object_payload || !row.body) throw new Error("Upload content has not been received.");
-    const requested = parse<StoredObject>(row.object_payload);
-    requireCreatorScopedObject(requested.key,input);
-    if (row.cell_id !== input.cellId || row.creator_id !== input.creatorId || input.cellId !== this.local.configuration.cellId || row.body.byteLength !== input.byteLength || digest(row.body) !== input.checksum) throw new Error("Upload scope, checksum or length does not match.");
-    const {writtenAt:_untrusted,...source}=requested;
-    const object = {...source,checksum:input.checksum,byteLength:input.byteLength,versionId:`upload-${input.uploadId}`};
-    this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_upload_completions(id,cell_id,creator_id,object_payload,state) VALUES(?,?,?,?,'prepared')").run(input.uploadId,input.cellId,input.creatorId,json(object));
-    const saved = this.completion(input);
-    if (!saved || !this.sameUploadObject(saved.object,object)) throw new Error("Upload completion intent conflicts.");
-    const path = this.objectPath(object); mkdirSync(resolve(path,'..'),{recursive:true});
-    try { writeFileSync(path,row.body,{flag:'wx',mode:0o600}); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
-    return this.finishCompletion(input,object);
-  }
-  async seal(input: UploadSealInput): Promise<UploadSealResult> {
-    if(input.cellId!==this.local.configuration.cellId)throw new Error('Upload seal is not scoped to this cell.');
-    for(let attempt=0;attempt<3;attempt++){
-      const sealed=this.local.database.prepare('SELECT cell_id,creator_id,proof_id,closed_at FROM ubeeq_upload_seals WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;proof_id:string;closed_at:string} | undefined;
-      if(sealed){
-        if(sealed.cell_id!==input.cellId || sealed.creator_id!==input.creatorId)throw new Error('Upload seal scope does not match.');
-        return {state:'sealed',proofId:sealed.proof_id,closedAt:sealed.closed_at};
-      }
-      const receipt=this.local.database.prepare('SELECT cell_id,creator_id,object_payload FROM ubeeq_upload_completions WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;object_payload:string} | undefined;
-      if(receipt){
-        if(receipt.cell_id!==input.cellId || receipt.creator_id!==input.creatorId)throw new Error('Upload seal scope does not match.');
-        const object=parse<StoredObject>(receipt.object_payload),completion={...input,checksum:object.checksum!,byteLength:object.byteLength};
-        const recovered=await this.recoverCompletion(completion);
-        return {state:'completed',object:recovered ?? await this.complete(completion)};
-      }
-      const row=this.local.database.prepare('SELECT cell_id,creator_id,body FROM ubeeq_uploads WHERE id=?').get(input.uploadId) as {cell_id:string;creator_id:string;body:Uint8Array|null} | undefined;
-      if(!row || row.cell_id!==input.cellId || row.creator_id!==input.creatorId)throw new Error('Upload seal requires its owned provider session.');
-      if(row.body)return {state:'completed',object:await this.complete({...input,checksum:digest(row.body),byteLength:row.body.byteLength})};
-      const closed=this.local.transactionSync(()=>{
-        if(this.local.database.prepare('SELECT id FROM ubeeq_upload_completions WHERE id=?').get(input.uploadId))return undefined;
-        const current=this.local.database.prepare('SELECT body,cell_id,creator_id FROM ubeeq_uploads WHERE id=?').get(input.uploadId) as typeof row;
-        if(!current || current.body || current.cell_id!==input.cellId || current.creator_id!==input.creatorId)return undefined;
-        const closedAt=now(),proofId=digest(json([input.cellId,input.creatorId,input.uploadId,closedAt]));
-        this.local.database.prepare('INSERT INTO ubeeq_upload_seals(id,cell_id,creator_id,proof_id,closed_at) VALUES(?,?,?,?,?)').run(input.uploadId,input.cellId,input.creatorId,proofId,closedAt);
-        this.local.database.prepare('DELETE FROM ubeeq_uploads WHERE id=? AND cell_id=? AND creator_id=?').run(input.uploadId,input.cellId,input.creatorId);
-        return {state:'sealed' as const,proofId,closedAt};
-      });
-      if(closed)return closed;
-    }
-    throw new Error('Upload seal requires reconciliation.');
-  }
+  async acceptStream(input:UploadStreamAcceptance):Promise<void>{return this.uploadCustody.acceptStream(input);}
+  async abort(input:{uploadId:string;cellId:string;creatorId:string}):Promise<void>{return this.uploadCustody.abort(input);}
+  async complete(input:UploadCompletion):Promise<StoredObject>{return this.uploadCustody.complete(input);}
+  async recoverCompletion(input:UploadCompletion):Promise<StoredObject|undefined>{return this.uploadCustody.recoverCompletion(input);}
+  async seal(input:UploadSealInput):Promise<UploadSealResult>{return this.uploadCustody.seal(input);}
   async issue(request: { object: Pick<StoredObject, "bucket" | "key" | "versionId" | "scope">; expiresAt: string; disposition?: "inline" | "attachment" }): Promise<{ url: string; expiresAt: string }> {
     const match = request.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match || match[1] !== this.local.configuration.cellId) throw new Error("Delivery object is not scoped to this cell.");
     if (request.object.scope === "public" && !request.object.key.includes("/renditions/")) throw new Error("Only rendition objects may receive public cacheable delivery tokens.");
@@ -575,7 +505,7 @@ export class LocalFederationKey implements FederationSigner, FederationSignature
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
-    return this.enqueueSync(input);
+    return this.local.transaction(async()=>this.enqueueSync(input));
   }
   /** Joins an already-owned synchronous SQLite transaction without yielding. */
   enqueueSync<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): DurableJob<T> {
@@ -592,35 +522,39 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   }
   async lease<T>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<T> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const timestamp = now();
-    // Recovery is scoped to this worker's cell. Crashed attempts consume the same
-    // retry budget as reported failures, rather than being reclaimed forever.
-    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'dead_lettered', lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ? AND attempt >= max_attempts")
-      .run(json({ code: "lease_attempts_exhausted", message: "Worker leases expired through the configured attempt budget." }), timestamp, input.cellId, timestamp);
-    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ?")
-      .run(timestamp, timestamp, input.cellId, timestamp);
-    const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
-    const leaseToken = randomUUID(), expiresAt = new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString();
-    const row = this.local.database.prepare(`UPDATE ubeeq_jobs SET state = 'leased', attempt = attempt + 1, lease_token = ?, lease_expires_at = ?, updated_at = ?
-      WHERE id = (SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1)
-      AND state IN ('queued', 'retry_scheduled') RETURNING *`)
-      .get(leaseToken, expiresAt, timestamp, input.cellId, timestamp, ...(input.types ?? [])) as Record<string, unknown> | undefined;
-    return row ? { job: this.row(row) as DurableJob<T>, leaseToken } : undefined;
+    return this.local.transaction(async()=>{
+      const timestamp = now();
+      // Recovery is scoped to this worker's cell. Crashed attempts consume the same
+      // retry budget as reported failures, rather than being reclaimed forever.
+      this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'dead_lettered', lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ? AND attempt >= max_attempts")
+        .run(json({ code: "lease_attempts_exhausted", message: "Worker leases expired through the configured attempt budget." }), timestamp, input.cellId, timestamp);
+      this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ?")
+        .run(timestamp, timestamp, input.cellId, timestamp);
+      const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
+      const leaseToken = randomUUID(), expiresAt = new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString();
+      const row = this.local.database.prepare(`UPDATE ubeeq_jobs SET state = 'leased', attempt = attempt + 1, lease_token = ?, lease_expires_at = ?, updated_at = ?
+        WHERE id = (SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1)
+        AND state IN ('queued', 'retry_scheduled') RETURNING *`)
+        .get(leaseToken, expiresAt, timestamp, input.cellId, timestamp, ...(input.types ?? [])) as Record<string, unknown> | undefined;
+      return row ? { job: this.row(row) as DurableJob<T>, leaseToken } : undefined;
+    });
   }
-  async complete(input: { id: string; leaseToken: string }): Promise<void> { this.transition(input.id, input.leaseToken, "completed"); }
-  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt); }
-  async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { this.transition(input.id, input.leaseToken, "dead_lettered", input.error); }
-  async cancel(input: { id: string; reason?: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id); }
+  async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "completed");}); }
+  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt);}); }
+  async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "dead_lettered", input.error);}); }
+  async cancel(input: { id: string; reason?: string }): Promise<void> { await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id);}); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> {
-    const row = this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'queued', available_at = ?, lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state IN ('retry_scheduled', 'dead_lettered') RETURNING *")
-      .get(input.availableAt ?? now(), now(), input.id) as Record<string, unknown> | undefined;
-    if (!row) throw new JobRecoveryError();
-    return this.row(row);
+    return this.local.transaction(async()=>{
+      const row = this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'queued', available_at = ?, lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state IN ('retry_scheduled', 'dead_lettered') RETURNING *")
+        .get(input.availableAt ?? now(), now(), input.id) as Record<string, unknown> | undefined;
+      if (!row) throw new JobRecoveryError();
+      return this.row(row);
+    });
   }
-  async get(id: string): Promise<DurableJob | undefined> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined; }
-  async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row)); }
+  async get(id: string): Promise<DurableJob | undefined> { return this.local.transaction(async()=>{const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined;}); }
+  async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { return this.local.transaction(async()=>{const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row));}); }
   async schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }
-  async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`); }
+  async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`);}); }
   private row(row: Record<string, unknown>): DurableJob { const cellId = String(row.cell_id); const storedKey = String(row.idempotency_key); return { id: String(row.id), cellId, type: String(row.type), payload: parse(String(row.payload)), idempotencyKey: storedKey.startsWith(`${cellId}:`) ? storedKey.slice(cellId.length + 1) : storedKey, state: row.state as DurableJob["state"], attempt: Number(row.attempt), maxAttempts: Number(row.max_attempts), availableAt: String(row.available_at), leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined, createdAt: String(row.created_at), updatedAt: String(row.updated_at), correlationId: row.correlation_id ? String(row.correlation_id) : undefined, lastError: row.last_error ? parse(String(row.last_error)) : undefined }; }
   private write(job: DurableJob, leaseToken?: string, storedIdempotencyKey = `${job.cellId}:${job.idempotencyKey}`): void { this.local.database.prepare("INSERT INTO ubeeq_jobs (id,cell_id,type,payload,idempotency_key,state,attempt,max_attempts,available_at,lease_token,lease_expires_at,created_at,updated_at,correlation_id,last_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, attempt=excluded.attempt, available_at=excluded.available_at, lease_token=excluded.lease_token, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at, last_error=excluded.last_error").run(job.id, job.cellId, job.type, json(job.payload), storedIdempotencyKey, job.state, job.attempt, job.maxAttempts, job.availableAt, leaseToken ?? null, job.leaseExpiresAt ?? null, job.createdAt, job.updatedAt, job.correlationId ?? null, job.lastError ? json(job.lastError) : null); }
   private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void {

@@ -52,16 +52,18 @@ export class UsageSettlementOutbox {
   async deliver(record: HostRecord): Promise<void> {
     const intent = this.validate(record);
     if (intent.state === 'settled') return;
+    // The real external quota effect stays outside Raw. Only acknowledgement
+    // and conflict observation enter the repository's actual transaction queue.
     await this.quota.recordUsageSettlement(intent.input);
-    try { await this.records.update(record.id, record.revision, { value: { ...record.value, state: 'settled' } }); }
+    try { await this.repositories.transaction(transaction=>this.records.update(record.id, record.revision, { value: { ...record.value, state: 'settled' } },{transaction})); }
     catch (error) {
-      const current = await this.records.get(record.id);
+      const current = await this.repositories.transaction(transaction=>this.records.get(record.id,{transaction}));
       if (!current || this.validate(current).state !== 'settled' || (current.value as unknown as Intent).fingerprint !== intent.fingerprint) throw error;
     }
   }
   async drain(limit = 25): Promise<number> {
     let settled = 0;
-    for await (const record of repositoryItems(request => this.records.list(request))) {
+    for await (const record of repositoryItems(request => this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
       if (record.instanceId !== this.instanceId || record.homeCellId !== this.cellId || record.namespace !== namespace || record.value.state !== 'pending') continue;
       await this.deliver(record);
       if (++settled >= limit) break;
@@ -71,7 +73,7 @@ export class UsageSettlementOutbox {
   /** Recover expired final leases/cancellations even when the processor never reached its catch block. */
   async recoverTerminal(jobs: JobQueue, limit = 25): Promise<number> {
     let recovered = 0;
-    for await (const row of repositoryItems(request => this.records.list(request))) {
+    for await (const row of repositoryItems(request => this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
       if (row.instanceId !== this.instanceId || row.homeCellId !== this.cellId || row.namespace !== reservationNamespace || row.value.state !== 'pending') continue;
       const intent = row.value as unknown as ReservationIntent;
       if (!intent.input?.idempotencyKey || row.id !== this.reservationId(row.scopeId, intent.input.idempotencyKey) || intent.input.creatorId !== row.scopeId || row.key !== intent.input.idempotencyKey) throw new Error('Invalid processing reservation intent.');

@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
-import {cellScopedObjectKey,requireCreatorScopedObject,type StoredObject,type UploadAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
+import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {RepositoryRetainedSourceFiles,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
 import {RetainedRepositoryError} from './retained-repository-store.js';
@@ -38,7 +38,7 @@ export interface SourceFileCompletionPreparation {
 /** Supplied only from the immutable actual upload journal, including repair. */
 export interface SourceFileCompletionContext {readonly actorId:string}
 export interface SourceFileUploadOptions<M extends RetainedCreatorContentModels,F extends RetainedSourceFile> {
-  repositories:UbeeqRepositories;uploads:UploadAdapter&Partial<UploadContentAdapter>;quota:UsageQuotaPort;
+  repositories:UbeeqRepositories;uploads:UploadAdapter&Partial<UploadContentAdapter>&Partial<UploadContentStreamAdapter>;quota:UsageQuotaPort;
   files:RepositoryRetainedSourceFiles<M,F>;
   /** Fixed private provider bucket, never a client-selected bucket. */
   bucket:string;now?:()=>Date;expiresInMilliseconds?:number;
@@ -205,6 +205,28 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     await this.options.uploads.accept({...this.completion(value),body:input.body,operation:'upload_content'});
     // A cancellation racing this await is resolved by seal/recover; accepted
     // bytes remain owned and charged rather than silently discarded.
+  }
+  /** Stream through the exact already-issued capability. No new reservation or
+   * receipt is invented here; normal complete/recovery/seal settles custody. */
+  async acceptStream(input:{actorId:string;fileId:string;body:AsyncIterable<Uint8Array>}):Promise<void>{
+    this.outsideTransaction();
+    const value=await this.files.asActor(input.actorId,async()=>{
+      await this.files.captureSourceAccess(input.actorId);const value=this.value(await this.read(input.fileId,this.files.transaction()!));this.open(value);
+      const file=await this.file(input.fileId);this.matchFile(value,file);
+      if(value.actorId!==input.actorId||value.phase!=='issued'||file.uploadState!=='pending'||value.expiresAt<=this.now().toISOString())throw new SourceFileUploadError('upload_not_pending',409,'This original has no active upload capability.');return value;
+    });
+    if(!value.provider)throw new SourceFileUploadError('upload_not_pending',409,'This original has no persisted provider capability.');
+    async function* verifiedBody(){
+      let size=0;const checksum=createHash('sha256');
+      for await(const chunk of input.body){
+        if(!(chunk instanceof Uint8Array)||chunk.byteLength>value.object.byteLength-size)throw new SourceFileUploadError('upload_content_conflict',409,'Original bytes exceed the prepared size.');
+        size+=chunk.byteLength;checksum.update(chunk);yield chunk;
+      }
+      if(size!==value.object.byteLength||checksum.digest('hex')!==value.object.checksum)throw new SourceFileUploadError('upload_content_conflict',409,'Original bytes differ from the prepared size or checksum.');
+    }
+    await writeBoundedUploadStream({uploads:this.options.uploads,upload:structuredClone(value.provider),cellId:this.cellId,creatorId:value.creatorId,openBody:verifiedBody});
+    // A cancellation racing transfer is settled by the same permanent seal and
+    // recoverable physical receipt. Accepted actual bytes remain chargeable.
   }
   private async writePhysical(row:HostRecord,object:StoredObject,ready:boolean):Promise<HostRecord>{
     this.proveObject(this.value(row),object);

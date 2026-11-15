@@ -1,3 +1,5 @@
+import {removeOwnedS3Version} from './owned-version-removal.js';
+import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
 import {cognitoUserBySubject} from './cognito-subject.js';
 export {applyCustomerIssuedScope,createCustomerIssuedScopeHandler} from './customer-issued-scope.js';
 import {CognitoCustomerIdentities} from './customer-identities.js';
@@ -300,6 +302,7 @@ export class AwsMigrationControlWorker {
 }
 
 export class S3ObjectStorage implements ObjectStorage {
+  removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedS3Version(this.s3,{bucket:this.bucket,cellId:this.cellId,keyPrefix:this.keyPrefix},input);}
   constructor(private readonly s3: AwsCommandClient, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
   private objectKey(key: string): string { return this.keyPrefix && !key.startsWith(`${this.keyPrefix}/`) ? `${this.keyPrefix}/${key}` : key; }
   private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }

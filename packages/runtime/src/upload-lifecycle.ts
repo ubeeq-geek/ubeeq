@@ -41,6 +41,13 @@ export class UploadLifecycle {
     if(accounting && (!uploads.seal || !accounting.quota.closeStorageReservation))throw new Error('Physical upload closure and terminal storage reservations are required.');
     this.records = repositories.hostRecords;
   }
+  /** Every outside repository operation participates in the real adapter queue.
+   * The callback contains only its repository call: provider/queue/quota I/O is
+   * deliberately outside these short transactions. Explicit accepting blocks
+   * below retain their original passed transaction and all CAS/Work guards. */
+  private getRecord(id:string){return this.repositories.transaction(transaction=>this.records.get(id,{transaction}));}
+  private createRecord(record:Omit<HostRecord,'revision'|'createdAt'|'updatedAt'>){return this.repositories.transaction(transaction=>this.records.create(record,{transaction}));}
+  private updateRecord(id:string,revision:number,change:Partial<Omit<HostRecord,'id'|'revision'|'createdAt'|'updatedAt'>>){return this.repositories.transaction(transaction=>this.records.update(id,revision,change,{transaction}));}
   private id(uploadId: string) { return `upload-${hash([this.instanceId,namespace,uploadId])}`; }
   private value(row: HostRecord): UploadIntent {
     const value = row.value as unknown as UploadIntent;
@@ -72,13 +79,13 @@ export class UploadLifecycle {
     for(let attempt=0;attempt<5;attempt++){
       row=await this.read(value.uploadId);const current=this.value(row);this.open(current);value=current;
       if(current.accounting?.state==='reserved')return row;
-      try{return await this.records.update(row.id,row.revision,{value:{...row.value,accounting:{...value.accounting,state:'reserved'}}});}
+      try{return await this.updateRecord(row.id,row.revision,{value:{...row.value,accounting:{...value.accounting,state:'reserved'}}});}
       catch(error){if(!conflict(error) || attempt===4)throw error;}
     }
     throw new Error('Upload reservation acknowledgement requires reconciliation.');
   }
   private async read(uploadId: string, work?: WorkRecord): Promise<HostRecord> {
-    const row = await this.records.get(this.id(uploadId));
+    const row = await this.getRecord(this.id(uploadId));
     if (!row) throw new UploadLifecycleError('upload_not_found',404,'Upload session was not found.');
     const value = this.value(row);
     if (work && (value.workId !== work.id || value.creatorId !== work.creatorId || work.instanceId !== this.instanceId || work.homeCellId !== this.cellId)) throw new UploadLifecycleError('upload_scope_conflict',409,'Upload belongs to a different Work or Creator.');
@@ -94,13 +101,13 @@ export class UploadLifecycle {
     if (!expected.mimeType?.trim() || !Number.isSafeInteger(expected.byteLength) || expected.byteLength < 0 || expected.checksum !== undefined && !/^[a-f0-9]{64}$/.test(expected.checksum)
       || idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyKey))) throw new UploadLifecycleError('invalid_upload',400,'Upload type, size, checksum or request identity is invalid.');
     const uploadId = idempotencyKey ? hash([this.instanceId,work.creatorId,idempotencyKey]) : randomUUID(), requestHash = hash([work.id,work.creatorId,expected]);
-    let row = await this.records.get(this.id(uploadId));
+    let row = await this.getRecord(this.id(uploadId));
     if (!row) {
       const value: UploadIntent = {schemaVersion:1,uploadId,actorId,workId:work.id,creatorId:work.creatorId,expected:{...expected},requestHash,
         expiresAt:new Date(Date.now()+15*60_000).toISOString(),object:{bucket:this.cellId,key:cellScopedObjectKey({cellId:this.cellId,creatorId:work.creatorId,kind:'uploads',objectId:uploadId}),contentType:expected.mimeType,byteLength:expected.byteLength,...(expected.checksum ? {checksum:expected.checksum} : {}),scope:'private'},
         phase:'prepared',assetId:`asset-${hash([this.instanceId,uploadId])}`,queueState:'pending',...(this.accounting ? {accounting:{key:this.usageKey(uploadId),state:'pending' as const}} : {})};
-      try { row = await this.records.create({id:this.id(uploadId),instanceId:this.instanceId,namespace,scopeId:work.creatorId,key:uploadId,homeCellId:work.homeCellId,dataHomeRegion:work.dataHomeRegion,dataHomeAssignedAt:work.dataHomeAssignedAt,routingRevision:work.routingRevision,value:value as unknown as Record<string,unknown>}); }
-      catch (error) { row = await this.records.get(this.id(uploadId)); if (!row) throw error; }
+      try { row = await this.createRecord({id:this.id(uploadId),instanceId:this.instanceId,namespace,scopeId:work.creatorId,key:uploadId,homeCellId:work.homeCellId,dataHomeRegion:work.dataHomeRegion,dataHomeAssignedAt:work.dataHomeAssignedAt,routingRevision:work.routingRevision,value:value as unknown as Record<string,unknown>}); }
+      catch (error) { row = await this.getRecord(this.id(uploadId)); if (!row) throw error; }
     }
     let value = this.value(row);
     if (value.requestHash !== requestHash || value.actorId !== actorId) throw new UploadLifecycleError('upload_idempotency_conflict',409,'Upload request identity already belongs to different input.');
@@ -117,7 +124,7 @@ export class UploadLifecycle {
       row = await this.read(uploadId,work); value = this.value(row);
       this.open(value);
       if (value.provider) return this.response(value);
-      try { const saved = await this.records.update(row.id,row.revision,{value:{...row.value,provider,phase:'issued'}}); return this.response(this.value(saved)); }
+      try { const saved = await this.updateRecord(row.id,row.revision,{value:{...row.value,provider,phase:'issued'}}); return this.response(this.value(saved)); }
       catch (error) { const saved = this.value(await this.read(uploadId,work)); if (saved.provider) return this.response(saved); if (!conflict(error) || attempt===4) throw error; }
     }
     throw new Error('Upload initiation contention.');
@@ -151,7 +158,7 @@ export class UploadLifecycle {
     if (input.byteLength !== value.expected.byteLength || value.expected.checksum && input.checksum !== value.expected.checksum) throw new UploadLifecycleError('upload_completion_conflict',409,'Upload completion differs from its requested size or checksum.');
     for (let attempt=0;!value.completion && attempt<5;attempt++) {
       if(!recoveredObject)this.open(value);
-      try { row = await this.records.update(row.id,row.revision,{value:{...row.value,completion:{...input}}}); }
+      try { row = await this.updateRecord(row.id,row.revision,{value:{...row.value,completion:{...input}}}); }
       catch (error) {
         const latest=await this.read(uploadId,work);
         if (!this.value(latest).completion && (!conflict(error) || attempt===4)) throw error;
@@ -190,11 +197,11 @@ export class UploadLifecycle {
     }
     row = await this.read(uploadId,work); value = this.value(row);
     if(this.accounting && value.usageIntentId){
-      const intent=await this.records.get(value.usageIntentId);
+      const intent=await this.getRecord(value.usageIntentId);
       if(!intent || intent.scopeId!==value.creatorId || (intent.value.input as {idempotencyKey?:string})?.idempotencyKey!==value.accounting?.key)throw new Error('Upload storage settlement intent requires reconciliation.');
       try{await this.accounting.usageOutbox.deliver(intent);}catch{/* The owned physical effect and settlement intent remain durable. */}
     }
-    const asset = await this.repositories.assets.get(value.assetId);
+    const asset = await this.repositories.transaction(transaction=>this.repositories.assets.get(value.assetId,{transaction}));
     if (!asset || asset.instanceId !== this.instanceId || asset.creatorId !== value.creatorId || asset.workId !== value.workId || asset.homeCellId !== this.cellId || asset.objectVersion !== value.completedObject!.versionId) throw new Error('Completed upload asset requires reconciliation.');
     let job:DurableJob | null = null;
     try { job = await this.ensureQueue(row); } catch { /* The committed pending intent is independently recoverable. */ }
@@ -207,7 +214,7 @@ export class UploadLifecycle {
       if(!value.accounting || ['completed','sealed','retained'].includes(value.phase))return;
       if(value.phase==='closing')break;
       if(!force && Date.parse(value.expiresAt)>Date.now())return;
-      try{row=await this.records.update(row.id,row.revision,{value:{...row.value,phase:'closing',closingAt:new Date().toISOString()}});value=this.value(row);break;}
+      try{row=await this.updateRecord(row.id,row.revision,{value:{...row.value,phase:'closing',closingAt:new Date().toISOString()}});value=this.value(row);break;}
       catch(error){row=await this.read(value.uploadId);value=this.value(row);if(!conflict(error) || attempt===4)throw error;}
     }
     if(value.phase!=='closing')return;
@@ -217,7 +224,7 @@ export class UploadLifecycle {
       const object=seal.object,completion={checksum:object.checksum!,byteLength:object.byteLength};
       if(!/^[a-f0-9]{64}$/.test(completion.checksum) || value.expected.checksum && value.expected.checksum!==completion.checksum)throw new Error('Recovered original checksum requires reconciliation.');
       this.proveObject({...value,completion},object);
-      const work=await this.repositories.works.get(value.workId);
+      const work=await this.repositories.transaction(transaction=>this.repositories.works.get(value.workId,{transaction}));
       if(work && work.instanceId===this.instanceId && work.creatorId===value.creatorId && work.status!=='deleted' && (!value.completion || hash(value.completion)===hash(completion))){
         try{await this.completeOwned(value.uploadId,work,value.actorId,completion,value.correlationId,object);return;}
         catch(error){if(!(error instanceof UploadLifecycleError) || error.code!=='upload_work_unavailable')throw error;}
@@ -248,7 +255,7 @@ export class UploadLifecycle {
       });break;}
       catch(error){if(!conflict(error) || attempt===4)throw error;}
     }
-    const saved=this.value(await this.read(value.uploadId)),intent=saved.closureIntentId ? await this.records.get(saved.closureIntentId) : undefined;
+    const saved=this.value(await this.read(value.uploadId)),intent=saved.closureIntentId ? await this.getRecord(saved.closureIntentId) : undefined;
     if(!intent || intent.scopeId!==value.creatorId || (intent.value.input as {idempotencyKey?:string})?.idempotencyKey!==value.accounting!.key)throw new Error('Upload closure intent requires reconciliation.');
     try{await this.accounting.closureOutbox.deliver(intent);}catch{/* Retry the durable proof; never infer a released reservation. */}
   }
@@ -259,21 +266,21 @@ export class UploadLifecycle {
     const value = this.value(row);
     if (value.phase!=='completed') return null;
     if (value.queueState==='queued') { const job=value.jobId ? await this.jobs.get(value.jobId) : undefined; if(job)this.proveJob(value,job); return job??null; }
-    const asset = await this.repositories.assets.get(value.assetId);
+    const asset = await this.repositories.transaction(transaction=>this.repositories.assets.get(value.assetId,{transaction}));
     if (!asset || asset.instanceId !== this.instanceId || asset.creatorId !== value.creatorId || asset.homeCellId !== this.cellId) throw new Error('Upload processing intent requires its owned asset.');
     const job = await this.jobs.enqueue({cellId:this.cellId,type:'asset.process',payload:{assetId:asset.id},idempotencyKey:`asset-process:${asset.id}:${asset.objectVersion}`,maxAttempts:3,...(value.correlationId ? {correlationId:value.correlationId} : {})});
     this.proveJob(value,job);
     for (let attempt=0;attempt<5;attempt++) {
       const current = await this.read(value.uploadId), saved = this.value(current);
       if (saved.queueState==='queued') { if (saved.jobId!==job.id) throw new Error('Upload processing receipt conflicts.'); return job; }
-      try { await this.records.update(current.id,current.revision,{value:{...current.value,queueState:'queued',jobId:job.id}}); return job; }
+      try { await this.updateRecord(current.id,current.revision,{value:{...current.value,queueState:'queued',jobId:job.id}}); return job; }
       catch (error) { if (!conflict(error) || attempt===4) { const latest=this.value(await this.read(value.uploadId)); if(latest.queueState==='queued'&&latest.jobId===job.id)return job; throw error; } }
     }
     throw new Error('Upload queue receipt contention.');
   }
   async repair(limit=25): Promise<number> {
     let count=0, failure:unknown;
-    for await (const row of repositoryItems(request=>this.records.list(request))) {
+    for await (const row of repositoryItems(request=>this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
       if (row.instanceId!==this.instanceId || row.homeCellId!==this.cellId || row.namespace!==namespace) continue;
       const needsQueue=row.value.phase==='completed' && row.value.queueState==='pending';
       const needsClosure=this.accounting && row.value.accounting && (row.value.phase==='closing' || ['prepared','issued'].includes(row.value.phase as string) && Date.parse(row.value.expiresAt as string)<=Date.now());
