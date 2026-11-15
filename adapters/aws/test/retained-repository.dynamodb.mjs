@@ -31,6 +31,17 @@ test('actual DynamoDB retains rich records and coalesces identical Creator guard
  await assert.rejects(f.repositories.works.create({...creatorInput,id:'parallel',creatorId:'creator',title:'Wrong authority',status:'draft'}),{code:'creator_content_authority_conflict'});assert.equal(await f.repositories.works.get('parallel'),undefined);
 });
 
+test('actual DynamoDB creates seeded entities and their cohort once and rolls back a later failed birth step',async t=>{
+ const f=await fixture(t,false),send=f.client.send.bind(f.client);let cohortWrites=0;
+ f.client.send=async(command,...rest)=>{if(command.constructor.name==='TransactWriteCommand')cohortWrites+=command.input.TransactItems.filter(item=>item.Put?.Item?.repository==='hostRecords'&&item.Put.Item.value?.namespace==='retained-creator-content'&&item.Put.Item.value.key==='cohort').length;return send(command,...rest);};
+ const initial=[{kind:'settings',key:'state',value:{tenantId:'tenant',creatorId:'creator',revision:0,presets:[],opaque:{keep:['complete','JSON']}}},{kind:'origin',key:'birth',value:{kind:'actual-birth'}}];
+ await f.repositories.transaction(tx=>createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx,initial));assert.equal(cohortWrites,1);
+ const reopened=retainedStore(f.independent),saved=await reopened.getRetainedEntity('settings','state');assert.deepEqual(saved,initial[0].value);assert.equal((await reopened.getRetainedEntity('origin','birth')).kind,'actual-birth');
+ await reopened.asActor('actor',()=>reopened.putRetainedEntity('settings','state',{...saved,revision:1}));assert.equal((await f.store().getRetainedEntity('settings','state')).revision,1);
+ const failed=await fixture(t,false);await assert.rejects(failed.repositories.transaction(async tx=>{await createRetainedRepositoryCreator(failed.repositories,creatorInput,'tenant',tx,initial);throw Error('Synthetic later lifecycle failure');}),/Synthetic later lifecycle failure/);
+ assert.equal(await failed.repositories.creators.get('creator'),undefined);assert.deepEqual((await failed.repositories.hostRecords.snapshot()).items,[]);
+});
+
 test('different guards and guarded-item writes still poison the whole actual Dynamo transaction',async t=>{
  const f=await fixture(t),repo=f.repositories;
  await assert.rejects(repo.transaction(async transaction=>{

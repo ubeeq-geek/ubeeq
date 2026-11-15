@@ -63,11 +63,23 @@ const requireScope=(scope:RetainedRepositoryScope)=>{if(Object.values(scope).som
 /** Trusted birth hook ONLY, in the actual new-Creator creation transaction.
  * Existing Creators must migrate a complete inventory under a fenced writer.
  * Reads never initialize an absent authority or assume an empty legacy history. */
-export async function createRetainedRepositoryCreator(repositories:UbeeqRepositories,record:Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>,tenantId:string,transaction:PersistenceTransaction):Promise<CreatorRecord>{
+export interface RetainedCreatorBirthEntity {readonly kind:string;readonly key:string;readonly value:Readonly<Record<string,unknown>>}
+/** Initial host entities and the cohort are each created exactly once. This is
+ * genuine birth only, never an existing-Creator adoption or migration shortcut. */
+export async function createRetainedRepositoryCreator(repositories:UbeeqRepositories,record:Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>,tenantId:string,transaction:PersistenceTransaction,initialEntities:readonly RetainedCreatorBirthEntity[]=[]):Promise<CreatorRecord>{
+ record=structuredClone(record);
  const scope={instanceId:record.instanceId,tenantId,creatorId:record.id,cellId:record.homeCellId,region:record.dataHomeRegion};requireScope(scope);
+ if(!Array.isArray(initialEntities))throw invalid();
+ const seen=new Set<string>(),initial=initialEntities.map(entry=>{
+  if(!entry||typeof entry.kind!=='string'||!entry.kind||typeof entry.key!=='string'||!entry.key)throw invalid();
+  const address:Address={category:'entity',kind:entry.kind,key:entry.key},key=addressKey(address),payload=json(entry.value);
+  if(seen.has(key)||'tenantId' in payload&&payload.tenantId!==scope.tenantId||'creatorId' in payload&&payload.creatorId!==scope.creatorId)throw invalid();
+  seen.add(key);return {address,key,payload};
+ });
  if(!repositories.hostRecords?.snapshot || await repositories.creators.get(record.id,{transaction}))throw invalid();
  const creator=await repositories.creators.create({...record,contentAuthority:'retained-v1'},{transaction});
- await repositories.hostRecords.create({id:identity(scope,'cohort'),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key:'cohort',value:cohortValue(scope,[])},{transaction});
+ for(const {address,key,payload}of initial)await repositories.hostRecords.create({id:identity(scope,address),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key,value:{schemaVersion:1,...address,payload}},{transaction});
+ await repositories.hostRecords.create({id:identity(scope,'cohort'),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key:'cohort',value:cohortValue(scope,initial.map(entry=>identity(scope,entry.address)))},{transaction});
  return creator;
 }
 

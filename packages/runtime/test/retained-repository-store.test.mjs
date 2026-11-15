@@ -37,6 +37,32 @@ test('retained birth refuses existing Creators and ordinary repositories cannot 
  const creator=await repo.creators.get('creator');await assert.rejects(repo.creators.update('creator',creator.revision,{contentAuthority:undefined}),{code:'creator_content_authority_conflict'});await assert.rejects(repo.creators.remove('creator',creator.revision),{code:'creator_content_authority_conflict'});
 });
 
+test('genuine birth seeds complete host entities and its cohort once, with normal guarded edits after reopen',async t=>{
+ const f=await fixture(t,false),initial=[{kind:'settings',key:'state',value:{tenantId:'tenant',creatorId:'creator',revision:0,custom:[],opaque:{preserve:['full','JSON']}}},{kind:'host-origin',key:'birth',value:{protocol:'actual-new-creator'}}];
+ const created=await f.repositories.transaction(tx=>createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx,initial));assert.equal(created.revision,1);
+ initial[0].value.opaque.preserve.push('external mutation');
+ const rows=(await f.repositories.hostRecords.list({limit:100})).items;assert.equal(rows.length,3);assert.ok(rows.every(row=>row.revision===1));
+ const reopened=f.reopen(),saved=await reopened.getRetainedEntity('settings','state');assert.deepEqual(saved.opaque,{preserve:['full','JSON']});assert.equal((await reopened.getRetainedEntity('host-origin','birth')).protocol,'actual-new-creator');
+ await reopened.asActor('actor',()=>reopened.putRetainedEntity('settings','state',{...saved,revision:1,custom:['A real later edit']}));assert.equal((await reopened.getRetainedEntity('settings','state')).revision,1);
+ await assert.rejects(f.repositories.transaction(tx=>createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx,initial)),{code:'retained_content_invalid'});
+ assert.deepEqual(await reopened.getRetainedEntity('settings','state'),{...saved,revision:1,custom:['A real later edit']});
+});
+
+test('invalid or duplicate birth entities fail before any identity or cohort write',async t=>{
+ for(const initial of [null,{},[{kind:'',key:'x',value:{}}],[{kind:'x',key:'',value:{}}],[{kind:'x',key:'x',value:[]}],[{kind:'x',key:'x',value:{tenantId:'foreign'}}],[{kind:'x',key:'x',value:{creatorId:'foreign'}}],[{kind:'x',key:'x',value:{}},{kind:'x',key:'x',value:{different:true}}]]){
+  const f=await fixture(t,false);await assert.rejects(f.repositories.transaction(tx=>createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx,initial)),{code:'retained_content_invalid'});assert.deepEqual((await f.repositories.creators.list({limit:100})).items,[]);assert.deepEqual((await f.repositories.hostRecords.list({limit:100})).items,[]);
+ }
+});
+
+test('a failed initial entity or later enclosing intake step rolls back identity and all initial cohort records',async t=>{
+ for(const stage of ['entity','enclosing']){
+  const f=await fixture(t,false),repository=f.repositories.hostRecords,save=repository.create.bind(repository);
+  if(stage==='entity')repository.create=async(row,options)=>{if(row.value?.kind==='second')throw Error('Synthetic initial entity outage');return save(row,options);};
+  try{await assert.rejects(f.repositories.transaction(async tx=>{await createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx,[{kind:'first',key:'state',value:{original:true}},{kind:'second',key:'state',value:{original:true}}]);throw Error('Synthetic later intake outage');}),/Synthetic/);}finally{repository.create=save;}
+  assert.deepEqual((await f.repositories.creators.list({limit:100})).items,[]);assert.deepEqual((await f.repositories.hostRecords.list({limit:100})).items,[]);
+ }
+});
+
 test('legacy content without a cohort is unavailable for migration, never an invented empty history',async t=>{
  const f=await fixture(t,false);await f.repositories.creators.create(creatorInput);await f.repositories.works.create({...creatorInput,id:'legacy-work',creatorId:'creator',title:'Retained legacy subject',status:'draft'});
  await assert.rejects(f.store().listWorksByCreator('tenant','creator'),{code:'retained_content_migration_required'});assert.equal((await f.repositories.works.get('legacy-work')).title,'Retained legacy subject');
