@@ -33,6 +33,23 @@ test('Creator request identities isolate actors and unkeyed calls retain intenti
  await assert.rejects(createIntakeCreator(f.local.repositories,{...f.input,idempotencyKey:'invalid/key'},f.create()),error=>error.status===400);
 });
 
+test('host profile fingerprints bind the same durable Creator receipt and reject changed or missing rich details',async t=>{
+ const f=await localFixture(t),input={...f.input,requestFingerprint:'a'.repeat(64)};
+ const created=await createIntakeCreator(f.local.repositories,input,f.create());
+ const edited=await f.local.repositories.creators.update(created.id,created.revision,{bio:'Later edits survive retry'});
+ assert.deepEqual(await createIntakeCreator(f.local.repositories,input,f.create()),edited);
+ for(const requestFingerprint of ['b'.repeat(64),undefined])await assert.rejects(createIntakeCreator(f.local.repositories,{...input,requestFingerprint},f.create()),error=>error.code==='creator_intent_conflict');
+ const old={...f.input,idempotencyKey:'old-format',handle:'old-format'};await createIntakeCreator(f.local.repositories,old,f.create(old));
+ await assert.rejects(createIntakeCreator(f.local.repositories,{...old,requestFingerprint:input.requestFingerprint},f.create(old)),error=>error.code==='creator_intent_conflict');
+ assert.equal(f.creates(),2);
+});
+
+test('invalid host fingerprints fail before snapshots, storage or preparation',async()=>{
+ let touched=0;const repositories={transaction(){touched++;throw Error('Unexpected storage');}};
+ for(const requestFingerprint of [null,{},7,'','A'.repeat(64),'a'.repeat(63),'a'.repeat(65)])await assert.rejects(createIntakeCreator(repositories,{requestFingerprint},()=>{touched++;},()=>{touched++;}),error=>error.code==='invalid_creator_intent'&&error.status===400);
+ assert.equal(touched,0);
+});
+
 async function httpFixture(t,creatorLifecycle,overrides={}){
  const directory=await mkdtemp(join(tmpdir(),'creator-lifecycle-http-')),runtime=createCoreRuntime({databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',region:'local',instanceId:'instance',publicBaseUrl:'http://localhost',...overrides,creatorLifecycle});
  await new Promise(resolve=>runtime.server.listen(0,'127.0.0.1',resolve));t.after(async()=>{await runtime.close();await rm(directory,{recursive:true,force:true});});

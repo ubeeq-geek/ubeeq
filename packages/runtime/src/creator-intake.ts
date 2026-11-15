@@ -8,6 +8,8 @@ export class CreatorIntakeError extends Error {
 export interface CreatorIntakeInput {
   instanceId: string; cellId: string; region: string; actorId: string;
   handle: string; displayName: string; idempotencyKey?: string;
+  /** Trusted host SHA-256 of additional creation details bound to this intent. */
+  requestFingerprint?: string;
 }
 export type NewCreatorIntakeRecord=Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>;
 export type CreatorIntakeFactory=(input:{record:Readonly<NewCreatorIntakeRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:PersistenceTransaction})=>Promise<CreatorRecord>;
@@ -38,6 +40,7 @@ export async function createIntakeCreator(repositories: UbeeqRepositories, input
   create: (transaction: PersistenceTransaction, id: string, preparedFactory?:CreatorIntakeFactory) => Promise<CreatorRecord>,
   prepareCreation?:CreatorIntakePreparation): Promise<CreatorRecord> {
   input=structuredClone(input);
+  if(input.requestFingerprint!==undefined&&(typeof input.requestFingerprint!=='string'||!/^[a-f0-9]{64}$/.test(input.requestFingerprint)))throw new CreatorIntakeError(400,'invalid_creator_intent','Creator request fingerprint is invalid.');
   if(prepareCreation!==undefined&&typeof prepareCreation!=='function')throw new CreatorIntakeError(503,'creator_creation_invalid','Creator preparation requires a trusted function.');
   const prepare=async(id:string):Promise<CreatorIntakeFactory|undefined>=>{
     if(!prepareCreation)return;
@@ -65,7 +68,7 @@ export async function createIntakeCreator(repositories: UbeeqRepositories, input
     if (receipt.instanceId !== input.instanceId || receipt.homeCellId !== input.cellId || receipt.dataHomeRegion !== input.region
       || receipt.namespace !== 'runtime-creator-intake' || receipt.scopeId !== creatorId || receipt.key !== key || receipt.value.schemaVersion !== 1
       || receipt.value.actorId !== input.actorId || receipt.value.creatorId !== creatorId) throw new CreatorIntakeError(409, 'creator_intake_requires_reconciliation', 'The saved Creator request requires reconciliation.');
-    if (receipt.value.handle !== input.handle || receipt.value.displayName !== input.displayName) throw new CreatorIntakeError(409, 'creator_intent_conflict', 'This Creator request identity already belongs to different profile details.');
+    if (receipt.value.handle !== input.handle || receipt.value.displayName !== input.displayName || receipt.value.requestFingerprint !== input.requestFingerprint) throw new CreatorIntakeError(409, 'creator_intent_conflict', 'This Creator request identity already belongs to different profile details.');
     const creator = await repositories.creators.get(creatorId, { transaction });
     if (!creator || creator.instanceId !== input.instanceId || creator.subjectId !== input.actorId || creator.homeCellId !== input.cellId || creator.dataHomeRegion !== input.region) throw new CreatorIntakeError(409, 'creator_intake_requires_reconciliation', 'The saved Creator request requires reconciliation.');
     return creator;
@@ -81,7 +84,7 @@ export async function createIntakeCreator(repositories: UbeeqRepositories, input
       const creator = await createNew(transaction, creatorId,factory);
       await records.create({ id: receiptId, instanceId: creator.instanceId, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion,
         dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, namespace: 'runtime-creator-intake', scopeId: creatorId, key,
-        value: { schemaVersion: 1, actorId: input.actorId, creatorId, handle: input.handle, displayName: input.displayName } }, { transaction });
+        value: { schemaVersion: 1, actorId: input.actorId, creatorId, handle: input.handle, displayName: input.displayName, ...(input.requestFingerprint!==undefined?{requestFingerprint:input.requestFingerprint}:{}) } }, { transaction });
       return creator;
     });
   } catch (error) {

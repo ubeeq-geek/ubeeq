@@ -102,6 +102,10 @@
     "./retained-source-http": {
       "types": "./dist/retained-source-http.d.ts",
       "default": "./dist/retained-source-http.js"
+    },
+    "./creator-intake": {
+      "types": "./dist/creator-intake.d.ts",
+      "default": "./dist/creator-intake.js"
     }
   },
   "scripts": {
@@ -167,6 +171,9 @@
       ],
       "retained-source-http": [
         "dist/retained-source-http.d.ts"
+      ],
+      "creator-intake": [
+        "dist/creator-intake.d.ts"
       ]
     }
   }

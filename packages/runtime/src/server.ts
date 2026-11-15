@@ -130,6 +130,10 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Host-selected lease for bounded native decoding; defaults to 60 seconds. */
   processingLeaseSeconds?: number;
   adapters?: ReferenceAdapterSet;
+  /** Trusted synchronous local composition before the concrete local constructor.
+   * The returned set remains runtime-owned, including SQLite defaults and close.
+   * Cannot be combined with the host-owned generic adapters path. */
+  createLocalAdapters?: (configuration:LocalAdapterConfiguration)=>ReturnType<typeof createLocalAdapterSet>;
   regionalControlPlane?: RegionalControlPlane;
   tenancy?: TenancyAndAccessPort;
   hostPorts?: HostExtensionRuntimePorts | ((adapters: ReferenceAdapterSet) => HostExtensionRuntimePorts);
@@ -172,6 +176,10 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
 };
 
 export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
+  if(configuration.createLocalAdapters!==undefined){
+    if(typeof configuration.createLocalAdapters!=='function')throw new Error('Local adapter creation requires a trusted factory.');
+    if(configuration.adapters!==undefined)throw new Error('Choose either runtime-owned local adapter creation or host-owned adapters.');
+  }
   const cellId = configuration.cellId ?? "local-single-cell";
   const region = configuration.region ?? "local";
   const processingLeaseSeconds=configuration.processingLeaseSeconds??60;
@@ -186,7 +194,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     sessionTtlSeconds: configuration.sessionTtlSeconds,
     credentialEncryptionKey: configuration.credentialEncryptionKey,
   };
-  const localAdapters = configuration.adapters ? undefined : createLocalAdapterSet(localConfiguration);
+  const localAdapters = configuration.adapters ? undefined : (configuration.createLocalAdapters ?? createLocalAdapterSet)(localConfiguration);
   const adapters: ReferenceAdapterSet = configuration.adapters ?? {
     repositories: localAdapters!.repositories, storage: localAdapters!.storage, uploads: localAdapters!.storage,
     delivery: localAdapters!.storage, jobs: localAdapters!.jobs, identity: localAdapters!.identity,
