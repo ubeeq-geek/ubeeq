@@ -10,6 +10,23 @@ import {SourceFileUploads,sourceFileOriginalCreatorPrefix,sourceFileOriginalObje
 import {sourceStore,actorRecord,sourceFile,sourceAudit,creatorInput,scope} from './retained-source-fixture.mjs';
 const bytes=Buffer.from('Synthetic immutable source original');
 const checksum=createHash('sha256').update(bytes).digest('hex');
+
+test('original finalization and cold repair receive the immutable actual upload-journal actor',async t=>{
+ let attempts=0;const contexts=[];
+ const f=await fixture(t,{prepareCompletion:async(file,object,context)=>{
+  attempts++;contexts.push(context);assert.equal(Object.isFrozen(context),true);
+  assert.deepEqual(context,{actorId:(await f.journal()).value.actorId});
+  assert.throws(()=>{context.actorId='request-controlled-actor';},TypeError);
+  if(attempts===1)throw Error('Synthetic decoder unavailable after physical completion');
+  const stored=await f.local.storage.get(object);assert.equal(stored.object.versionId,object.versionId);
+  return {checksumSha256:createHash('sha256').update(stored.body).digest('hex'),sizeBytes:stored.body.length,metadata:file.metadata};
+ }});
+ await f.initiate();await f.accept();await assert.rejects(f.complete(),/decoder unavailable/);
+ assert.equal((await f.journal()).value.phase,'retained');f.restart();await f.uploads.repair();
+ assert.equal((await f.store.getSourceFileById('original')).uploadState,'ready');
+ assert.equal(attempts,2);assert.ok(contexts.every(context=>context.actorId==='actor'));
+ assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_completions').get().n,1);
+});
 /** A truthful quota-port unit fixture. Physical acceptance in these tests is
  * always the real LocalFilesystemStorage and SQLite provider, not this fixture. */
 function quotaPort(){

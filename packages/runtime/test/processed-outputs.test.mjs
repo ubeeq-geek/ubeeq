@@ -8,6 +8,8 @@ import {createLocalAdapterSet} from '@ubeeq/adapter-local';
 import {createCoreRuntime} from '../dist/index.js';
 import {createDefaultOpenCorePorts} from '@ubeeq/extension-sdk';
 import {creatorAssetObjectInventory} from '@ubeeq/portability';
+import {persistProcessedOutputs} from '@ubeeq/runtime/processed-outputs';
+import {OwnedObjectWrites} from '@ubeeq/runtime/owned-object-writes';
 // Tests output persistence with a synthetic trusted processor, not codec validity.
 test('the runtime delivers declared processed audio bytes and preserves the original',async t=>{
  const directory=await mkdtemp(join(tmpdir(),'processed-media-regression-'));
@@ -119,4 +121,24 @@ for(const seconds of [60,180])test(`bounded native processing uses the configure
 });
 test('invalid processing leases reject before constructing a local database',()=>{
  for(const value of [0,29,901,1.5,NaN,Infinity,'180'])assert.throws(()=>createCoreRuntime({publicBaseUrl:'http://localhost',processingLeaseSeconds:value}),/Processing leases/);
+});
+
+for(const encoded of [true,false])test(`private primary ${encoded?'encoded':'fallback'} outputs recover actual versions without a public object or duplicate write`,async t=>{
+ const f=await fixture(t,()=>{throw Error('The worker processor is not used by this direct output-port test.');});
+ const asset=await f.local.repositories.assets.get('asset'),quota={
+  async checkAndReserveQuota(){return {allowed:true};},async recordUsageSettlement(){},async closeStorageReservation(){}
+ };
+ let writes=0,produced=0,checks=0;
+ const complete=f.local.storage.complete.bind(f.local.storage);f.local.storage.complete=async input=>{writes++;return complete(input);};
+ const options={repositories:f.local.repositories,storage:f.local.storage,owned:new OwnedObjectWrites(f.local.repositories,f.local.storage,quota,'instance','cell'),
+  asset,source:f.storage,usageKey:'private-source-derivatives',primaryScope:'private',
+  assertCurrent:async()=>{checks++;assert.equal((await f.local.repositories.assets.get(asset.id)).revision,asset.revision);},
+  produce:async()=>{produced++;return {result:result(encoded?[output({sourceVersionId:asset.objectVersion},'preview','private derivative')]:[]),fallback:async()=>({bytes:Buffer.from('private fallback'),mimeType:'image/png'})};},
+  transform:async(bytes,mimeType)=>({bytes,mimeType})};
+ const first=await persistProcessedOutputs(options),recovered=await persistProcessedOutputs(options);
+ assert.equal(first.storage.scope,'private');assert.ok(first.renditions.every(value=>value.storage.scope==='private'));assert.deepEqual(recovered,first);assert.equal(produced,1);assert.equal(writes,1);assert.ok(checks>=2);
+ assert.deepEqual(Buffer.from((await f.local.storage.get(first.storage)).body),Buffer.from(encoded?'private derivative':'private fallback'));
+ await assert.rejects(persistProcessedOutputs({...options,primaryScope:'public'}),/reconciliation/);assert.equal(writes,1);assert.equal(produced,1);
+ const plans=(await f.local.repositories.hostRecords.list({limit:100})).items.filter(row=>row.namespace==='runtime-processed-outputs');
+ assert.equal(plans.length,1);assert.ok(plans[0].value.plan.outputs.every(value=>value.scope==='private'));
 });

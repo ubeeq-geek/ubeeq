@@ -35,6 +35,8 @@ interface Session {
 export interface SourceFileCompletionPreparation {
   checksumSha256:string;sizeBytes:number;metadata?:RetainedSourceFile['metadata'];
 }
+/** Supplied only from the immutable actual upload journal, including repair. */
+export interface SourceFileCompletionContext {readonly actorId:string}
 export interface SourceFileUploadOptions<M extends RetainedCreatorContentModels,F extends RetainedSourceFile> {
   repositories:UbeeqRepositories;uploads:UploadAdapter&Partial<UploadContentAdapter>;quota:UsageQuotaPort;
   files:RepositoryRetainedSourceFiles<M,F>;
@@ -43,7 +45,7 @@ export interface SourceFileUploadOptions<M extends RetainedCreatorContentModels,
   /** Read/verify the exact original and run the actual type-specific decoder,
    * credentials and idempotent owned rendition path before metadata acceptance.
    * Provider effects happen before the accepting repository transaction. */
-  prepareCompletion(file:Readonly<F>,object:Readonly<StoredObject>):Promise<SourceFileCompletionPreparation>;
+  prepareCompletion(file:Readonly<F>,object:Readonly<StoredObject>,context:Readonly<SourceFileCompletionContext>):Promise<SourceFileCompletionPreparation>;
 }
 export interface SourceFileUploadResult<F extends RetainedSourceFile> {
   file:F;state:'issued'|'sealed'|'retained'|'completed';object?:StoredObject;usagePending:boolean;
@@ -234,7 +236,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
         // Do not hold a repository transaction while reading/decoding an original
         // or writing provider-owned renditions. Their real owner journals recover
         // those side effects if accepting source metadata later fails.
-        prepared=await this.options.prepareCompletion(structuredClone(snapshot),structuredClone(object));
+        prepared=await this.options.prepareCompletion(structuredClone(snapshot),structuredClone(object),Object.freeze({actorId:value.actorId}));
         if(!prepared||Object.keys(prepared).some(key=>!['checksumSha256','sizeBytes','metadata'].includes(key))||prepared.checksumSha256!==object.checksum||prepared.sizeBytes!==object.byteLength
           ||prepared.metadata!==undefined&&(!prepared.metadata||Array.isArray(prepared.metadata)||typeof prepared.metadata!=='object'||Object.values(prepared.metadata).some(item=>item!==null&&(!['string','number','boolean'].includes(typeof item)||typeof item==='number'&&!Number.isFinite(item)))))throw new SourceFileUploadError('original_finalization_conflict',409,'Verified original metadata differs from its physical receipt.');
         for(const [key,item] of Object.entries(snapshot.metadata??{}))if(!Object.hasOwn(prepared.metadata??{},key)||!same(prepared.metadata![key],item))throw new SourceFileUploadError('original_metadata_conflict',409,'Original finalization must preserve its existing metadata.');

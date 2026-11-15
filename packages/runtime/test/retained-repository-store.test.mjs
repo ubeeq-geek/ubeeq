@@ -100,3 +100,63 @@ test('wrapped repositories retain real host overrides and reject foreign transac
  const creator=await repo.creators.update('creator',1,{displayName:'Renamed'});assert.equal(calls,1);assert.equal(creator.displayName,'Renamed');
  await assert.rejects(repo.creators.update('creator',creator.revision,{displayName:'Wrong scope'},{transaction:{id:'foreign'}}),/not active/);assert.equal((await repo.creators.get('creator')).displayName,'Renamed');
 });
+
+const entitySource=()=>({tenantId:'tenant',creatorId:'creator',externalPublicationId:'publication',externalAccountId:'connection',externalContentId:'pending:publication',assetId:'work',createdAt:at,updatedAt:at,rawMetadataJson:{nested:{all:['original','fields']},requested:false},opaque:{retain:true}});
+const entityTarget=value=>({...value,externalContentId:'actual-remote',updatedAt:'2026-11-15T00:01:00.000Z',rawMetadataJson:{...value.rawMetadataJson,observed:{id:'actual-remote'}}});
+
+test('conditional entity move preserves full JSON across restart and updates only the same canonical cohort',async t=>{
+ const f=await fixture(t),store=f.store(),source=entitySource(),next=entityTarget(source),kind='compatibility-publication';
+ await store.asActor('actor',()=>store.putRetainedEntity(kind,'pending-key',{...source,notStored:undefined}));
+ const before=(await f.repositories.hostRecords.snapshot()).items.filter(row=>row.namespace==='retained-creator-content');
+ await store.asActor('actor',async()=>{
+  await store.moveRetainedEntity({kind,fromKey:'pending-key',toKey:'remote-key',expected:{opaque:source.opaque,...source,notStored:undefined},next});
+  assert.equal(await store.getRetainedEntity(kind,'pending-key'),undefined);assert.deepEqual(await store.getRetainedEntity(kind,'remote-key'),next);
+ });
+ const reopened=f.reopen();assert.equal(await reopened.getRetainedEntity(kind,'pending-key'),undefined);assert.deepEqual(await reopened.getRetainedEntity(kind,'remote-key'),next);
+ const rows=(await f.repositories.hostRecords.snapshot()).items.filter(row=>row.namespace==='retained-creator-content');
+ assert.equal(rows.length,before.length,'Move creates no competing operation receipt or second source copy.');
+ assert.equal(rows.filter(row=>row.value.category==='entity'&&row.value.kind===kind).length,1);
+ assert.ok(rows.find(row=>row.key==='cohort').revision>before.find(row=>row.key==='cohort').revision);
+});
+
+test('entity moves/removals conflict on stale full JSON, missing source, occupied matching target and repeated calls',async t=>{
+ const f=await fixture(t),store=f.store(),source=entitySource(),next=entityTarget(source),kind='compatibility-publication';
+ await store.asActor('actor',async()=>{await store.putRetainedEntity(kind,'old',source);await store.putRetainedEntity(kind,'occupied',next);});
+ const conflict={code:'retained_entity_conflict',status:409};
+ await assert.rejects(store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:{...source,opaque:{retain:false}},next})),conflict);
+ await assert.rejects(store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'occupied',expected:source,next})),conflict);
+ await assert.rejects(store.asActor('actor',()=>store.removeRetainedEntity({kind,key:'old',expected:{...source,rawMetadataJson:{}}})),conflict);
+ await assert.rejects(store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'old',expected:source,next:source})),{code:'retained_entity_invalid',status:400});
+ assert.deepEqual(await store.getRetainedEntity(kind,'old'),source);assert.equal(await store.getRetainedEntity(kind,'new'),undefined);
+ await store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:source,next}));
+ await assert.rejects(store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:source,next})),conflict);
+ await store.asActor('actor',()=>store.removeRetainedEntity({kind,key:'new',expected:next}));
+ await assert.rejects(store.asActor('actor',()=>store.removeRetainedEntity({kind,key:'new',expected:next})),conflict);
+ assert.deepEqual(await store.getRetainedEntity(kind,'occupied'),next,'An unrelated occupied entity is retained.');
+});
+
+test('entity commands require current actor/scope and a rejected nested move rolls back canonical writes and the whole cohort',async t=>{
+ const f=await fixture(t),store=f.store(),source=entitySource(),next=entityTarget(source),kind='compatibility-publication';
+ await store.asActor('actor',()=>store.putRetainedEntity(kind,'old',source));
+ await assert.rejects(store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:source,next}),{code:'access_denied'});
+ await assert.rejects(store.asActor('outsider',()=>store.removeRetainedEntity({kind,key:'old',expected:source})),{code:'access_denied'});
+ for(const changed of [{...next,tenantId:'foreign'},{...next,creatorId:'foreign'},Object.fromEntries(Object.entries(next).filter(([key])=>key!=='creatorId'))])await assert.rejects(store.asActor('actor',()=>store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:source,next:changed})),{code:'retained_entity_invalid'});
+ const before=(await f.repositories.hostRecords.snapshot()).items;
+ await assert.rejects(store.asActor('actor',async()=>{await store.createWork(work());await store.moveRetainedEntity({kind,fromKey:'old',toKey:'new',expected:source,next});throw Error('Synthetic outer failure after complete staging');}),/outer failure/);
+ assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,before);assert.equal(await store.getWork('tenant','work'),null);
+ for(const failure of ['stale move','occupied target','stale removal']){
+  await assert.rejects(store.asActor('actor',async()=>{
+   await store.createWork(work());
+   if(failure==='occupied target')await store.putRetainedEntity(kind,'occupied',next);
+   // Call/catch the actual public conditional command directly. No explicit
+   // run wrapper around the failed call may hide a missing rollback-only mark.
+   if(failure==='stale removal')await assert.rejects(store.removeRetainedEntity({kind,key:'old',expected:{}}),{code:'retained_entity_conflict'});
+   else await assert.rejects(store.moveRetainedEntity({kind,fromKey:'old',toKey:failure==='occupied target'?'occupied':'new',expected:failure==='stale move'?{...source,externalTitle:'Stale observed title'}:source,next}),{code:'retained_entity_conflict'});
+  }),/failed or unawaited/);
+  assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,before,'Caught '+failure+' must roll back all preceding canonical/entity changes.');
+  assert.equal(await store.getWork('tenant','work'),null);assert.deepEqual(await store.getRetainedEntity(kind,'old'),source);
+ }
+
+ await store.asActor('actor',async()=>{await store.removeRetainedEntity({kind,key:'old',expected:source});await store.createWork(work());});
+ assert.equal(await store.getRetainedEntity(kind,'old'),undefined);assert.equal((await store.getWork('tenant','work')).title,work().title);
+});

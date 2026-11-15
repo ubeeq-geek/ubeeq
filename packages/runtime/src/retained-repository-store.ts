@@ -25,6 +25,18 @@ export interface RetainedAuditEvent {
  auditId:string;action:string;actorUserId?:string|null;actorRole?:string;
  detail?:Readonly<Record<string,unknown>>;createdAt:string;
 }
+/** Neutral host-entity commands are conditional storage operations, not proof
+ * of a provider result. The host must enlist its real domain/result authority. */
+export interface RetainedEntityRemoval {
+ kind:string;key:string;expected:Readonly<Record<string,unknown>>;
+}
+export interface RetainedEntityMove {
+ kind:string;fromKey:string;toKey:string;expected:Readonly<Record<string,unknown>>;next:Readonly<Record<string,unknown>>;
+}
+export class RetainedEntityMutationError extends Error {
+ readonly status:number;
+ constructor(readonly code:'retained_entity_invalid'|'retained_entity_conflict',message:string){super(message);this.status=code==='retained_entity_conflict'?409:400;}
+}
 export class RetainedRepositoryError extends Error {
  constructor(readonly code:'retained_content_migration_required'|'retained_content_invalid'|'retained_content_too_large'|'access_denied',message:string,readonly status=409){super(message);}
 }
@@ -206,6 +218,44 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
  async getRetainedEntity<T>(kind:string,key:string):Promise<T|undefined>{return this.getEntity('entity',kind,key);}
  async listRetainedEntities<T>(kind:string):Promise<T[]>{return this.listEntities('entity',kind);}
  async putRetainedEntity(kind:string,key:string,value:unknown):Promise<void>{return this.putEntity('entity',kind,key,value);}
+ private async _retainedEntityMutationActor():Promise<void>{
+  const actor=this.currentActor();
+  if(!actor||!await this.authorizeActor(actor,'edit'))throw new RetainedRepositoryError('access_denied','Current Creator editing authority is required for an entity mutation.',403);
+ }
+ private _retainedEntityAddress(kind:string,key:string):Address {
+  if(typeof kind!=='string'||!kind||typeof key!=='string'||!key)throw new RetainedEntityMutationError('retained_entity_invalid','An exact entity kind and key are required.');
+  return {category:'entity',kind,key};
+ }
+ private _retainedEntityScope(value:Value):void {
+  if(Object.hasOwn(value,'tenantId')&&value.tenantId!==this.scope.tenantId||Object.hasOwn(value,'creatorId')&&value.creatorId!==this.scope.creatorId)
+   throw new RetainedEntityMutationError('retained_entity_invalid','An entity mutation must retain its current tenant and Creator scope.');
+ }
+ /** Missing/stale source is a conflict, including a repeated successful call.
+  * Absence is never interpreted as a historical success receipt. */
+ async removeRetainedEntity(input:RetainedEntityRemoval):Promise<void>{
+  await this._retainedEntityMutationActor();
+  const address=this._retainedEntityAddress(input.kind,input.key),expected=json(input.expected);this._retainedEntityScope(expected);
+  const state=this.active(),key=addressKey(address),current=state.extra.get(key);
+  if(!current||publicationIdentityHash(current.payload)!==publicationIdentityHash(expected))throw new RetainedEntityMutationError('retained_entity_conflict','The complete original entity changed or is absent.');
+  state.extra.delete(key);
+ }
+ /** Atomically move one full host-owned JSON entity inside the existing Raw
+  * overlay. Distinct keys, full source match and absent target are mandatory.
+  * No receipt or provider success is invented; repeated calls conflict. A host
+  * publishing adapter must join its verified CONFIRMED result/remote binding
+  * and operation ID to this SAME publicationAtomic transaction. */
+ async moveRetainedEntity(input:RetainedEntityMove):Promise<void>{
+  await this._retainedEntityMutationActor();
+  const from=this._retainedEntityAddress(input.kind,input.fromKey),to=this._retainedEntityAddress(input.kind,input.toKey);
+  if(input.fromKey===input.toKey)throw new RetainedEntityMutationError('retained_entity_invalid','An entity move requires distinct original and target keys.');
+  const expected=json(input.expected),next=json(input.next);this._retainedEntityScope(expected);this._retainedEntityScope(next);
+  for(const field of ['tenantId','creatorId'])if(Object.hasOwn(expected,field)!==Object.hasOwn(next,field))throw new RetainedEntityMutationError('retained_entity_invalid','An entity move cannot add or discard its ownership scope.');
+  const state=this.active(),fromKey=addressKey(from),toKey=addressKey(to),current=state.extra.get(fromKey);
+  if(!current||publicationIdentityHash(current.payload)!==publicationIdentityHash(expected)||state.extra.has(toKey))throw new RetainedEntityMutationError('retained_entity_conflict','The complete original entity changed or its target is occupied.');
+  // No await between the two overlay changes. Flush performs the original-row
+  // revision deletion, target absence creation and cohort CAS as one transaction.
+  state.extra.delete(fromKey);state.extra.set(toKey,{address:to,payload:next});
+ }
  protected override async validatePublication(previous:M['publication']|null,next:M['publication']):Promise<void>{
   assertPublicationDisclosureHistoryImmutable(previous,next);
   if(!previous?.command?.preparationVersion)return;

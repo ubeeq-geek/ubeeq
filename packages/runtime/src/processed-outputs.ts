@@ -20,13 +20,18 @@ const conflict=(error:unknown)=>/conflict|revision|conditional|already exists|tr
 export async function persistProcessedOutputs(input:{
   repositories:UbeeqRepositories; storage:ObjectStorage; owned?:OwnedObjectWrites;
   asset:AssetRecord; source:StoredObject; usageKey:string;
+  /** Source-library derivatives must remain private before a Work/release.
+   * Omitted/public retains the established public-primary journal identity. */
+  primaryScope?:StoredObject['scope'];
   assertCurrent():Promise<void>;
   produce():Promise<{result:Result; fallback():Promise<{bytes:Uint8Array;mimeType:string}>}>;
   transform(bytes:Uint8Array,mimeType:string):Promise<{bytes:Uint8Array;mimeType:string}>;
 }):Promise<ProcessedOutputs>{
   const {repositories,asset,source,usageKey}=input, records=repositories.hostRecords;
+  const primaryScope=input.primaryScope??'public';
+  if(primaryScope!=='public'&&primaryScope!=='private')throw new Error('A valid processed primary scope is required.');
   const identity={creatorId:asset.creatorId,operation:'asset.rendition',idempotencyKey:usageKey};
-  const binding=hash([asset.instanceId,asset.homeCellId,asset.dataHomeRegion,asset.dataHomeAssignedAt,asset.routingRevision,asset.creatorId,asset.id,asset.objectVersion,asset.checksum,asset.mimeType,source,usageKey]);
+  const binding=hash([asset.instanceId,asset.homeCellId,asset.dataHomeRegion,asset.dataHomeAssignedAt,asset.routingRevision,asset.creatorId,asset.id,asset.objectVersion,asset.checksum,asset.mimeType,source,usageKey,...(primaryScope==='public'?[]:[{primaryScope}])]);
   const id=`processed-outputs-${hash([asset.instanceId,asset.homeCellId,asset.creatorId,usageKey])}`;
   let row=await records?.get(id);
   const read=(record:HostRecord):Journal=>{
@@ -35,7 +40,8 @@ export async function persistProcessedOutputs(input:{
       || !value?.plan || value.plan.binding!==binding || value.fingerprint!==hash(value.plan) || !value.objects
       || !Array.isArray(value.plan.outputs) || value.plan.outputs.length<1 || value.plan.outputs.length>65
       || new Set(value.plan.outputs.map(output=>output.id)).size!==value.plan.outputs.length
-      || !value.plan.outputs.some(output=>output.id===value.plan.primary))throw new Error('Processed output journal requires reconciliation.');
+      || !value.plan.outputs.some(output=>output.id===value.plan.primary&&output.scope===primaryScope)
+      || value.plan.outputs.some(output=>output.id!==value.plan.primary&&output.scope!=='private'))throw new Error('Processed output journal requires reconciliation.');
     for(const [key,object]of Object.entries(value.objects))prove(value.plan,key,object);
     return value;
   };
@@ -53,6 +59,8 @@ export async function persistProcessedOutputs(input:{
       if(legacy.metadata.outputSet!==undefined)throw new Error('Processed output set journal is missing; reconciliation is required.');
       const result=legacy.metadata.processingResult as Evidence;
       if(!result?.metadata||!Array.isArray(result.renditions))throw new Error('Recovered processing evidence requires reconciliation.');
+      if(legacy.object.scope!==primaryScope)throw new Error('Recovered processing scope requires reconciliation.');
+      await input.assertCurrent();
       return {result,storage:legacy.object,renditions:[]};
     }
   }
@@ -100,10 +108,10 @@ export async function persistProcessedOutputs(input:{
     let primary:string|undefined;
     for(const rendition of result.renditions)if(rendition.body){
       const transformed=await input.transform(Uint8Array.from(rendition.body),rendition.contentType);
-      const key=add(transformed.bytes,transformed.mimeType,rendition===selected?'public':'private');aliases[rendition.id]=key;
+      const key=add(transformed.bytes,transformed.mimeType,rendition===selected?primaryScope:'private');aliases[rendition.id]=key;
       if(rendition===selected)primary=key;
     }
-    if(!primary){const fallback=await produced.fallback();primary=add(fallback.bytes,fallback.mimeType,'public');}
+    if(!primary){const fallback=await produced.fallback();primary=add(fallback.bytes,fallback.mimeType,primaryScope);}
     const plan:Plan={binding,result:serial,primary,outputs,aliases},fingerprint=hash(plan);
     if(journal){if(journal.fingerprint!==fingerprint)throw new Error('Processed output recipe or bytes changed during recovery.');}
     else{

@@ -43,6 +43,10 @@
       "types": "./dist/owned-object-writes.d.ts",
       "default": "./dist/owned-object-writes.js"
     },
+    "./processed-outputs": {
+      "types": "./dist/processed-outputs.d.ts",
+      "default": "./dist/processed-outputs.js"
+    },
     "./owned-website-blobs": {
       "types": "./dist/owned-website-blobs.d.ts",
       "default": "./dist/owned-website-blobs.js"
@@ -125,6 +129,9 @@
   },
   "typesVersions": {
     "*": {
+      "processed-outputs": [
+        "dist/processed-outputs.d.ts"
+      ],
       "content-preparations": [
         "dist/content-preparations.d.ts"
       ],
