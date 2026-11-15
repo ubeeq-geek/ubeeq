@@ -17,6 +17,14 @@ export interface RetainedRepositoryBindings<M extends RetainedCreatorContentMode
  /** The source/transform host retains its original source-file and replacement guards. */
  validateAssetAttachment(input:RetainedAssetAttachmentCommit<M>):Promise<void>;
 }
+export interface RetainedRepositoryChange {
+ category:'canonical'|'command'|'entity';kind:string;key:string;
+ previous?:Readonly<Record<string,unknown>>;next?:Readonly<Record<string,unknown>>;
+}
+export interface RetainedAuditEvent {
+ auditId:string;action:string;actorUserId?:string|null;actorRole?:string;
+ detail?:Readonly<Record<string,unknown>>;createdAt:string;
+}
 export class RetainedRepositoryError extends Error {
  constructor(readonly code:'retained_content_migration_required'|'retained_content_invalid'|'retained_content_too_large'|'access_denied',message:string,readonly status=409){super(message);}
 }
@@ -81,7 +89,8 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
  async authorizeActor(actorId:string,access:RetainedRepositoryAccess='edit'):Promise<boolean>{
   if(typeof actorId!=='string'||!actorId)return false;
   return this.run(async()=>{
-   const state=this.active(),role=await this.bindings.resolveActorRole(actorId,structuredClone(state.creator),state.transaction);
+   const state=this.active();if(access!=='read'&&'deletion' in state.creator&&state.creator.deletion)return false;
+   const role=await this.bindings.resolveActorRole(actorId,structuredClone(state.creator),state.transaction);
    const allowed=(access==='read'?['owner','admin','manager','editor','viewer']:access==='manage'?['owner','admin','manager']:['owner','admin','manager','editor']).includes(role??'');
    if(allowed && access!=='read'){
     if(state.actor && state.actor!==actorId)throw new RetainedRepositoryError('access_denied','One saved actor must own this accepting transaction.',403);
@@ -91,7 +100,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   });
  }
  async asActor<T>(actorId:string,operation:()=>Promise<T>,access:RetainedRepositoryAccess='edit'):Promise<T>{return this.run(async()=>{if(!await this.authorizeActor(actorId,access))throw new RetainedRepositoryError('access_denied','Current Creator access is required.',403);return operation();});}
- private async run<T>(operation:(transaction:PersistenceTransaction)=>Promise<T>):Promise<T>{
+ protected async run<T>(operation:(transaction:PersistenceTransaction)=>Promise<T>):Promise<T>{
   const inherited=this.context.getStore();
   if(inherited){
    if(inherited.phase!=='open'){inherited.rollbackOnly=true;throw Error('This retained-content transaction has ended.');}
@@ -102,7 +111,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   try{return await (this.bindings.transactions??this.repositories).transaction(async transaction=>{
    await snapshot.bind(transaction);
    const creator=await this.repositories.creators.get(this.scope.creatorId,{transaction});
-   if(!creator || creator.instanceId!==this.scope.instanceId || creator.homeCellId!==this.scope.cellId || creator.dataHomeRegion!==this.scope.region || ('status' in creator && creator.status!==undefined && creator.status!=='active') || ('deletion' in creator && creator.deletion))throw new RetainedRepositoryError('access_denied','The current Creator data home is unavailable.',403);
+   if(!creator || creator.instanceId!==this.scope.instanceId || creator.homeCellId!==this.scope.cellId || creator.dataHomeRegion!==this.scope.region)throw new RetainedRepositoryError('access_denied','The current Creator data home is unavailable.',403);
    if(creator.contentAuthority!=='retained-v1')throw new RetainedRepositoryError('retained_content_migration_required','This Creator needs a fenced retained-content migration.',503);
    const rows=snapshot.items.filter(row=>row.instanceId===this.scope.instanceId && row.namespace===namespace && row.scopeId===this.scope.creatorId);
    const cohort=rows.find(row=>row.id===identity(this.scope,'cohort'));
@@ -151,10 +160,37 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   }
   return result;
  }
+ /** Read access and domain lifecycle policy are separate. Historical records
+  * remain available to authorized readers during deletion; ordinary writes do not. */
+ protected currentCreator():Readonly<CreatorRecord>{return Object.freeze(structuredClone(this.active().creator));}
+ protected currentActor():string|undefined{return this.active().actor;}
+ /** A domain maintenance adapter may authorize ONLY a narrowly validated delta.
+  * The base store never grants a worker general Creator mutation authority. */
+ protected mayCommitMaintenance(_changes:readonly RetainedRepositoryChange[]):boolean{return false;}
+ protected mayAppendMaintenanceAudit(_event:Readonly<RetainedAuditEvent>):boolean{return false;}
+ protected retainedEntityEntries<T>(kind:string):Array<{key:string;value:T}>{
+  return [...this.active().extra.values()].filter(entry=>entry.address.category==='entity'&&entry.address.kind===kind).map(entry=>({key:entry.address.key,value:structuredClone(entry.payload) as T}));
+ }
+ protected async appendRetainedAudit(event:RetainedAuditEvent,subjectId?:string):Promise<void>{
+  const state=this.active(),copy=json(event);
+  if(typeof event.auditId!=='string'||!event.auditId||typeof event.action!=='string'||!event.action||!Number.isFinite(Date.parse(event.createdAt)))throw invalid();
+  if((!state.actor||state.actor!==event.actorUserId)&&!this.mayAppendMaintenanceAudit(structuredClone(event)))throw new RetainedRepositoryError('access_denied','An actual actor or a scoped maintenance intent must own this audit.',403);
+  await this.repositories.auditEvents.create({id:event.auditId,instanceId:this.scope.instanceId,...home(state.creator),action:event.action,
+   ...(event.actorUserId?{actorId:event.actorUserId}:{}),...(subjectId?{subjectId}:{}),payload:{retainedCreatorId:this.scope.creatorId,retainedAudit:copy}},{transaction:state.transaction});
+ }
+ protected async readRetainedAudit<T extends RetainedAuditEvent>(id:string):Promise<T|null>{
+  const state=this.active(),row=await this.repositories.auditEvents.get(id,{transaction:state.transaction});
+  if(!row||row.instanceId!==this.scope.instanceId||row.homeCellId!==this.scope.cellId||row.dataHomeRegion!==this.scope.region||row.payload.retainedCreatorId!==this.scope.creatorId)return null;
+  return structuredClone(row.payload.retainedAudit) as T??null;
+ }
  private async flush(state:State):Promise<void>{
   const after=this.encode(state),changed=[...new Set([...state.before.keys(),...after.keys()])].filter(key=>publicationIdentityHash(state.before.get(key)?.payload)!==publicationIdentityHash(after.get(key)?.payload));
   if(!changed.length)return;
-  if(!state.actor)throw new RetainedRepositoryError('access_denied','An actual actor guard is required before changing retained content.',403);
+  if(state.actor&&'deletion' in state.creator&&state.creator.deletion)throw new RetainedRepositoryError('access_denied','Creator deletion is in progress.',403);
+  if(!state.actor&&!this.mayCommitMaintenance(changed.map(key=>{
+   const previous=state.before.get(key),next=after.get(key),address=next?.address??previous!.address;
+   return {...address,...(previous?{previous:structuredClone(previous.payload)}:{}),...(next?{next:structuredClone(next.payload)}:{})};
+  })))throw new RetainedRepositoryError('access_denied','An actual actor guard is required before changing retained content.',403);
   for(const key of changed){
    const before=state.before.get(key),next=after.get(key);
    if(!next){await this.repositories.hostRecords!.remove(before!.row.id,before!.row.revision,{transaction:state.transaction});continue;}

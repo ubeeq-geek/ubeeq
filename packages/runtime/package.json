@@ -86,6 +86,10 @@
     "./retained-repository-store": {
       "types": "./dist/retained-repository-store.d.ts",
       "default": "./dist/retained-repository-store.js"
+    },
+    "./retained-source-files": {
+      "types": "./dist/retained-source-files.d.ts",
+      "default": "./dist/retained-source-files.js"
     }
   },
   "scripts": {
@@ -139,6 +143,9 @@
       ],
       "retained-repository-store": [
         "dist/retained-repository-store.d.ts"
+      ],
+      "retained-source-files": [
+        "dist/retained-source-files.d.ts"
       ]
     }
   }

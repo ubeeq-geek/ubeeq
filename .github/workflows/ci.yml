@@ -39,6 +39,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm run test:managed-retained-sources
       - run: npm run test:managed-retained-repository
       - run: npm run test:managed-snapshots
       - run: npm run test:managed-websites
