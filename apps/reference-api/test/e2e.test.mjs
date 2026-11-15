@@ -66,7 +66,7 @@ test("runs the portable signed-in upload, publish, delivery, and export workflow
     const publication = await request(base, `/v1/works/${work.body.work.id}/publications`, { method: "POST", headers: { ...headers, "idempotency-key": "publish-local-work" }, body: JSON.stringify({ destination: "local" }) });
     assert.equal(publication.response.status, 201);
     const publicWork = await request(base, `/v1/public/works/${work.body.work.id}`);
-    assert.equal(publicWork.response.status, 200); assert.equal(publicWork.body.work.status, "published");
+    assert.equal(publicWork.response.status, 200); assert.equal(publicWork.body.work.status, "ready");
     assert.match(publicWork.body.assets[0].storage.key, /\/renditions\//);
     const delivery = await fetch(publicWork.body.assets[0].delivery.url.replace("http://127.0.0.1:0", base));
     assert.deepEqual(Buffer.from(await delivery.arrayBuffer()), bytes); assert.equal(delivery.headers.get('cache-control'), 'private, no-store');

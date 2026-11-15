@@ -57,7 +57,7 @@ test('reference publication rolls back intent, publication, Work and audit on an
     }
     const published = await request(`/v1/works/${work.id}/publications`, { destination: 'local' });
     assert.equal(published.status, 201);
-    assert.equal(published.body.work.status, 'published');
+    assert.equal(published.body.work.status, 'ready');
     assert.equal((await local.repositories.publicationIntents.list({ limit: 100 })).items.length, 1);
     assert.equal((await local.repositories.publications.list({ limit: 100 })).items.length, 1);
     assert.equal((await local.repositories.auditEvents.list({ limit: 100 })).items.filter(item => item.action === 'work.published').length, 1);

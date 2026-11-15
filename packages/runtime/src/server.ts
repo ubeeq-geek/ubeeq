@@ -394,7 +394,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   const currentPublicWork = async (workId: string) => {
     const denied = () => new HttpError(404, 'work_not_found', 'Published work was not found');
     const work = await repositories.works.get(workId);
-    if (!work || work.status !== 'published' || !await repositories.creators.get(work.creatorId)) throw denied();
+    if (!work || !['ready', 'published'].includes(work.status) || !await repositories.creators.get(work.creatorId)) throw denied();
     const assets: AssetRecord[] = [];
     for await (const asset of repositoryItems(request => repositories.assets.list(request))) {
       if (asset.workId === work.id && asset.creatorId === work.creatorId && asset.status === 'ready') assets.push(asset);
@@ -980,10 +980,17 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         if (!role || !['owner', 'admin', 'editor'].includes(role)) throw new HttpError(403, 'work_edit_denied', 'Work editing access is required.');
         const body = await parseBody(request);
         if (body.revision !== work.revision) throw new HttpError(409, 'revision_conflict', 'Reload the work before saving changes.');
-        if (method === 'DELETE' && work.status === 'published') throw new HttpError(409, 'work_is_published', 'Unpublish the work before deleting it.');
         const changes: Partial<WorkRecord> = method === 'DELETE' ? { status: 'deleted' } : { title: requireString(body.title ?? work.title, 'title') };
         const updated = await repositories.transaction(async transaction=>{
           await authorizeWorkMutation(work.creatorId,identity.subject.id,work,transaction);
+          if(method==='DELETE'){
+            // A Work can be ready with no live destinations. Inspect all durable
+            // receipts, including later pages; the Work CAS below also conflicts
+            // with any concurrent successful publication.
+            for await(const publication of repositoryItems(page=>repositories.publications.list(page,{transaction}))){
+              if(publication.workId===work.id&&publication.status==='live')throw new HttpError(409,'work_is_published','Unpublish the Work before deleting it.');
+            }
+          }
           return method==='DELETE'
           ? withCollectionWorkLifecycleFence(repositories,{instanceId:configuration.instanceId??'local-reference',cellId,region},work.creatorId,
               transaction=>repositories.works.update(work.id,work.revision,changes,{transaction}))
@@ -1104,13 +1111,22 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const canonicalDestination = requestedDestination;
 
         if (!shouldPublish) {
-          const allPubs = await allRecords(repositories.publications);
-          const existing = allPubs.find((p) => p.workId === work.id && p.destination === canonicalDestination && p.status === 'live');
-          if (existing) {
-            await repositories.publications.update(existing.id, existing.revision, { status: 'removed' });
-            await repositories.works.update(work.id, work.revision, { status: 'draft' });
-            await audit({ action: 'work.withdrawn', actorId: identity.subject.id, subjectId: work.id, payload: { destination: canonicalDestination } });
-          }
+          await repositories.transaction(async transaction=>{
+            await authorizeWorkMutation(work.creatorId,identity.subject.id,work,transaction);
+            const live=[];
+            for await(const publication of repositoryItems(page=>repositories.publications.list(page,{transaction}))){
+              if(publication.workId===work.id&&publication.destination===canonicalDestination&&publication.status==='live'){
+                if(publication.instanceId!==work.instanceId||publication.homeCellId!==work.homeCellId)throw new HttpError(409,'publication_reconciliation_required','Publication custody requires reconciliation.');
+                if('preparationVersion' in publication||'executionPolicy' in publication)throw new HttpError(409,'publication_reconciliation_required','Use the provider-aware reviewed workflow for this Publication.');
+                live.push(publication);
+              }
+            }
+            // Remove every live local receipt for this destination atomically.
+            // Other destinations and the Work's readiness remain independent.
+            for(const publication of live)await repositories.publications.update(publication.id,publication.revision,{status:'removed'},{transaction});
+            if(live.length)await repositories.auditEvents.create({id:randomUUID(),instanceId:work.instanceId,...dataHomeOf(work),
+              action:'work.withdrawn',actorId:identity.subject.id,subjectId:work.id,payload:{destination:canonicalDestination,publicationIds:live.map(publication=>publication.id)}},{transaction});
+          });
           return json(response, 200, { workId, status: 'withdrawn', requestId }, requestId);
         }
 

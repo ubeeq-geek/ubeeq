@@ -22,7 +22,7 @@ export function createWebsiteSourceReader(repositories:UbeeqRepositories,revisio
     const current=(id:string)=>{
       const previous=publicWorks.get(id);if(previous)return previous;
       const work=works.get(id),media=assetsByWork.get(id)??[],live=publicationsByWork.get(id)??[];
-      if(!work||work.status!=='published'||!media.length||!live.length||[workspaceId,id,...media.map(asset=>asset.id)].some(subject=>held.has(subject)))throw new WebsiteError('media_not_public','A website source is no longer publicly available.');
+      if(!work||!['ready','published'].includes(work.status)||!media.length||!live.length||[workspaceId,id,...media.map(asset=>asset.id)].some(subject=>held.has(subject)))throw new WebsiteError('media_not_public','A website source is no longer publicly available.');
       const result={work,assets:media,publications:live};publicWorks.set(id,result);return result;
     };
     const revisions=new Map<string,string>();

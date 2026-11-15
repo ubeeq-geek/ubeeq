@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { repositoryItems, type UbeeqRepositories, type WorkRecord, type AssetRecord, type PublicationIntentRecord, type PublicationRecord } from '@ubeeq/persistence';
 
 export class PublicationRequestError extends Error {
-  constructor(readonly code: 'invalid_request' | 'invalid_idempotency_key' | 'idempotency_conflict' | 'publication_receipt_invalid' | 'processing_incomplete', message: string) {
+  constructor(readonly code: 'invalid_request' | 'invalid_idempotency_key' | 'idempotency_conflict' | 'publication_receipt_invalid' | 'processing_incomplete' | 'work_not_publishable', message: string) {
     super(message); this.name = 'PublicationRequestError';
   }
 }
@@ -25,6 +25,7 @@ export class PublicationService {
     const { workId, actorId, destination: rawDestination, idempotencyKey: header } = input;
     const work = structuredClone(await this.authorizeWork(workId, actorId));
     if (work.id !== workId || !actorId || typeof rawDestination !== 'string' || !rawDestination.trim()) throw new PublicationRequestError('invalid_request', 'A matching authorized Work, actor and destination are required.');
+    if (!['draft', 'ready', 'published'].includes(work.status)) throw new PublicationRequestError('work_not_publishable', 'Restore the Work before publishing it.');
     const destination = rawDestination.trim();
     if (header !== undefined && (typeof header !== 'string' || !header.trim() || header.length > 200)) throw new PublicationRequestError('invalid_idempotency_key', 'Use a non-empty idempotency key of at most 200 characters');
     const requestKey = typeof header === 'string' ? header.trim() : randomUUID();
@@ -52,9 +53,12 @@ export class PublicationService {
         if (existing) return existing;
         const intent = await repositories.publicationIntents.create({ id: intentId, ...scope, workId: work.id, destination, idempotencyKey: requestKey }, { transaction });
         const publication = await repositories.publications.create({ id: publicationId, ...scope, workId: work.id, destination, status: 'live' }, { transaction });
-        const publishedWork = await repositories.works.update(work.id, work.revision, { status: 'published' }, { transaction });
+        // Work readiness is independent of any destination's live receipt. Keep
+        // this CAS even for an already-ready Work: it fences the admitted revision
+        // against a concurrent edit or deletion, together with every receipt.
+        const readyWork = await repositories.works.update(work.id, work.revision, { status: 'ready' }, { transaction });
         await repositories.auditEvents.create({ id: randomUUID(), ...scope, action: 'work.published', actorId, subjectId: work.id, payload: { publicationId: publication.id, destination } }, { transaction });
-        return { intent, publication, work: publishedWork, idempotent: false };
+        return { intent, publication, work: readyWork, idempotent: false };
       }));
     } catch (error) {
       const existing = await replay();

@@ -130,6 +130,8 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
 }
 
 export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
+/** `published` is a retained legacy value. New publication commands leave the
+ * Work `ready`; current Publication records determine destination visibility. */
 export interface WorkRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; status: "draft" | "ready" | "published" | "archived" | "deleted"; }
 export interface AssetRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; workId?: string; mimeType: string; checksum: string; objectVersion: string; status: "pending" | "processing" | "ready" | "failed" | "deleted"; }
 export interface CollectionRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; visibility: "private" | "unlisted" | "public"; }

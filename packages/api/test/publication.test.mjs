@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { PublicationService } from '../dist/index.js';
 
 test('publication service requires explicit ownership, readiness and admission before any transaction', async () => {
-  const work = { id: 'work', creatorId: 'creator', instanceId: 'instance', homeCellId: 'cell', revision: 1, title: 'Original' };
+  const work = { id: 'work', creatorId: 'creator', instanceId: 'instance', homeCellId: 'cell', revision: 1, title: 'Original', status: 'draft' };
   let reads = 0, writes = 0, admission = 0;
   let assets = [{ id: 'asset', workId: 'work', creatorId: 'creator', status: 'ready' }];
   const repositories = {
@@ -34,7 +34,7 @@ test('publication service requires explicit ownership, readiness and admission b
 });
 
 test('publishing without assets requires explicit opt-in and still enforces admission and attachment readiness', async () => {
-  const work = { id: 'work', creatorId: 'creator', instanceId: 'instance', homeCellId: 'cell', revision: 1, title: 'Text' };
+  const work = { id: 'work', creatorId: 'creator', instanceId: 'instance', homeCellId: 'cell', revision: 1, title: 'Text', status: 'draft' };
   let assets = [], admissions = 0, writes = 0;
   const repositories = { publicationIntents: { get: async () => undefined }, assets: { list: async () => ({ items: assets }) },
     transaction: async () => { writes++; throw new Error('transaction reached'); } };
@@ -57,4 +57,12 @@ test('publishing without assets requires explicit opt-in and still enforces admi
     assets = [asset]; await assert.rejects(admitted.publish(input), { code: 'processing_incomplete' });
   }
   assert.equal(admissions, 2); assert.equal(writes, 1);
+});
+
+test('archived and deleted Works cannot acquire a new live publication', async () => {
+  for (const status of ['archived', 'deleted']) {
+    const work = { id: 'work', creatorId: 'creator', instanceId: 'instance', homeCellId: 'cell', revision: 1, title: 'Retired', status };
+    const service = new PublicationService({}, async () => work, async () => { assert.fail('Retired content reached publication admission.'); });
+    await assert.rejects(service.publish({ workId: 'work', actorId: 'owner', destination: 'local' }), { code: 'work_not_publishable' });
+  }
 });
