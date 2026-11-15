@@ -58,6 +58,14 @@
     "./preparation-records": {
       "types": "./dist/preparation-records.d.ts",
       "default": "./dist/preparation-records.js"
+    },
+    "./content-preparation-http": {
+      "types": "./dist/content-preparation-http.d.ts",
+      "default": "./dist/content-preparation-http.js"
+    },
+    "./content-preparation-node": {
+      "types": "./dist/content-preparation-node.d.ts",
+      "default": "./dist/content-preparation-node.js"
     }
   },
   "scripts": {
@@ -89,6 +97,12 @@
       ],
       "preparation-records": [
         "dist/preparation-records.d.ts"
+      ],
+      "content-preparation-http": [
+        "dist/content-preparation-http.d.ts"
+      ],
+      "content-preparation-node": [
+        "dist/content-preparation-node.d.ts"
       ]
     }
   }

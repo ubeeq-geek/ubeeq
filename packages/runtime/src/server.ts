@@ -1,3 +1,4 @@
+import {createContentPreparationNodeHandler,type ContentPreparationNodeBindings} from './content-preparation-node.js';
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { OwnedObjectWrites } from './owned-object-writes.js';
@@ -86,6 +87,10 @@ export interface RegionalControlPlane {
 }
 
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
+  /** Retained host supplies its real store, services and feature drivers. Core
+   * resolves the verified creator session before reading request input. */
+  contentPreparation?: (context:{adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string})=>ContentPreparationNodeBindings;
+
   commerce?: ReferenceCommerceConfiguration;
   registrationAdmission?: (input: { email: string; invitationCode?: string; organizationName?: string }) => Promise<{ allowed: boolean; reasonCode?: string }>;
   /** Trusted host preparation is database-only and atomic with Creator creation.
@@ -261,6 +266,11 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   );
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
+  const preparationBindings=configuration.contentPreparation?.({adapters,hostPorts,instanceId:composition.configuration.instanceId,cellId,region});
+  const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
+    if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
+    return preparationBindings.access(request,response,creatorId);
+  }},request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
   const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
   const uploadAccountingAvailable=Boolean(repositories.hostRecords && adapters.uploads.seal && hostPorts.usageQuota.closeStorageReservation);
   if(configuration.requireUploadAccounting && !uploadAccountingAvailable){localAdapters?.database.close();throw new Error('Physical upload closure and terminal storage quota reservations are required.');}
@@ -686,6 +696,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
       if (commerce && await commerce.handle(request, response, url)) return;
+      if (contentPreparation && await contentPreparation.handle(request,response)) return;
       // Fail closed for the entire operations namespace, including future routes.
       // Product/deployment composition must explicitly define operator authority.
       if (url.pathname === '/v1/operations' || url.pathname.startsWith('/v1/operations/')) await operatorSession(request);
@@ -1252,7 +1263,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     return hostPorts.connectorAppCredentials.resolveOAuthClient(input.provider, input.creatorId);
   };
   let disposed = false;
-  const dispose = () => { if (disposed) return; disposed = true; localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
+  const dispose = () => { if (disposed) return; disposed = true; contentPreparation?.close(); localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
   return { server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
     if (!server.listening) { dispose(); resolve(); return; }
     server.close(error => { if (error) reject(error); else { dispose(); resolve(); } });
