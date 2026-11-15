@@ -106,6 +106,10 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
    * in this transaction. Without an adapter, only the Creator's current owner
    * can mutate collections; an earlier role lookup cannot authorize a commit. */
   collectionAuthorization?: {
+    /** Optional current host policy for collection reads and displayed editing
+     * capabilities. This does not replace the accepting transaction guard below.
+     * An omitted resolver retains the neutral role-based behavior. */
+    resolveCapabilities?(input:{creator:Readonly<CreatorRecord>;actorUserId:string;repositories:UbeeqRepositories}):Promise<{canRead:boolean;canEdit:boolean}>;
     authorizeMutation(input:{creator:Readonly<CreatorRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:import('@ubeeq/persistence').PersistenceTransaction}):Promise<void>;
   };
   /** Current actor authority must join the actual Work transaction, including
@@ -393,7 +397,18 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     requireHomeCell({cellId},creator);
     if(creator.instanceId!==(configuration.instanceId??'local-reference')||creator.dataHomeRegion!==region)throw new HttpError(404,'creator_not_found','Creator not found.');
     const role=await tenancy.resolveCreatorRole(actorId,creator.id);
-    if(!role||write&&!['owner','admin','editor'].includes(role))throw new HttpError(403,'collection_edit_denied','Current collection access is required.');
+    if(!role)throw new HttpError(403,'collection_edit_denied','Current collection access is required.');
+    const legacyCanEdit=['owner','admin','editor'].includes(role);
+    let canRead=true,canEdit=legacyCanEdit;
+    if(configuration.collectionAuthorization?.resolveCapabilities!==undefined){
+      if(typeof configuration.collectionAuthorization.resolveCapabilities!=='function')throw new HttpError(503,'collection_capabilities_unavailable','Current collection capabilities are unavailable.');
+      let capabilities:{canRead:boolean;canEdit:boolean};
+      try{capabilities=await configuration.collectionAuthorization.resolveCapabilities({creator:Object.freeze(structuredClone(creator)),actorUserId:actorId,repositories});}
+      catch{throw new HttpError(503,'collection_capabilities_unavailable','Current collection capabilities are unavailable.');}
+      if(!capabilities||typeof capabilities!=='object'||Array.isArray(capabilities)||typeof capabilities.canRead!=='boolean'||typeof capabilities.canEdit!=='boolean'||capabilities.canEdit&&!capabilities.canRead)throw new HttpError(503,'collection_capabilities_unavailable','Current collection capabilities are unavailable.');
+      canRead=capabilities.canRead;canEdit=capabilities.canEdit;
+    }
+    if(!canRead||write&&!canEdit)throw new HttpError(403,'collection_edit_denied','Current collection access is required.');
     if(write)await requireCreatorWritable(creator);
     if(!repositories.hostRecords)throw new HttpError(503,'collection_management_unavailable','Durable collection storage is required.');
     const scope={instanceId:creator.instanceId,cellId,region};
@@ -405,7 +420,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         await repositories.creators.checkRevision(current.id,current.revision,{transaction});
       }
     });
-    return{store,canEdit:['owner','admin','editor'].includes(role)&&Boolean(configuration.collectionAuthorization||creator.subjectId===actorId),service:new CreatorCollectionService(store,async requested=>requested.tenantId===creator.instanceId&&requested.creatorId===creator.id)};
+    return{store,canEdit:canRead&&canEdit&&Boolean(configuration.collectionAuthorization||creator.subjectId===actorId),service:new CreatorCollectionService(store,async requested=>requested.tenantId===creator.instanceId&&requested.creatorId===creator.id)};
   };
   const collectionFields=(body:Record<string,unknown>,allowed:readonly string[])=>{
     if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(key=>!allowed.includes(key)))throw new HttpError(400,'invalid_request','Collection request contains unsupported fields.');

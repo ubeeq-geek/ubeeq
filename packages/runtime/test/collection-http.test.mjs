@@ -79,11 +79,46 @@ test('imported and legacy collections remain visible and opaque data survives wi
  assert.equal((await f.request('/v1/collections/'+managed.id,'PATCH',{revision:managed.revision,title:'Unsafe'})).body.error.code,'collection_migration_required');
  assert.deepEqual((await f.local.repositories.collections.get('untracked')).remoteConfiguration,{retain:true});
 });
-test('trusted host mutation authorization is enforced even when a role preflight remains permissive',async t=>{
+test('trusted host mutation authorization is enforced even when role and capability preflights remain permissive',async t=>{
  let allowed=true,calls=0;
- const f=await fixture(t,{collectionAuthorization:{authorizeMutation:async({creator,repositories,transaction,actorUserId})=>{
+ const f=await fixture(t,{collectionAuthorization:{resolveCapabilities:async()=>({canRead:true,canEdit:true}),authorizeMutation:async({creator,repositories,transaction,actorUserId})=>{
   calls++;assert.equal(Object.isFrozen(creator),true);if(!allowed||creator.subjectId!==actorUserId)throw new CreatorCollectionError('access_denied','Current membership is required.');
   await repositories.creators.checkRevision(creator.id,creator.revision,{transaction});
  }}}),c=await f.create();allowed=false;
  const result=await f.request('/v1/collections/'+c.id,'PATCH',{revision:c.revision,title:'Revoked'});assert.equal(result.status,403);assert.equal(calls,2);assert.equal((await f.local.repositories.collections.get(c.id)).title,'A collection');
+});
+
+test('current host collection capabilities govern list/item reads and advertised editing without granting a mutation',async t=>{
+ let capabilities={canRead:true,canEdit:true},acceptingCalls=0;
+ const f=await fixture(t,{collectionAuthorization:{
+  resolveCapabilities:async({creator,actorUserId,repositories})=>{
+   assert.equal(Object.isFrozen(creator),true);assert.equal(actorUserId,creator.subjectId);assert.equal(repositories,f.local.repositories);
+   return {...capabilities,internalEvidence:{mustNotBeSerialized:true}};
+  },
+  authorizeMutation:async({creator,repositories,transaction})=>{acceptingCalls++;await repositories.creators.checkRevision(creator.id,creator.revision,{transaction});}
+ }}),c=await f.create(),path='/v1/collections/'+c.id;
+ assert.equal(c.permissions.canEdit,true);assert.equal(acceptingCalls,1);
+ capabilities={canRead:true,canEdit:false};
+ const listing=await f.request('/v1/collections');assert.equal(listing.status,200);assert.equal(listing.body.capabilities.canCreate,false);assert.equal(listing.body.collections[0].permissions.canEdit,false);assert.equal(JSON.stringify(listing.body).includes('internalEvidence'),false);
+ const detail=await f.request(path);assert.equal(detail.status,200);assert.equal(detail.body.collection.permissions.canEdit,false);assert.equal(detail.body.collection.id,c.id);
+ for(const [target,method,body] of [[path,'PATCH',{revision:c.revision,title:'Denied'}],[path,'DELETE',{revision:c.revision}],[path+'/works','PUT',{revision:c.revision,workIds:[],expectedWorkIds:[]}],['/v1/collections','POST',{title:'Denied'}]])assert.equal((await f.request(target,method,body)).status,403);
+ assert.equal(acceptingCalls,1,'displayed denial must not invoke the accepting writer');assert.equal((await f.local.repositories.collections.get(c.id)).title,'A collection');
+ capabilities={canRead:false,canEdit:false};
+ assert.equal((await f.request('/v1/collections')).status,403);assert.equal((await f.request(path)).status,403);assert.equal((await f.request(path,'PATCH',{revision:c.revision,title:'Still denied'})).status,403);
+ assert.equal((await f.request('/v1/works')).status,200,'the collection-specific policy does not change Work access');
+});
+
+test('invalid, contradictory and unavailable collection capability results fail closed without returning content or changing records',async t=>{
+ let result={canRead:true,canEdit:true},outage=false,acceptingCalls=0;
+ const authorization={resolveCapabilities:async()=>{if(outage)throw Error('Synthetic host authority outage');return result;},authorizeMutation:async({creator,repositories,transaction})=>{acceptingCalls++;await repositories.creators.checkRevision(creator.id,creator.revision,{transaction});}};
+ const f=await fixture(t,{collectionAuthorization:authorization}),c=await f.create(),path='/v1/collections/'+c.id;
+ for(const invalid of [undefined,null,[],false,'permitted',{canRead:true},{canRead:'true',canEdit:true},{canRead:false,canEdit:true}]){
+  result=invalid;
+  for(const [target,method,body] of [['/v1/collections','GET',undefined],[path,'GET',undefined],[path,'PATCH',{revision:c.revision,title:'Forged grant'}]]){
+   const denied=await f.request(target,method,body);assert.equal(denied.status,503);assert.equal(denied.body.error.code,'collection_capabilities_unavailable');assert.equal(denied.body.collection,undefined);assert.equal(denied.body.collections,undefined);
+  }
+ }
+ outage=true;assert.equal((await f.request(path)).status,503);
+ for(const invalidResolver of [null,false,{},'allowed']){authorization.resolveCapabilities=invalidResolver;assert.equal((await f.request(path)).status,503,'a malformed configured resolver cannot fall back to neutral permissions');}
+ assert.equal(acceptingCalls,1);assert.equal((await f.local.repositories.collections.get(c.id)).title,'A collection');
 });
