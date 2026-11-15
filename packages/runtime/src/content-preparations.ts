@@ -32,6 +32,7 @@ export interface ContentWorkflowPatch {
 }
 /** Uses the same durable transaction authority as canonical content and publication commands. */
 export class ContentWorkflowService<S extends PreparationOrganizationState, C extends { tenantId: string }> {
+    private recoveryCursor?: string;
     constructor(readonly store: ContentPreparationStore<S>, readonly config: C, private readonly host: ContentPreparationHost, private readonly now: () => string = () => new Date().toISOString(), private readonly authorization: ContentPreparationAuthorization = host) {
         const required = ['authorizeCreator', 'canManageCollections', 'recoveryAuthorization', 'defaultSettings', 'inspectOriginal', 'captureSetup', 'contentMetadataWork', 'validateCollectionVolumes', 'resolvedCollectionMembers', 'recordImageCompatibility'] as const;
         if (required.some(name => typeof host?.[name] !== 'function') || typeof authorization?.authorizeCreator !== 'function' || typeof authorization?.canManageCollections !== 'function')
@@ -617,17 +618,42 @@ export class ContentWorkflowService<S extends PreparationOrganizationState, C ex
             for (const draft of await this.list(creator.creatorId))
                 if (draft.state === 'accepted') {
                     try {
-                        const record = await this.get(creator.creatorId, draft.id);
-                        const actor = this.host.recoveryAuthorization(record.actorId);
-                        const recovery = new ContentWorkflowService(this.store, this.config, this.host, this.now, {
-                            authorizeCreator: async creatorId => await actor.authorizeCreator(creatorId) && (record.arrangement !== 'collection' || await actor.canManageCollections(creatorId)),
-                            canManageCollections: creatorId => actor.canManageCollections(creatorId)
-                        });
-                        await recovery.resume(creator.creatorId, draft.id);
+                        await this.recoverDraft(creator.creatorId, draft.id);
                     }
                     catch { /* Retain accepted child receipts; a focused retry shows the current blocker. */ }
                 }
         }
+    }
+    private async recoverDraft(creatorId: string, id: string) {
+        const record = await this.atomic().get(this.kind(creatorId), id) as ContentWorkflowDraft | undefined;
+        if (!record || record.tenantId !== this.config.tenantId || record.creatorId !== creatorId)
+            throw new ContentPreparationError('not_found', 'Preparation not found.', 404);
+        const actor = this.host.recoveryAuthorization(record.actorId);
+        const recovery = new ContentWorkflowService(this.store, this.config, this.host, this.now, {
+            authorizeCreator: async id => await actor.authorizeCreator(id) && (record.arrangement !== 'collection' || await actor.canManageCollections(id)),
+            canManageCollections: id => actor.canManageCollections(id)
+        });
+        return recovery.resume(creatorId, id);
+    }
+    /** Discover from canonical accepted commands; never create a second queue or
+     * use the worker's identity as the saved actor's authority. One command is
+     * resumed per poll. The cursor affects fairness only and is safe to discard. */
+    async recoverNext() {
+        const candidates: Array<{key:string;creatorId:string;id:string}> = [];
+        for (const creator of await this.store.listCreators()) {
+            if (creator.status !== 'active' || creator.deletion || !validId(creator.creatorId)) continue;
+            const drafts = await this.atomic().list(this.kind(creator.creatorId)) as ContentWorkflowDraft[];
+            const operations = await this.atomic().list(this.kind(creator.creatorId, 'operation'));
+            for (const draft of drafts) if (draft.tenantId === this.config.tenantId && draft.creatorId === creator.creatorId && draft.state === 'accepted'
+                && operations.some(operation => operation.state === 'accepted' && operation.draft?.id === draft.id))
+                candidates.push({key:JSON.stringify([creator.creatorId,draft.id]),creatorId:creator.creatorId,id:draft.id});
+        }
+        candidates.sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0);
+        const next=candidates.find(candidate=>!this.recoveryCursor || candidate.key>this.recoveryCursor)??candidates[0];
+        if (!next) return;
+        this.recoveryCursor=next.key;
+        const draft=await this.recoverDraft(next.creatorId,next.id);
+        return {kind:'content-preparation' as const,creatorId:next.creatorId,id:next.id,state:draft.state};
     }
     /** Assemble private draft units in bounded, resumable transactions. Never publish or queue a send. */
     async saveDraft(creatorId: string, id: string, expectedRevision: number, operationId: string) {

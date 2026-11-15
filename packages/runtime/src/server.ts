@@ -1,4 +1,4 @@
-import {createContentPreparationNodeHandler,type ContentPreparationNodeBindings} from './content-preparation-node.js';
+import {createContentPreparationNodeHandler,type ContentPreparationRuntimeBindings} from './content-preparation-node.js';
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
 import { OwnedObjectWrites } from './owned-object-writes.js';
@@ -89,7 +89,7 @@ export interface RegionalControlPlane {
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   /** Retained host supplies its real store, services and feature drivers. Core
    * resolves the verified creator session before reading request input. */
-  contentPreparation?: (context:{adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string})=>ContentPreparationNodeBindings;
+  contentPreparation?: (context:{adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string})=>ContentPreparationRuntimeBindings;
 
   commerce?: ReferenceCommerceConfiguration;
   registrationAdmission?: (input: { email: string; invitationCode?: string; organizationName?: string }) => Promise<{ allowed: boolean; reasonCode?: string }>;
@@ -267,6 +267,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
   const preparationBindings=configuration.contentPreparation?.({adapters,hostPorts,instanceId:composition.configuration.instanceId,cellId,region});
+  if(preparationBindings && typeof preparationBindings.runNextJob!=='function'){
+    localAdapters?.database.close();
+    throw Error('Content preparation HTTP requires its durable recovery and release worker.');
+  }
   const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
     if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
     return preparationBindings.access(request,response,creatorId);
@@ -595,7 +599,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   }) : undefined;
   let lastWebsitePolicyScan=0;
   let commerceTurn=true;
-  const runNextJob = async (workerId: string) => {
+  const runCoreJob = async (workerId: string) => {
     if (uploadLifecycle) try { await uploadLifecycle.repair(); } catch { await audit({ action:'upload.queue_repair_deferred',subjectId:cellId }); }
     if (ownedObjectWrites) try { await ownedObjectWrites.repair(); } catch { await audit({action:'storage.output_repair_deferred',subjectId:cellId}); }
     if (usageOutbox) try { await usageOutbox.recoverTerminal(adapters.jobs); await usageOutbox.drain(); } catch { await audit({ action: 'usage.settlement_retry_deferred', subjectId: cellId }); }
@@ -712,6 +716,23 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       else await adapters.jobs.retry({ id: lease.job.id, leaseToken: lease.leaseToken, error: details, retryAt: new Date(Date.now() + 1_000).toISOString() });
       throw error;
     }
+  };
+
+  let preparationTurn=true;
+  const runNextJob=async(workerId:string)=>{
+    if(!preparationBindings)return runCoreJob(workerId);
+    const first=preparationTurn;preparationTurn=!preparationTurn;
+    const runPreparation=()=>preparationBindings.runNextJob(workerId),runCore=()=>runCoreJob(workerId);
+    const polls=first?[runPreparation,runCore]:[runCore,runPreparation];
+    let failed=false,failure:unknown;
+    for(const poll of polls){
+      try { const result=await poll();if(result!==undefined && result!==null)return result; }
+      catch(error){
+        failed=true;failure??=error;
+        if(poll===runPreparation)try{await audit({action:'content.preparation.worker_deferred',subjectId:cellId});}catch{/* Preserve the original failure if durable diagnostics are also unavailable. */}
+      }
+    }
+    if(failed)throw failure;
   };
 
   const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {

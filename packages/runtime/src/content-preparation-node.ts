@@ -9,6 +9,10 @@ export interface ContentPreparationNodeRequest extends ContentPreparationHttpReq
  readonly session:AuthenticatedSession;
 }
 export type ContentPreparationNodeBindings<S extends ContentPreparationHttpService=ContentPreparationHttpService>=Omit<ContentPreparationHttpBindings<ContentPreparationNodeRequest,ContentPreparationHttpResponse,S>,'actorId'|'basePath'>&{close?():void};
+/** The actual host supplies one composition for both request and worker paths. */
+export type ContentPreparationRuntimeBindings<S extends ContentPreparationHttpService=ContentPreparationHttpService>=ContentPreparationNodeBindings<S>&{
+ runNextJob(workerId:string):Promise<unknown>;
+};
 type Route={method:string;pattern:RegExp;parameters:string[];handle:(request:ContentPreparationNodeRequest,response:ContentPreparationHttpResponse)=>Promise<unknown>};
 const escape=(value:string)=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
 function responseFor(response:ServerResponse,head:boolean):ContentPreparationHttpResponse {

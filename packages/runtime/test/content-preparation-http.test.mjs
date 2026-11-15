@@ -146,7 +146,7 @@ test('core composition supplies actual adapters and enforces configured tenancy 
  const rich=new FixtureStore();let hostCalls=0,closed=0,tenancyCalls=0,captured;
  const runtime=createCoreRuntime({instanceId:'instance',cellId:'cell',region:'local',publicBaseUrl:'http://localhost',adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity},
   tenancy:{mode:'single_operator',assertCanCreateCreatorUser:async()=>{},assertCanCreateCustomerAccount:async()=>{},listAccessibleCreatorIds:async()=>[],resolveCreatorRole:async()=>{tenancyCalls++;return null;},isContributorManagementEnabled:()=>false,isOrganizationManagementEnabled:()=>false},
-  contentPreparation:context=>{captured=context;return {...bindingsFor(rich),access:async()=>{hostCalls++;return true;},close:()=>{closed++;}};}});
+  contentPreparation:context=>{captured=context;return {...bindingsFor(rich),runNextJob:()=>new ContentWorkflowService(rich,{tenantId:'tenant'},fixtureHost(rich,'owner')).recoverNext(),access:async()=>{hostCalls++;return true;},close:()=>{closed++;}};}});
  await new Promise(resolve=>runtime.server.listen(0,'127.0.0.1',resolve));
  t.after(async()=>{await runtime.close();local.database.close();await rm(directory,{recursive:true,force:true});});
  const credentials={email:'owner@example.test',password:'Synthetic password 123!'};await local.identity.register(credentials);const signed=await local.identity.authenticate(credentials);

@@ -48,6 +48,7 @@ export interface PreparedRelease<M extends ContentReleaseModels> {
 }
 /** Owns accepted content publication commands. Preparation and private processing never authorize a write. */
 export class ContentReleaseService<M extends ContentReleaseModels> {
+    private workerCursor?: string;
     readonly representations: ReleaseRepresentations<M>;
     constructor(readonly workflows: ContentReleaseWorkflow<M>, readonly allowed: (work: M['work']) => Promise<boolean>, private readonly host:ContentReleaseHost<M>, representations:ReleaseRepresentations<M>, readonly runtime?:{tick():Promise<unknown>}) {
         const required=['isNativeDestination','nativeWorkDestination','nativeCollectionDestination','nativeWorkAnnouncementBinding','nativeCollectionAnnouncementBinding','collection','announcement','contentPublishing','resolvedContentOffer','validateNativeCollectionOffer','communityActorAllowed','announcementRules','announcementDestinations','announcementKnownLinks','parseAnnouncement','validateAnnouncement','announcementDocumentForDestination','stageAnnouncementMedia','pinCollectionAnnouncementMedia','activateAnnouncementMedia','readStagedAnnouncementMedia','readAnnouncementFile','readAnnouncementImage','evaluatePublicationPolicy','nativeWorkPublication','resolvedCollectionMembers','evaluateNativeCollectionPublication','announcementPlans','captureCollectionReleaseRequirements','readOrchestrationValue'] as const;
@@ -541,6 +542,8 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         if (!initial || initial.state !== 'accepted' || initial.scheduledAt && Date.parse(initial.scheduledAt) > Date.now())
             return;
         try {
+            if (initial.scheduledAt && !Number.isFinite(Date.parse(initial.scheduledAt)))
+                throw new ContentPreparationError('schedule_invalid', 'The saved release time is invalid. Review a new release time.');
             if (initial.scheduledAt && Date.now() - Date.parse(initial.scheduledAt) > 86400000)
                 throw new ContentPreparationError('schedule_expired', 'The release exceeded its allowed lateness. Review a new release time.');
             if (publicationIdentityHash(await this.store.getCreatorById(creatorId)) !== initial.creatorFingerprint || initial.blockRulesRevision !== (await this.host.announcementRules()).revision)
@@ -740,6 +743,29 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             await atomic.put(this.workflows.kind(creatorId), draft.id, draft);
         });
         await this.runtime?.tick();
+    }
+    /** One due release or pending cancellation per worker poll. Discovery is
+     * read-only; run/cancel retain the existing durable claims and live guards. */
+    async runNextJob() {
+        const candidates: Array<{key:string;creatorId:string;id:string;cancel:boolean}> = [];
+        for (const creator of await this.store.listCreators()) {
+            if (creator.status !== 'active' || creator.deletion) continue;
+            const rows=await this.atomic().list(this.key(creator.creatorId)) as PreparedRelease<M>[];
+            for (const row of rows) {
+                if (row.creatorId !== creator.creatorId) continue;
+                const cancel=row.state==='cancelled' && row.cancellationPending===true;
+                if (cancel || row.state==='accepted' && (!row.scheduledAt || !Number.isFinite(Date.parse(row.scheduledAt)) || Date.parse(row.scheduledAt)<=Date.now()))
+                    candidates.push({key:JSON.stringify([creator.creatorId,row.id]),creatorId:creator.creatorId,id:row.id,cancel});
+            }
+        }
+        candidates.sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0);
+        const next=candidates.find(candidate=>!this.workerCursor || candidate.key>this.workerCursor)??candidates[0];
+        if (!next) return;
+        this.workerCursor=next.key;
+        if (next.cancel) await this.cancelConnected(next.creatorId,next.id);
+        else await this.run(next.creatorId,next.id);
+        const current=await this.atomic().get(this.key(next.creatorId),next.id) as PreparedRelease<M> | undefined;
+        return current?{kind:next.cancel?'content-cancellation' as const:'content-release' as const,creatorId:next.creatorId,id:next.id,state:current.state}:undefined;
     }
     async tick() {
         await this.workflows.recover();

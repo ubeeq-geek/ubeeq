@@ -7,6 +7,8 @@ import {installSqliteRetainedContentAtomic} from '@ubeeq/adapter-local';
 import {publicationIdentityHash} from '@ubeeq/persistence';
 import {defaultContentPreparation} from '@ubeeq/core';
 import {ContentReleaseService} from '../dist/content-releases.js';
+import {ContentWorkflowService} from '../dist/content-preparations.js';
+import {createContentPreparationWorker} from '../dist/content-worker.js';
 const at='2026-11-15T00:00:00.000Z',tenant='tenant',creatorId='creator',actorId='original-owner';
 const kind=(id,suffix='draft')=>`content-workflow:${tenant}:${id}:${suffix}`;
 const creator={creatorId,status:'active',slug:'creator',name:'Creator'};
@@ -86,4 +88,40 @@ test('hosts without durable release storage can initialize while release access 
  }
  assert.deepEqual(await f.store.listPublicationsByWork(tenant,'work'),[]);
  assert.deepEqual((await base.get(kind(creatorId,'release'),'release')).completed,[]);
+});
+
+test('bounded release polling skips future schedules and stops after one durable due command',async t=>{
+ const f=await fixture(t),current=f.make(f.store),future={...f.release,id:'future',scheduledAt:new Date(Date.now()+3600000).toISOString()};
+ await f.store.publicationAtomic.run(()=>f.store.publicationAtomic.put(kind(creatorId,'release'),future.id,future));
+ const result=await current.service.runNextJob();assert.equal(result.kind,'content-release');assert.equal(result.id,'release');assert.equal(result.state,'completed');
+ assert.equal((await f.store.publicationAtomic.get(kind(creatorId,'release'),'future')).state,'accepted');
+ assert.equal(await current.service.runNextJob(),undefined);
+ assert.equal((await f.store.listPublicationsByWork(tenant,'work')).length,1);
+});
+
+test('bounded release polling retains revoked actor and malformed schedule denials in the durable review state',async t=>{
+ for(const failure of ['actor','schedule']){
+  const f=await fixture(t);
+  await f.store.publicationAtomic.run(async()=>{
+   if(failure==='actor')f.store.members=[];
+   else await f.store.publicationAtomic.put(kind(creatorId,'release'),'release',{...f.release,scheduledAt:'not-a-time'});
+  });
+  const current=f.make(f.attach()),result=await current.service.runNextJob();assert.equal(result.state,'needs_review');
+  const status=await current.service.status(creatorId,'release');assert.match(status.error,failure==='actor'?/Publishing access changed/:/release time is invalid/);
+  assert.deepEqual(await f.store.listPublicationsByWork(tenant,'work'),[]);assert.equal(await current.service.runNextJob(),undefined);
+ }
+});
+
+test('one shared worker drains actual preparation and release services against the same SQLite authority',async t=>{
+ const f=await fixture(t),current=f.make(f.store);
+ const preparationHost=actor=>{
+  const allowed=async id=>id===creatorId&&(await f.store.listCreatorMembers(id)).some(member=>member.userId===actor);
+  return {authorizeCreator:allowed,canManageCollections:allowed,recoveryAuthorization:preparationHost,defaultSettings:defaultContentPreparation,inspectOriginal:unused,captureSetup:unused,contentMetadataWork:unused,validateCollectionVolumes:unused,resolvedCollectionMembers:unused,recordImageCompatibility:unused};
+ };
+ const workflows=new ContentWorkflowService(f.store,{tenantId:tenant},preparationHost(actorId));
+ const releases=new ContentReleaseService(workflows,async()=>true,current.host,current.representations),worker=createContentPreparationWorker(workflows,releases);
+ assert.throws(()=>createContentPreparationWorker({...workflows,recoverNext:workflows.recoverNext.bind(workflows)},releases),/same workflow and release authority/);
+ const result=await worker.runNextJob('worker-is-not-the-saved-actor');assert.equal(result.kind,'content-release');assert.equal(result.state,'completed');
+ assert.equal((await f.store.listPublicationsByWork(tenant,'work')).length,1);assert.equal(await worker.runNextJob('retry'),undefined);
+ assert.deepEqual((await f.store.getWork(tenant,'work')).opaque,work.opaque);
 });

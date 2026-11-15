@@ -78,6 +78,10 @@
     "./retained-preparation-host": {
       "types": "./dist/retained-preparation-host.d.ts",
       "default": "./dist/retained-preparation-host.js"
+    },
+    "./content-worker": {
+      "types": "./dist/content-worker.d.ts",
+      "default": "./dist/content-worker.js"
     }
   },
   "scripts": {
@@ -125,6 +129,9 @@
       ],
       "retained-preparation-host": [
         "dist/retained-preparation-host.d.ts"
+      ],
+      "content-worker": [
+        "dist/content-worker.d.ts"
       ]
     }
   }
