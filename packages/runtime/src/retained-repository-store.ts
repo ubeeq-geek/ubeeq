@@ -191,6 +191,9 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
  /** A domain maintenance adapter may authorize ONLY a narrowly validated delta.
   * The base store never grants a worker general Creator mutation authority. */
  protected mayCommitMaintenance(_changes:readonly RetainedRepositoryChange[]):boolean{return false;}
+ /** Exact host-owned provider-effect move only. No current actor is invented;
+  * final mayCommitMaintenance still independently guards the complete delta. */
+ protected mayMoveRetainedEntityAsMaintenance(_input:Readonly<RetainedEntityMove>):boolean{return false;}
  protected mayAppendMaintenanceAudit(_event:Readonly<RetainedAuditEvent>):boolean{return false;}
  protected retainedEntityEntries<T>(kind:string):Array<{key:string;value:T}>{
   return [...this.active().extra.values()].filter(entry=>entry.address.category==='entity'&&entry.address.kind===kind).map(entry=>({key:entry.address.key,value:structuredClone(entry.payload) as T}));
@@ -257,11 +260,12 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   * publishing adapter must join its verified CONFIRMED result/remote binding
   * and operation ID to this SAME publicationAtomic transaction. */
  async moveRetainedEntity(input:RetainedEntityMove):Promise<void>{
-  await this._retainedEntityMutationActor();
   const from=this._retainedEntityAddress(input.kind,input.fromKey),to=this._retainedEntityAddress(input.kind,input.toKey);
   if(input.fromKey===input.toKey)throw new RetainedEntityMutationError('retained_entity_invalid','An entity move requires distinct original and target keys.');
   const expected=json(input.expected),next=json(input.next);this._retainedEntityScope(expected);this._retainedEntityScope(next);
   for(const field of ['tenantId','creatorId'])if(Object.hasOwn(expected,field)!==Object.hasOwn(next,field))throw new RetainedEntityMutationError('retained_entity_invalid','An entity move cannot add or discard its ownership scope.');
+  if(this.currentActor())await this._retainedEntityMutationActor();
+  else if(!this.mayMoveRetainedEntityAsMaintenance({kind:input.kind,fromKey:input.fromKey,toKey:input.toKey,expected,next}))throw new RetainedRepositoryError('access_denied','Current editing authority or exact provider-effect maintenance is required.',403);
   const state=this.active(),fromKey=addressKey(from),toKey=addressKey(to),current=state.extra.get(fromKey);
   if(!current||publicationIdentityHash(current.payload)!==publicationIdentityHash(expected)||state.extra.has(toKey))throw new RetainedEntityMutationError('retained_entity_conflict','The complete original entity changed or its target is occupied.');
   // No await between the two overlay changes. Flush performs the original-row
