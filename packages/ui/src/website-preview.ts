@@ -256,10 +256,22 @@ export const websitePreviewHtml = (files:Record<string,string>,initial='index.ht
 };
 
 /** Temporary local preview cache, shared with the standalone preview document. */
-export const saveWebsitePreview = async (html:string,scope?:WebsitePreviewScope):Promise<string> => {
+export const saveWebsitePreview = async (html:string,scope?:WebsitePreviewScope,signal?:AbortSignal):Promise<string> => {
   validateWebsitePreviewScope(scope);
+  const cancelled=()=>new Error('This website preview is no longer active.');
+  if(signal?.aborted)throw cancelled();
   const id=crypto.randomUUID(),now=Date.now();
   const db=await new Promise<IDBDatabase>((resolve,reject)=>{const request=indexedDB.open('ubeeq-website-previews-v1',1);request.onupgradeneeded=()=>request.result.createObjectStore('previews',{keyPath:'id'});request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(new Error('Browser storage is unavailable for website previews.'));});
-  try{await new Promise<void>((resolve,reject)=>{const tx=db.transaction('previews','readwrite'),store=tx.objectStore('previews'),rows:{id:string;createdAt:number}[]=[];const cursor=store.openCursor();cursor.onsuccess=()=>{const row=cursor.result;if(row){if(row.value.expiresAt<=now)row.delete();else if(row.value.namespace===scope?.namespace)rows.push({id:row.value.id,createdAt:row.value.createdAt});row.continue();}else{for(const row of rows.sort((a,b)=>b.createdAt-a.createdAt).slice(2))store.delete(row.id);store.put({id,html,createdAt:now,expiresAt:now+30*60*1000,...(scope?{namespace:scope.namespace,...(scope.context?{context:{...scope.context}}:{})}:{})});}};tx.oncomplete=()=>resolve();tx.onerror=tx.onabort=()=>reject(new Error('Unable to store the temporary preview. Check available browser storage.'));});}finally{db.close();}
+  try{await new Promise<void>((resolve,reject)=>{
+    if(signal?.aborted){reject(cancelled());return;}
+    const tx=db.transaction('previews','readwrite'),store=tx.objectStore('previews'),rows:{id:string;createdAt:number}[]=[];
+    const cleanup=()=>signal?.removeEventListener('abort',abort);
+    const abort=()=>{try{tx.abort();}catch{/* A completed transaction cannot be aborted. */}cleanup();reject(cancelled());};
+    signal?.addEventListener('abort',abort,{once:true});
+    tx.oncomplete=()=>{cleanup();signal?.aborted?reject(cancelled()):resolve();};
+    tx.onerror=tx.onabort=()=>{cleanup();reject(signal?.aborted?cancelled():new Error('Unable to store the temporary preview. Check available browser storage.'));};
+    if(signal?.aborted){abort();return;}
+    const cursor=store.openCursor();cursor.onsuccess=()=>{if(signal?.aborted)return;const row=cursor.result;if(row){if(row.value.expiresAt<=now)row.delete();else if(row.value.namespace===scope?.namespace)rows.push({id:row.value.id,createdAt:row.value.createdAt});row.continue();}else{for(const row of rows.sort((a,b)=>b.createdAt-a.createdAt).slice(2))store.delete(row.id);store.put({id,html,createdAt:now,expiresAt:now+30*60*1000,...(scope?{namespace:scope.namespace,...(scope.context?{context:{...scope.context}}:{})}:{})});}};
+  });}finally{db.close();}
   return id;
 };
