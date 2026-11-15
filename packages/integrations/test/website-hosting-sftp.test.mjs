@@ -1,5 +1,5 @@
-import test from 'node:test';import assert from 'node:assert/strict';import { createHash } from 'node:crypto';import { posix } from 'node:path';
-import ssh2 from 'ssh2';const {Server,utils}=ssh2;import { once } from 'node:events';
+import test from 'node:test';import assert from 'node:assert/strict';import { createHash, generateKeyPairSync } from 'node:crypto';import { posix } from 'node:path';
+import ssh2 from 'ssh2';const {Server}=ssh2;import { once } from 'node:events';
 import { SftpWebsiteHostingAdapter,connectWebsiteSftp } from '../dist/index.js';
 const hash=b=>createHash('sha256').update(b).digest('hex');
 function fixture(mode){const records=new Map([['/managed',{directory:true}]]),operations=[];let interrupt=false;
@@ -53,7 +53,9 @@ test('SFTP rejects symlink roots, unknown ownership and unconfirmed pointer serv
  const f=fixture('pointer');f.target.config.stagingProtected='';await assert.rejects(f.adapter.validateTarget(f.target,f.connection),{code:'sftp_server_configuration_required'});f.records.set('/managed/ubeeq-owner.txt',{bytes:Buffer.from('another-owner')});await assert.rejects(f.adapter.validateTarget(f.target,f.connection),{code:'hosting_ownership'});f.records.set('/managed',{link:'/private'});await assert.rejects(f.adapter.validateTarget(f.target,f.connection),{code:'unsafe_sftp_root'});
 });
 test('real SSH transport refuses a changed host key before authentication and requires outbound approval',async t=>{
- const key=utils.generateKeyPairSync('ed25519'),server=new Server({hostKeys:[key.private]},client=>{client.on('error',()=>{});client.on('authentication',ctx=>ctx.reject());});server.on('error',()=>{});server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>new Promise(r=>server.close(r)));
+ // Use Node's PEM encoder: ssh2's Ed25519 generator can truncate a leading
+ // zero byte in the public key, randomly rejecting its own fixture before SSH.
+ const key={private:generateKeyPairSync('rsa',{modulusLength:2048,privateKeyEncoding:{type:'pkcs1',format:'pem'},publicKeyEncoding:{type:'spki',format:'pem'}}).privateKey},server=new Server({hostKeys:[key.private]},client=>{client.on('error',()=>{});client.on('authentication',ctx=>ctx.reject());});server.on('error',()=>{});server.listen(0,'127.0.0.1');await once(server,'listening');t.after(()=>new Promise(r=>server.close(r)));
  const target={config:{hostname:'127.0.0.1',port:String(server.address().port),hostKeyFingerprint:'SHA256:'+'A'.repeat(43)}};let authorized=0;
  await assert.rejects(connectWebsiteSftp({target,credential:{username:'test',privateKey:key.private},authorizeHost:async()=>authorized++}),{code:'host_key_changed'});assert.equal(authorized,1);
  await assert.rejects(connectWebsiteSftp({target,credential:{username:'test',privateKey:key.private},authorizeHost:async()=>{throw new Error('outbound denied');}}),/outbound denied/);
