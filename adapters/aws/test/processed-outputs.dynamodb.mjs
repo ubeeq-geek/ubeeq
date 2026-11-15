@@ -35,7 +35,11 @@ test('actual DynamoDB output sets recover accepted files across independent repo
  assert.deepEqual(recovered,first);assert.equal(f.writes,2);assert.equal(first.storage.contentType,'audio/mpeg');assert.equal(first.renditions.length,3);
  assert.deepEqual(first.renditions[1].storage,first.renditions[2].storage);assert.equal(first.renditions[1].storage.scope,'private');
  assert.equal([...f.settlements.values()].reduce((n,value)=>n+(value.storageBytesDelta??0),0),13);
- assert.equal((await f.rows()).filter(row=>row.value.namespace==='runtime-processed-outputs').length,1);
+ const rows=await f.rows();
+ assert.equal(rows.filter(row=>row.repository==='hostRecords'&&row.value.namespace==='runtime-processed-outputs').length,1);
+ const markers=rows.filter(row=>row.sk==='fence');
+ assert.deepEqual(markers.map(row=>row.pk).sort(),['__ubeeq_repository_snapshot#assets','__ubeeq_repository_snapshot#hostRecords']);
+ assert.ok(markers.every(row=>typeof row.version==='string'&&!('value' in row)&&!('repository' in row)));
 });
 test('an accepted DynamoDB output-set update with a lost reply recovers its exact physical versions',async t=>{
  const f=await fixture(t),update=f.repositories.hostRecords.update.bind(f.repositories.hostRecords);let lost=false;

@@ -69,11 +69,22 @@ export interface TransactionRunner {
   transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T>;
 }
 
+/** Complete canonical inventory, captured outside a write transaction. bind()
+ * conditionally guards every mutation (including insertions and removals) until
+ * commit, and enables repository list reads from that guarded inventory plus the
+ * transaction's own writes. It must never be backed by an eventual index or by
+ * an assumed empty legacy history. All writers must use the adapter's protocol. */
+export interface RepositorySnapshot<T> {
+  readonly items: readonly T[];
+  bind(transaction: PersistenceTransaction): Promise<void>;
+}
+
 /**
  * All durable repositories retain idempotency keys for at least the adapter's documented retention period.
  * Updates must reject stale revisions with OptimisticConcurrencyError.
  */
 export interface RevisionedRepository<T extends RevisionedRecord> {
+  snapshot?(): Promise<RepositorySnapshot<T>>;
   /** Commit-time read guard. Required by publication commands; never emulate with an unguarded read. */
   checkRevision?(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void>;
   create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { transaction?: PersistenceTransaction; idempotencyKey?: string }): Promise<T>;
@@ -87,8 +98,13 @@ const DATA_HOME_FIELDS = ["homeCellId", "dataHomeRegion", "dataHomeAssignedAt", 
 
 /** Provider-neutral fail-closed boundary for canonical creator-owned repositories. */
 export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> implements RevisionedRepository<T> {
+  readonly snapshot?: () => Promise<RepositorySnapshot<T>>;
   constructor(readonly repository: RevisionedRepository<T>, readonly cellId: string) {
     if (!cellId.trim()) throw new Error("A cell-scoped repository requires a cellId.");
+    if (repository.snapshot) this.snapshot = async () => {
+      const snapshot = await repository.snapshot!();
+      return {items:snapshot.items.filter(record=>record.homeCellId===this.cellId),bind:transaction=>snapshot.bind(transaction)};
+    };
   }
   private local(record: T | undefined): T | undefined {
     return record?.homeCellId === this.cellId ? record : undefined;
@@ -109,8 +125,10 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   async list(request: PageRequest, options?: Parameters<RevisionedRepository<T>["list"]>[1]): Promise<Page<T>> {
     const limit = Math.max(1, request.limit); const items: T[] = []; let cursor = request.cursor;
     do {
-      const page = await this.repository.list({ cursor, limit: 1 }, options);
-      const record = page.items[0]; if (record?.homeCellId === this.cellId) items.push(record);
+      const count=Math.min(100,limit-items.length);
+      const page = await this.repository.list({ cursor, limit:count }, options);
+      if(page.items.length>count)throw Error('Repository exceeded its requested page size.');
+      for(const record of page.items)if(record.homeCellId===this.cellId)items.push(record);
       cursor = page.nextCursor;
       if (!cursor || items.length >= limit) return { items, nextCursor: cursor };
     } while (cursor);

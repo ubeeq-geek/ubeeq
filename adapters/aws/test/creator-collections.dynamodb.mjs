@@ -34,7 +34,7 @@ test('independent Dynamo coordinators cannot reserve the same slug concurrently;
  for(const client of [f.client,f.other]){const send=client.send.bind(client);client.send=async(command,...rest)=>{if(collectionWrite(command)){if(++arrived===2)release();await ready;}return send(command,...rest);};}
  const results=await Promise.allSettled([f.service.create(f.collection('one','same')),second.service.create(f.collection('two','same'))]);
  assert.equal(results.filter(r=>r.status==='fulfilled').length,1);assert.equal(results.filter(r=>r.status==='rejected').length,1);
- const rows=await f.rows(),collections=rows.filter(r=>r.repository==='collections'),directory=rows.find(r=>r.value.namespace==='runtime-collection-directory');assert.equal(collections.length,1);assert.deepEqual(directory.value.value.collectionIds,[collections[0].id]);
+ const rows=await f.rows(),collections=rows.filter(r=>r.repository==='collections'),directory=rows.find(r=>r.repository==='hostRecords'&&r.value.namespace==='runtime-collection-directory');assert.equal(collections.length,1);assert.deepEqual(directory.value.value.collectionIds,[collections[0].id]);
  const winning=await f.service.get('instance',collections[0].id);await f.service.update({...winning,slug:'renamed'},'draft',winning.revision);
  await assert.rejects(second.service.create(f.collection('three','same')),e=>e.code==='slug_conflict');
 });
@@ -65,8 +65,11 @@ test('permission revocation after authorization and cover custody changes after 
 test('120 ordered members commit within Dynamo transaction limits and a fresh coordinator preserves the order',async t=>{
  const f=await fixture(t);await f.service.create(f.collection('many'));const ids=Array.from({length:120},(_,i)=>'work-'+i);
  for(let i=0;i<ids.length;i+=8)await Promise.all(ids.slice(i,i+8).map(f.work));
- const send=f.client.send.bind(f.client);let writeCount=0;f.client.send=async(command,...rest)=>{if(collectionWrite(command))writeCount=command.input.TransactItems.length;return send(command,...rest);};
- await f.service.replaceWorks('instance','many',ids,[],1);assert.equal(writeCount,4);const other=f.connect(f.independent);
+ const send=f.client.send.bind(f.client);let writes=[];f.client.send=async(command,...rest)=>{if(collectionWrite(command))writes=command.input.TransactItems;return send(command,...rest);};
+ await f.service.replaceWorks('instance','many',ids,[],1);
+ const markerWrites=writes.filter(write=>write.Put?.Item?.pk==='__ubeeq_repository_snapshot#hostRecords');
+ assert.equal(markerWrites.length,1);assert.equal(markerWrites[0].Put.Item.sk,'fence');assert.match(markerWrites[0].Put.Item.version,/^[0-9a-f-]{36}$/);
+ assert.equal(writes.length,5,'the same four domain guards/writes plus one atomic authority marker, independent of member count');const other=f.connect(f.independent);
  assert.deepEqual((await other.store.listCollectionWorks('instance','many')).map(m=>m.workId),ids);
  const c=await other.service.get('instance','many');assert.equal(c.revision,2);
  await assert.rejects(other.service.replaceWorks('instance','many',[...ids].reverse(),ids,1),e=>e.code==='revision_conflict');
@@ -89,7 +92,7 @@ test('concurrent collection creation retries recover one durable record across i
   createCollectionFromIntent(f.repositories,f.store,input,id=>f.service.create(f.collection(id,'same'))),
   createCollectionFromIntent(f.independent,second.store,input,id=>second.service.create(f.collection(id,'same'))),
  ]);
- assert.equal(results[0].id,results[1].id);const rows=await f.rows();assert.equal(rows.filter(r=>r.repository==='collections').length,1);assert.equal(rows.filter(r=>r.value.namespace==='runtime-collection-intake').length,1);
+ assert.equal(results[0].id,results[1].id);const rows=await f.rows();assert.equal(rows.filter(r=>r.repository==='collections').length,1);assert.equal(rows.filter(r=>r.repository==='hostRecords'&&r.value.namespace==='runtime-collection-intake').length,1);
 });
 test('import fencing atomically exposes incoming IDs and prevents imported management metadata from granting write authority',async t=>{
  const f=await fixture(t);await f.service.create(f.collection('one'));const creator=await f.repositories.creators.get('creator');

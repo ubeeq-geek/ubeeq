@@ -72,6 +72,67 @@ test('concurrent first-creator claims cannot create two operator users', async (
   });
 });
 
+test('publication commit rechecks actor, policy and sources after preflight in the canonical transaction', async () => {
+  for (const {scenario, compatibility} of ['creator', 'asset', 'hold', 'policy', 'missing-source-guard'].flatMap(scenario => [{scenario, compatibility:false}, {scenario, compatibility:true}])) {
+    let repositories, changed = false, evaluations = 0;
+    await fixture({ hostPorts: adapters => {
+      repositories = adapters.repositories;
+      const creators = async () => (await repositories.creators.list({ limit: 100 })).items;
+      return createDefaultOpenCorePorts({
+        tenancyAndAccess: createSingleOperatorTenancyPort({ getOperatorUserId: async () => (await creators())[0]?.subjectId ?? null, listOperatorCreatorIds: async actor => (await creators()).filter(c => c.subjectId === actor).map(c => c.id) }),
+        publicationAdmission: { async evaluatePublication(input) {
+          evaluations++;
+          if (!changed) {
+            changed = true;
+            const work = await repositories.works.get(input.workId), creator = await repositories.creators.get(work.creatorId);
+            const asset = (await repositories.assets.list({ limit: 100 })).items[0];
+            if (scenario === 'creator') await repositories.creators.update(creator.id, creator.revision, { subjectId: 'revoked-owner' });
+            if (scenario === 'asset') await repositories.assets.update(asset.id, asset.revision, { status: 'pending' });
+            if (scenario === 'hold') await repositories.moderationHolds.create({ id: 'late-hold', instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision, subjectId: work.id, state: 'active', reason: 'review' });
+
+          }
+          const allowed = scenario !== 'policy' || evaluations === 1;
+          return { allowed, state: allowed ? 'eligible' : 'restricted', reasonCodes: allowed ? [] : ['HOST_POLICY_DENIED'] };
+        } },
+      });
+    } }, async ({ request, signIn }) => {
+      const token = await signIn('operator@example.test');
+      await request('/v1/creators', token, { handle: 'operator', displayName: 'Operator' });
+      const { work } = (await request('/v1/works', token, { title: 'Admission must remain current' })).body;
+      await repositories.assets.create({ id: 'asset', instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision, creatorId: work.creatorId, workId: work.id, status: 'ready', mimeType: 'image/png', checksum: 'a'.repeat(64), objectVersion: 'source-v1' });
+      if(scenario==='missing-source-guard')repositories.assets.snapshot=undefined;
+      const result = await request(`/v1/works/${work.id}/publications${compatibility ? '/native' : ''}`, token, compatibility ? { published: true } : { destination: 'native' }, compatibility ? 'PUT' : 'POST');
+      assert.equal(result.status, ({ creator: 403, asset: 409, hold: 409, policy: 403, 'missing-source-guard': 503 })[scenario], scenario + ': ' + JSON.stringify(result.body));
+      assert.deepEqual((await repositories.publicationIntents.list({ limit: 100 })).items, [], scenario);
+      assert.deepEqual((await repositories.publications.list({ limit: 100 })).items, [], scenario);
+      assert.equal((await repositories.works.get(work.id)).status, 'draft', scenario);
+      assert.equal((await repositories.auditEvents.list({ limit: 100 })).items.filter(row => row.action === 'work.published').length, 0, scenario);
+    });
+  }
+});
+
+test('both publication routes reject ready assets attached from a different instance or data home', async () => {
+  for(const compatibility of [false,true])for(const change of [{instanceId:'another-instance'},{dataHomeRegion:'another-region'},{routingRevision:2},{dataHomeAssignedAt:'2020-01-01T00:00:00.000Z'}]){
+    let repositories;
+    await fixture({hostPorts:adapters=>{
+      repositories=adapters.repositories;
+      const creators=async()=>(await repositories.creators.list({limit:100})).items;
+      return createDefaultOpenCorePorts({tenancyAndAccess:createSingleOperatorTenancyPort({getOperatorUserId:async()=>(await creators())[0]?.subjectId??null,listOperatorCreatorIds:async actor=>(await creators()).filter(c=>c.subjectId===actor).map(c=>c.id)})});
+    }},async({request,signIn})=>{
+      const token=await signIn('operator@example.test');
+      await request('/v1/creators',token,{handle:'operator',displayName:'Operator'});
+      const {work}=(await request('/v1/works',token,{title:'Source custody'})).body;
+      await repositories.assets.create({id:'foreign-source',instanceId:work.instanceId,homeCellId:work.homeCellId,dataHomeRegion:work.dataHomeRegion,dataHomeAssignedAt:work.dataHomeAssignedAt,routingRevision:work.routingRevision,creatorId:work.creatorId,workId:work.id,status:'ready',mimeType:'image/png',checksum:'a'.repeat(64),objectVersion:'source-v1',...change});
+      const result=await request(`/v1/works/${work.id}/publications${compatibility?'/native':''}`,token,compatibility?{published:true}:{destination:'native'},compatibility?'PUT':'POST');
+      assert.equal(result.status,409,JSON.stringify({change,body:result.body}));
+      assert.equal(result.body.error.code,'publication_source_scope_mismatch');
+      assert.deepEqual((await repositories.publications.list({limit:100})).items,[]);
+      assert.deepEqual((await repositories.publicationIntents.list({limit:100})).items,[]);
+      assert.equal((await repositories.works.get(work.id)).status,'draft');
+    });
+  }
+});
+
 test('registration admission runs before account creation and does not consume a refused email', async () => {
   let allowed = false;
   await fixture({ registrationAdmission: async () => ({ allowed, reasonCode: 'INVITATION_REQUIRED' }) }, async ({ request }) => {

@@ -3,12 +3,13 @@
  * for a scalable machine cell; no application service imports this package.
  */
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import {AsyncLocalStorage} from 'node:async_hooks';
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type RepositorySnapshot, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
 import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
@@ -28,11 +29,13 @@ export interface PostgresAdapterConfiguration {
 
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">;
 type MachineTransaction = PersistenceTransaction & { client: PoolClient };
+type MachineTransactionState={id:string;client:PoolClient;active:boolean;failed:boolean};
 
 /** Applies explicit SQL migrations and exposes atomic repository transactions. */
 export class PostgresDatabase {
   readonly pool: Pool;
-  private readonly transactions = new Map<string, PoolClient>();
+  private readonly transactions = new Map<string, MachineTransactionState>();
+  private readonly context=new AsyncLocalStorage<MachineTransactionState>();
 
   constructor(readonly configuration: PostgresAdapterConfiguration, pool?: Pool) {
     if (!configuration.connectionString.trim() || !configuration.cellId.trim()) throw new Error("PostgreSQL adapters require connectionString and cellId.");
@@ -41,7 +44,7 @@ export class PostgresDatabase {
 
   async migrate(): Promise<void> {
     await this.pool.query("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL)");
-    for (const id of ["001-core", "002-identity"]) {
+    for (const id of ["001-core", "002-identity", "003-repository-snapshots"]) {
       const applied = await this.pool.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1", [id]);
       if (applied.rowCount) continue;
       const client = await this.pool.connect();
@@ -59,23 +62,34 @@ export class PostgresDatabase {
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
+    const inherited=this.context.getStore();
+    if(inherited){
+      if(!inherited.active)throw Error('PostgreSQL transaction context has ended.');
+      try{return await operation({id:inherited.id,client:inherited.client} as MachineTransaction);}catch(error){inherited.failed=true;throw error;}
+    }
     const client = await this.pool.connect();
     const transaction: MachineTransaction = { id: `postgres-${randomUUID()}`, client };
-    this.transactions.set(transaction.id, client);
+    const state={...transaction,active:true,failed:false};this.transactions.set(transaction.id,state);
     try {
       await client.query("BEGIN");
-      const result = await operation(transaction);
+      const result = await this.context.run(state,()=>operation(transaction));
+      if(state.failed)throw Error('PostgreSQL transaction aborted after a failed operation.');
+      state.active=false;
       await client.query("COMMIT");
       return result;
     } catch (error) { await client.query("ROLLBACK"); throw error; }
-    finally { this.transactions.delete(transaction.id); client.release(); }
+    finally { state.active=false;this.transactions.delete(transaction.id); client.release(); }
   }
 
+  failTransaction():void{const state=this.context.getStore();if(state?.active)state.failed=true;}
+
   queryable(transaction?: PersistenceTransaction): Queryable {
-    if (!transaction) return this.pool;
-    const client = this.transactions.get(transaction.id) ?? (transaction as Partial<MachineTransaction>).client;
-    if (!client) throw new Error("PostgreSQL repository received an unknown transaction.");
-    return client;
+    const context=this.context.getStore();
+    if(context&&!context.active)throw Error('PostgreSQL transaction context has ended.');
+    if(!transaction)return context?.client??this.pool;
+    const state=this.transactions.get(transaction.id);
+    if(!state?.active||state!==context){this.failTransaction();throw Error('PostgreSQL repository received an unknown transaction.');}
+    return state.client;
   }
 
   async close(): Promise<void> { await this.pool.end(); }
@@ -114,6 +128,21 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
   async get(id: string, options?: { transaction?: PersistenceTransaction }): Promise<T | undefined> {
     const result = await this.database.queryable(options?.transaction).query<{ payload: T }>("SELECT payload FROM ubeeq_records WHERE repository = $1 AND id = $2", [this.repository, id]);
     return result.rows[0]?.payload;
+  }
+  async checkRevision(id:string,expectedRevision:number,options:{transaction:PersistenceTransaction}):Promise<void>{
+    const result=await this.database.queryable(options.transaction).query<{revision:number}>('SELECT revision FROM ubeeq_records WHERE repository = $1 AND id = $2 FOR SHARE',[this.repository,id]);
+    if(result.rows[0]?.revision!==expectedRevision){this.database.failTransaction();throw new OptimisticConcurrencyError(id,expectedRevision);}
+  }
+  async snapshot():Promise<RepositorySnapshot<T>>{
+    // One MVCC statement captures the complete legacy inventory and its marker.
+    const result=await this.database.pool.query<{version:string;items:T[]}>("SELECT coalesce((SELECT version FROM ubeeq_repository_versions WHERE repository = $1),0)::text AS version, coalesce((SELECT jsonb_agg(payload ORDER BY id) FROM ubeeq_records WHERE repository = $1),'[]'::jsonb) AS items",[this.repository]);
+    const expected=result.rows[0].version;
+    return {items:result.rows[0].items,bind:async transaction=>{
+      const db=this.database.queryable(transaction);
+      await db.query('INSERT INTO ubeeq_repository_versions (repository, version) VALUES ($1,0) ON CONFLICT DO NOTHING',[this.repository]);
+      const current=await db.query<{version:string}>('SELECT version::text AS version FROM ubeeq_repository_versions WHERE repository = $1 FOR SHARE',[this.repository]);
+      if(current.rows[0]?.version!==expected){this.database.failTransaction();throw new OptimisticConcurrencyError('repository:'+this.repository,0);}
+    }};
   }
   async list(request: PageRequest, options?: { transaction?: PersistenceTransaction }): Promise<Page<T>> {
     const result = await this.database.queryable(options?.transaction).query<{ id: string; payload: T }>("SELECT id, payload FROM ubeeq_records WHERE repository = $1 AND id > $2 ORDER BY id LIMIT $3", [this.repository, afterCursor(request.cursor), limit(request.limit) + 1]);

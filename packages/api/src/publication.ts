@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { repositoryItems, type UbeeqRepositories, type WorkRecord, type AssetRecord, type PublicationIntentRecord, type PublicationRecord } from '@ubeeq/persistence';
+import { repositoryItems, type UbeeqRepositories, type WorkRecord, type AssetRecord, type PublicationIntentRecord, type PublicationRecord, type PersistenceTransaction } from '@ubeeq/persistence';
 
 export class PublicationRequestError extends Error {
   constructor(readonly code: 'invalid_request' | 'invalid_idempotency_key' | 'idempotency_conflict' | 'publication_receipt_invalid' | 'processing_incomplete' | 'work_not_publishable', message: string) {
@@ -8,7 +8,7 @@ export class PublicationRequestError extends Error {
 }
 export type PublicationRepositories = Pick<UbeeqRepositories, 'publicationIntents' | 'publications' | 'auditEvents' | 'transaction'> & {
   works: Pick<UbeeqRepositories['works'], 'get' | 'update'>;
-  assets: Pick<UbeeqRepositories['assets'], 'list'>;
+  assets: Pick<UbeeqRepositories['assets'], 'list' | 'snapshot'>;
 };
 export interface PublicationResult { intent: PublicationIntentRecord; publication: PublicationRecord; work: WorkRecord; idempotent: boolean }
 
@@ -19,7 +19,13 @@ export class PublicationService {
   constructor(private readonly repositories: PublicationRepositories,
     private readonly authorizeWork: (workId: string, actorId: string) => Promise<WorkRecord>,
     private readonly admit: (work: WorkRecord, assets: readonly AssetRecord[]) => Promise<void>,
-    private readonly options: { allowWithoutAssets?: (work: Readonly<WorkRecord>) => boolean } = {}) {}
+    private readonly options: {
+      allowWithoutAssets?: (work: Readonly<WorkRecord>) => boolean;
+      prepareCommit?: () => Promise<(transaction: PersistenceTransaction) => Promise<void>>;
+      /** The application binds live actor/source read guards to this exact transaction.
+       * Admission is rechecked while those guards and the publication CAS are held. */
+      authorizeCommit?: (work: WorkRecord, assets: readonly AssetRecord[], actorId: string, transaction: PersistenceTransaction) => Promise<void>;
+    } = {}) {}
 
   async publish(input: { workId: string; actorId: string; destination: string; idempotencyKey?: unknown }): Promise<PublicationResult> {
     const { workId, actorId, destination: rawDestination, idempotencyKey: header } = input;
@@ -42,15 +48,24 @@ export class PublicationService {
     };
     const previous = await replay();
     if (previous) return structuredClone(previous);
+    const sourceSnapshot=await repositories.assets.snapshot?.();
     const assets: AssetRecord[] = [];
-    for await (const asset of repositoryItems(request => repositories.assets.list(request))) if (asset.workId === work.id) assets.push(asset);
+    if(sourceSnapshot)assets.push(...sourceSnapshot.items.filter(asset=>asset.workId===work.id));
+    else for await (const asset of repositoryItems(request => repositories.assets.list(request))) if (asset.workId === work.id) assets.push(asset);
     if ((!assets.length && this.options.allowWithoutAssets?.(structuredClone(work)) !== true) || assets.some(asset => asset.status !== 'ready' || asset.creatorId !== work.creatorId)) throw new PublicationRequestError('processing_incomplete', 'All Work assets must belong to its Creator and finish processing before publication');
+    const bindAuthority=await this.options.prepareCommit?.();
     await this.admit(structuredClone(work), structuredClone(assets));
     const scope = { instanceId: work.instanceId, homeCellId: work.homeCellId, dataHomeRegion: work.dataHomeRegion, dataHomeAssignedAt: work.dataHomeAssignedAt, routingRevision: work.routingRevision };
     try {
       return structuredClone(await repositories.transaction(async transaction => {
         const existing = await replay();
         if (existing) return existing;
+        await sourceSnapshot?.bind(transaction);
+        await bindAuthority?.(transaction);
+        if (this.options.authorizeCommit) {
+          await this.options.authorizeCommit(structuredClone(work), structuredClone(assets), actorId, transaction);
+          await this.admit(structuredClone(work), structuredClone(assets));
+        }
         const intent = await repositories.publicationIntents.create({ id: intentId, ...scope, workId: work.id, destination, idempotencyKey: requestKey }, { transaction });
         const publication = await repositories.publications.create({ id: publicationId, ...scope, workId: work.id, destination, status: 'live' }, { transaction });
         // Work readiness is independent of any destination's live receipt. Keep

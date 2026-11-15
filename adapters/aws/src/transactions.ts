@@ -2,18 +2,29 @@ import type { AwsCommandClient } from './client-port.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { DeleteCommand, GetCommand, PutCommand, TransactWriteCommand, type TransactWriteCommandInput, type DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import type { PersistenceTransaction } from '@ubeeq/persistence';
+import type { PersistenceTransaction, PageRequest, RepositorySnapshot, Page } from '@ubeeq/persistence';
 import { OptimisticConcurrencyError } from '@ubeeq/persistence';
+import {DynamoRepositorySnapshots,type SnapshotTransactionState} from './repository-snapshots.js';
 
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
-  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
-type State = { id: string; active: boolean; failed: boolean; writes: NonNullable<TransactWriteCommandInput['TransactItems']>; overlay: Map<string, Record<string, any> | undefined> };
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void;
+  snapshotRepository?<T>(table:string,repository:string):Promise<RepositorySnapshot<T>>;
+  snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
+  mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
+type State = SnapshotTransactionState & { writes: NonNullable<TransactWriteCommandInput['TransactItems']> };
 const keyOf = (table: string | undefined, key: Record<string, any>) => JSON.stringify([table, key.pk, key.sk]);
 
 /** Atomic repository write batches. Reads are not a serializable snapshot. */
 export const createTransactionalDynamo = (base: Dynamo) => {
   const context = new AsyncLocalStorage<State>();
-  const client: Dynamo = { checkRevision: (table, key, expectedRevision) => {
+  const snapshots=new DynamoRepositorySnapshots(base,()=>context.getStore());
+  const client: Dynamo = {
+    snapshotRepository:(table,repository)=>snapshots.capture(table,repository),
+    snapshotPage:(table,repository,request)=>snapshots.list(table,repository,request),
+    mutateRepository:(table,repository,operation)=>transaction(async()=>{
+      const result=await operation();await snapshots.changed(table,repository);return result;
+    }),
+    checkRevision: (table, key, expectedRevision) => {
     const state = context.getStore();
     if (!state?.active) throw new Error('Revision guards require an active transaction.');
     const identity = keyOf(table, key);
@@ -63,24 +74,32 @@ export const createTransactionalDynamo = (base: Dynamo) => {
       try { return await operation({ id: inherited.id }); }
       catch (error) { inherited.failed = true; throw error; }
     }
-    const state: State = { id: randomUUID(), active: true, failed: false, writes: [], overlay: new Map() };
+    const state: State = { id: randomUUID(), active: true, failed: false, writes: [], overlay: new Map(), fences:new Map() };
     try {
       return await context.run(state, async () => {
         const result = await operation({ id: state.id });
         if (state.failed) throw new Error('DynamoDB transaction aborted after a failed operation.');
+        const batch=[...state.writes,...snapshots.writes(state)];
+        if(batch.length>100)throw Error('A repository transaction supports at most 100 distinct writes, including inventory guards.');
         // Close staging before sending: detached callbacks cannot modify an in-flight batch.
         state.active = false;
-        if (state.writes.length) {
-          try { await base.send(new TransactWriteCommand({ TransactItems: state.writes, ClientRequestToken: state.id })); }
+        if (batch.length) {
+          try { await base.send(new TransactWriteCommand({ TransactItems: batch, ClientRequestToken: state.id })); }
           catch (error) {
             const failure = error as { name?: string; CancellationReasons?: { Code?: string }[] };
             const reasons = failure.CancellationReasons;
-            if (failure.name === 'TransactionCanceledException' && reasons?.length === state.writes.length &&
+            if (failure.name === 'TransactionCanceledException' && reasons?.length === batch.length &&
               reasons.every(reason => reason.Code === 'None' || reason.Code === 'ConditionalCheckFailed')) {
+              for(let position=0;position<reasons.length;position++)if(reasons[position].Code==='ConditionalCheckFailed'){
+                const write=batch[position],item=write.Put??write.Delete??write.ConditionCheck;
+                const key=write.Put?.Item??write.Delete?.Key??write.ConditionCheck?.Key;
+                const fence=snapshots.failedFence(state,item?.TableName,key);
+                if(fence)throw new OptimisticConcurrencyError('repository:'+fence.repository,0);
+              }
               const index = reasons.findIndex((reason, position) => reason.Code === 'ConditionalCheckFailed' &&
-                typeof (state.writes[position].Put || state.writes[position].Delete || state.writes[position].ConditionCheck)?.ExpressionAttributeValues?.[':revision'] === 'number');
+                typeof (batch[position].Put || batch[position].Delete || batch[position].ConditionCheck)?.ExpressionAttributeValues?.[':revision'] === 'number');
               if (index >= 0) {
-                const write = state.writes[index];
+                const write = batch[index];
                 const key = write.Put?.Item?.pk || write.Delete?.Key?.pk || write.ConditionCheck?.Key?.pk;
                 const revision = (write.Put || write.Delete || write.ConditionCheck)!.ExpressionAttributeValues![':revision'];
                 if (typeof key === 'string') throw new OptimisticConcurrencyError(key.slice(key.indexOf('#') + 1), revision);

@@ -36,13 +36,10 @@ test('reference publication rolls back intent, publication, Work and audit on an
     assert.equal(heldResponse.status, 409); assert.equal(heldResponse.body.error.code, 'admission_blocked');
     assert.deepEqual((await local.repositories.publicationIntents.list({ limit: 100 })).items, []);
     await local.repositories.moderationHolds.update(hold.id, hold.revision, { state: 'released' });
-    const listAssets = local.repositories.assets.list.bind(local.repositories.assets);
-    local.repositories.assets.list = async page => {
-      if (page.cursor) throw new Error('later asset page unavailable');
-      return listAssets(page);
-    };
+    const captureAssets = local.repositories.assets.snapshot.bind(local.repositories.assets);
+    local.repositories.assets.snapshot = async () => { throw new Error('source inventory unavailable'); };
     try { assert.equal((await request(`/v1/works/${work.id}/publications`, { destination: 'local' })).status, 500); }
-    finally { local.repositories.assets.list = listAssets; }
+    finally { local.repositories.assets.snapshot = captureAssets; }
     assert.deepEqual((await local.repositories.publicationIntents.list({ limit: 100 })).items, []);
     const auditBefore = (await local.repositories.auditEvents.list({ limit: 100 })).items;
     for (const [repository, method] of [[local.repositories.publications, 'create'], [local.repositories.works, 'update'], [local.repositories.auditEvents, 'create']]) {

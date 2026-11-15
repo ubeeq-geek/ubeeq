@@ -35,6 +35,18 @@ test("PostgreSQL repositories and queue satisfy shared durable contracts", { ski
     }
     await verifyJobQueueContract(new PostgresJobQueue(database), `postgres-contract-${randomUUID()}`);
     await verifyPasswordIdentityContract(new PostgresPasswordIdentity(database));
+    const scope={instanceId:'machine',homeCellId:'cell-a',dataHomeRegion:'test',dataHomeAssignedAt:'2026-01-01',routingRevision:1};
+    await repositories.publications.create({id:'legacy-snapshot',...scope,workId:'work',destination:'native',status:'live'});
+    await database.pool.query('DELETE FROM ubeeq_repository_versions WHERE repository = $1',['publications']);
+    const legacy=await repositories.publications.snapshot();assert.ok(legacy.items.some(row=>row.id==='legacy-snapshot'));
+    await database.transaction(async transaction=>{await legacy.bind(transaction);await database.transaction(async joined=>assert.equal(joined.id,transaction.id));});
+    for(const operation of ['insert','update','remove']){
+      const snapshot=await repositories.publications.snapshot();
+      if(operation==='insert')await repositories.publications.create({id:'changed-snapshot',...scope,workId:'work',destination:'native',status:'live'});
+      else if(operation==='update')await repositories.publications.update('changed-snapshot',1,{status:'removed'});
+      else await repositories.publications.remove('changed-snapshot',2);
+      await assert.rejects(database.transaction(async transaction=>{await assert.rejects(snapshot.bind(transaction),{name:'OptimisticConcurrencyError'});}),/aborted/);
+    }
   } finally { await database.close(); }
 });
 

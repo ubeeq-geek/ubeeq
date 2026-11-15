@@ -3,6 +3,7 @@ import { CognitoJwtVerifier } from 'aws-jwt-verify';
 export * from './retained-creator-content.js';
 export type { AwsCommandClient } from './client-port.js';
 import type { AwsCommandClient } from './client-port.js';
+import {supportsRepositorySnapshots} from './repository-snapshots.js';
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DescribeTableCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -35,7 +36,10 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
 };
 export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
-  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void;
+  snapshotRepository?<T>(table:string,repository:string):Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
+  snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
+  mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
 const now = () => new Date().toISOString();
 const pk = (repository: string, id: string) => `${repository}#${id}`;
 /** AWS's standard document client rejects undefined attributes; absence is the portable representation. */
@@ -46,7 +50,13 @@ const withoutUndefined = <T>(value: T): T => {
 };
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
-  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {}
+  readonly snapshot?:()=>Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
+  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {
+    if(dynamo.snapshotRepository&&supportsRepositorySnapshots(repository))this.snapshot=()=>dynamo.snapshotRepository!<T>(configuration.tableName,repository);
+  }
+  private mutate<R>(operation:()=>Promise<R>):Promise<R>{
+    return this.dynamo.mutateRepository&&supportsRepositorySnapshots(this.repository)?this.dynamo.mutateRepository(this.configuration.tableName,this.repository,operation):operation();
+  }
   private guard(previous: T | undefined, next: T) {
     try {
       if (this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
@@ -68,19 +78,21 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
     const timestamp = now(), value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T;
     this.guard(undefined, value);
     try {
-      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+      await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, value.id), sk: 'record', repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) },
-        ConditionExpression: 'attribute_not_exists(pk)' }));
+        ConditionExpression: 'attribute_not_exists(pk)' })));
       return value;
     } catch (error) {
-      const existing = options?.idempotencyKey && (error as { name?: string }).name === 'ConditionalCheckFailedException' ? await this.get(value.id) : undefined;
+      const failure=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      const conditional=failure.name==='ConditionalCheckFailedException'||failure.name==='TransactionCanceledException'&&failure.CancellationReasons?.some(reason=>reason.Code==='ConditionalCheckFailed');
+      const existing = options?.idempotencyKey && conditional ? await this.get(value.id) : undefined;
       if (existing) return existing;
       throw error;
     }
   }
   async get(id: string, options?: { transaction?: { id: string } }): Promise<T | undefined> { this.assertTransaction(options); const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConsistentRead: true })); return response.Item?.value as T | undefined; }
   /** Records are queried through the explicit repository/id index, never a filtered scan. */
-  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
+  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const snapshot=this.dynamo.snapshotPage?.<T>(this.configuration.tableName,this.repository,request);if(snapshot)return snapshot;const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, 'id' | 'revision' | 'createdAt' | 'updatedAt'>>, options?: { transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
     const current = await this.get(id);
@@ -88,16 +100,16 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
     const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T;
     this.guard(current, value);
     try {
-      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+      await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, id), sk: 'record', repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) },
-        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } }));
+        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } })));
       return value;
     } catch (error) {
       if ((error as { name?: string }).name === 'ConditionalCheckFailedException') throw new OptimisticConcurrencyError(id, expectedRevision);
       throw error;
     }
   }
-  async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
+  async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.mutate(()=>this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } }))); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
 }
 
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);

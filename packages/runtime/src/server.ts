@@ -343,6 +343,30 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       await repositories.creators.checkRevision(current.id,current.revision,{transaction});
     }
   };
+  const requireSnapshot=async<T>(repository:{snapshot?:()=>Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>})=>{
+    if(!repository.snapshot)throw new HttpError(503,'publication_authority_unavailable','Publication requires a complete, guarded content inventory.');
+    return repository.snapshot();
+  };
+  const preparePublicationCommit=async()=>{
+    if(!repositories.assets.snapshot)throw new HttpError(503,'publication_authority_unavailable','Publication requires a complete, guarded source inventory.');
+    const snapshots:import('@ubeeq/persistence').RepositorySnapshot<unknown>[]=[await requireSnapshot(repositories.moderationHolds)];
+    // Commercial membership, organizations, approvals and evidence share this
+    // authority. Guard absence as well as every existing record, without a GSI.
+    if(repositories.hostRecords)snapshots.push(await requireSnapshot(repositories.hostRecords));
+    return async(transaction:import('@ubeeq/persistence').PersistenceTransaction)=>{
+      for(const snapshot of snapshots)await snapshot.bind(transaction);
+    };
+  };
+  const authorizePublicationCommit=async(work:WorkRecord,assets:readonly AssetRecord[],actorId:string,transaction:import('@ubeeq/persistence').PersistenceTransaction):Promise<void>=>{
+    await authorizeWorkMutation(work.creatorId,actorId,work,transaction);
+    for(const asset of assets){
+      if(asset.instanceId!==work.instanceId||asset.creatorId!==work.creatorId||asset.workId!==work.id
+        ||asset.homeCellId!==work.homeCellId||asset.dataHomeRegion!==work.dataHomeRegion
+        ||asset.routingRevision!==work.routingRevision||asset.dataHomeAssignedAt!==work.dataHomeAssignedAt){
+        throw new HttpError(409,'publication_source_scope_mismatch','Every publication source must belong to the current Work and data home.');
+      }
+    }
+  };
   const audit = async (input: { action: string; actorId?: string; subjectId?: string; payload?: Record<string, unknown> }): Promise<void> => {
     await repositories.auditEvents.create({ id: randomUUID(), instanceId: configuration.instanceId ?? "local-reference", ...cellOwned, action: input.action, actorId: input.actorId, subjectId: input.subjectId, payload: input.payload ?? {} });
   };
@@ -981,15 +1005,12 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const body = await parseBody(request);
         if (body.revision !== work.revision) throw new HttpError(409, 'revision_conflict', 'Reload the work before saving changes.');
         const changes: Partial<WorkRecord> = method === 'DELETE' ? { status: 'deleted' } : { title: requireString(body.title ?? work.title, 'title') };
+        const publicationSnapshot=method==='DELETE'?await requireSnapshot(repositories.publications):undefined;
         const updated = await repositories.transaction(async transaction=>{
           await authorizeWorkMutation(work.creatorId,identity.subject.id,work,transaction);
-          if(method==='DELETE'){
-            // A Work can be ready with no live destinations. Inspect all durable
-            // receipts, including later pages; the Work CAS below also conflicts
-            // with any concurrent successful publication.
-            for await(const publication of repositoryItems(page=>repositories.publications.list(page,{transaction}))){
-              if(publication.workId===work.id&&publication.status==='live')throw new HttpError(409,'work_is_published','Unpublish the Work before deleting it.');
-            }
+          if(publicationSnapshot){
+            await publicationSnapshot.bind(transaction);
+            if(publicationSnapshot.items.some(publication=>publication.workId===work.id&&publication.status==='live'))throw new HttpError(409,'work_is_published','Unpublish the Work before deleting it.');
           }
           return method==='DELETE'
           ? withCollectionWorkLifecycleFence(repositories,{instanceId:configuration.instanceId??'local-reference',cellId,region},work.creatorId,
@@ -1096,7 +1117,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             destination: requireString(body.destination, 'destination'), visibility: 'public', textSignals: { title: work.title },
             mediaSignals: { assets: assets.map(asset => ({ id: asset.id, revision: asset.revision, checksum: asset.checksum, sourceVersionId: asset.objectVersion })) } });
           if (!decision.allowed) throw new HttpError(403, decision.reasonCodes[0] ?? 'publication_denied', decision.userMessage ?? 'Publication requires admission.');
-        });
+        }, { prepareCommit:preparePublicationCommit, authorizeCommit: authorizePublicationCommit });
         const result = await service.publish({ workId: publicationMatch[1], actorId: identity.subject.id, destination: requireString(body.destination, 'destination'), idempotencyKey: request.headers['idempotency-key'] });
         return json(response, result.idempotent ? 200 : 201, { ...result, requestId }, requestId);
       }
@@ -1111,15 +1132,14 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const canonicalDestination = requestedDestination;
 
         if (!shouldPublish) {
+          const snapshot=await requireSnapshot(repositories.publications);
           await repositories.transaction(async transaction=>{
             await authorizeWorkMutation(work.creatorId,identity.subject.id,work,transaction);
-            const live=[];
-            for await(const publication of repositoryItems(page=>repositories.publications.list(page,{transaction}))){
-              if(publication.workId===work.id&&publication.destination===canonicalDestination&&publication.status==='live'){
-                if(publication.instanceId!==work.instanceId||publication.homeCellId!==work.homeCellId)throw new HttpError(409,'publication_reconciliation_required','Publication custody requires reconciliation.');
-                if('preparationVersion' in publication||'executionPolicy' in publication)throw new HttpError(409,'publication_reconciliation_required','Use the provider-aware reviewed workflow for this Publication.');
-                live.push(publication);
-              }
+            await snapshot.bind(transaction);
+            const live=snapshot.items.filter(publication=>publication.workId===work.id&&publication.destination===canonicalDestination&&publication.status==='live');
+            for(const publication of live){
+              if(publication.instanceId!==work.instanceId||publication.homeCellId!==work.homeCellId)throw new HttpError(409,'publication_reconciliation_required','Publication custody requires reconciliation.');
+              if('preparationVersion' in publication||'executionPolicy' in publication)throw new HttpError(409,'publication_reconciliation_required','Use the provider-aware reviewed workflow for this Publication.');
             }
             // Remove every live local receipt for this destination atomically.
             // Other destinations and the Work's readiness remain independent.
@@ -1136,7 +1156,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
             destination: canonicalDestination, visibility: 'public', textSignals: { title: w.title },
             mediaSignals: { assets: assets.map(asset => ({ id: asset.id, revision: asset.revision, checksum: asset.checksum, sourceVersionId: asset.objectVersion })) } });
           if (!decision.allowed) throw new HttpError(403, decision.reasonCodes[0] ?? 'publication_denied', decision.userMessage ?? 'Publication requires admission.');
-        });
+        }, { prepareCommit:preparePublicationCommit, authorizeCommit: authorizePublicationCommit });
         const result = await service.publish({
           workId,
           actorId: identity.subject.id,

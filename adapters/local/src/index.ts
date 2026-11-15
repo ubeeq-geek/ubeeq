@@ -21,7 +21,7 @@ import { JobRecoveryError } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
-import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type RepositorySnapshot, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
@@ -80,7 +80,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -209,6 +209,24 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     const hasMore = rows.length > limit;
     const items = rows.slice(0, limit).map(({ payload }) => parse<T>(payload));
     return { items, nextCursor: hasMore ? Buffer.from(items.at(-1)!.id).toString("base64url") : undefined };
+  }
+
+  async snapshot(): Promise<RepositorySnapshot<T>> {
+    return this.local.transaction(async () => {
+      const version = () => {
+        const value = (this.local.database.prepare('SELECT version FROM ubeeq_repository_versions WHERE repository = ?').get(this.repository) as {version:number}|undefined)?.version ?? 0;
+        if (!Number.isSafeInteger(value) || value < 0) throw new Error('Repository change marker requires reconciliation.');
+        return value;
+      };
+      const expected = version();
+      // One canonical table read includes legacy rows; zero is a mutation marker,
+      // never a claim that the inventory or publication history is empty.
+      const rows = this.local.database.prepare('SELECT payload FROM ubeeq_records WHERE repository = ? ORDER BY id').all(this.repository) as Array<{payload:string}>;
+      return {items:rows.map(row=>parse<T>(row.payload)),bind:async transaction=>{
+        this.local.assertTransaction(transaction);
+        if (version() !== expected) { this.local.failTransaction(); throw new OptimisticConcurrencyError('repository:'+this.repository, expected); }
+      }};
+    });
   }
 
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> {
