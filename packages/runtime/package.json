@@ -66,6 +66,10 @@
     "./content-preparation-node": {
       "types": "./dist/content-preparation-node.d.ts",
       "default": "./dist/content-preparation-node.js"
+    },
+    "./content-representations": {
+      "types": "./dist/content-representations.d.ts",
+      "default": "./dist/content-representations.js"
     }
   },
   "scripts": {
@@ -88,7 +92,8 @@
     "@ubeeq/integrations": "^0.1.0",
     "@ubeeq/jobs": "^0.1.0",
     "@ubeeq/media-sharp": "^0.1.0",
-    "@ubeeq/storage": "^0.1.0"
+    "@ubeeq/storage": "^0.1.0",
+    "sharp": "^0.35.5"
   },
   "typesVersions": {
     "*": {
@@ -103,6 +108,9 @@
       ],
       "content-preparation-node": [
         "dist/content-preparation-node.d.ts"
+      ],
+      "content-representations": [
+        "dist/content-representations.d.ts"
       ]
     }
   }
