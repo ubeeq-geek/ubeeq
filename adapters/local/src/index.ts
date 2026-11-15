@@ -1,3 +1,4 @@
+export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
 export { SqliteCommerceStore } from './commerce.js';
 export { SqliteWebsiteStore } from './websites.js';
