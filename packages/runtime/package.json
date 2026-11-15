@@ -70,6 +70,10 @@
     "./content-representations": {
       "types": "./dist/content-representations.d.ts",
       "default": "./dist/content-representations.js"
+    },
+    "./content-releases": {
+      "types": "./dist/content-releases.d.ts",
+      "default": "./dist/content-releases.js"
     }
   },
   "scripts": {
@@ -111,6 +115,9 @@
       ],
       "content-representations": [
         "dist/content-representations.d.ts"
+      ],
+      "content-releases": [
+        "dist/content-releases.d.ts"
       ]
     }
   }
