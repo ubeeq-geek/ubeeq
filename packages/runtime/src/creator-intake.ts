@@ -11,6 +11,10 @@ export interface CreatorIntakeInput {
 }
 export type NewCreatorIntakeRecord=Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>;
 export type CreatorIntakeFactory=(input:{record:Readonly<NewCreatorIntakeRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:PersistenceTransaction})=>Promise<CreatorRecord>;
+/** Trusted host preparation runs outside the accepting write transaction so a
+ * complete guarded inventory can be captured. Only the returned writer receives
+ * that transaction; HTTP data cannot select a writer or change the admitted ID. */
+export type CreatorIntakePreparation=(input:{intent:Readonly<CreatorIntakeInput>;creatorId:string;repositories:UbeeqRepositories})=>Promise<CreatorIntakeFactory>;
 
 /** Select storage at birth; the trusted factory must persist exactly the identity
  * admitted by the host. Its record, storage cohort and later host preparation all
@@ -19,6 +23,7 @@ export type CreatorIntakeFactory=(input:{record:Readonly<NewCreatorIntakeRecord>
 export async function persistIntakeCreator(repositories:UbeeqRepositories,record:NewCreatorIntakeRecord,actorUserId:string,transaction:PersistenceTransaction,factory?:CreatorIntakeFactory):Promise<CreatorRecord>{
  const requested=structuredClone(record);
  if(requested.subjectId!==actorUserId)throw new CreatorIntakeError(503,'creator_creation_invalid','Creator storage did not accept the requested identity.');
+ if(await repositories.creators.get(requested.id,{transaction}))throw new CreatorIntakeError(409,'creator_intake_requires_reconciliation','This Creator already exists without the matching intake receipt.');
  const created=factory?await factory({record:Object.freeze(structuredClone(requested)),actorUserId,repositories,transaction}):await repositories.creators.create(requested,{transaction});
  const saved=await repositories.creators.get(requested.id,{transaction});
  if(!created||!saved||saved.revision!==1||publicationIdentityHash(saved)!==publicationIdentityHash(created)||Object.entries(requested).some(([key,value])=>publicationIdentityHash(saved[key as keyof CreatorRecord])!==publicationIdentityHash(value)))throw new CreatorIntakeError(503,'creator_creation_invalid','Creator storage did not accept the requested identity.');
@@ -30,13 +35,25 @@ export async function persistIntakeCreator(repositories:UbeeqRepositories,record
  * restore edited profile values. Unkeyed callers retain intentional new creation.
  */
 export async function createIntakeCreator(repositories: UbeeqRepositories, input: CreatorIntakeInput,
-  create: (transaction: PersistenceTransaction, id: string) => Promise<CreatorRecord>): Promise<CreatorRecord> {
-  const createNew=async(transaction:PersistenceTransaction,id:string)=>{
-    const creator=await create(transaction,id);
+  create: (transaction: PersistenceTransaction, id: string, preparedFactory?:CreatorIntakeFactory) => Promise<CreatorRecord>,
+  prepareCreation?:CreatorIntakePreparation): Promise<CreatorRecord> {
+  input=structuredClone(input);
+  if(prepareCreation!==undefined&&typeof prepareCreation!=='function')throw new CreatorIntakeError(503,'creator_creation_invalid','Creator preparation requires a trusted function.');
+  const prepare=async(id:string):Promise<CreatorIntakeFactory|undefined>=>{
+    if(!prepareCreation)return;
+    const factory=await prepareCreation({intent:Object.freeze(structuredClone(input)),creatorId:id,repositories});
+    if(typeof factory!=='function')throw new CreatorIntakeError(503,'creator_creation_invalid','Creator preparation did not supply a trusted writer.');
+    return factory;
+  };
+  const createNew=async(transaction:PersistenceTransaction,id:string,factory?:CreatorIntakeFactory)=>{
+    const creator=await create(transaction,id,factory);
     if(repositories.hostRecords)await prepareNewCreatorCollectionDirectory(repositories,creator,transaction);
     return creator;
   };
-  if (input.idempotencyKey === undefined) return repositories.transaction(transaction => createNew(transaction, randomUUID()));
+  if (input.idempotencyKey === undefined) {
+    const id=randomUUID(),factory=await prepare(id);
+    return repositories.transaction(transaction=>createNew(transaction,id,factory));
+  }
   if (typeof input.idempotencyKey !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(input.idempotencyKey)) throw new CreatorIntakeError(400, 'invalid_creator_intent', 'Creator request identity is invalid.');
   const records = repositories.hostRecords;
   if (!records) throw new CreatorIntakeError(503, 'creator_intake_unavailable', 'Durable Creator request receipts are required.');
@@ -53,10 +70,15 @@ export async function createIntakeCreator(repositories: UbeeqRepositories, input
     if (!creator || creator.instanceId !== input.instanceId || creator.subjectId !== input.actorId || creator.homeCellId !== input.cellId || creator.dataHomeRegion !== input.region) throw new CreatorIntakeError(409, 'creator_intake_requires_reconciliation', 'The saved Creator request requires reconciliation.');
     return creator;
   };
+  // Receipt recovery precedes expensive host preparation. A replay never
+  // captures a new snapshot, reinitializes defaults, or repeats financial birth.
+  const existing=await repositories.transaction(transaction=>recover(transaction));
+  if(existing)return existing;
   try {
+    const factory=await prepare(creatorId);
     return await repositories.transaction(async transaction => {
       const existing = await recover(transaction); if (existing) return existing;
-      const creator = await createNew(transaction, creatorId);
+      const creator = await createNew(transaction, creatorId,factory);
       await records.create({ id: receiptId, instanceId: creator.instanceId, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion,
         dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, namespace: 'runtime-creator-intake', scopeId: creatorId, key,
         value: { schemaVersion: 1, actorId: input.actorId, creatorId, handle: input.handle, displayName: input.displayName } }, { transaction });

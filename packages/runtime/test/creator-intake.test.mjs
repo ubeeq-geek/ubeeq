@@ -21,7 +21,7 @@ test('Creator and request receipt roll back together when receipt persistence fa
 });
 test('unknown commit replies and concurrent keyed creation recover one Creator without repeating preparation',async t=>{
  const f=await localFixture(t),transaction=f.local.repositories.transaction.bind(f.local.repositories);let lost=true;
- f.local.repositories.transaction=async run=>{const result=await transaction(run);if(lost){lost=false;throw Error('Accepted response lost');}return result;};
+ f.local.repositories.transaction=async run=>{const result=await transaction(run);if(lost&&result?.id){lost=false;throw Error('Accepted response lost');}return result;};
  const result=await Promise.all([createIntakeCreator(f.local.repositories,f.input,f.create()),createIntakeCreator(f.local.repositories,f.input,f.create())]);assert.equal(result[0].id,result[1].id);assert.equal(f.creates(),1);
  const edited=await f.local.repositories.creators.update(result[0].id,result[0].revision,{displayName:'Edited profile'});assert.equal((await createIntakeCreator(f.local.repositories,f.input,f.create())).displayName,edited.displayName);
  await assert.rejects(createIntakeCreator(f.local.repositories,{...f.input,handle:'changed'},f.create()),error=>error.status===409);assert.equal(f.creates(),1);

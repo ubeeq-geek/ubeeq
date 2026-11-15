@@ -273,6 +273,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     throw Error('Content preparation HTTP requires its durable recovery and release worker.');
   }
   if(preparationBindings?.createCreator!==undefined&&typeof preparationBindings.createCreator!=='function'){localAdapters?.database.close();throw Error('Retained Creator birth requires a trusted factory.');}
+  if(preparationBindings?.prepareCreatorCreation!==undefined&&(typeof preparationBindings.prepareCreatorCreation!=='function'||preparationBindings.createCreator!==undefined)){localAdapters?.database.close();throw Error('Retained Creator birth requires one trusted writer or pre-transaction preparation.');}
   const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
     if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
     return preparationBindings.access(request,response,creatorId);
@@ -918,7 +919,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const existingUsers = tenancy.mode === 'single_operator' ? await getDistinctOperatorUserIds() : [];
         const handle = requireString(body.handle, 'handle'), displayName = requireString(body.displayName, 'displayName');
         const createCreator = () => createIntakeCreator(repositories, { instanceId: configuration.instanceId ?? 'local-reference', cellId, region, actorId: identity.subject.id,
-          handle, displayName, idempotencyKey: body.idempotencyKey as string | undefined }, async (transaction, creatorId) => {
+          handle, displayName, idempotencyKey: body.idempotencyKey as string | undefined }, async (transaction, creatorId, preparedFactory) => {
         if (tenancy.mode === 'single_operator') {
           const claims = repositories.instanceOperators;
           if (!claims) throw new HttpError(503, 'operator_claim_store_required', 'An atomic operator claim store is required.');
@@ -939,10 +940,10 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           handle,
           displayName,
           subjectId: identity.subject.id
-        }, identity.subject.id, transaction, preparationBindings?.createCreator);
+        }, identity.subject.id, transaction, preparedFactory??preparationBindings?.createCreator);
         await configuration.creatorLifecycle?.prepare({ creator: Object.freeze(structuredClone(created)), actorUserId: identity.subject.id, repositories, transaction });
         return created;
-        });
+        },preparationBindings?.prepareCreatorCreation);
         let creator: CreatorRecord;
         try { creator = await createCreator(); }
         catch (error) {
