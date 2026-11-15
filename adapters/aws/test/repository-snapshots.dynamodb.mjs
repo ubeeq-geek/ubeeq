@@ -21,6 +21,68 @@ async function fixture(t){
  return {client,other,table,repositories,independent,scope,rows:async()=>(await client.send(new ScanCommand({TableName:table}))).Items??[]};
 }
 
+test('actual Dynamo point absence guards reject a late authority insertion and atomically roll back companion writes',async t=>{
+ const f=await fixture(t),send=f.client.send.bind(f.client);let insert=true;
+ const role={id:'late-role',...f.scope,namespace:'platform-role',scopeId:'users',key:'actor',value:{role:'user'}};
+ f.client.send=async(command,...rest)=>{
+  if(insert&&command.constructor.name==='TransactWriteCommand'&&command.input.TransactItems.some(item=>item.ConditionCheck?.Key?.pk==='hostRecords#late-role')){
+   insert=false;await f.independent.hostRecords.create(role);
+  }
+  return send(command,...rest);
+ };
+ await assert.rejects(f.repositories.transaction(async transaction=>{
+  assert.equal(await f.repositories.hostRecords.get(role.id,{transaction}),undefined);
+  await f.repositories.hostRecords.checkAbsent(role.id,{transaction});
+  await f.repositories.hostRecords.checkAbsent(role.id,{transaction});
+  await f.repositories.auditEvents.create({id:'must-rollback',...f.scope,action:'unauthorized',payload:{}},{transaction});
+ }),error=>error.name==='OptimisticConcurrencyError'&&error.id===role.id&&error.expectedRevision===0);
+ assert.equal(insert,false);assert.ok(await f.repositories.hostRecords.get(role.id));assert.equal(await f.repositories.auditEvents.get('must-rollback'),undefined);
+});
+
+test('actual Dynamo absence guards allow unrelated authority writes without a whole inventory fence',async t=>{
+ const f=await fixture(t),send=f.client.send.bind(f.client);let change=true,batch;
+ f.client.send=async(command,...rest)=>{
+  if(change&&command.constructor.name==='TransactWriteCommand'){
+   change=false;batch=command.input.TransactItems;
+   await f.independent.hostRecords.create({id:'unrelated',...f.scope,namespace:'profile',scopeId:'users',key:'other',value:{status:'active'}});
+  }
+  return send(command,...rest);
+ };
+ await f.repositories.transaction(async transaction=>{
+  await f.repositories.hostRecords.checkAbsent('missing-profile',{transaction});
+  await f.repositories.auditEvents.create({id:'accepted-point-guard',...f.scope,action:'accepted',payload:{}},{transaction});
+ });
+ assert.equal(batch.length,2);assert.equal(batch.filter(item=>item.ConditionCheck).length,1);
+ assert.ok(await f.repositories.auditEvents.get('accepted-point-guard'));
+});
+
+test('actual Dynamo coalesces absence guards and preserves the hundred-item budget including every guard and write',async t=>{
+ const f=await fixture(t),repository=f.repositories.federationActors;
+ await f.repositories.transaction(async transaction=>{
+  for(let i=0;i<99;i++){await repository.checkAbsent('missing-'+i,{transaction});await repository.checkAbsent('missing-'+i,{transaction});}
+  await repository.create({id:'hundredth-item'},{transaction});
+ });
+ assert.ok(await repository.get('hundredth-item'));
+ await assert.rejects(f.repositories.transaction(async transaction=>{
+  for(let i=0;i<100;i++)await repository.checkAbsent('overflow-'+i,{transaction});
+  await repository.create({id:'must-not-commit'},{transaction});
+ }),/100 distinct/);
+ assert.equal(await repository.get('must-not-commit'),undefined);
+ for(const order of ['guard-write','write-guard','contradiction']){
+  await assert.rejects(f.repositories.transaction(async transaction=>{
+   await repository.create({id:'companion-'+order},{transaction});
+   if(order==='write-guard'){
+    await repository.create({id:order},{transaction});await assert.rejects(repository.checkAbsent(order,{transaction}),/guard or write/);
+   }else{
+    await repository.checkAbsent(order,{transaction});
+    if(order==='guard-write')await assert.rejects(repository.create({id:order},{transaction}),/guarded item/);
+    else await assert.rejects(repository.checkRevision(order,1,{transaction}),{name:'OptimisticConcurrencyError'});
+   }
+  }),/aborted/);
+  assert.equal(await repository.get('companion-'+order),undefined);
+ }
+});
+
 test('complete Dynamo inventories retain legacy data and reject changes even after the guard was staged',async t=>{
  const f=await fixture(t),legacy={id:'legacy',...f.scope,workId:'work',destination:'native',status:'live',revision:1,createdAt:'2026-01-01',updatedAt:'2026-01-01',opaque:{preserve:['all','legacy','fields']}};
  // An actual pre-protocol row, with no mutation marker and no invented empty history.

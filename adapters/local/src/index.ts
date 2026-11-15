@@ -16,7 +16,7 @@ export { readCreatorLibrarySnapshot, type CreatorLibrarySnapshot } from './libra
 export { LocalFavoriteStore } from './favorites.js';
 export { LocalCreatorFollowStore } from './creator-follows.js';
 export { LocalCommentStore } from './comments.js';
-import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
+import type { AuthenticatedSession, AuthorizationSubject, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
@@ -32,13 +32,14 @@ const json = <T>(value: T): string => JSON.stringify(value);
 const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
 type SqliteDatabase = { close(): void; exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
+type LocalTransactionState = { id: string; active: boolean; rollbackOnly: boolean; guards: Map<string, number | null>; writes: Set<string> };
 
 export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
-  private readonly transactionContext = new AsyncLocalStorage<{ id: string; active: boolean; rollbackOnly: boolean }>();
-  private owner?: { id: string; active: boolean; rollbackOnly: boolean };
+  private readonly transactionContext = new AsyncLocalStorage<LocalTransactionState>();
+  private owner?: LocalTransactionState;
   private transactionTail: Promise<void> = Promise.resolve();
 
   close(): void { this.database.close(); }
@@ -81,7 +82,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -96,6 +97,24 @@ export class LocalSqliteDatabase {
   failTransaction(): void {
     const context = this.transactionContext.getStore();
     if (context?.active) context.rollbackOnly = true;
+  }
+  guardRecord(repository: string, id: string, expected: number | null, transaction: PersistenceTransaction): boolean {
+    try{this.assertTransaction(transaction);}catch(error){this.failTransaction();throw error;}
+    const context=this.transactionContext.getStore()!,key=JSON.stringify([repository,id]);
+    if(context.writes.has(key)){context.rollbackOnly=true;throw new Error('A transaction must guard or write each item once.');}
+    if(context.guards.has(key)){
+      if(context.guards.get(key)!==expected){context.rollbackOnly=true;throw new OptimisticConcurrencyError(id,expected??0);}
+      return false;
+    }
+    context.guards.set(key,expected);return true;
+  }
+  recordWrite(repository: string, id: string): void {
+    const context=this.transactionContext.getStore();
+    if(!context)return;
+    this.assertTransaction(context);
+    const key=JSON.stringify([repository,id]);
+    if(context.guards.has(key)){context.rollbackOnly=true;throw new Error('A transaction cannot write a guarded item.');}
+    context.writes.add(key);
   }
   transactionSync<T>(operation: () => T): T {
     const inherited = this.transactionContext.getStore();
@@ -124,7 +143,7 @@ export class LocalSqliteDatabase {
     const previous = this.transactionTail;
     this.transactionTail = new Promise<void>(resolve => { release = resolve; });
     await previous;
-    const context = { id: `sqlite-${randomUUID()}`, active: true, rollbackOnly: false };
+    const context:LocalTransactionState = { id: `sqlite-${randomUUID()}`, active: true, rollbackOnly: false, guards:new Map(), writes:new Set() };
     this.owner = context;
     try {
       return await this.transactionContext.run(context, async () => {
@@ -186,6 +205,7 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
         const existing = this.local.database.prepare("SELECT record_id FROM ubeeq_idempotency WHERE repository = ? AND idempotency_key = ?").get(this.repository, options.idempotencyKey) as { record_id?: string } | undefined;
         if (existing?.record_id) return this.read(existing.record_id)!;
       }
+      this.local.recordWrite(this.repository,record.id);
       const existing = this.read(record.id);
       if (existing) throw new Error(`Record ${record.id} already exists.`);
       const timestamp = now();
@@ -201,10 +221,15 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     return this.read(id);
   }
   async checkRevision(id: string, expectedRevision: number, _options: { transaction: PersistenceTransaction }): Promise<void> {
-    this.local.assertTransaction(_options.transaction);
+    if(!this.local.guardRecord(this.repository,id,expectedRevision,_options.transaction))return;
     // The transaction owns BEGIN IMMEDIATE; this read stays guarded until commit.
     const current = this.read(id);
     if (!current || current.revision !== expectedRevision) { this.local.failTransaction(); throw new OptimisticConcurrencyError(id, expectedRevision); }
+  }
+  async checkAbsent(id: string, options: { transaction: PersistenceTransaction }): Promise<void> {
+    if(!this.local.guardRecord(this.repository,id,null,options.transaction))return;
+    // BEGIN IMMEDIATE excludes every other SQLite writer until this commit.
+    if(this.read(id)){this.local.failTransaction();throw new OptimisticConcurrencyError(id,0);}
   }
 
   private read(id: string): T | undefined {
@@ -242,6 +267,7 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
   async update(id:string,expectedRevision:number,change:Partial<Omit<T,'id'|'revision'|'createdAt'|'updatedAt'>>,options?:{transaction?:PersistenceTransaction}):Promise<T>{
     if(options?.transaction)this.local.assertTransaction(options.transaction);
     return this.local.transactionSync(()=>{
+      this.local.recordWrite(this.repository,id);
       const current=this.read(id);
       if(!current||current.revision!==expectedRevision){this.local.failTransaction();throw new OptimisticConcurrencyError(id,expectedRevision);}
       const value=this.retainHandleHistory({...current,...change,revision:current.revision+1,updatedAt:now()} as T,current);
@@ -254,6 +280,7 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
   async remove(id:string,expectedRevision:number,options?:{transaction?:PersistenceTransaction}):Promise<void>{
     if(options?.transaction)this.local.assertTransaction(options.transaction);
     this.local.transactionSync(()=>{
+      this.local.recordWrite(this.repository,id);
       this.guard(this.read(id),undefined);
       const result=this.local.database.prepare('DELETE FROM ubeeq_records WHERE repository = ? AND id = ? AND revision = ?').run(this.repository,id,expectedRevision);
       if(result.changes!==1)throw new OptimisticConcurrencyError(id,expectedRevision);
@@ -446,16 +473,32 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
     if (!row || row.status !== "active") throw new Error("Invalid local credentials.");
     const supplied = scryptSync(input.password, row.salt, 64); const expected = Buffer.from(row.password_hash, "hex");
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Invalid local credentials.");
+    const subject = await this.getAuthorizationSubject(row.id);
+    if (!subject) throw new Error("Invalid local credentials.");
     const token = randomBytes(32).toString("base64url"), id = randomUUID(), timestamp = now(), expiresAt = new Date(Date.now() + (this.local.configuration.sessionTtlSeconds ?? 86_400) * 1000).toISOString();
     this.local.database.prepare("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)").run(id, row.id, digest(token), expiresAt, timestamp);
-    return { token, session: { id, subject: { id: row.id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: timestamp, expiresAt, authenticationMethod: "password" } };
+    return { token, session: { id, subject, issuedAt: timestamp, expiresAt, authenticationMethod: "password" } };
   }
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
     const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string } | undefined;
     if (!row || row.expires_at <= now()) return undefined;
-    return { id: row.id, subject: { id: row.account_id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
+    const subject = await this.getAuthorizationSubject(row.account_id);
+    if (!subject) return undefined;
+    return { id: row.id, subject, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
   }
   async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }
+  async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    const row = this.local.database.prepare('SELECT id, email, status, account_scope, roles_json, scopes_json FROM ubeeq_accounts WHERE id = ?').get(subjectId) as { id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string } | undefined;
+    if (!row || row.status !== 'active') return undefined;
+    if (row.id !== subjectId || !['creator_operator', 'customer_account'].includes(row.account_scope)) throw new Error('Local authorization evidence is unavailable.');
+    const values = (encoded: string): string[] => {
+      let result: unknown;
+      try { result = JSON.parse(encoded); } catch { throw new Error('Local authorization evidence is unavailable.'); }
+      if (!Array.isArray(result) || result.some(value => typeof value !== 'string' || !value)) throw new Error('Local authorization evidence is unavailable.');
+      return result;
+    };
+    return { id: row.id, email: row.email, accountScope: row.account_scope as AuthorizationSubject['accountScope'], roles: values(row.roles_json), scopes: values(row.scopes_json) };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId); }
 }

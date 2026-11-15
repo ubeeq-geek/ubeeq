@@ -8,6 +8,7 @@ import {DynamoRepositorySnapshots,type SnapshotTransactionState} from './reposit
 
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void;
+  checkAbsent?: (table: string, key: Record<string, string>) => void;
   snapshotRepository?<T>(table:string,repository:string):Promise<RepositorySnapshot<T>>;
   snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
   mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
@@ -18,29 +19,33 @@ const keyOf = (table: string | undefined, key: Record<string, any>) => JSON.stri
 export const createTransactionalDynamo = (base: Dynamo) => {
   const context = new AsyncLocalStorage<State>();
   const snapshots=new DynamoRepositorySnapshots(base,()=>context.getStore());
-  const client: Dynamo = {
-    snapshotRepository:(table,repository)=>snapshots.capture(table,repository),
-    snapshotPage:(table,repository,request)=>snapshots.list(table,repository,request),
-    mutateRepository:(table,repository,operation)=>transaction(async()=>{
-      const result=await operation();await snapshots.changed(table,repository);return result;
-    }),
-    checkRevision: (table, key, expectedRevision) => {
+  const guard = (table: string, key: Record<string, string>, expectedRevision: number | null): void => {
     const state = context.getStore();
-    if (!state?.active) throw new Error('Revision guards require an active transaction.');
+    if (!state?.active) throw new Error('Read guards require an active transaction.');
     const identity = keyOf(table, key);
     const existing=state.writes.find(write=>write.ConditionCheck && keyOf(write.ConditionCheck.TableName,write.ConditionCheck.Key!)===identity)?.ConditionCheck;
     if(existing){
-      if(existing.ExpressionAttributeValues?.[':revision']===expectedRevision)return;
-      state.failed=true;throw new OptimisticConcurrencyError(String(key.pk).slice(String(key.pk).indexOf('#')+1),expectedRevision);
+      if(expectedRevision===null?existing.ConditionExpression==='attribute_not_exists(pk)':existing.ExpressionAttributeValues?.[':revision']===expectedRevision)return;
+      state.failed=true;throw new OptimisticConcurrencyError(String(key.pk).slice(String(key.pk).indexOf('#')+1),expectedRevision??0);
     }
     if (state.overlay.has(identity)) {
       state.failed = true;
       throw new Error('A transaction must guard or write each item once.');
     }
     if (state.writes.length >= 100) { state.failed = true; throw new Error('A repository transaction supports at most 100 distinct writes.'); }
-    state.writes.push({ ConditionCheck: { TableName: table, Key: key, ConditionExpression: 'attribute_exists(pk) AND #revision = :revision',
-      ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } } });
-  }, failTransaction: () => {
+    state.writes.push({ ConditionCheck: { TableName: table, Key: key, ...(expectedRevision===null
+      ? {ConditionExpression:'attribute_not_exists(pk)'}
+      : {ConditionExpression:'attribute_exists(pk) AND #revision = :revision',ExpressionAttributeNames:{'#revision':'revision'},ExpressionAttributeValues:{':revision':expectedRevision}}) } });
+  };
+  const client: Dynamo = {
+    snapshotRepository:(table,repository)=>snapshots.capture(table,repository),
+    snapshotPage:(table,repository,request)=>snapshots.list(table,repository,request),
+    mutateRepository:(table,repository,operation)=>transaction(async()=>{
+      const result=await operation();await snapshots.changed(table,repository);return result;
+    }),
+    checkRevision:(table,key,expectedRevision)=>guard(table,key,expectedRevision),
+    checkAbsent:(table,key)=>guard(table,key,null),
+    failTransaction: () => {
     const state = context.getStore();
     if (state?.active) state.failed = true;
   }, assertTransaction: transaction => {
@@ -108,6 +113,11 @@ export const createTransactionalDynamo = (base: Dynamo) => {
                 const key = write.Put?.Item?.pk || write.Delete?.Key?.pk || write.ConditionCheck?.Key?.pk;
                 const revision = (write.Put || write.Delete || write.ConditionCheck)!.ExpressionAttributeValues![':revision'];
                 if (typeof key === 'string') throw new OptimisticConcurrencyError(key.slice(key.indexOf('#') + 1), revision);
+              }
+              const absent = reasons.findIndex((reason, position) => reason.Code === 'ConditionalCheckFailed' && batch[position].ConditionCheck?.ConditionExpression === 'attribute_not_exists(pk)');
+              if (absent >= 0) {
+                const key = batch[absent].ConditionCheck!.Key!.pk;
+                if (typeof key === 'string') throw new OptimisticConcurrencyError(key.slice(key.indexOf('#') + 1), 0);
               }
             }
             throw error;

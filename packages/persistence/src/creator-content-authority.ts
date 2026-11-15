@@ -44,6 +44,7 @@ export function protectCreatorContentAuthority<T extends UbeeqRepositories>(repo
       get:source.get.bind(source),list:source.list.bind(source),
       ...(source.snapshot?{snapshot:source.snapshot.bind(source)}:{}),
       ...(source.checkRevision?{checkRevision:source.checkRevision.bind(source)}:{}),
+      ...(source.checkAbsent?{checkAbsent:source.checkAbsent.bind(source)}:{}),
       create:(record,options)=>repositories.transaction(async transaction=>{
         if(options?.transaction&&options.transaction.id!==transaction.id)throw new Error('Transaction handle is not active on this repository context.');
         await check(undefined,record as Partial<R>,transaction);

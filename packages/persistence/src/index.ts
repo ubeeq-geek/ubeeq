@@ -88,6 +88,9 @@ export interface RevisionedRepository<T extends RevisionedRecord> {
   snapshot?(): Promise<RepositorySnapshot<T>>;
   /** Commit-time read guard. Required by publication commands; never emulate with an unguarded read. */
   checkRevision?(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void>;
+  /** Guard physical record absence until this transaction commits. A plain
+   * missing get() is not evidence. Conflicts use expectedRevision zero. */
+  checkAbsent?(id: string, options: { transaction: PersistenceTransaction }): Promise<void>;
   create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { transaction?: PersistenceTransaction; idempotencyKey?: string }): Promise<T>;
   get(id: string, options?: { transaction?: PersistenceTransaction }): Promise<T | undefined>;
   list(request: PageRequest, options?: { transaction?: PersistenceTransaction }): Promise<Page<T>>;
@@ -100,12 +103,15 @@ const DATA_HOME_FIELDS = ["homeCellId", "dataHomeRegion", "dataHomeAssignedAt", 
 /** Provider-neutral fail-closed boundary for canonical creator-owned repositories. */
 export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> implements RevisionedRepository<T> {
   readonly snapshot?: () => Promise<RepositorySnapshot<T>>;
+  readonly checkAbsent?: (id: string, options: { transaction: PersistenceTransaction }) => Promise<void>;
   constructor(readonly repository: RevisionedRepository<T>, readonly cellId: string) {
     if (!cellId.trim()) throw new Error("A cell-scoped repository requires a cellId.");
     if (repository.snapshot) this.snapshot = async () => {
       const snapshot = await repository.snapshot!();
       return {items:snapshot.items.filter(record=>record.homeCellId===this.cellId),bind:transaction=>snapshot.bind(transaction)};
     };
+    // A hidden foreign-cell row must never become evidence of physical absence.
+    if (repository.checkAbsent) this.checkAbsent = repository.checkAbsent.bind(repository);
   }
   private local(record: T | undefined): T | undefined {
     return record?.homeCellId === this.cellId ? record : undefined;

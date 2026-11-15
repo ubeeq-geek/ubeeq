@@ -40,6 +40,11 @@ export interface CreatorDelegation {
 export interface IdentityAdapter {
   verifySession(input: { credential: string; audience?: string }): Promise<AuthenticatedSession | undefined>;
   getAccount(subjectId: string): Promise<IdentityAccount | undefined>;
+  /** Current provider authority for a saved actor, without reusing session claims.
+   * Missing/inactive accounts return undefined; unavailable evidence must fail
+   * closed. Callers must not replace missing evidence with saved session claims.
+   * This live lookup does not promise a database transaction guard. */
+  getAuthorizationSubject?(subjectId: string): Promise<AuthorizationSubject | undefined>;
   listDelegations(input: { creatorId: string; subjectId: string; at: string }): Promise<readonly CreatorDelegation[]>;
   beginVerification?(input: { accountId: string; channel: string }): Promise<void>;
   completeVerification?(input: { accountId: string; proof: string }): Promise<void>;

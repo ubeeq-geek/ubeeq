@@ -14,14 +14,14 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { AdminGetUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
+import { AdminGetUserCommand, AdminListGroupsForUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
 import { CellScopedRepository, OptimisticConcurrencyError, repositoryItems, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
-import { PasswordAuthenticationError, type AuthenticatedSession, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
+import { PasswordAuthenticationError, type AuthenticatedSession, type AuthorizationSubject, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
@@ -38,6 +38,7 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
 export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void;
+  checkAbsent?: (table: string, key: Record<string, string>) => void;
   snapshotRepository?<T>(table:string,repository:string):Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
   snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
   mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
@@ -73,6 +74,11 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
     this.assertTransaction(options);
     if (!this.dynamo.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
     this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
+  }
+  async checkAbsent(id: string, options: { transaction: { id: string } }): Promise<void> {
+    this.assertTransaction(options);
+    if (!this.dynamo.checkAbsent) throw new Error('Repository does not support commit-time absence guards.');
+    this.dynamo.checkAbsent(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' });
   }
   async create(record: Omit<T, 'revision' | 'createdAt' | 'updatedAt'>, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
@@ -560,7 +566,7 @@ export class CognitoIdentity implements IdentityAdapter {
         issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
     } catch { return undefined; }
   }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+  private async currentUser(subjectId: string): Promise<{ account: IdentityAccount; attributes: Array<{ Name?: string; Value?: string }> } | undefined> {
     if (typeof subjectId !== 'string' || !subjectId || subjectId.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(subjectId)) return undefined;
     let user;
     try { user = await this.cognito.send(new AdminGetUserCommand({ UserPoolId: this.userPoolId, Username: subjectId })); }
@@ -569,6 +575,7 @@ export class CognitoIdentity implements IdentityAdapter {
       // Never substitute an active account when the provider is unavailable or the host lacks permission.
       throw new Error('Cognito account status is unavailable.');
     }
+    if (!user || typeof user !== 'object') throw new Error('Cognito account evidence is unavailable.');
     const status = user.UserStatus;
     if (user.Username !== subjectId || typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
     const timestamp = (value: unknown) => {
@@ -576,7 +583,39 @@ export class CognitoIdentity implements IdentityAdapter {
       if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error('Cognito account timestamp is invalid.');
       return value.toISOString();
     };
-    return { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status) ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) };
+    return { account: { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status) ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) }, attributes: user.UserAttributes };
+  }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    return (await this.currentUser(subjectId))?.account;
+  }
+  async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    const current = await this.currentUser(subjectId);
+    if (!current || current.account.status !== 'active') return undefined;
+    const unavailable = () => new Error('Cognito authorization evidence is unavailable.');
+    if (!Array.isArray(current.attributes) || current.attributes.some(attribute => !attribute || typeof attribute.Name !== 'string' || typeof attribute.Value !== 'string')) throw unavailable();
+    const attribute = (name: string): string | undefined => {
+      const matches = current.attributes.filter(value => value.Name === name);
+      if (matches.length > 1) throw unavailable();
+      return matches[0]?.Value;
+    };
+    const scope = attribute('custom:account_scope');
+    if (scope !== undefined && scope !== 'creator_operator' && scope !== 'customer_account') throw unavailable();
+    const roles = new Set<string>(), cursors = new Set<string>();
+    let nextToken: string | undefined;
+    do {
+      let page;
+      try { page = await this.cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: this.userPoolId, Username: subjectId, Limit: 60, ...(nextToken ? { NextToken: nextToken } : {}) })); }
+      catch { throw unavailable(); }
+      if (!page || typeof page !== 'object' || page.Groups !== undefined && !Array.isArray(page.Groups)) throw unavailable();
+      for (const group of page.Groups ?? []) {
+        if (!group || typeof group.GroupName !== 'string' || !group.GroupName) throw unavailable();
+        roles.add(group.GroupName);
+      }
+      if (page.NextToken !== undefined && (typeof page.NextToken !== 'string' || !page.NextToken || cursors.has(page.NextToken))) throw unavailable();
+      nextToken = page.NextToken;
+      if (nextToken) cursors.add(nextToken);
+    } while (nextToken);
+    return { id: subjectId, email: attribute('email'), emailVerified: attribute('email_verified') === 'true', accountScope: scope === 'customer_account' ? 'customer_account' : 'creator_operator', roles: [...roles] };
   }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
