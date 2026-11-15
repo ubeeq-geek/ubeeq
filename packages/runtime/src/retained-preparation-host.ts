@@ -17,6 +17,7 @@ export async function prepareSourceFileIntake<F extends PreparationSourceFile,A 
     originalFilename: unknown;
     mimeType: unknown;
     sizeBytes: unknown;
+    checksumSha256?: unknown;
     publishingWorkId?: string;
     fileId?: string;
 }, access: A, assertStorage: () => Promise<void>, host:RetainedSourceIntakeHost<F>): Promise<F> {
@@ -25,6 +26,7 @@ export async function prepareSourceFileIntake<F extends PreparationSourceFile,A 
     const mimeType = typeof input.mimeType === 'string' ? input.mimeType.trim() : 'application/octet-stream', sizeBytes = input.sizeBytes;
     if (!originalFilename || originalFilename.length > 255 || /[\r\n\x00]/.test(originalFilename) || !Number.isSafeInteger(sizeBytes) || Number(sizeBytes) < 1 || Number(sizeBytes) > maximum || !/^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(mimeType))
         throw new SourceFileIntakeError(`Choose a non-empty file of at most ${maximum} bytes with a valid media type.`);
+    if(input.checksumSha256!==undefined&&(typeof input.checksumSha256!=='string'||!/^[a-f0-9]{64}$/.test(input.checksumSha256)))throw new SourceFileIntakeError('Choose the exact SHA-256 checksum of this original.');
     if (input.publishingWorkId) {
         const work = await store.getWork(config.tenantId, input.publishingWorkId);
         if (!work || work.creatorId !== input.creatorId || work.deletedAt || work.archivedAt)
@@ -34,7 +36,8 @@ export async function prepareSourceFileIntake<F extends PreparationSourceFile,A 
     if (privateStorage)
         await assertStorage();
     const fileId = input.fileId ?? randomUUID(), now = new Date().toISOString();
-    const file = host.file({ fileId, creatorId: input.creatorId, originalFilename, mimeType, sizeBytes: Number(sizeBytes), storageKey: `${host.originalCreatorPrefix(input.creatorId, privateStorage)}${fileId}/source`, sourceKind: mimeType.startsWith('video/') ? 'video' : mimeType.startsWith('audio/') ? 'audio' : mimeType.startsWith('image/') ? 'image' : mimeType === 'application/pdf' || mimeType.startsWith('text/') ? 'document' : 'other', downloadable: false, premium: false, restricted: false, ...(input.publishingWorkId ? { metadata: { publishingWorkId: input.publishingWorkId } } : {}), revision: 1, uploadState: 'pending', createdAt: now, updatedAt: now });
+    const file = host.file({ fileId, creatorId: input.creatorId, originalFilename, mimeType, sizeBytes: Number(sizeBytes), ...(input.checksumSha256===undefined?{}:{checksumSha256:input.checksumSha256 as string}), storageKey: `${host.originalCreatorPrefix(input.creatorId, privateStorage)}${fileId}/source`, sourceKind: mimeType.startsWith('video/') ? 'video' : mimeType.startsWith('audio/') ? 'audio' : mimeType.startsWith('image/') ? 'image' : mimeType === 'application/pdf' || mimeType.startsWith('text/') ? 'document' : 'other', downloadable: false, premium: false, restricted: false, ...(input.publishingWorkId ? { metadata: { publishingWorkId: input.publishingWorkId } } : {}), revision: 1, uploadState: 'pending', createdAt: now, updatedAt: now });
+    if(input.checksumSha256!==undefined&&file.checksumSha256!==input.checksumSha256)throw new SourceFileIntakeError('The original host must retain its precommitted checksum.');
     await store.commitSourceFile({ expected: null, file, access, audit: { auditId: randomUUID(), actorUserId: access.actorUserId, actorRole: access.isAdmin ? 'admin' : 'creator', action: 'source_file.upload.prepared', createdAt: now, detail: { fileId, creatorId: input.creatorId, revision: 1, uploadState: 'pending', downloadable: false } } });
     return file;
 }
@@ -48,7 +51,7 @@ export async function inspectStoredOriginal<F extends PreparationSourceFile>(con
     const root = await realpath(config.localMediaDirectory), target = await realpath(resolve(root, file.storageKey));
     if (!target.startsWith(`${root}/`) || !isObjectKeyWithinPrefix(target.slice(root.length + 1), `${host.originalCreatorPrefix(file.creatorId, host.isPrivateOriginalKey(file.storageKey))}${file.fileId}/`)) throw new Error('Invalid original location.');
   }
-  const stream = await host.openStream(file.storageKey);
+  const stream = await host.openStream(file.storageKey,file);
   const hash = createHash('sha256'); let size = 0;
   try {
     for await (const chunk of stream as AsyncIterable<Buffer>) {

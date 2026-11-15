@@ -70,6 +70,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     this.now=options.now??(()=>new Date());this.duration=options.expiresInMilliseconds??15*60_000;
     if(!Number.isSafeInteger(this.duration)||this.duration<1||this.duration>15*60_000)throw Error('Original upload expiry must be bounded to fifteen minutes.');
   }
+  get scope(){return Object.freeze({...this.files.scope});}
   private id(fileId:string){return 'source-upload-'+ownedEvidenceHash([this.instanceId,this.cellId,this.files.scope.tenantId,this.files.scope.creatorId,fileId]);}
   private usageKey(row:HostRecord){return 'source-original:'+row.id;}
   private home(row:CellOwnedRecord):CellOwnedRecord{return {homeCellId:row.homeCellId,dataHomeRegion:row.dataHomeRegion,dataHomeAssignedAt:row.dataHomeAssignedAt,routingRevision:row.routingRevision};}
@@ -128,7 +129,9 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   }
   /** The authoritative pending SourceFile is created by prepareSourceFileIntake.
    * A checksum is required before a browser receives any upload capability. */
+  private outsideTransaction(){if(this.files.transaction())throw new SourceFileUploadError('upload_transaction_active',409,'Issue or finalize original uploads only after the metadata transaction has committed.');}
   async initiate(input:{actorId:string;fileId:string;checksumSha256:string}):Promise<SourceFileUploadResult<F>&{upload:UploadInitiation;completed:boolean}>{
+    this.outsideTransaction();
     for(let attempt=0;attempt<5;attempt++){try{return await this.initiateOwned(input);}catch(error){if(!conflict(error)||attempt===4)throw error;}}
     throw Error('Original upload initiation requires reconciliation.');
   }
@@ -189,6 +192,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     throw Error('Original upload update requires reconciliation.');
   }
   async accept(input:{actorId:string;fileId:string;body:Uint8Array}):Promise<void>{
+    this.outsideTransaction();
     if(!this.options.uploads.accept)throw new SourceFileUploadError('direct_upload_required',404,'Use the signed storage upload capability for this original.');
     const value=await this.files.asActor(input.actorId,async()=>{
       await this.files.captureSourceAccess(input.actorId);const value=this.value(await this.read(input.fileId,this.files.transaction()!));this.open(value);
@@ -258,6 +262,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     throw Error('Original source completion requires reconciliation.');
   }
   async complete(input:{actorId:string;fileId:string}):Promise<SourceFileUploadResult<F>>{
+    this.outsideTransaction();
     const row=await this.files.asActor(input.actorId,async()=>{
       await this.files.captureSourceAccess(input.actorId);const row=await this.read(input.fileId,this.files.transaction()!),value=this.value(row);
       if(value.actorId!==input.actorId)throw new SourceFileUploadError('upload_identity_conflict',403,'The original upload must be completed by its initiating actor.');
@@ -288,6 +293,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     await this.deliver(row);return row;
   }
   async cancel(input:{actorId:string;fileId:string;expectedRevision:number}):Promise<SourceFileUploadResult<F>>{
+    this.outsideTransaction();
     const row=await this.files.asActor(input.actorId,async()=>{
       const access=await this.files.captureSourceAccess(input.actorId),file=await this.file(input.fileId),row=await this.read(input.fileId,this.files.transaction()!);this.matchFile(this.value(row),file);
       if(file.uploadState==='ready')throw new SourceFileUploadError('upload_already_completed',409,'Completed originals cannot be cancelled.');
@@ -313,6 +319,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   /** Maintenance rechecks the saved actor before any ordinary source mutation.
    * Physical settlement/closure itself must also survive actor revocation. */
   async recover(fileId:string):Promise<SourceFileUploadResult<F>>{
+    this.outsideTransaction();
     let row=await this.read(fileId),value=this.value(row);
     if(value.phase==='closing'||['prepared','issued'].includes(value.phase)&&value.expiresAt<=this.now().toISOString())row=await this.close(row);
     else if(value.completedObject)row=await this.finish(row,value.completedObject,false);

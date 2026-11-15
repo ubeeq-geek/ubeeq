@@ -1,3 +1,4 @@
+import {createRetainedSourceFileNodeHandler} from './retained-source-http.js';
 import {createContentPreparationNodeHandler,type ContentPreparationRuntimeBindings} from './content-preparation-node.js';
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
 import { UploadLifecycle, UploadLifecycleError } from './upload-lifecycle.js';
@@ -276,6 +277,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
     return preparationBindings.access(request,response,creatorId);
   }},request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
+  const retainedSources=preparationBindings?.sourceFiles?createRetainedSourceFileNodeHandler(preparationBindings.sourceFiles,request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
   const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
   const uploadAccountingAvailable=Boolean(repositories.hostRecords && adapters.uploads.seal && hostPorts.usageQuota.closeStorageReservation);
   if(configuration.requireUploadAccounting && !uploadAccountingAvailable){localAdapters?.database.close();throw new Error('Physical upload closure and terminal storage quota reservations are required.');}
@@ -745,6 +747,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
       const method = request.method ?? "GET";
       if (commerce && await commerce.handle(request, response, url)) return;
+      if (retainedSources && await retainedSources.handle(request,response)) return;
       if (contentPreparation && await contentPreparation.handle(request,response)) return;
       // Fail closed for the entire operations namespace, including future routes.
       // Product/deployment composition must explicitly define operator authority.

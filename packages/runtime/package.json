@@ -94,6 +94,10 @@
     "./source-file-uploads": {
       "types": "./dist/source-file-uploads.d.ts",
       "default": "./dist/source-file-uploads.js"
+    },
+    "./retained-source-http": {
+      "types": "./dist/retained-source-http.d.ts",
+      "default": "./dist/retained-source-http.js"
     }
   },
   "scripts": {
@@ -153,6 +157,9 @@
       ],
       "source-file-uploads": [
         "dist/source-file-uploads.d.ts"
+      ],
+      "retained-source-http": [
+        "dist/retained-source-http.d.ts"
       ]
     }
   }

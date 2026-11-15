@@ -349,6 +349,16 @@ export class S3CompatibleStorage implements ObjectStorage, UploadContentAdapter,
     const body = new Uint8Array(await response.Body!.transformToByteArray());
     return { object: { bucket: this.configuration.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body };
   }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(!input.versionId||input.versionId==='null'||input.bucket!==this.configuration.bucket)throw Error('An exact version in the configured object bucket is required.');
+    const key=input.key;this.local(key);
+    const response=await this.client.send(new GetObjectCommand({Bucket:this.configuration.bucket,Key:key,VersionId:input.versionId}));
+    const body=response.Body;
+    const close=async()=>{if(body&&typeof (body as {destroy?:unknown}).destroy==='function')(body as unknown as {destroy():void}).destroy();};
+    if(!body||typeof (body as unknown as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]!=='function'||response.VersionId!==input.versionId||!Number.isSafeInteger(response.ContentLength)||response.ContentLength!<0){await close();throw Error('Original storage did not return the exact immutable stream.');}
+    const object:StoredObject={bucket:this.configuration.bucket,key,versionId:response.VersionId,contentType:response.ContentType??'application/octet-stream',byteLength:response.ContentLength!,checksum:response.Metadata?.checksum,scope:(response.Metadata?.scope as StoredObject['scope'])??'private',...(response.LastModified?{writtenAt:response.LastModified.toISOString()}:{})};
+    return {object,body:body as unknown as AsyncIterable<Uint8Array>,close};
+  }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.local(input.key); await this.client.send(new DeleteObjectCommand({ Bucket: this.configuration.bucket, Key: input.key, VersionId: input.versionId })); }
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
     if (input.multipart) throw new Error("Multipart S3-compatible uploads require a multipart adapter.");

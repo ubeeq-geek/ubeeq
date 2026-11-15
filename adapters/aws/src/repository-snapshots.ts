@@ -10,7 +10,7 @@ export interface SnapshotTransactionState {
 const identity=(table:string,repository:string)=>JSON.stringify([table,repository]);
 const fenceKey=(repository:string)=>({pk:'__ubeeq_repository_snapshot#'+repository,sk:'fence'});
 const conflict=(repository:string)=>new OptimisticConcurrencyError('repository:'+repository,0);
-const guardedRepositories=new Set(['assets','publications','moderationHolds','hostRecords']);
+const guardedRepositories=new Set(['creators','assets','publications','moderationHolds','hostRecords']);
 export const supportsRepositorySnapshots=(repository:string)=>guardedRepositories.has(repository);
 
 /** Complete base-table observations guarded by one mutation marker per repository.

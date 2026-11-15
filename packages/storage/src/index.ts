@@ -3,6 +3,7 @@ import { isObjectKeyWithinPrefix } from './object-key-scope.js';
 export * from './object-key-scope.js';
 export { readBoundedBytes } from './bounded-bytes.js';
 export { writeBoundedUploadContent } from './bounded-upload-content.js';
+export { inspectStoredObjectStream } from './original-stream.js';
 export { transferVerifiedObject, type VerifiedObjectTransferPorts } from './verified-transfer.js';
 
 /** Storage and delivery ports with no product-specific retention or access policy. */
@@ -20,7 +21,17 @@ export interface StoredObject {
   writtenAt?: string;
 }
 
+export interface StoredObjectReadStream {
+  object:StoredObject;body:AsyncIterable<Uint8Array>;
+  /** Dispose the provider body even when the consumer stops before iteration. */
+  close():Promise<void>;
+}
+export interface StreamingObjectStorage {
+  /** Exact immutable version only; never silently read the latest key. */
+  openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectReadStream>;
+}
 export interface ObjectStorage {
+  openReadStream?:StreamingObjectStorage['openReadStream'];
   put(input: { object: StoredObject; body: Uint8Array }): Promise<void>;
   get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }>;
   remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void>;

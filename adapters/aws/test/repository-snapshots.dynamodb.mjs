@@ -189,3 +189,51 @@ test('actual HTTP deletion and withdrawal use complete publication history when 
  const removed=await call('/v1/works/'+work.id+'/publications/native',{published:false},'PUT');assert.equal(removed.status,200,JSON.stringify(removed.body));assert.ok((await f.repositories.publications.snapshot()).items.every(row=>row.status==='removed'));
  const deleted=await call('/v1/works/'+work.id,{revision:work.revision},'DELETE');assert.equal(deleted.status,200,JSON.stringify(deleted.body));
 });
+
+
+test('actual Dynamo Creator inventories retain rich legacy rows and fence concurrent insert/update/removal across every SDK writer',async t=>{
+ const f=await fixture(t),legacy={id:'legacy-creator',...f.scope,handle:'legacy',displayName:'Legacy Creator',subjectId:'owner',revision:1,createdAt:'2026-01-01',updatedAt:'2026-01-01',opaque:{preserve:['all','Creator','fields']}};
+ // A pre-protocol Creator remains complete without a marker or an invented
+ // empty inventory. The managed directory cannot fall back to a stale GSI.
+ await f.client.send(new PutCommand({TableName:f.table,Item:{pk:'creators#'+legacy.id,sk:'record',repository:'creators',id:legacy.id,revision:1,value:legacy}}));
+ const send=f.client.send.bind(f.client);let race;
+ f.client.send=async(command,...rest)=>{
+  if(command.constructor.name==='QueryCommand'&&command.input.ExpressionAttributeValues?.[':repository']==='creators')return {Items:[]};
+  if(race&&command.constructor.name==='TransactWriteCommand'){const run=race;race=undefined;await run();}
+  return send(command,...rest);
+ };
+ assert.deepEqual((await f.repositories.creators.list({limit:100})).items,[]);
+ assert.deepEqual((await f.repositories.creators.snapshot()).items,[legacy]);
+ const markerVersions=new Set();
+ for(const operation of ['insert','update','remove']){
+  const before=await f.repositories.creators.snapshot();
+  race=async()=>{
+   if(operation==='insert')await f.independent.creators.create({id:'late-creator',...f.scope,handle:'late',displayName:'Late Creator',subjectId:'owner',opaque:{retained:true}});
+   else if(operation==='update')await f.independent.creators.update('late-creator',1,{displayName:'Changed Creator'});
+   else await f.independent.creators.remove('late-creator',2);
+  };
+  await assert.rejects(f.repositories.transaction(async transaction=>{
+   await before.bind(transaction);
+   assert.deepEqual((await f.repositories.creators.list({limit:100},{transaction})).items,before.items);
+   await f.repositories.auditEvents.create({id:'creator-directory-'+operation,...f.scope,action:'must.rollback',payload:{}},{transaction});
+  }),{name:'OptimisticConcurrencyError'},operation);
+  assert.equal(race,undefined);assert.equal(await f.repositories.auditEvents.get('creator-directory-'+operation),undefined);
+  const marker=(await f.rows()).find(row=>row.pk==='__ubeeq_repository_snapshot#creators');assert.equal(marker.sk,'fence');assert.match(marker.version,/^[0-9a-f-]{36}$/);markerVersions.add(marker.version);
+ }
+ assert.equal(markerVersions.size,3,'create, update and remove each advance the same atomic inventory marker');
+ const fresh=await f.repositories.creators.snapshot();fresh.items[0].displayName='Untrusted edited copy';
+ await f.repositories.transaction(async transaction=>{await fresh.bind(transaction);assert.equal((await f.repositories.creators.list({limit:100},{transaction})).items[0].displayName,legacy.displayName);});
+ assert.deepEqual(await f.repositories.creators.get(legacy.id),legacy);assert.equal(await f.repositories.creators.get('late-creator'),undefined);
+});
+
+test('actual Dynamo guarded Creator inventory includes transactional births and coalesces its marker with the accepting write',async t=>{
+ const f=await fixture(t),snapshot=await f.repositories.creators.snapshot();let batch;
+ const send=f.client.send.bind(f.client);f.client.send=async(command,...rest)=>{if(command.constructor.name==='TransactWriteCommand')batch=command.input.TransactItems;return send(command,...rest);};
+ await f.repositories.transaction(async transaction=>{
+  await snapshot.bind(transaction);
+  await f.repositories.creators.create({id:'new-creator',...f.scope,handle:'new',displayName:'New Creator',subjectId:'owner'},{transaction});
+  assert.deepEqual((await f.repositories.creators.list({limit:100},{transaction})).items.map(row=>row.id),['new-creator']);
+ });
+ assert.equal(batch.length,2);assert.equal(batch.filter(item=>item.Put?.Item?.pk==='__ubeeq_repository_snapshot#creators').length,1);
+ assert.equal((await f.repositories.creators.snapshot()).items[0].id,'new-creator');
+});

@@ -18,9 +18,10 @@ async function fixture(t){
 }
 function assertCompleteCreation(rows){
  assert.equal(rows.filter(row=>row.repository).length,4,'Creator, host birth, collection directory and receipt remain unchanged');
- const markers=rows.filter(row=>!row.repository);assert.equal(markers.length,1);
- assert.equal(markers[0].pk,'__ubeeq_repository_snapshot#hostRecords');assert.equal(markers[0].sk,'fence');assert.match(markers[0].version,/^[0-9a-f-]{36}$/);
- assert.equal(rows.length,5,'the mutation marker commits with the original four records');
+ const markers=rows.filter(row=>!row.repository);assert.equal(markers.length,2);
+ assert.deepEqual(markers.map(row=>row.pk).sort(),['__ubeeq_repository_snapshot#creators','__ubeeq_repository_snapshot#hostRecords']);
+ for(const marker of markers){assert.equal(marker.sk,'fence');assert.match(marker.version,/^[0-9a-f-]{36}$/);}
+ assert.equal(rows.length,6,'both mutation markers commit with the original four records');
 }
 test('actual Creator, host birth and request receipt commit together and recover a lost transaction response',async t=>{
  const f=await fixture(t),send=f.client.send.bind(f.client);let lost=false;

@@ -52,7 +52,7 @@ export interface RetainedOriginalStream extends AsyncIterable<Buffer|string> {de
 export interface RetainedOriginalHost {
  originalCreatorPrefix(creatorId:string,privateStorage:boolean):string;
  isPrivateOriginalKey(key:string):boolean;
- openStream(key:string):Promise<RetainedOriginalStream>;
+ openStream(key:string,file:Readonly<PreparationSourceFile>):Promise<RetainedOriginalStream>;
 }
 export interface RetainedSourceAccess {actorUserId:string;isAdmin:boolean}
 export interface RetainedIntakeFile extends PreparationSourceFile {

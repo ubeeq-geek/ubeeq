@@ -41,6 +41,7 @@ jobs:
       - run: npm test
       - run: npm run test:managed-retained-sources
       - run: npm run test:managed-source-uploads
+      - run: npm run test:managed-source-http
       - run: npm run test:managed-retained-repository
       - run: npm run test:managed-snapshots
       - run: npm run test:managed-websites

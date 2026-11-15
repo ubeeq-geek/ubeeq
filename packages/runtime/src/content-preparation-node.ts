@@ -1,3 +1,4 @@
+import type {RetainedSourceHttpBindings} from './retained-source-http.js';
 import type {CreatorIntakeFactory} from './creator-intake.js';
 import type {IncomingMessage,ServerResponse} from 'node:http';
 import type {AuthenticatedSession} from '@ubeeq/auth';
@@ -15,6 +16,8 @@ export type ContentPreparationRuntimeBindings<S extends ContentPreparationHttpSe
  /** Optional trusted birth writer for this same retained content composition.
   * Existing Creator migration is a separate fenced operator operation. */
  createCreator?:CreatorIntakeFactory;
+ /** Original uploads share this retained authority and the verified core session. */
+ sourceFiles?:RetainedSourceHttpBindings<any,any>;
  runNextJob(workerId:string):Promise<unknown>;
 };
 type Route={method:string;pattern:RegExp;parameters:string[];handle:(request:ContentPreparationNodeRequest,response:ContentPreparationHttpResponse)=>Promise<unknown>};

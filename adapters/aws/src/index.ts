@@ -310,6 +310,16 @@ export class S3ObjectStorage implements ObjectStorage {
     if (response.VersionId) input.object.versionId = response.VersionId;
   }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const key = this.objectKey(input.key); this.requireLocalKey(key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(!input.versionId||input.versionId==='null'||input.bucket!==this.bucket)throw Error('An exact version in the configured object bucket is required.');
+    const key=this.objectKey(input.key);this.requireLocalKey(key);if(key!==input.key)throw Error('An exact physical key is required.');
+    const response=await this.s3.send(new GetObjectCommand({Bucket:this.bucket,Key:key,VersionId:input.versionId}));
+    const body=response.Body;
+    const close=async()=>{if(body&&typeof (body as {destroy?:unknown}).destroy==='function')(body as unknown as {destroy():void}).destroy();};
+    if(!body||typeof (body as unknown as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]!=='function'||response.VersionId!==input.versionId||!Number.isSafeInteger(response.ContentLength)||response.ContentLength!<0){await close();throw Error('Original storage did not return the exact immutable stream.');}
+    const object:StoredObject={bucket:this.bucket,key,versionId:response.VersionId,contentType:response.ContentType??'application/octet-stream',byteLength:response.ContentLength!,checksum:response.Metadata?.checksum,scope:(response.Metadata?.scope as StoredObject['scope'])??'private',...(response.LastModified?{writtenAt:response.LastModified.toISOString()}:{})};
+    return {object,body:body as unknown as AsyncIterable<Uint8Array>,close};
+  }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const key = this.objectKey(input.key); this.requireLocalKey(key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); }
 }
 

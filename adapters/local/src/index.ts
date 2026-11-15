@@ -5,7 +5,7 @@ export { SqliteCommerceStore } from './commerce.js';
 export { SqliteWebsiteStore } from './websites.js';
 export * from './website-hosting.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync, statSync, realpathSync, openSync, closeSync, fstatSync, constants, createReadStream } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -345,6 +345,22 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
   }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> {
     const path = this.objectPath(input); return { object: parse<StoredObject>(readFileSync(`${path}.json`, "utf8")), body: readFileSync(path) };
+  }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(input.bucket!==this.local.configuration.cellId||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(input.versionId??''))throw Error('An exact local object version is required.');
+    const match=input.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//);if(!match||match[1]!==this.local.configuration.cellId)throw Error('Original stream is outside its cell.');
+    requireCreatorScopedObject(input.key,{cellId:match[1],creatorId:match[2]});
+    const root=realpathSync(resolve(this.local.configuration.dataDirectory,'objects',input.bucket)),path=resolve(root,input.key,input.versionId);
+    if(!path.startsWith(root+'/')||realpathSync(path)!==path||realpathSync(path+'.json')!==path+'.json')throw Error('Original stream location escapes its owned root.');
+    let fd:number|undefined;
+    try{
+      if(statSync(path+'.json').size>64*1024)throw Error('Original stream metadata exceeds its safe size.');
+      const object=parse<StoredObject>(readFileSync(path+'.json','utf8'));
+      fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);const observed=fstatSync(fd);
+      if(!observed.isFile()||object.bucket!==input.bucket||object.key!==input.key||object.versionId!==input.versionId||object.byteLength!==observed.size||!Number.isSafeInteger(object.byteLength)||!object.contentType||!['private','restricted','public'].includes(object.scope))throw Error('Original stream metadata conflicts.');
+      const body=createReadStream(path,{fd,autoClose:true,highWaterMark:64*1024});fd=undefined;
+      return {object,body,async close(){body.destroy();}};
+    }finally{if(fd!==undefined)closeSync(fd);}
   }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const path = this.objectPath(input); rmSync(path, { force: true }); rmSync(`${path}.json`, { force: true }); }
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation> {

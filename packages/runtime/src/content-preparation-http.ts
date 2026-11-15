@@ -43,7 +43,7 @@ export interface ContentPreparationHttpBindings<R,V,S extends ContentPreparation
  managementUrl(creator:string):string;
  prepareUpload?(request:R,creator:string,fileId:string):Promise<PreparationSourceFile>;
  verifyUploadStorage?():Promise<void>;
- uploadDescriptor?(file:PreparationSourceFile):Promise<unknown>;
+ uploadDescriptor?(file:PreparationSourceFile,request:R):Promise<unknown>;
  canManageCollections?(request:R,creator:string):Promise<boolean>;
  mapError?(error:unknown):{status:number;body:unknown}|undefined;
 }
@@ -144,7 +144,7 @@ export function registerContentPreparationRoutes<R extends ContentPreparationHtt
             throw new ContentPreparationError('unsupported_operation', 'Staged uploads are unavailable.', 503);
         await options.verifyUploadStorage?.();
         const staged = await service.stageUpload(creatorId, req.params.id, req.body.expectedRevision, req.body.operationId, req.body.upload, fileId => options.prepareUpload!(req, creatorId, fileId));
-        return { ...staged, upload: await options.uploadDescriptor(staged.file) };
+        return { ...staged, upload: await options.uploadDescriptor(staged.file,req) };
     });
     route('post', '/workflows/:id/objects/:objectId/complete', (req, service, creatorId) => service.completeUpload(creatorId, req.params.id, req.params.objectId, req.body.expectedRevision, req.body.operationId));
     route('post', '/workflows/:id/announcement-draft/review', (req, service, creatorId) => options.createRelease(service).prepareAnnouncementDraft(creatorId, req.params.id, req.body.expectedRevision, actorId(req)));
