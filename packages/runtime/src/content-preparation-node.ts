@@ -1,3 +1,4 @@
+import type {CreatorIntakeFactory} from './creator-intake.js';
 import type {IncomingMessage,ServerResponse} from 'node:http';
 import type {AuthenticatedSession} from '@ubeeq/auth';
 import {ContentPreparationError} from './content-preparations.js';
@@ -11,6 +12,9 @@ export interface ContentPreparationNodeRequest extends ContentPreparationHttpReq
 export type ContentPreparationNodeBindings<S extends ContentPreparationHttpService=ContentPreparationHttpService>=Omit<ContentPreparationHttpBindings<ContentPreparationNodeRequest,ContentPreparationHttpResponse,S>,'actorId'|'basePath'>&{close?():void};
 /** The actual host supplies one composition for both request and worker paths. */
 export type ContentPreparationRuntimeBindings<S extends ContentPreparationHttpService=ContentPreparationHttpService>=ContentPreparationNodeBindings<S>&{
+ /** Optional trusted birth writer for this same retained content composition.
+  * Existing Creator migration is a separate fenced operator operation. */
+ createCreator?:CreatorIntakeFactory;
  runNextJob(workerId:string):Promise<unknown>;
 };
 type Route={method:string;pattern:RegExp;parameters:string[];handle:(request:ContentPreparationNodeRequest,response:ContentPreparationHttpResponse)=>Promise<unknown>};

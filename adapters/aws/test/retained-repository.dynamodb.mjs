@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createLocalAdapterSet} from '@ubeeq/adapter-local';
+import {createCoreRuntime} from '@ubeeq/runtime';
 import {DynamoDBClient,CreateTableCommand,DeleteTableCommand} from '@aws-sdk/client-dynamodb';
 import {DynamoDBDocumentClient} from '@aws-sdk/lib-dynamodb';
 import {createDynamoRepositories} from '../dist/index.js';
@@ -9,12 +14,12 @@ import {retainedStore,scope,creatorInput,work} from '../../../packages/runtime/t
 
 const endpoint=process.env.TEST_DYNAMODB_ENDPOINT;
 if(!endpoint||!/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(endpoint))throw Error('An explicit loopback DynamoDB test endpoint is required.');
-async function fixture(t){
+async function fixture(t,birth=true){
  const configuration={endpoint,region:scope.region,credentials:{accessKeyId:'DUMMYLOCALTEST',secretAccessKey:'DUMMYLOCALTEST'}},raw=new DynamoDBClient(configuration),otherRaw=new DynamoDBClient(configuration),client=DynamoDBDocumentClient.from(raw),other=DynamoDBDocumentClient.from(otherRaw),table='retained-repository-'+randomUUID();let created=false;
  t.after(async()=>{try{if(created)await raw.send(new DeleteTableCommand({TableName:table}));}finally{raw.destroy();otherRaw.destroy();}});
  await raw.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:['pk','sk','repository','id'].map(AttributeName=>({AttributeName,AttributeType:'S'})),GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
  const repositories=createDynamoRepositories(client,{tableName:table,cellId:'cell'}),independent=createDynamoRepositories(other,{tableName:table,cellId:'cell'});
- await repositories.transaction(tx=>createRetainedRepositoryCreator(repositories,creatorInput,'tenant',tx));
+ if(birth)await repositories.transaction(tx=>createRetainedRepositoryCreator(repositories,creatorInput,'tenant',tx));
  return {client,repositories,independent,store:()=>retainedStore(repositories)};
 }
 
@@ -53,4 +58,24 @@ test('revocation after staging rolls back rich content, its command receipt and 
 test('exceeding the actual physical transaction budget never leaves a partial rich inventory',async t=>{
  const f=await fixture(t),store=f.store();await assert.rejects(store.asActor('actor',async()=>{for(let i=0;i<100;i++)await store.createWork(work('work-'+i));}),/at most 100/);
  assert.deepEqual(await f.store().listWorksByCreator('tenant','creator'),[]);
+});
+
+
+test('actual HTTP retained birth joins Creator, storage cohort, host preparation and intake receipt in one Dynamo transaction',async t=>{
+ const f=await fixture(t,false),directory=await mkdtemp(join(tmpdir(),'retained-dynamo-intake-')),local=createLocalAdapterSet({databasePath:join(directory,'identity.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
+ let fail=true,births=0,preparations=0;
+ const unused=()=>{throw Error('This birth acceptance test does not install preparation, media or publication drivers.');};
+ const runtime=createCoreRuntime({instanceId:'instance',cellId:'cell',region:scope.region,publicBaseUrl:'http://localhost',adapters:{repositories:f.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity},
+  creatorLifecycle:{prepare:async input=>{preparations++;const {creator,repositories,transaction}=input;assert.equal(creator.contentAuthority,'retained-v1');await repositories.hostRecords.create({id:'birth-'+creator.id,instanceId:creator.instanceId,homeCellId:creator.homeCellId,dataHomeRegion:creator.dataHomeRegion,dataHomeAssignedAt:creator.dataHomeAssignedAt,routingRevision:creator.routingRevision,namespace:'test-host-birth',scopeId:creator.id,key:'birth',value:{actorId:input.actorUserId}},{transaction});if(fail)throw Error('Synthetic host preparation failure');}},
+  contentPreparation:()=>({createCreator:async input=>{births++;return createRetainedRepositoryCreator(input.repositories,input.record,'tenant',input.transaction);},access:unused,createService:unused,createRelease:unused,enabled:()=>false,durableDrafts:unused,offerings:unused,announcementDestinations:unused,destinations:unused,managementUrl:unused,runNextJob:unused})});
+ t.after(async()=>{await runtime.close();local.database.close();await rm(directory,{recursive:true,force:true});});
+ const credentials={email:'retained-owner@example.test',password:'Synthetic local password 123!'},account=await local.identity.register(credentials),signed=await local.identity.authenticate(credentials);
+ await new Promise(resolve=>runtime.server.listen(0,'127.0.0.1',resolve));
+ const call=async()=>{const response=await fetch(`http://127.0.0.1:${runtime.server.address().port}/v1/creators`,{method:'POST',headers:{authorization:'Bearer '+signed.token,'content-type':'application/json'},body:JSON.stringify({handle:'retained-owner',displayName:'Retained Owner',idempotencyKey:'actual-birth'})});return {status:response.status,body:await response.json()};};
+ assert.equal((await call()).status,500);assert.equal(await f.repositories.instanceOperators.get('instance'),undefined);assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,[]);assert.deepEqual((await f.repositories.creators.list({limit:100})).items,[]);
+ fail=false;const created=await call();assert.equal(created.status,202,JSON.stringify(created.body));const id=created.body.creator.id;
+ assert.equal(created.body.creator.subjectId,account.subjectId);assert.equal(created.body.creator.contentAuthority,'retained-v1');assert.equal((await f.repositories.instanceOperators.get('instance')).actorId,account.subjectId);
+ const recovered=await call();assert.equal(recovered.body.creator.id,id);assert.equal(births,2);assert.equal(preparations,2,'neither callback repeats after the successful commit');
+ const store=retainedStore(f.repositories,{}, {...scope,creatorId:id});assert.deepEqual(await store.listWorksByCreator('tenant',id),[],'the empty inventory belongs to a proven newly born Creator');
+ const rows=(await f.repositories.hostRecords.snapshot()).items;assert.equal(rows.filter(row=>row.namespace==='retained-creator-content').length,1);assert.equal(rows.filter(row=>row.namespace==='test-host-birth').length,1);assert.equal(rows.filter(row=>row.namespace==='runtime-creator-intake').length,1);
 });

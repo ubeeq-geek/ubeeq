@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { CreatorRecord, PersistenceTransaction, UbeeqRepositories } from '@ubeeq/persistence';
+import {publicationIdentityHash,type CreatorRecord,type PersistenceTransaction,type UbeeqRepositories} from '@ubeeq/persistence';
 import {prepareNewCreatorCollectionDirectory} from './creator-collections.js';
 
 export class CreatorIntakeError extends Error {
@@ -9,6 +9,22 @@ export interface CreatorIntakeInput {
   instanceId: string; cellId: string; region: string; actorId: string;
   handle: string; displayName: string; idempotencyKey?: string;
 }
+export type NewCreatorIntakeRecord=Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>;
+export type CreatorIntakeFactory=(input:{record:Readonly<NewCreatorIntakeRecord>;actorUserId:string;repositories:UbeeqRepositories;transaction:PersistenceTransaction})=>Promise<CreatorRecord>;
+
+/** Select storage at birth; the trusted factory must persist exactly the identity
+ * admitted by the host. Its record, storage cohort and later host preparation all
+ * join the original intake transaction. A returned object is not proof of a write.
+ */
+export async function persistIntakeCreator(repositories:UbeeqRepositories,record:NewCreatorIntakeRecord,actorUserId:string,transaction:PersistenceTransaction,factory?:CreatorIntakeFactory):Promise<CreatorRecord>{
+ const requested=structuredClone(record);
+ if(requested.subjectId!==actorUserId)throw new CreatorIntakeError(503,'creator_creation_invalid','Creator storage did not accept the requested identity.');
+ const created=factory?await factory({record:Object.freeze(structuredClone(requested)),actorUserId,repositories,transaction}):await repositories.creators.create(requested,{transaction});
+ const saved=await repositories.creators.get(requested.id,{transaction});
+ if(!created||!saved||saved.revision!==1||publicationIdentityHash(saved)!==publicationIdentityHash(created)||Object.entries(requested).some(([key,value])=>publicationIdentityHash(saved[key as keyof CreatorRecord])!==publicationIdentityHash(value)))throw new CreatorIntakeError(503,'creator_creation_invalid','Creator storage did not accept the requested identity.');
+ return saved;
+}
+
 /** The trusted creator factory and its optional host receipt share this transaction.
  * Lost replies recover the original record; retries never repeat preparation or
  * restore edited profile values. Unkeyed callers retain intentional new creation.

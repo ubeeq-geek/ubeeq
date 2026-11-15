@@ -21,7 +21,11 @@ require an actor accepted inside that scope. The saved actor remains subject to
 the same guard during recovery; a worker identity confers no Creator permission.
 
 `createRetainedRepositoryCreator` creates a new Creator and its empty cohort in
-one transaction. It refuses an existing Creator, including a revision-one legacy
+one transaction. The server-owned content composition supplies `createCreator`
+when it selects this birth writer; the normal host preparation and activation
+lifecycle remains in place. Core validates the actual persisted result against the
+admitted ID, actor, profile and data home before preparing receipts. It refuses an
+existing Creator, including a revision-one legacy
 Creator. `contentAuthority: retained-v1` fences the normal SQLite, PostgreSQL and
 Dynamo repository compositions against compact content writes and prevents normal
 callers from changing the authority or deleting its Creator. This is an operator
@@ -38,6 +42,9 @@ and access evidence inside the accepting transaction.
 This adapter is not the default product factory. No existing Creator is migrated
 or switched by installing it. Complete retained source, organization, metadata,
 provider and browser composition must still be connected before activation.
+Compact list/export endpoints return an accurate unavailable error for a retained
+Creator until its retained routes are mounted; they never export or display an
+invented empty history. This is a staging boundary, not completed route compatibility.
 All generic and operator writers, including older binaries, must be quiesced for
 an existing-Creator migration; do not switch the authority while they run. Reusing
 a deleted legacy Creator ID requires inventory reconciliation, not the birth path.

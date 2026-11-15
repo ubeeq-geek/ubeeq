@@ -11,14 +11,14 @@ export const publication=(extra={})=>({tenantId:scope.tenantId,creatorId:scope.c
 /** Tests resolve the persisted owner and source in the actual accepting scope.
  * There is no unconditional authority or no-op source validator.
  */
-export function retainedStore(repositories,options={}){
+export function retainedStore(repositories,options={},selectedScope=scope){
  let store;
  class Store extends RepositoryRetainedContentStore {
   async getCreatorById(id){const c=await repositories.creators.get(id);return c?.contentAuthority==='retained-v1'?{...c,creatorId:c.id,name:c.displayName,status:'active'}:null;}
   async listCreators(){return (await repositories.creators.list({limit:100})).items.filter(c=>c.contentAuthority==='retained-v1').map(c=>({...c,creatorId:c.id,status:'active'}));}
   async getAnnouncementOrchestration(){return null;}
  }
- store=new Store(repositories,scope,{
+ store=new Store(repositories,selectedScope,{
   resolveActorRole:async(actor,creator,transaction)=>{
    const current=await repositories.creators.get(creator.id,{transaction});
    await repositories.creators.checkRevision(current.id,current.revision,{transaction});

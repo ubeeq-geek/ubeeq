@@ -5,7 +5,7 @@ import { OwnedObjectWrites } from './owned-object-writes.js';
 import {persistProcessedOutputs} from './processed-outputs.js';
 import { OwnedWebsiteBlobs } from './owned-website-blobs.js';
 import { createIntakeWork, WorkIntakeError } from './work-intake.js';
-import { createIntakeCreator, CreatorIntakeError } from './creator-intake.js';
+import { createIntakeCreator, persistIntakeCreator, CreatorIntakeError } from './creator-intake.js';
 import {withCollectionWorkLifecycleFence,RepositoryCreatorCollectionStore,CollectionManagementError,createCollectionFromIntent,invalidateCollectionDirectoryForImport,type RuntimeCollection} from './creator-collections.js';
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
@@ -271,6 +271,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     localAdapters?.database.close();
     throw Error('Content preparation HTTP requires its durable recovery and release worker.');
   }
+  if(preparationBindings?.createCreator!==undefined&&typeof preparationBindings.createCreator!=='function'){localAdapters?.database.close();throw Error('Retained Creator birth requires a trusted factory.');}
   const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
     if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
     return preparationBindings.access(request,response,creatorId);
@@ -314,6 +315,9 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     const defaultCreator = await repositories.creators.get(accessibleIds[0]);
     if (defaultCreator) return defaultCreator;
     throw new HttpError(404, "creator_not_found", "No creator profile belongs to the current subject");
+  };
+  const requireCompactContent=(creator:CreatorRecord)=>{
+    if(creator.contentAuthority==='retained-v1')throw new HttpError(503,'retained_content_routes_unavailable','This Creator requires the retained content routes.');
   };
   const ownedWork = async (workId: string, subjectId: string, requestedCreatorId?: string, access: "read" | "edit" = "edit"): Promise<WorkRecord> => {
     const work = await repositories.works.get(workId);
@@ -925,14 +929,14 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
           existingCreatorUserCount: existingUsers.length,
           actorUserId: identity.subject.id
         });
-        const created = await repositories.creators.create({
+        const created = await persistIntakeCreator(repositories, {
           id: creatorId,
           instanceId: configuration.instanceId ?? "local-reference",
           ...cellOwned,
           handle,
           displayName,
           subjectId: identity.subject.id
-        }, { transaction });
+        }, identity.subject.id, transaction, preparationBindings?.createCreator);
         await configuration.creatorLifecycle?.prepare({ creator: Object.freeze(structuredClone(created)), actorUserId: identity.subject.id, repositories, transaction });
         return created;
         });
@@ -972,6 +976,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === 'GET' && (url.pathname === '/v1/works' || url.pathname === '/v1/collections')) {
         const identity = await session(request);
         const creator = await creatorFor(identity.subject.id, resolveRequestCreatorId(request, url));
+        requireCompactContent(creator);
         if (url.pathname === '/v1/works') {
           const works = (await allRecords(repositories.works)).filter(work => work.creatorId === creator.id && work.status !== 'deleted');
           return json(response, 200, { works, requestId }, requestId);
@@ -1222,7 +1227,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         response.setHeader('x-request-id', requestId); response.end(found.body); return;
       }
       if (method === "GET" && url.pathname === "/v1/exports/me") {
-        const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
+        const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireCompactContent(creator); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
         const works = (await allRecords(repositories.works)).filter((record) => record.creatorId === creator.id); const workIds = new Set(works.map(({ id }) => id));
         const assets = (await allRecords(repositories.assets)).filter((record) => record.creatorId === creator.id); const collections = (await allRecords(repositories.collections)).filter((record) => record.creatorId === creator.id);
         const publications = (await allRecords(repositories.publications)).filter((record) => workIds.has(record.workId)); const publicationIntents = (await allRecords(repositories.publicationIntents)).filter((record) => workIds.has(record.workId));
@@ -1235,7 +1240,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "POST" && url.pathname === "/v1/imports") {
         const identity = await session(request); const body = await parseBody(request); let manifest;
         try { manifest = validateCreatorExport(body.manifest); } catch (error) { throw new HttpError(400, "invalid_export_manifest", error instanceof Error ? error.message : "Export manifest is invalid"); }
-        const creator = await creatorFor(identity.subject.id); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
+        const creator = await creatorFor(identity.subject.id); requireCompactContent(creator); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
         if (body.importId !== undefined && (typeof body.importId !== 'string' || !body.importId.trim() || body.importId.length > 200)) throw new HttpError(400, 'invalid_import_id', 'Import ID must be a non-empty string of at most 200 characters.');
         const importId = typeof body.importId === 'string' ? body.importId.trim() : randomUUID();
         const requireMatchingCheckpoint = (checkpoint: ImportCheckpointRecord) => {

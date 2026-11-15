@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLocalAdapterSet } from '@ubeeq/adapter-local';
 import { createCoreRuntime } from '../dist/index.js';
-import { createIntakeCreator } from '../dist/creator-intake.js';
+import { createIntakeCreator, persistIntakeCreator } from '../dist/creator-intake.js';
 
 async function localFixture(t) {
  const directory=await mkdtemp(join(tmpdir(),'creator-intake-')),local=createLocalAdapterSet({databasePath:join(directory,'data.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
@@ -59,4 +59,21 @@ test('replaying a saved Creator request cannot reactivate it after the host revo
  let allowed=true,activations=0,prepares=0;const tenancy={mode:'multi_tenant_saas',async assertCanCreateCreatorUser(){},async assertCanCreateCustomerAccount(){},async listAccessibleCreatorIds(){return[];},async resolveCreatorRole(){return allowed?'owner':null;},isContributorManagementEnabled:()=>true,isOrganizationManagementEnabled:()=>true};
  const f=await httpFixture(t,{prepare:async input=>{prepares++;await writeBirth(input);},activate:async()=>{activations++;return{state:'ready'};}},{tenancy}),token=await f.signIn('revoked@example.test'),body={handle:'revoked',displayName:'Revoked',idempotencyKey:'same-request'};
  assert.equal((await f.request('/v1/creators',body,token)).status,201);allowed=false;const denied=await f.request('/v1/creators',body,token);assert.equal(denied.status,403);assert.equal(denied.body.error.code,'creator_not_accessible');assert.equal(activations,1);assert.equal(prepares,1);
+});
+
+
+test('trusted birth factories must persist the exact admitted identity and receipt or roll back their writes',async t=>{
+ for(const flaw of ['id','subjectId','instanceId','dataHomeRegion','routingRevision','handle','displayName','unpersisted','forged-reply']){
+  const f=await localFixture(t),repositories=f.local.repositories;
+  await assert.rejects(createIntakeCreator(repositories,f.input,(transaction,id)=>persistIntakeCreator(repositories,{id,instanceId:f.input.instanceId,...f.home,subjectId:f.input.actorId,handle:f.input.handle,displayName:f.input.displayName},f.input.actorId,transaction,async input=>{
+   const record={...input.record};
+   if(!['unpersisted','forged-reply'].includes(flaw))record[flaw]=flaw==='routingRevision'?2:'different';
+   await repositories.hostRecords.create({id:'factory-side-effect',instanceId:f.input.instanceId,...f.home,namespace:'test-factory',scopeId:id,key:'birth',value:{actorId:input.actorUserId}},{transaction});
+   if(flaw==='unpersisted')return {...record,revision:1,createdAt:'2026-01-01',updatedAt:'2026-01-01'};
+   const created=await repositories.creators.create(record,{transaction});
+   return flaw==='forged-reply'?{...created,displayName:'A fabricated receipt'}:created;
+  })),error=>error.code==='creator_creation_invalid',flaw);
+  assert.deepEqual((await repositories.creators.list({limit:100})).items,[],flaw);
+  assert.deepEqual((await repositories.hostRecords.list({limit:100})).items,[],flaw);
+ }
 });
