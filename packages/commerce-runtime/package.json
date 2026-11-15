@@ -21,6 +21,7 @@
     "@ubeeq/storage": "^0.1.0",
     "@ubeeq/portability": "^0.1.0",
     "@ubeeq/ui": "^0.1.0",
-    "parse5": "^7.1.2"
+    "parse5": "^7.1.2",
+    "@ubeeq/auth": "^0.1.0"
   }
 }

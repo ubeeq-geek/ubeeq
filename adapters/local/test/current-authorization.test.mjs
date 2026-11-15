@@ -22,7 +22,7 @@ test('SQLite current principal and existing sessions observe persisted scope, ro
     f.database.database.prepare('UPDATE ubeeq_accounts SET account_scope = ?, roles_json = ?, scopes_json = ? WHERE id = ?').run('customer_account', '["customer_account"]', '["purchase.read"]', f.account.id);
     const expected = { id: f.account.id, email: f.credentials.email, accountScope: 'customer_account', roles: ['customer_account'], scopes: ['purchase.read'] };
     assert.deepEqual(await f.identity.getAuthorizationSubject(f.account.id), expected);
-    assert.deepEqual((await f.identity.verifySession({ credential: login.token })).subject, expected);
+    assert.equal(await f.identity.verifySession({ credential: login.token }), undefined, 'an old issued token cannot acquire a different account scope');
     assert.deepEqual((await f.identity.authenticate(f.credentials)).session.subject, expected);
     f.database.database.prepare('UPDATE ubeeq_accounts SET status = ? WHERE id = ?').run('suspended', f.account.id);
     assert.equal(await f.identity.getAuthorizationSubject(f.account.id), undefined);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { CognitoIdentity } from '../dist/index.js';
 const fixture = (response = { Username: 'operator', Enabled: true, UserStatus: 'CONFIRMED' }) => {
   const calls = [];
-  const state = { response };
+  const state = { response: response instanceof Error?response:{...response,UserAttributes:response.UserAttributes??[{Name:'sub',Value:response.Username}]} };
   const adapter = new CognitoIdentity({ send: async command => { calls.push(command); if (state.response instanceof Error) throw state.response; return state.response; } }, 'us-east-2_test', 'client');
   return { adapter, calls, state };
 };
@@ -91,7 +91,7 @@ test('Cognito current authorization rejects provider outages, malformed scope/id
   f.state.user = Object.assign(new Error('private provider diagnostic'), { name: 'AccessDeniedException' });
   await assert.rejects(f.adapter.getAuthorizationSubject('operator'), { message: 'Cognito account status is unavailable.' });
   for (const user of [
-    { ...baseline, Username: 'different' },
+    { ...baseline, Username:'different' },
     { ...baseline, UserAttributes: undefined },
     { ...baseline, UserAttributes: [...baseline.UserAttributes, { Name: 'custom:account_scope', Value: 'unknown_scope' }] },
     { ...baseline, UserAttributes: [...baseline.UserAttributes, { Name: 'custom:account_scope', Value: 'creator_operator' }, { Name: 'custom:account_scope', Value: 'customer_account' }] }

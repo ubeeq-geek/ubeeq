@@ -1,3 +1,4 @@
+export * from './customer-identity.js';
 /** An authenticated principal expressed without identity-provider assumptions. */
 export * from "./request-identity.js";
 export * from "./single-operator-tenancy.js";
@@ -38,7 +39,14 @@ export interface CreatorDelegation {
 
 /** Provider-neutral boundary for local, OIDC, and future cloud identity adapters. */
 export interface IdentityAdapter {
+  /** Actual persisted customer lifecycle; absent means unavailable, never Local fallback. */
+  readonly customerAccounts?:import('./customer-identity.js').CustomerIdentityProvider;
   verifySession(input: { credential: string; audience?: string }): Promise<AuthenticatedSession | undefined>;
+  /** Optional REAL provider-local accepting session transaction. Rechecks the
+   * persisted credential/revocation/current subject while the callback joins
+   * same-database policy and accepts a derived session. No managed/network
+   * implementation may claim this without an actual provider-local fence. */
+  withVerifiedSession?<T>(input:{credential:string;audience?:string},operation:(session:AuthenticatedSession,transaction:import('./customer-identity.js').CustomerIdentityTransaction)=>Promise<T>):Promise<T|undefined>;
   getAccount(subjectId: string): Promise<IdentityAccount | undefined>;
   /** Current provider authority for a saved actor, without reusing session claims.
    * Missing/inactive accounts return undefined; unavailable evidence must fail

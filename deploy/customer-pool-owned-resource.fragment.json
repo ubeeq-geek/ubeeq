@@ -1,0 +1,19 @@
+{
+  "Schema": [
+    {
+      "Name": "account_scope",
+      "AttributeDataType": "String",
+      "Mutable": true,
+      "Required": false
+    }
+  ],
+  "LambdaConfig": {
+    "PreTokenGenerationConfig": {
+      "LambdaArn": "<actual deployed ScopeClaimsFunctionArn>",
+      "LambdaVersion": "V2_0"
+    }
+  },
+  "ClientRequirement": {
+    "WriteAttributes": "Preserve each actual client list, excluding custom:account_scope; omitted/default lists are not accepted as proof."
+  }
+}

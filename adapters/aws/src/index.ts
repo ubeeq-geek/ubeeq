@@ -1,3 +1,6 @@
+import {cognitoUserBySubject} from './cognito-subject.js';
+export {applyCustomerIssuedScope,createCustomerIssuedScopeHandler} from './customer-issued-scope.js';
+import {CognitoCustomerIdentities} from './customer-identities.js';
 import {protectCreatorContentAuthority} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
@@ -554,12 +557,13 @@ export class SecretsManagerCredentialVault implements CredentialVault {
 }
 
 export interface VerifiedCognitoAccessClaims {
-  sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[];
+  sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[]; 'custom:account_scope'?:string;
 }
 export class CognitoIdentity implements IdentityAdapter {
+  readonly customerAccounts:CognitoCustomerIdentities;
   private verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> };
   constructor(private readonly cognito: AwsCommandClient, private readonly userPoolId: string, private readonly clientId: string,
-    options: { verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { this.verifier = options.verifier; }
+    private readonly options: {subjectIdMode?:'legacy_username'|'canonical_sub';verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { if(options.subjectIdMode!==undefined&&!['legacy_username','canonical_sub'].includes(options.subjectIdMode))throw Error('Choose an explicit supported Cognito subject ID mode.');this.verifier = options.verifier;this.customerAccounts=new CognitoCustomerIdentities(cognito,userPoolId,clientId,this,options.subjectIdMode??'legacy_username'); }
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
     try {
@@ -571,29 +575,39 @@ export class CognitoIdentity implements IdentityAdapter {
       const id = user.Username;
       const attributes = (user.UserAttributes ?? []) as Array<{ Name?: string; Value?: string }>;
       if (typeof id !== 'string' || !id || (payload.username && id !== payload.username) || attributes.find(item => item.Name === 'sub')?.Value !== payload.sub) return undefined;
-      const customer = attributes.find(item => item.Name === 'custom:account_scope')?.Value === 'customer_account';
-      return { id: input.credential, subject: { id, email: attributes.find(item => item.Name === 'email')?.Value, emailVerified: attributes.find(item => item.Name === 'email_verified')?.Value === 'true', roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
+      const accountScopes=attributes.filter(item=>item.Name==='custom:account_scope');
+      if(accountScopes.length>1||accountScopes.length&&!['creator_operator','customer_account'].includes(accountScopes[0].Value??''))return undefined;
+      const customer = accountScopes[0]?.Value === 'customer_account',issuedScope=payload['custom:account_scope'];
+      if(accountScopes.length===1&&issuedScope!==accountScopes[0].Value||issuedScope!==undefined&&(!['creator_operator','customer_account'].includes(issuedScope)||issuedScope!==(customer?'customer_account':'creator_operator')))return undefined;
+      return { id: input.credential, subject: { id:customer||this.options.subjectIdMode==='canonical_sub'?payload.sub:id, email: attributes.find(item => item.Name === 'email')?.Value, emailVerified: attributes.find(item => item.Name === 'email_verified')?.Value === 'true', roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
         issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
     } catch { return undefined; }
   }
-  private async currentUser(subjectId: string): Promise<{ account: IdentityAccount; attributes: Array<{ Name?: string; Value?: string }> } | undefined> {
+  private async currentUser(subjectId: string): Promise<{ account: IdentityAccount; attributes: Array<{ Name?: string; Value?: string }>;providerUsername:string } | undefined> {
     if (typeof subjectId !== 'string' || !subjectId || subjectId.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(subjectId)) return undefined;
     let user;
-    try { user = await this.cognito.send(new AdminGetUserCommand({ UserPoolId: this.userPoolId, Username: subjectId })); }
+    try { user=this.options.subjectIdMode==='canonical_sub'?await cognitoUserBySubject(this.cognito,this.userPoolId,subjectId):await this.cognito.send(new AdminGetUserCommand({UserPoolId:this.userPoolId,Username:subjectId})); }
     catch (error) {
-      if ((error as { name?: string })?.name === 'UserNotFoundException') return undefined;
+      if ((error as { name?: string })?.name === 'UserNotFoundException') return undefined;else
       // Never substitute an active account when the provider is unavailable or the host lacks permission.
       throw new Error('Cognito account status is unavailable.');
     }
-    if (!user || typeof user !== 'object') throw new Error('Cognito account evidence is unavailable.');
+    if(!user)return undefined;
+    if (typeof user !== 'object') throw new Error('Cognito account evidence is unavailable.');
     const status = user.UserStatus;
-    if (user.Username !== subjectId || typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
+    if (typeof user.Username!=='string'||!user.Username||!Array.isArray(user.UserAttributes)||user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='sub').length!==1||typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
     const timestamp = (value: unknown) => {
       if (value === undefined) return '';
       if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error('Cognito account timestamp is invalid.');
       return value.toISOString();
     };
-    return { account: { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status) ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) }, attributes: user.UserAttributes };
+    const canonicalSub=user.UserAttributes.find((attribute:{Name?:string})=>attribute.Name==='sub')?.Value;if(typeof canonicalSub!=='string'||!canonicalSub)throw new Error('Cognito account evidence is unavailable.');
+    const isCustomer=user.UserAttributes.some((attribute:{Name?:string;Value?:string})=>attribute.Name==='custom:account_scope'&&attribute.Value==='customer_account');
+    if(!isCustomer&&this.options.subjectIdMode!=='canonical_sub'&&user.Username!==subjectId)throw new Error('Cognito account evidence is unavailable.');
+    const currentId=isCustomer||this.options.subjectIdMode==='canonical_sub'?canonicalSub:user.Username;if(currentId!==subjectId)return undefined;
+    const customerScopes=user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='custom:account_scope'),emailVerifications=user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='email_verified');
+    const verifiedCustomerSetup=status==='FORCE_CHANGE_PASSWORD'&&customerScopes.length===1&&customerScopes[0].Value==='customer_account'&&emailVerifications.length===1&&emailVerifications[0].Value==='true';
+    return { account: { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status)||verifiedCustomerSetup ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) }, attributes: user.UserAttributes,providerUsername:user.Username };
   }
   async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
     return (await this.currentUser(subjectId))?.account;
@@ -614,7 +628,7 @@ export class CognitoIdentity implements IdentityAdapter {
     let nextToken: string | undefined;
     do {
       let page;
-      try { page = await this.cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: this.userPoolId, Username: subjectId, Limit: 60, ...(nextToken ? { NextToken: nextToken } : {}) })); }
+      try { page = await this.cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: this.userPoolId, Username: current.providerUsername, Limit: 60, ...(nextToken ? { NextToken: nextToken } : {}) })); }
       catch { throw unavailable(); }
       if (!page || typeof page !== 'object' || page.Groups !== undefined && !Array.isArray(page.Groups)) throw unavailable();
       for (const group of page.Groups ?? []) {
@@ -664,12 +678,12 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 }
 
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
-export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; subjectIdMode?:'legacy_username'|'canonical_sub'; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
-  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId);
+  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});
   return {
     repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),

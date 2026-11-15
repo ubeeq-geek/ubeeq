@@ -1,3 +1,4 @@
+import {LocalCustomerIdentities} from './customer-identities.js';
 import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
@@ -82,7 +83,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "023-customer-password-effects"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -477,7 +478,8 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
 }
 
 export class LocalIdentityAdapter implements PasswordIdentityAdapter {
-  constructor(private readonly local: LocalSqliteDatabase) {}
+  readonly customerAccounts:LocalCustomerIdentities;
+  constructor(private readonly local: LocalSqliteDatabase) {this.customerAccounts=new LocalCustomerIdentities(local);}
   async register(input: { email: string; password: string }): Promise<IdentityAccount> {
     if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
     const id = randomUUID(), timestamp = now(), salt = randomBytes(16).toString("hex"), passwordHash = scryptSync(input.password, salt, 64).toString("hex");
@@ -485,26 +487,37 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
     return { id, subjectId: id, status: "active", createdAt: timestamp, updatedAt: timestamp };
   }
   async authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
-    const row = this.local.database.prepare("SELECT id, password_hash, salt, status, created_at, updated_at FROM ubeeq_accounts WHERE email = ?").get(input.email.toLowerCase()) as { id: string; password_hash: string; salt: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined;
-    if (!row || row.status !== "active") throw new Error("Invalid local credentials.");
+    const read=()=>this.local.database.prepare("SELECT id,email,password_hash,salt,status,account_scope,roles_json,scopes_json,email_verified,customer_password_state FROM ubeeq_accounts WHERE email = ?").get(input.email.toLowerCase()) as {id:string;email:string;password_hash:string;salt:string;status:string;account_scope:string;roles_json:string;scopes_json:string;email_verified:number;customer_password_state:string}|undefined;
+    const row=read();
+    if (!row || row.status !== "active" || row.customer_password_state!=="set") throw new Error("Invalid local credentials.");
     const supplied = scryptSync(input.password, row.salt, 64); const expected = Buffer.from(row.password_hash, "hex");
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Invalid local credentials.");
-    const subject = await this.getAuthorizationSubject(row.id);
-    if (!subject) throw new Error("Invalid local credentials.");
-    const token = randomBytes(32).toString("base64url"), id = randomUUID(), timestamp = now(), expiresAt = new Date(Date.now() + (this.local.configuration.sessionTtlSeconds ?? 86_400) * 1000).toISOString();
-    this.local.database.prepare("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)").run(id, row.id, digest(token), expiresAt, timestamp);
-    return { token, session: { id, subject, issuedAt: timestamp, expiresAt, authenticationMethod: "password" } };
+    return this.local.transaction(async()=>{
+      const current=read();
+      if(!current||!Object.keys(row).every(key=>row[key as keyof typeof row]===current[key as keyof typeof current]))throw new Error("Invalid local credentials.");
+      const subject=await this.getAuthorizationSubject(row.id);
+      if(!subject||subject.accountScope!==row.account_scope)throw new Error("Invalid local credentials.");
+      const token = randomBytes(32).toString("base64url"), id = randomUUID(), timestamp = now(), expiresAt = new Date(Date.now() + (this.local.configuration.sessionTtlSeconds ?? 86_400) * 1000).toISOString();
+      this.local.database.prepare("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at, account_scope_at_issue) VALUES (?, ?, ?, ?, ?, ?)").run(id, row.id, digest(token), expiresAt, timestamp, subject.accountScope);
+      return { token, session: { id, subject, issuedAt: timestamp, expiresAt, authenticationMethod: "password" as const } };
+    });
   }
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
-    const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string } | undefined;
+    const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at, s.account_scope_at_issue FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string; account_scope_at_issue:string } | undefined;
     if (!row || row.expires_at <= now()) return undefined;
     const subject = await this.getAuthorizationSubject(row.account_id);
-    if (!subject) return undefined;
+    if (!subject || subject.accountScope!==row.account_scope_at_issue) return undefined;
     return { id: row.id, subject, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
+  }
+  async withVerifiedSession<T>(input:{credential:string;audience?:string},operation:(session:AuthenticatedSession,transaction:import('@ubeeq/auth').CustomerIdentityTransaction)=>Promise<T>):Promise<T|undefined>{
+    return this.local.transaction(async transaction=>{
+      const session=await this.verifySession(input);if(!session)return undefined;
+      return operation(session,transaction);
+    });
   }
   async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }
   async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
-    const row = this.local.database.prepare('SELECT id, email, status, account_scope, roles_json, scopes_json FROM ubeeq_accounts WHERE id = ?').get(subjectId) as { id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string } | undefined;
+    const row = this.local.database.prepare('SELECT id, email, status, account_scope, roles_json, scopes_json, email_verified FROM ubeeq_accounts WHERE id = ?').get(subjectId) as { id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string; email_verified:number } | undefined;
     if (!row || row.status !== 'active') return undefined;
     if (row.id !== subjectId || !['creator_operator', 'customer_account'].includes(row.account_scope)) throw new Error('Local authorization evidence is unavailable.');
     const values = (encoded: string): string[] => {
@@ -513,10 +526,14 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
       if (!Array.isArray(result) || result.some(value => typeof value !== 'string' || !value)) throw new Error('Local authorization evidence is unavailable.');
       return result;
     };
-    return { id: row.id, email: row.email, accountScope: row.account_scope as AuthorizationSubject['accountScope'], roles: values(row.roles_json), scopes: values(row.scopes_json) };
+    return { id: row.id, email: row.email, ...(row.email_verified===1?{emailVerified:true}:{}), accountScope: row.account_scope as AuthorizationSubject['accountScope'], roles: values(row.roles_json), scopes: values(row.scopes_json) };
   }
   async listDelegations(): Promise<readonly []> { return []; }
-  async revokeSession(input: { sessionId: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId); }
+  async revokeSession(input: { sessionId: string }): Promise<void> {
+    // Independent sign-out joins the real writer queue; it never fails merely
+    // because another accepting Local operation currently owns this connection.
+    await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId);});
+  }
 }
 
 /** Development-only encrypted credential custody. Production adapters must use a managed vault/key boundary. */

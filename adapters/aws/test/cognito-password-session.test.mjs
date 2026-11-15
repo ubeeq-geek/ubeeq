@@ -8,7 +8,7 @@ function fixture() {
     calls.push(command);
     if(command.constructor.name==='InitiateAuthCommand'){if(state.result instanceof Error)throw state.result;return state.result;}
     if(command.constructor.name==='GetUserCommand')return{Username:'operator',UserAttributes:[{Name:'sub',Value:'subject'},{Name:'email_verified',Value:'true'}]};
-    if(command.constructor.name==='AdminGetUserCommand')return{Username:'operator',Enabled:state.enabled,UserStatus:'CONFIRMED'};
+    if(command.constructor.name==='AdminGetUserCommand')return{Username:'operator',Enabled:state.enabled,UserStatus:'CONFIRMED',UserAttributes:[{Name:'sub',Value:'subject'},{Name:'email_verified',Value:'true'}]};
     throw Error('Unexpected command');
   }},'us-east-2_test','client',{verifier:{verify:async()=>({sub:'subject',username:'operator',iat:Math.floor(Date.now()/1000),exp:Math.floor(Date.now()/1000)+3600})}});
   return {calls,state,identity};
@@ -18,6 +18,7 @@ test('Cognito password sign-in returns a verified current session bound to the c
   assert.equal(result.token,'opaque-token');assert.equal(result.session.subject.id,'operator');assert.equal(result.session.subject.emailVerified,true);
   assert.deepEqual(f.calls[0].input,{AuthFlow:'USER_PASSWORD_AUTH',ClientId:'client',AuthParameters:{USERNAME:'operator@example.test',PASSWORD:'Synthetic password 123!'}});
   assert.deepEqual(f.calls.map(c=>c.constructor.name),['InitiateAuthCommand','GetUserCommand','AdminGetUserCommand']);
+  assert.deepEqual(f.calls[2].input,{UserPoolId:'us-east-2_test',Username:'operator'});
 });
 for(const [name,code] of [['NotAuthorizedException','invalid_credentials'],['UserNotFoundException','invalid_credentials'],['UserNotConfirmedException','authentication_challenge_required'],['PasswordResetRequiredException','authentication_challenge_required'],['TooManyRequestsException','identity_provider_unavailable']]){
   test(`Cognito ${name} returns a safe ${code} failure`,async()=>{

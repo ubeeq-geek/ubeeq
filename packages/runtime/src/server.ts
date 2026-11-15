@@ -11,7 +11,7 @@ import {withCollectionWorkLifecycleFence,RepositoryCreatorCollectionStore,Collec
 import { UsageSettlementOutbox } from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
 import type { WebsiteGallery, WebsiteDependency } from '@ubeeq/core';
-import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration } from './commerce.js';
+import { createReferenceCommerce, referenceCommerceConfigurationFromEnvironment, type ReferenceCommerceConfiguration, type ReferenceCommerceDependencies } from './commerce.js';
 import type { WebsitePublicAsset } from '@ubeeq/portability';
 import { WebsiteError, normalizeContentSlug,CreatorCollectionService,CreatorCollectionError } from '@ubeeq/core';
 import { handleWebsiteHostingRequest } from './website-hosting.js';
@@ -87,12 +87,26 @@ export interface RegionalControlPlane {
   orchestrator?: MigrationOrchestrator;
 }
 
+/** Trusted construction context. Local vault is the actual runtime-owned
+ * encrypted adapter, never a memory fallback or a caller-selected credential. */
+export interface ReferenceCommerceCompositionContext {
+ adapters:ReferenceAdapterSet;instanceId:string;cellId:string;region:string;publicBaseUrl:string;
+ local?:{configuration:Readonly<LocalAdapterConfiguration>;vault:import('@ubeeq/integrations').CredentialVault};
+}
+export interface ReferenceCommerceComposition {
+ configuration:ReferenceCommerceConfiguration;
+ dependencies?:Pick<ReferenceCommerceDependencies,'subject'|'customerSubject'|'customerCredential'|'creator'>;
+}
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   /** Retained host supplies its real store, services and feature drivers. Core
    * resolves the verified creator session before reading request input. */
   contentPreparation?: (context:{adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string})=>ContentPreparationRuntimeBindings;
 
   commerce?: ReferenceCommerceConfiguration;
+  /** Synchronous trusted configuration using the actual already-created adapters.
+   * Core creates, exposes and closes exactly one resulting Commerce runtime.
+   * Cannot be combined with legacy direct commerce configuration. */
+  configureCommerce?:(context:ReferenceCommerceCompositionContext)=>ReferenceCommerceComposition|undefined;
   registrationAdmission?: (input: { email: string; invitationCode?: string; organizationName?: string }) => Promise<{ allowed: boolean; reasonCode?: string }>;
   /** Trusted host preparation is database-only and atomic with Creator creation.
    * Activation runs after commit and must be idempotent; a deferred activation
@@ -175,7 +189,8 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
   };
 };
 
-export const createReferenceApi = (configuration: ReferenceApiConfiguration): { server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
+export const createReferenceApi = (configuration: ReferenceApiConfiguration): { commerce?:ReturnType<typeof createReferenceCommerce>; server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
+  if(configuration.configureCommerce!==undefined&&(typeof configuration.configureCommerce!=='function'||configuration.commerce!==undefined))throw new Error('Configure one trusted Commerce composition or direct Commerce configuration.');
   if(configuration.createLocalAdapters!==undefined){
     if(typeof configuration.createLocalAdapters!=='function')throw new Error('Local adapter creation requires a trusted factory.');
     if(configuration.adapters!==undefined)throw new Error('Choose either runtime-owned local adapter creation or host-owned adapters.');
@@ -615,18 +630,26 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     enqueue:async payload=>{await adapters.jobs.enqueue({cellId,type:'website.deploy',payload,idempotencyKey:payload.idempotencyKey,maxAttempts:20});},
     audit:async event=>{await audit({action:event.action,actorId:event.actor.actorId,subjectId:event.targetId??event.intentId??event.actor.workspaceId,payload:{generation:event.generation,digest:event.digest,result:event.result}});}
   }):undefined);
-  if (configuration.commerce && ((!localAdapters && !(configuration.commerce.store && configuration.commerce.vault)) || (!configuration.commerce.vault && (!configuration.credentialEncryptionKey || configuration.credentialEncryptionKey.length < 32)))) throw new Error('Commerce requires a durable store and an encrypted vault; local vaults require an explicit encryption key of at least 32 characters.');
-  const commerce = configuration.commerce ? createReferenceCommerce(configuration.commerce, {
+  let commerce:ReturnType<typeof createReferenceCommerce>|undefined;
+  try{
+  const commerceBinding=configuration.configureCommerce?.({adapters,instanceId:configuration.instanceId??'local-reference',cellId,region,publicBaseUrl:configuration.publicBaseUrl,...(localAdapters?{local:{configuration:Object.freeze({...localAdapters.database.configuration}),vault:localAdapters.credentials}}:{})});
+  if(commerceBinding!==undefined&&(!commerceBinding||typeof commerceBinding!=='object'||!commerceBinding.configuration||typeof commerceBinding.configuration!=='object'||typeof (commerceBinding as unknown as {then?:unknown}).then==='function'))throw new Error('Commerce composition must synchronously return actual configuration.');
+  if(commerceBinding?.dependencies&&Object.entries(commerceBinding.dependencies).some(([name,value])=>!['subject','customerSubject','customerCredential','creator'].includes(name)||value!==undefined&&typeof value!=='function'))throw new Error('Commerce authentication bindings require actual trusted functions.');
+  const commerceConfiguration=commerceBinding?.configuration??configuration.commerce;
+  if (commerceConfiguration && ((!localAdapters && !(commerceConfiguration.store && commerceConfiguration.vault)) || ((!commerceConfiguration.vault||commerceConfiguration.vault===localAdapters?.credentials) && (!localAdapters?.database.configuration.credentialEncryptionKey || localAdapters.database.configuration.credentialEncryptionKey.length < 32)))) throw new Error('Commerce requires a durable store and an encrypted vault; local vaults require an explicit encryption key of at least 32 characters.');
+  commerce = commerceConfiguration ? createReferenceCommerce(commerceConfiguration, {
     deploymentId: configuration.instanceId ?? 'local-reference', cellId, publicBaseUrl: configuration.publicBaseUrl, dataDirectory: localConfiguration.dataDirectory,
-    vault: configuration.commerce.vault ?? localAdapters!.credentials, storage: adapters.storage, subject: async request => (await session(request, true)).subject.id,
+    vault: commerceConfiguration.vault ?? localAdapters!.credentials, storage: adapters.storage, subject: async request => (await session(request, true)).subject.id,
     creator: async(subjectId,ownerId)=>{if(!ownerId)return creatorFor(subjectId);const creator=await repositories.creators.get(ownerId);if(!creator)throw new HttpError(404,'creator_not_found','Creator was not found.');
       if(creator.subjectId!==subjectId){const at=new Date().toISOString(),delegations=await adapters.identity.listDelegations({creatorId:ownerId,subjectId,at});
         if(!delegations.some(d=>d.creatorId===ownerId&&d.subjectId===subjectId&&(!d.expiresAt||d.expiresAt>at)&&d.scopes.includes('commerce.manage')))throw new HttpError(403,'creator_authorization_denied','Commerce management delegation is required.');}
       return creator;},
     publicCreator:async ownerId=>{const creator=await repositories.creators.get(ownerId);return creator?{displayName:creator.displayName,handle:creator.handle,bio:creator.bio}:undefined;},
     contentAvailable: async (ownerId, assetId) => !(await allRecords(repositories.moderationHolds)).some(h => h.state === 'active' && (h.subjectId === ownerId || h.subjectId === assetId)),
-    pruneCredentials: localAdapters&&!configuration.commerce.vault ? (references,cutoff)=>localAdapters.credentials.pruneCommerceOrphans(references,cutoff) : undefined
+    ...commerceBinding?.dependencies,
+    pruneCredentials: localAdapters&&!commerceConfiguration.vault ? (references,cutoff)=>localAdapters.credentials.pruneCommerceOrphans(references,cutoff) : undefined
   }) : undefined;
+  }catch(error){localWebsiteStore?.close();localAdapters?.database.close();throw error;}
   let lastWebsitePolicyScan=0;
   let commerceTurn=true;
   const runCoreJob = async (workerId: string) => {
@@ -1353,7 +1376,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   };
   let disposed = false;
   const dispose = () => { if (disposed) return; disposed = true; contentPreparation?.close(); localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
-  return { server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
+  return { commerce, server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
     if (!server.listening) { dispose(); resolve(); return; }
     server.close(error => { if (error) reject(error); else { dispose(); resolve(); } });
   }) };
