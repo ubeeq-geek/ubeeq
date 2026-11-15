@@ -63,6 +63,18 @@ test('revoked saved authority cannot be replaced by the worker identity',async t
  assert.ok((await f.local.repositories.auditEvents.list({limit:100})).items.some(row=>row.action==='content.preparation.worker_deferred'));
 });
 
+test('a fresh host skips a denied old actor before resuming another eligible accepted draft',async t=>{
+ const f=await fixture(t),draft=await f.acceptInterrupted('eligible');
+ const accepted=await f.atomic.get(f.recovery.kind('creator'),draft.id);
+ const operation=(await f.atomic.list(f.recovery.kind('creator','operation'))).find(row=>row.state==='accepted'&&row.draft?.id===draft.id);
+ await f.atomic.run(async()=>{
+  await f.atomic.put(f.recovery.kind('creator'),'0',{...accepted,id:'0',actorId:'revoked-actor'});
+  await f.atomic.put(f.recovery.kind('creator','operation'),'denied-operation',{...operation,id:'denied-operation',draft:{...operation.draft,id:'0',actorId:'revoked-actor'}});
+ });
+ const result=await f.runtime.runNextJob('a-fresh-unprivileged-worker');assert.equal(result.id,draft.id);assert.equal(f.store.works.length,1);
+ assert.equal((await f.atomic.get(f.recovery.kind('creator'),'0')).state,'accepted');
+});
+
 test('a deferred retained worker cannot starve an actual queued processing-recovery job',async t=>{
  const f=await fixture(t);f.failWorker(Error('Retained authority temporarily unavailable'));
  const asset=await f.local.repositories.assets.create({id:'already-processed',instanceId:'instance',homeCellId:'cell',dataHomeRegion:'local',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1,creatorId:'creator',mimeType:'text/plain',checksum:'a'.repeat(64),objectVersion:'source-v1',status:'ready'});

@@ -11,7 +11,12 @@ export function createContentPreparationWorker<Workflow extends {recoverNext():P
         async runNextJob(_workerId:string):Promise<unknown> {
             const first=preparationTurn;preparationTurn=!preparationTurn;
             const poll=first?[()=>workflows.recoverNext(),()=>releases.runNextJob()]:[()=>releases.runNextJob(),()=>workflows.recoverNext()];
-            for (const next of poll) { const result=await next();if(result!==undefined && result!==null)return result; }
+            let failed=false,failure:unknown;
+            for (const next of poll) {
+                try { const result=await next();if(result!==undefined && result!==null)return result; }
+                catch(error){failed=true;failure??=error;}
+            }
+            if(failed)throw failure;
         }
     };
 }

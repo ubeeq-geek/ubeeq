@@ -6,7 +6,9 @@ instance/cell scope for both paths. A missing worker rejects construction rather
 than accepting preparations that this host cannot recover.
 
 `ContentWorkflowService.recoverNext()` resumes one accepted assembly command
-under its saved actor's current authority. `ContentReleaseService.runNextJob()`
+under its saved actor's current authority. A denied actor is skipped before a
+command attempt so it cannot starve eligible work after a cold start; positive
+observations still require the original commit-time checks. `ContentReleaseService.runNextJob()`
 handles one due release or pending cancellation using its existing conditional
 claims, review fingerprints, policy checks and child receipts. Future releases
 remain pending. Invalid persisted schedules become `needs_review` and cannot

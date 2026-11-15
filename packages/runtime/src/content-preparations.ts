@@ -649,11 +649,21 @@ export class ContentWorkflowService<S extends PreparationOrganizationState, C ex
                 candidates.push({key:JSON.stringify([creator.creatorId,draft.id]),creatorId:creator.creatorId,id:draft.id});
         }
         candidates.sort((a,b)=>a.key<b.key?-1:a.key>b.key?1:0);
-        const next=candidates.find(candidate=>!this.recoveryCursor || candidate.key>this.recoveryCursor)??candidates[0];
-        if (!next) return;
-        this.recoveryCursor=next.key;
-        const draft=await this.recoverDraft(next.creatorId,next.id);
-        return {kind:'content-preparation' as const,creatorId:next.creatorId,id:next.id,state:draft.state};
+        const ordered=[...candidates.filter(candidate=>!this.recoveryCursor || candidate.key>this.recoveryCursor),...candidates.filter(candidate=>this.recoveryCursor && candidate.key<=this.recoveryCursor)];
+        let denied=false;
+        for(const next of ordered){
+            this.recoveryCursor=next.key;
+            const record=await this.atomic().get(this.kind(next.creatorId),next.id) as ContentWorkflowDraft | undefined;
+            if(!record || record.tenantId!==this.config.tenantId || record.creatorId!==next.creatorId)throw new ContentPreparationError('not_found','Preparation not found.',404);
+            const actor=this.host.recoveryAuthorization(record.actorId);
+            // A denied old command must not starve eligible commands after a cold
+            // start. Positive observations still authorize nothing: recoverDraft
+            // repeats live authority inside the original conditional children.
+            if(!await actor.authorizeCreator(next.creatorId) || record.arrangement==='collection' && !await actor.canManageCollections(next.creatorId)){denied=true;continue;}
+            const draft=await this.recoverDraft(next.creatorId,next.id);
+            return {kind:'content-preparation' as const,creatorId:next.creatorId,id:next.id,state:draft.state};
+        }
+        if(denied)throw new ContentPreparationError('access_denied','Content preparation access denied.',403);
     }
     /** Assemble private draft units in bounded, resumable transactions. Never publish or queue a send. */
     async saveDraft(creatorId: string, id: string, expectedRevision: number, operationId: string) {

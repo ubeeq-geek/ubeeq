@@ -112,16 +112,35 @@ test('bounded release polling retains revoked actor and malformed schedule denia
  }
 });
 
-test('one shared worker drains actual preparation and release services against the same SQLite authority',async t=>{
- const f=await fixture(t),current=f.make(f.store);
+function joinedWorker(f){
+ const current=f.make(f.store);
  const preparationHost=actor=>{
   const allowed=async id=>id===creatorId&&(await f.store.listCreatorMembers(id)).some(member=>member.userId===actor);
   return {authorizeCreator:allowed,canManageCollections:allowed,recoveryAuthorization:preparationHost,defaultSettings:defaultContentPreparation,inspectOriginal:unused,captureSetup:unused,contentMetadataWork:unused,validateCollectionVolumes:unused,resolvedCollectionMembers:unused,recordImageCompatibility:unused};
  };
  const workflows=new ContentWorkflowService(f.store,{tenantId:tenant},preparationHost(actorId));
  const releases=new ContentReleaseService(workflows,async()=>true,current.host,current.representations),worker=createContentPreparationWorker(workflows,releases);
+ return {workflows,releases,worker};
+}
+
+test('one shared worker drains actual preparation and release services against the same SQLite authority',async t=>{
+ const f=await fixture(t),{workflows,releases,worker}=joinedWorker(f);
  assert.throws(()=>createContentPreparationWorker({...workflows,recoverNext:workflows.recoverNext.bind(workflows)},releases),/same workflow and release authority/);
  const result=await worker.runNextJob('worker-is-not-the-saved-actor');assert.equal(result.kind,'content-release');assert.equal(result.state,'completed');
  assert.equal((await f.store.listPublicationsByWork(tenant,'work')).length,1);assert.equal(await worker.runNextJob('retry'),undefined);
  assert.deepEqual((await f.store.getWork(tenant,'work')).opaque,work.opaque);
+});
+
+
+test('cold-start recovery denial cannot starve a separately authorized due release',async t=>{
+ const f=await fixture(t),blocked={...f.draft,id:'blocked',actorId:'revoked-actor'};
+ await f.store.publicationAtomic.run(async()=>{
+  await f.store.publicationAtomic.put(kind(creatorId),blocked.id,blocked);
+  await f.store.publicationAtomic.put(kind(creatorId,'operation'),'blocked-save',{id:'blocked-save',state:'accepted',draft:blocked});
+ });
+ const {worker}=joinedWorker(f),result=await worker.runNextJob('a-new-worker');
+ assert.equal(result.kind,'content-release');assert.equal(result.state,'completed');
+ assert.equal((await f.store.publicationAtomic.get(kind(creatorId),blocked.id)).state,'accepted');
+ assert.equal((await f.store.listPublicationsByWork(tenant,'work')).length,1);
+ await assert.rejects(worker.runNextJob('next-poll'),/access denied/i);
 });
