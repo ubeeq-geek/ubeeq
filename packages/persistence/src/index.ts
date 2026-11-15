@@ -1,3 +1,4 @@
+export * from './creator-content-authority.js';
 export * from './retained-content-atomic.js';
 /** Provider-neutral durable persistence contracts. Provider implementations belong in adapter packages. */
 import type { PublicationImageConfiguration, PublicationImageDeliveryEvidence } from '@ubeeq/core';
@@ -147,7 +148,7 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   }
 }
 
-export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
+export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { contentAuthority?: 'retained-v1'; instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
 /** `published` is a retained legacy value. New publication commands leave the
  * Work `ready`; current Publication records determine destination visibility. */
 export interface WorkRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; status: "draft" | "ready" | "published" | "archived" | "deleted"; }

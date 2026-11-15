@@ -1,3 +1,4 @@
+import {protectCreatorContentAuthority} from '@ubeeq/persistence';
 /**
  * Provider-neutral machine adapters. PostgreSQL is the canonical durable store
  * for a scalable machine cell; no application service imports this package.
@@ -166,7 +167,7 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
 const repository = <T extends RevisionedRecord>(database: PostgresDatabase, name: string) => new PostgresRevisionedRepository<T>(database, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(database: PostgresDatabase, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(database, name), database.configuration.cellId);
 
-export const createPostgresRepositories = (database: PostgresDatabase): UbeeqRepositories => ({
+export const createPostgresRepositories = (database: PostgresDatabase): UbeeqRepositories => protectCreatorContentAuthority({
   transaction: (operation) => database.transaction(operation),
   hostRecords: cellRepository(database, "hostRecords"), creators: cellRepository(database, "creators"), works: cellRepository(database, "works"), assets: cellRepository(database, "assets"), collections: cellRepository(database, "collections"), workMemberships: cellRepository(database, "workMemberships"), publicationIntents: cellRepository(database, "publicationIntents"), publications: cellRepository(database, "publications"), reconciliationSnapshots: cellRepository(database, "reconciliationSnapshots"), moderationEvidence: cellRepository(database, "moderationEvidence"), moderationHolds: cellRepository(database, "moderationHolds"), reviewCases: cellRepository(database, "reviewCases"), auditEvents: cellRepository(database, "auditEvents"), usageEvents: cellRepository(database, "usageEvents"), creditLots: cellRepository(database, "creditLots"), creditReservations: cellRepository(database, "creditReservations"), balances: cellRepository(database, "balances"), integrationAccounts: cellRepository(database, "integrationAccounts"), syncCursors: cellRepository(database, "syncCursors"), integrationJobs: cellRepository(database, "integrationJobs"), exportManifests: cellRepository(database, "exportManifests"), importCheckpoints: cellRepository(database, "importCheckpoints"), instanceOperators: repository(database, "instanceOperators"), federationActors: repository(database, "federationActors"), remotePublicationReferences: repository(database, "remotePublicationReferences"),
 });

@@ -1,3 +1,4 @@
+import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
 export { SqliteCommerceStore } from './commerce.js';
@@ -141,10 +142,18 @@ export class LocalSqliteDatabase {
 
 class SqliteRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
-  private guard(previous: T | undefined, next: T) {
+  private guard(previous:T|undefined,next:T|undefined){
     try {
-      if (this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
-      if (this.repository === 'publicationOperations') assertPublicationDeliveryWrite(previous as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord, next as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord);
+      if(this.repository==='creators')assertCreatorContentAuthorityChange(previous as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,next as unknown as import('@ubeeq/persistence').CreatorRecord|undefined);
+      if((compactCreatorContentRepositories as readonly string[]).includes(this.repository)){
+        const read=(repository:string,id:string)=>{const row=this.local.database.prepare('SELECT payload FROM ubeeq_records WHERE repository = ? AND id = ?').get(repository,id) as {payload:string}|undefined;return row?JSON.parse(row.payload):undefined;};
+        for(const value of [previous,next] as Array<Record<string,any>|undefined>){
+          if(!value)continue;const creatorId=value.creatorId??(value.workId?read('works',value.workId)?.creatorId:undefined)??(value.collectionId?read('collections',value.collectionId)?.creatorId:undefined);
+          if(creatorId&&read('creators',creatorId)?.contentAuthority==='retained-v1')throw new CreatorContentAuthorityError();
+        }
+      }
+      if (next && this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
+      if (next && this.repository === 'publicationOperations') assertPublicationDeliveryWrite(previous as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord, next as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord);
     } catch (error) { this.local.failTransaction(); throw error; }
   }
 
@@ -170,7 +179,8 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     return { ...value, handleHistory: [...new Set([...(old?.handleHistory || []), ...(old?.handle ? [old.handle] : []), ...(next.handleHistory || []), next.handle])] };
   }
 
-  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string }): Promise<T> {
+  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string; transaction?:PersistenceTransaction }): Promise<T> {
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
     return this.local.transactionSync(() => {
       if (options?.idempotencyKey) {
         const existing = this.local.database.prepare("SELECT record_id FROM ubeeq_idempotency WHERE repository = ? AND idempotency_key = ?").get(this.repository, options.idempotencyKey) as { record_id?: string } | undefined;
@@ -229,19 +239,25 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     });
   }
 
-  async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> {
-    const current = await this.get(id);
-    if (!current || current.revision !== expectedRevision) { this.local.failTransaction(); throw new OptimisticConcurrencyError(id, expectedRevision); }
-    const value = this.retainHandleHistory({ ...current, ...change, revision: current.revision + 1, updatedAt: now() } as T, current);
-    this.guard(current, value);
-    const result = this.write(() => this.local.database.prepare("UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?").run(value.revision, json(value), value.updatedAt, this.repository, id, expectedRevision));
-    if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
-    return value;
+  async update(id:string,expectedRevision:number,change:Partial<Omit<T,'id'|'revision'|'createdAt'|'updatedAt'>>,options?:{transaction?:PersistenceTransaction}):Promise<T>{
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
+    return this.local.transactionSync(()=>{
+      const current=this.read(id);
+      if(!current||current.revision!==expectedRevision){this.local.failTransaction();throw new OptimisticConcurrencyError(id,expectedRevision);}
+      const value=this.retainHandleHistory({...current,...change,revision:current.revision+1,updatedAt:now()} as T,current);
+      this.guard(current,value);
+      const result=this.write(()=>this.local.database.prepare('UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?').run(value.revision,json(value),value.updatedAt,this.repository,id,expectedRevision));
+      if(result.changes!==1)throw new OptimisticConcurrencyError(id,expectedRevision);
+      return value;
+    });
   }
-
-  async remove(id: string, expectedRevision: number): Promise<void> {
-    const result = this.local.database.prepare("DELETE FROM ubeeq_records WHERE repository = ? AND id = ? AND revision = ?").run(this.repository, id, expectedRevision);
-    if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
+  async remove(id:string,expectedRevision:number,options?:{transaction?:PersistenceTransaction}):Promise<void>{
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
+    this.local.transactionSync(()=>{
+      this.guard(this.read(id),undefined);
+      const result=this.local.database.prepare('DELETE FROM ubeeq_records WHERE repository = ? AND id = ? AND revision = ?').run(this.repository,id,expectedRevision);
+      if(result.changes!==1)throw new OptimisticConcurrencyError(id,expectedRevision);
+    });
   }
 }
 

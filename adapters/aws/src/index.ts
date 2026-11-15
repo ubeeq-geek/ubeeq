@@ -1,3 +1,4 @@
+import {protectCreatorContentAuthority} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 export * from './retained-creator-content.js';
@@ -116,11 +117,11 @@ const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepos
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
 export const createDynamoPublicationCommandRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): PublicationCommandRepositories & UbeeqRepositories => {
   const { client: dynamo, transaction } = createTransactionalDynamo(base);
-  return { ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
+  return protectCreatorContentAuthority({ ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
     claims: cellRepository(dynamo, config, 'publicationClaims'), operations: cellRepository(dynamo, config, 'publicationOperations'),
-    outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') };
+    outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') });
 };
-const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction,
+const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => protectCreatorContentAuthority({ transaction,
   hostRecords: cellRepository(dynamo, config, 'hostRecords'),
   creators: cellRepository(dynamo, config, 'creators'), works: cellRepository(dynamo, config, 'works'), assets: cellRepository(dynamo, config, 'assets'),
   collections: cellRepository(dynamo, config, 'collections'), workMemberships: cellRepository(dynamo, config, 'workMemberships'),

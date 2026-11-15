@@ -28,7 +28,12 @@ export const createTransactionalDynamo = (base: Dynamo) => {
     const state = context.getStore();
     if (!state?.active) throw new Error('Revision guards require an active transaction.');
     const identity = keyOf(table, key);
-    if (state.overlay.has(identity) || state.writes.some(write => write.ConditionCheck && keyOf(write.ConditionCheck.TableName, write.ConditionCheck.Key!) === identity)) {
+    const existing=state.writes.find(write=>write.ConditionCheck && keyOf(write.ConditionCheck.TableName,write.ConditionCheck.Key!)===identity)?.ConditionCheck;
+    if(existing){
+      if(existing.ExpressionAttributeValues?.[':revision']===expectedRevision)return;
+      state.failed=true;throw new OptimisticConcurrencyError(String(key.pk).slice(String(key.pk).indexOf('#')+1),expectedRevision);
+    }
+    if (state.overlay.has(identity)) {
       state.failed = true;
       throw new Error('A transaction must guard or write each item once.');
     }

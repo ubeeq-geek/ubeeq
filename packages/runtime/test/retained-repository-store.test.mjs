@@ -1,0 +1,102 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {createLocalAdapterSet} from '@ubeeq/adapter-local';
+import {createRetainedRepositoryCreator} from '../dist/retained-repository-store.js';
+import {scope,creatorInput,work,asset,publication,retainedStore,seedAsset,at} from './retained-repository-fixture.mjs';
+
+async function fixture(t,birth=true){
+ const directory=await mkdtemp(join(tmpdir(),'retained-repository-')),path=join(directory,'state.sqlite'),open=()=>createLocalAdapterSet({databasePath:path,dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});let local=open();
+ t.after(async()=>{local.database.close();await rm(directory,{recursive:true,force:true});});
+ if(birth)await local.repositories.transaction(tx=>createRetainedRepositoryCreator(local.repositories,creatorInput,scope.tenantId,tx));
+ return {get local(){return local;},get repositories(){return local.repositories;},store:()=>retainedStore(local.repositories),reopen:()=>{local.database.close();local=open();return retainedStore(local.repositories);}};
+}
+
+test('full records and commands reopen from the repository, preserving business IDs, raw metadata and independent memberships',async t=>{
+ const f=await fixture(t),store=f.store(),w=work(),second=work('second'),a=asset(),p=publication(),kind='content-workflow:tenant:creator:operation';
+ await store.asActor('actor',async()=>{
+  await store.createWork(w);await store.createWork(second);await seedAsset(store,a);
+  for(const id of [w.workId,second.workId])await store.attachAssetToWork(scope.tenantId,{workId:id,assetId:a.assetId,role:'primary',position:0,caption:'Original caption'});
+  await store.upsertPublication(p);await store.publicationAtomic.put(kind,'saved-operation',{id:'saved-operation',actorId:'actor',state:'accepted',draft:{id:'original-draft',opaque:{keep:true}}});
+ });
+ const reopened=f.reopen();assert.deepEqual(await reopened.getWork('tenant','work'),w);assert.deepEqual(await reopened.getPublication('tenant','publication'),p);assert.deepEqual(await reopened.getCanonicalAsset('tenant','asset'),a);
+ assert.equal((await reopened.listCanonicalAssetsByWork('tenant','second'))[0].attachment.caption,'Original caption');
+ assert.equal((await reopened.publicationAtomic.get(kind,'saved-operation')).draft.opaque.keep,true);
+ assert.deepEqual((await f.repositories.works.list({limit:100})).items,[],'no compact Work copy');
+ const copy=await reopened.getWork('tenant','work');copy.opaque.keep.push('mutated');assert.deepEqual((await reopened.getWork('tenant','work')).opaque.keep,['all','fields']);
+});
+
+test('retained birth refuses existing Creators and ordinary repositories cannot become a parallel writer',async t=>{
+ const f=await fixture(t),repo=f.repositories;
+ await assert.rejects(repo.transaction(tx=>createRetainedRepositoryCreator(repo,creatorInput,'tenant',tx)),{code:'retained_content_invalid'});
+ for(const [name,value] of [['works',{id:'compact-work',...creatorInput,creatorId:'creator',title:'Must not write',status:'draft'}],['assets',{id:'compact-asset',...creatorInput,creatorId:'creator',mimeType:'image/png',checksum:'x',objectVersion:'v1',status:'ready'}],['collections',{id:'compact-collection',...creatorInput,creatorId:'creator',title:'Must not write'}]]){
+  await assert.rejects(repo[name].create(value),{code:'creator_content_authority_conflict'});assert.deepEqual((await repo[name].list({limit:100})).items,[]);
+ }
+ const creator=await repo.creators.get('creator');await assert.rejects(repo.creators.update('creator',creator.revision,{contentAuthority:undefined}),{code:'creator_content_authority_conflict'});await assert.rejects(repo.creators.remove('creator',creator.revision),{code:'creator_content_authority_conflict'});
+});
+
+test('legacy content without a cohort is unavailable for migration, never an invented empty history',async t=>{
+ const f=await fixture(t,false);await f.repositories.creators.create(creatorInput);await f.repositories.works.create({...creatorInput,id:'legacy-work',creatorId:'creator',title:'Retained legacy subject',status:'draft'});
+ await assert.rejects(f.store().listWorksByCreator('tenant','creator'),{code:'retained_content_migration_required'});assert.equal((await f.repositories.works.get('legacy-work')).title,'Retained legacy subject');
+ await assert.rejects(f.repositories.transaction(tx=>createRetainedRepositoryCreator(f.repositories,creatorInput,'tenant',tx)),{code:'retained_content_invalid'});
+ assert.equal((await f.repositories.hostRecords.list({limit:100})).items.length,0);
+});
+
+test('writes need a current actor, tenant matches and failed nested operations poison the entire acceptance',async t=>{
+ const f=await fixture(t),store=f.store();await assert.rejects(store.createWork(work()),{code:'access_denied'});
+ await assert.rejects(store.asActor('revoked',()=>store.createWork(work())),{code:'access_denied'});
+ await assert.rejects(store.asActor('actor',async()=>{await store.createWork(work());await store.createWork(work('foreign',{tenantId:'other'}));}));
+ await assert.rejects(store.asActor('actor',async()=>{await store.createWork(work());try{await store.commitWorkRevision(work('missing',{revision:2}),1);}catch{}await store.putRetainedEntity('audit','must-rollback',{message:'No partial acceptance'});}));
+ assert.deepEqual(await store.listWorksByCreator('tenant','creator'),[]);assert.equal(await store.getRetainedEntity('audit','must-rollback'),undefined);
+});
+
+test('replacement retires only this Work membership and checks the original source evidence atomically',async t=>{
+ const f=await fixture(t),store=f.store(),old=asset(),replacement=asset('replacement');
+ await store.asActor('actor',async()=>{for(const id of ['work','second'])await store.createWork(work(id));await seedAsset(store,old);for(const id of ['work','second'])await store.attachAssetToWork('tenant',{workId:id,assetId:old.assetId,position:0,role:'primary'});await store.putRetainedEntity('source-file',replacement.assetId,{fileId:replacement.assetId,creatorId:'creator',storageKey:replacement.storage.objectKey,uploadState:'ready',revision:1});});
+ const input={work:work('work',{revision:2,primaryAssetId:replacement.assetId}),previousRevision:1,asset:replacement,attachment:{workId:'work',assetId:replacement.assetId,position:0,role:'primary'},replacement:{previousAsset:old}};
+ await assert.rejects(store.asActor('actor',()=>store.commitAssetAttachment({...input,sourceFileGuard:{file:{fileId:'changed'}}})));
+ assert.equal((await store.getWork('tenant','work')).revision,1);assert.equal(await store.getCanonicalAsset('tenant','replacement'),null);
+ await store.asActor('actor',()=>store.commitAssetAttachment(input));
+ assert.equal((await store.listCanonicalAssetsByWork('tenant','work')).find(row=>row.assetId==='asset').replacedByAssetId,'replacement');
+ assert.equal((await store.listCanonicalAssetsByWork('tenant','second'))[0].replacedByAssetId,undefined);assert.equal((await store.getCanonicalAsset('tenant','asset')).replacedByAssetId,undefined);
+ await assert.rejects(store.asActor('actor',()=>store.commitAssetAttachment(input)));assert.equal((await store.listCanonicalAssetsByWork('tenant','work')).length,2);
+});
+
+test('shared metadata revisions are conditional as one batch and inventory paging retains deleted-row cursor positions',async t=>{
+ const f=await fixture(t),store=f.store();await store.asActor('actor',async()=>{await store.createWork(work('a',{status:'deleted'}));await store.createWork(work('b'));});
+ const page=await store.listUbeeqWorksPage('tenant','creator',{limit:1});assert.deepEqual(page.items,[]);assert.deepEqual(page.next,{updatedAt:at,workId:'a'});assert.equal((await store.listUbeeqWorksPage('tenant','creator',{limit:1,after:page.next})).items[0].workId,'b');
+ await assert.rejects(store.asActor('actor',()=>store.commitSharedWorkRevisions([{work:work('a',{revision:2}),expectedRevision:1},{work:work('b',{revision:3}),expectedRevision:2}])));assert.equal((await store.getWork('tenant','a')).revision,1);
+ await store.asActor('actor',()=>store.commitSharedWorkRevisions([{work:work('a',{revision:2}),expectedRevision:1},{work:work('b',{revision:2}),expectedRevision:1}]));assert.equal((await store.getWork('tenant','b')).revision,2);
+});
+
+test('publication observation updates provider data only, preserving full historical and command fields',async t=>{
+ const f=await fixture(t),store=f.store(),p=publication();await store.asActor('actor',async()=>{await store.createWork(work());await store.upsertPublication(p);});
+ assert.equal(await store.asActor('actor',()=>store.claimPublicationState({...p,status:'removed'},p)),false);
+ assert.equal(await store.asActor('actor',()=>store.claimPublicationState(p,{...p,status:'removed',providerData:{remoteGallery:['observed']}},2)),false);
+ assert.equal(await store.asActor('actor',()=>store.claimPublicationState(p,{...p,status:'removed',providerData:{remoteGallery:['observed']}},1)),true);
+ assert.deepEqual(await store.getPublication('tenant','publication'),{...p,providerData:{remoteGallery:['observed']}});
+});
+
+test('missing raw inventory rows cause reconciliation instead of silently deleting retained history',async t=>{
+ const f=await fixture(t),store=f.store();await store.asActor('actor',()=>store.createWork(work()));
+ const row=(await f.repositories.hostRecords.snapshot()).items.find(row=>row.value.kind==='works');await f.repositories.hostRecords.remove(row.id,row.revision);
+ await assert.rejects(store.getWork('tenant','work'),{code:'retained_content_invalid'});
+});
+
+
+test('a corrupt ownerless Work is rejected instead of disappearing from Creator inventory',async t=>{
+ const f=await fixture(t),store=f.store();await store.asActor('actor',()=>store.createWork(work()));
+ const row=(await f.repositories.hostRecords.snapshot()).items.find(row=>row.value.kind==='works'),value=structuredClone(row.value);delete value.payload.creatorId;
+ await f.repositories.hostRecords.update(row.id,row.revision,{value});
+ await assert.rejects(store.listWorksByCreator('tenant','creator'),{code:'retained_content_invalid'});
+});
+
+test('wrapped repositories retain real host overrides and reject foreign transaction handles',async t=>{
+ const f=await fixture(t,false),repo=f.repositories;await repo.creators.create(creatorInput);
+ const update=repo.creators.update.bind(repo.creators);let calls=0;
+ repo.creators.update=async(...args)=>{calls++;return update(...args);};
+ const creator=await repo.creators.update('creator',1,{displayName:'Renamed'});assert.equal(calls,1);assert.equal(creator.displayName,'Renamed');
+ await assert.rejects(repo.creators.update('creator',creator.revision,{displayName:'Wrong scope'},{transaction:{id:'foreign'}}),/not active/);assert.equal((await repo.creators.get('creator')).displayName,'Renamed');
+});

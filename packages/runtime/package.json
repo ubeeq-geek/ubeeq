@@ -82,6 +82,10 @@
     "./content-worker": {
       "types": "./dist/content-worker.d.ts",
       "default": "./dist/content-worker.js"
+    },
+    "./retained-repository-store": {
+      "types": "./dist/retained-repository-store.d.ts",
+      "default": "./dist/retained-repository-store.js"
     }
   },
   "scripts": {
@@ -132,6 +136,9 @@
       ],
       "content-worker": [
         "dist/content-worker.d.ts"
+      ],
+      "retained-repository-store": [
+        "dist/retained-repository-store.d.ts"
       ]
     }
   }
