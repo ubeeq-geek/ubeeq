@@ -1,4 +1,5 @@
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
+export * from './retained-creator-content.js';
 export type { AwsCommandClient } from './client-port.js';
 import type { AwsCommandClient } from './client-port.js';
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */

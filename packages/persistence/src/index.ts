@@ -2,6 +2,8 @@
 import type { PublicationImageConfiguration, PublicationImageDeliveryEvidence } from '@ubeeq/core';
 export * from "./creator-content.js";
 export * from './content-preparation.js';
+export * from './retained-creator-content.js';
+export * from './creator-work-inventory.js';
 export * from './websites.js';
 export * from './website-hosting.js';
 export * from './creator-content-restore.js';
