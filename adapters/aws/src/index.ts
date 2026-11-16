@@ -585,11 +585,19 @@ export class SecretsManagerCredentialVault implements CredentialVault {
 export interface VerifiedCognitoAccessClaims {
   sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[]; 'custom:account_scope'?:string;
 }
+export interface CognitoIdentityRealm {readonly provider:'cognito';readonly userPoolId:string;readonly clientId:string;readonly subjectIdMode:'legacy_username'|'canonical_sub'}
+const actualCognitoRealms=new WeakMap<object,{realm:CognitoIdentityRealm;client:AwsCommandClient}>();
+/** Namespace provenance from the ACTUAL concrete identity constructor. This
+ * never asserts a new/empty pool or complete historical safety migration. */
+export function requireCognitoIdentityRealm(identity:IdentityAdapter):Readonly<CognitoIdentityRealm>{const actual=identity&&actualCognitoRealms.get(identity);if(!actual)throw Error('The actual configured Cognito identity adapter is required.');return actual.realm;}
+/** Actual provider metadata from the same closed-over credential authority. */
+export async function describeCognitoIdentityRealm(identity:IdentityAdapter){const actual=identity&&actualCognitoRealms.get(identity);if(!actual)throw Error('The actual configured Cognito identity adapter is required.');const {DescribeUserPoolCommand,DescribeUserPoolClientCommand}=await import('@aws-sdk/client-cognito-identity-provider');const [pool,client]=await Promise.all([actual.client.send(new DescribeUserPoolCommand({UserPoolId:actual.realm.userPoolId})),actual.client.send(new DescribeUserPoolClientCommand({UserPoolId:actual.realm.userPoolId,ClientId:actual.realm.clientId}))]);const details=pool.UserPool,application=client.UserPoolClient;if(!details||!application||details.Id!==actual.realm.userPoolId||typeof details.Arn!=='string'||!(details.CreationDate instanceof Date)||!Number.isFinite(details.CreationDate.getTime())||application.UserPoolId!==actual.realm.userPoolId||application.ClientId!==actual.realm.clientId||!(application.CreationDate instanceof Date)||!Number.isFinite(application.CreationDate.getTime()))throw Error('The actual Cognito principal namespace is unavailable or inconsistent.');return Object.freeze({...actual.realm,userPoolArn:details.Arn,userPoolCreatedAt:details.CreationDate.toISOString(),clientCreatedAt:application.CreationDate.toISOString()});}
+
 export class CognitoIdentity implements IdentityAdapter {
   readonly customerAccounts:CognitoCustomerIdentities;
   private verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> };
   constructor(private readonly cognito: AwsCommandClient, private readonly userPoolId: string, private readonly clientId: string,
-    private readonly options: {subjectIdMode?:'legacy_username'|'canonical_sub';verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { if(options.subjectIdMode!==undefined&&!['legacy_username','canonical_sub'].includes(options.subjectIdMode))throw Error('Choose an explicit supported Cognito subject ID mode.');this.verifier = options.verifier;this.customerAccounts=new CognitoCustomerIdentities(cognito,userPoolId,clientId,this,options.subjectIdMode??'legacy_username'); }
+    private readonly options: {subjectIdMode?:'legacy_username'|'canonical_sub';verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { if(options.subjectIdMode!==undefined&&!['legacy_username','canonical_sub'].includes(options.subjectIdMode))throw Error('Choose an explicit supported Cognito subject ID mode.');actualCognitoRealms.set(this,{realm:Object.freeze({provider:'cognito',userPoolId,clientId,subjectIdMode:options.subjectIdMode??'legacy_username'}),client:cognito});this.verifier = options.verifier;this.customerAccounts=new CognitoCustomerIdentities(cognito,userPoolId,clientId,this,options.subjectIdMode??'legacy_username'); }
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
     try {
@@ -734,3 +742,5 @@ export {DynamoCommerceStore} from './commerce.js';
 export {DynamoWebsiteStore,type DynamoWebsiteConfiguration} from './websites.js';
 export {DynamoWebsiteHostingStore} from './website-hosting-store.js';
 export {DynamoCollectionMetadataStore,assertCollectionMetadataTransactionBudget,type DynamoCollectionMetadataConfiguration,type CollectionMetadataTransactionItems} from './collection-metadata-store.js';
+
+export {createFreshCognitoPrincipalRealm,requireFreshCognitoPrincipalGenesis,type FreshCognitoPrincipalGenesis,type FreshCognitoPrincipalConfiguration} from './cognito-principal-realm.js';
