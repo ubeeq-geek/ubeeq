@@ -111,6 +111,15 @@ export interface ReferenceWebsiteRuntime {
  service:WebsiteService|undefined;persistence:RuntimeWebsitePersistence|undefined;publishing:WebsitePublishingService|undefined;
  hostingConnections:WebsiteHostingConnections|undefined;hostingAdapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
 }
+/** Host-owned hosting infrastructure composed with the same credential vault,
+ * durable OAuth states and current authorization policy as its website service.
+ * Native adapters are the exact objects included in adapters, so the HTTP
+ * serving routes and publishing worker share one deployment implementation. */
+export interface ReferenceWebsiteHostingInfrastructure {
+ readonly connections?:WebsiteHostingConnections;
+ readonly adapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
+ readonly nativeAdapters:readonly NativeWebsiteHostingAdapter[];
+}
 /** Preparation is composed after the actual website and Commerce services, so
  * a host can bind connected publishing without a second runtime or inventory. */
 export interface ReferenceContentPreparationContext {
@@ -184,6 +193,9 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   websiteHostingAdapters?:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
   websitePreviewMaxFileBytes?:number;
   websitePublishing?: WebsitePublishingService;
+  /** Complete host-composed infrastructure. When supplied, Core uses these
+   * exact instances instead of constructing additional hosting adapters. */
+  websiteHostingInfrastructure?:Readonly<ReferenceWebsiteHostingInfrastructure>;
   nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
   /** Explicit outbound policy is required before any external hosting connection is enabled. */
   websiteHostingExternal?:{authorizeUrl:(url:URL)=>Promise<void>;authorizeSftpHost:(host:string,port:number)=>Promise<void>;netlify?:{clientId:string;redirectUri:string}};
@@ -230,6 +242,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     credentialEncryptionKey: configuration.credentialEncryptionKey,
   };
   const localAdapters = configuration.adapters ? undefined : (configuration.createLocalAdapters ?? createLocalAdapterSet)(localConfiguration);
+  const hostingInfrastructure=configuration.websiteHostingInfrastructure;
+  try{
+    if(hostingInfrastructure){
+      if(hostingInfrastructure.nativeAdapters.some(adapter=>!hostingInfrastructure.adapters.includes(adapter)))throw new WebsiteError('hosting_adapter_mismatch','Native serving adapters must be the same instances used for publishing.');
+      if(new Set(hostingInfrastructure.adapters.map(adapter=>adapter.id)).size!==hostingInfrastructure.adapters.length)throw new WebsiteError('duplicate_hosting_adapter','Each hosting adapter must have a unique identifier.');
+    }
+  }catch(error){localAdapters?.database.close();throw error;}
   const adapters: ReferenceAdapterSet = configuration.adapters ?? {
     repositories: localAdapters!.repositories, storage: localAdapters!.storage, uploads: localAdapters!.storage,
     delivery: localAdapters!.storage, jobs: localAdapters!.jobs, identity: localAdapters!.identity,
@@ -616,15 +635,15 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   }) : undefined);
   const nativeProfiles=configuration.nativeWebsiteProfiles??[];
   const nativeProbe=createHostingPublicProbe({authorizeUrl:async url=>{if(!nativeProfiles.some(p=>{const template=new URL(p.publicUrlTemplate.replace('{site}','a'.repeat(32)));return url.origin===template.origin;}))throw new WebsiteError('unsafe_probe','Public probe origin is outside the administrator profiles.');}});
-  const nativeHosting=nativeProfiles.map(p=>new NativeWebsiteHostingAdapter(p,nativeProbe));
+  const nativeHosting=hostingInfrastructure?[...hostingInfrastructure.nativeAdapters]:nativeProfiles.map(p=>new NativeWebsiteHostingAdapter(p,nativeProbe));
   const authorizeHostingManager=async(actor:{workspaceId:string;actorId:string})=>{const creator=await repositories.creators.get(actor.workspaceId);if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);};
   const external=configuration.websiteHostingExternal;
   if(external&&localAdapters&&!configuration.credentialEncryptionKey)throw new WebsiteError('hosting_vault_key_required','External hosting requires an explicit credential vault encryption key.');
   if(external&&websiteStore&&(!adapters.credentials||!websiteStore.hostingOAuthStates))throw new WebsiteError('hosting_credentials_required','External hosting requires a durable credential vault and OAuth state store.');
-  const hostingConnections=external&&websiteStore?.hostingOAuthStates&&adapters.credentials?new WebsiteHostingConnections({cellId,vault:adapters.credentials,states:websiteStore.hostingOAuthStates,authorize:authorizeHostingManager,get:(w,id)=>websiteStore.getConnection(w,id),list:w=>websiteStore.listConnections(w),save:(c,r)=>websiteStore.saveConnection(c,r),netlify:external.netlify}):undefined;
+  const hostingConnections=hostingInfrastructure?hostingInfrastructure.connections:(external&&websiteStore?.hostingOAuthStates&&adapters.credentials?new WebsiteHostingConnections({cellId,vault:adapters.credentials,states:websiteStore.hostingOAuthStates,authorize:authorizeHostingManager,get:(w,id)=>websiteStore.getConnection(w,id),list:w=>websiteStore.listConnections(w),save:(c,r)=>websiteStore.saveConnection(c,r),netlify:external.netlify}):undefined);
   const externalProbe=external?createHostingPublicProbe({authorizeUrl:external.authorizeUrl}):undefined;
-  const hostingAdapters:import('@ubeeq/core').WebsiteHostingAdapter[]=[...nativeHosting,...configuration.websiteHostingAdapters??[]];
-  if(hostingConnections&&externalProbe&&external&&websiteStore){
+  const hostingAdapters:import('@ubeeq/core').WebsiteHostingAdapter[]=hostingInfrastructure?[...hostingInfrastructure.adapters]:[...nativeHosting,...configuration.websiteHostingAdapters??[]];
+  if(!hostingInfrastructure&&hostingConnections&&externalProbe&&external&&websiteStore){
     const credential=(c:import('@ubeeq/core').HostingConnection)=>hostingConnections.credential(c);
     if(external.netlify)hostingAdapters.push(new NetlifyWebsiteHostingAdapter({credential,probe:externalProbe}));
     hostingAdapters.push(new CloudflarePagesWebsiteHostingAdapter({credential,probe:externalProbe}));
