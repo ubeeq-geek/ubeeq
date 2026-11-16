@@ -27,6 +27,7 @@ export interface ContentPreparationReleaseDriver {
  accept(creator:string,id:string,revision:number,operation:string,review:string,fingerprint:string):Promise<unknown>;
  cancel(creator:string,id:string,revision:number):Promise<unknown>;
  status(creator:string,id:string):Promise<unknown>;
+ resumeAnnouncementActivation?(creator:string,id:string):Promise<unknown>;
 }
 export interface ContentPreparationHttpBindings<R,V,S extends ContentPreparationHttpService> {
  basePath?:string;
@@ -37,12 +38,12 @@ export interface ContentPreparationHttpBindings<R,V,S extends ContentPreparation
  createRelease(service:S):ContentPreparationReleaseDriver;
  enabled():boolean;
  durableDrafts():boolean;
- offerings(creator:string):Promise<unknown[]>;
- announcementDestinations(creator:string):Promise<unknown[]>;
+ offerings(creator:string,request:R):Promise<unknown[]>;
+ announcementDestinations(creator:string,request:R):Promise<unknown[]>;
  destinations(creator:string,actor:string):Promise<unknown[]>;
  managementUrl(creator:string):string;
  prepareUpload?(request:R,creator:string,fileId:string):Promise<PreparationSourceFile>;
- verifyUploadStorage?():Promise<void>;
+ verifyUploadStorage?(request:R,creator:string):Promise<void>;
  uploadDescriptor?(file:PreparationSourceFile,request:R):Promise<unknown>;
  canManageCollections?(request:R,creator:string):Promise<boolean>;
  mapError?(error:unknown):{status:number;body:unknown}|undefined;
@@ -65,7 +66,7 @@ export function registerContentPreparationRoutes<R extends ContentPreparationHtt
             const creatorId = typeof req.query.creatorId === 'string' ? req.query.creatorId : typeof req.body?.creatorId === 'string' ? req.body.creatorId : '';
             if (await options.access(req, res, creatorId) !== true)
                 return res.headersSent ? undefined : res.status(403).json({code:'access_denied',message:'Content preparation access denied.'});
-            if (options.enabled() !== true && method !== 'get' && !['/workflows/:id/save', '/workflows/:id/resume', '/releases/:id/cancel'].includes(path))
+            if (options.enabled() !== true && method !== 'get' && !['/workflows/:id/save', '/workflows/:id/resume', '/releases/:id/cancel','/releases/:id/resume'].includes(path))
                 return res.status(503).json({ code: 'workflow_disabled', message: 'New content operations are temporarily unavailable. Saved preparations and accepted releases are retained.' });
             const service = options.createService(req, res, 'operation');
             try {
@@ -121,8 +122,8 @@ export function registerContentPreparationRoutes<R extends ContentPreparationHtt
         ...await intakeCapabilities(req, creatorId),
         intake: { images: ['image/jpeg', 'image/png', 'image/webp', 'image/avif'], writing: ['article', 'literature'], files: true, existingWorks: true },
         previews: { uploaded: true, image: true, textRange: true, timeRange: { available: false, code: 'unsupported_operation', alternative: 'Upload a prepared clip or sample; source references remain available.' } },
-        offerings: await options.offerings(creatorId),
-        announcementDestinations: await options.announcementDestinations(creatorId),
+        offerings: await options.offerings(creatorId,req),
+        announcementDestinations: await options.announcementDestinations(creatorId,req),
         destinations: await options.destinations(creatorId, actorId(req)),
         managementUrl: options.managementUrl(creatorId)
     }));
@@ -142,7 +143,7 @@ export function registerContentPreparationRoutes<R extends ContentPreparationHtt
     route('post', '/workflows/:id/uploads', async (req, service, creatorId) => {
         if (!options.prepareUpload || !options.uploadDescriptor)
             throw new ContentPreparationError('unsupported_operation', 'Staged uploads are unavailable.', 503);
-        await options.verifyUploadStorage?.();
+        await options.verifyUploadStorage?.(req,creatorId);
         const staged = await service.stageUpload(creatorId, req.params.id, req.body.expectedRevision, req.body.operationId, req.body.upload, fileId => options.prepareUpload!(req, creatorId, fileId));
         return { ...staged, upload: await options.uploadDescriptor(staged.file,req) };
     });
@@ -153,6 +154,7 @@ export function registerContentPreparationRoutes<R extends ContentPreparationHtt
     route('post', '/workflows/:id/review', (req, service, creatorId) => req.body.action === 'save' ? service.review(creatorId, req.params.id, req.body.expectedRevision, 'save') : options.createRelease(service).prepare(creatorId, req.params.id, req.body.expectedRevision, req.body.action, req.body.recipes, actorId(req)));
     route('post', '/workflows/:id/release', (req, service, creatorId) => options.createRelease(service).accept(creatorId, req.params.id, req.body.expectedRevision, req.body.operationId, req.body.reviewId, req.body.fingerprint));
     route('post', '/releases/:id/cancel', (req, service, creatorId) => options.createRelease(service).cancel(creatorId, req.params.id, req.body.expectedRevision));
+    route('post','/releases/:id/resume',(req,service,creatorId)=>{const release=options.createRelease(service);if(!release.resumeAnnouncementActivation)throw new ContentPreparationError('unsupported_operation','Accepted announcement activation recovery is unavailable.',503);return release.resumeAnnouncementActivation(creatorId,req.params.id);});
     route('get', '/releases/:id', (req, service, creatorId) => options.createRelease(service).status(creatorId, req.params.id));
     route('post', '/workflows/:id/save', (req, service, creatorId) => service.saveDraft(creatorId, req.params.id, req.body.expectedRevision, req.body.operationId));
     route('post', '/workflows/:id/refresh-references', (req, service, creatorId) => service.refreshReferences(creatorId, req.params.id, req.body.expectedRevision, req.body.operationId));

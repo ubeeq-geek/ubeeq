@@ -86,6 +86,15 @@ export interface RepositorySnapshot<T> {
  */
 export interface RevisionedRepository<T extends RevisionedRecord> {
   snapshot?(): Promise<RepositorySnapshot<T>>;
+  /** Mark this adapter's active transaction rollback-only after a repository
+   * wrapper rejects its own accepting guard. This grants no write authority. */
+  failTransaction?():void;
+  /** Mathematical physical-row sizing from the actual adapter, including its
+   * full durable envelope. No caller-configurable logical/content budget. */
+  physicalRecordFits?(record:T):boolean;
+  /** Preserve an original managed JSON-row contract without importing its
+   * managed-only limit into Local's complete JSON storage. Provider-owned math. */
+  originalJsonFits?(value:Readonly<Record<string,unknown>>,managedByteLimit:number):boolean;
   /** Commit-time read guard. Required by publication commands; never emulate with an unguarded read. */
   checkRevision?(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void>;
   /** Guard physical record absence until this transaction commits. A plain
@@ -103,6 +112,8 @@ const DATA_HOME_FIELDS = ["homeCellId", "dataHomeRegion", "dataHomeAssignedAt", 
 /** Provider-neutral fail-closed boundary for canonical creator-owned repositories. */
 export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> implements RevisionedRepository<T> {
   readonly snapshot?: () => Promise<RepositorySnapshot<T>>;
+  readonly physicalRecordFits?: (record:T)=>boolean;
+  readonly originalJsonFits?: (value:Readonly<Record<string,unknown>>,managedByteLimit:number)=>boolean;
   readonly checkAbsent?: (id: string, options: { transaction: PersistenceTransaction }) => Promise<void>;
   constructor(readonly repository: RevisionedRepository<T>, readonly cellId: string) {
     if (!cellId.trim()) throw new Error("A cell-scoped repository requires a cellId.");
@@ -110,9 +121,12 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
       const snapshot = await repository.snapshot!();
       return {items:snapshot.items.filter(record=>record.homeCellId===this.cellId),bind:transaction=>snapshot.bind(transaction)};
     };
+    if(repository.originalJsonFits)this.originalJsonFits=repository.originalJsonFits.bind(repository);
+    if(repository.physicalRecordFits)this.physicalRecordFits=record=>record.homeCellId===cellId&&repository.physicalRecordFits!(record);
     // A hidden foreign-cell row must never become evidence of physical absence.
     if (repository.checkAbsent) this.checkAbsent = repository.checkAbsent.bind(repository);
   }
+  failTransaction():void {this.repository.failTransaction?.();}
   private local(record: T | undefined): T | undefined {
     return record?.homeCellId === this.cellId ? record : undefined;
   }
@@ -124,10 +138,14 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
     return this.local(await this.repository.get(id, options));
   }
   async checkRevision(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void> {
-    const record = await this.get(id, options);
-    if (!record) throw new CellOwnershipError(this.cellId);
-    if (!this.repository.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
-    await this.repository.checkRevision(id, expectedRevision, options);
+    try {
+      if (!this.repository.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
+      // Enlist before the first await. A detached wrapper must not perform an
+      // untracked point read while its companion transaction accepts a write.
+      await this.repository.checkRevision(id, expectedRevision, options);
+      const record = await this.get(id, options);
+      if (!record) throw new CellOwnershipError(this.cellId);
+    } catch(error) {this.failTransaction();throw error;}
   }
   async list(request: PageRequest, options?: Parameters<RevisionedRepository<T>["list"]>[1]): Promise<Page<T>> {
     const limit = Math.max(1, request.limit); const items: T[] = []; let cursor = request.cursor;

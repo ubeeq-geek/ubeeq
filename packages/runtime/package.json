@@ -110,6 +110,10 @@
     "./usage-settlement-outbox": {
       "types": "./dist/usage-settlement-outbox.d.ts",
       "default": "./dist/usage-settlement-outbox.js"
+    },
+    "./retained-value-codec": {
+      "types": "./dist/retained-value-codec.d.ts",
+      "default": "./dist/retained-value-codec.js"
     }
   },
   "scripts": {
@@ -181,6 +185,9 @@
       ],
       "usage-settlement-outbox": [
         "dist/usage-settlement-outbox.d.ts"
+      ],
+      "retained-value-codec": [
+        "dist/retained-value-codec.d.ts"
       ]
     }
   }

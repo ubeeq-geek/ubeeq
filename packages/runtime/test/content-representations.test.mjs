@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createReadStream} from 'node:fs';
 import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,dirname,resolve} from 'node:path';
@@ -97,4 +98,14 @@ test('missing private media and policy host bindings fail before any processing 
  const f=await fixture(t);
  for(const name of ['isNativeDestination','prepareImageRenditions','readPublishingSource','originalFile','inspectOriginal','creatorWatermark','watermarkOverlay','writePrivate','readPrivate','file','canReadRepresentation'])assert.throws(()=>new ContentRepresentations(f.store,{tenantId:'tenant'},{...f.host,[name]:undefined}),error=>error.code==='unsupported_operation'&&error.status===503);
  assert.equal(f.sourceReads,0);assert.equal(f.writes.length,0);
+});
+
+
+test('full originals can use real streamed integrity without materializing decoder bytes, preserving the legacy read fallback',async t=>{
+ const f=await fixture(t);let inspected=0;f.host.inspectPublishingSource=async asset=>{inspected++;const digest=createHash('sha256');let size=0;for await(const part of createReadStream(f.path(asset.storage.objectKey),{highWaterMark:64})){size+=part.length;digest.update(part);}assert.equal(size,asset.sizeBytes);assert.equal(digest.digest('hex'),asset.checksumSha256);};
+ const full=await f.service.full(f.work);assert.equal(inspected,1);assert.equal(f.sourceReads,0);assert.equal(full.assets[0].file.sizeBytes,f.original.length);assert.deepEqual((await f.service.read(full,full.assets[0].id)).bytes,f.original);
+ // Generated image previews genuinely need decoder input and retain the actual
+ // configured byte-reading path. The new seam never pretends to render bytes.
+ await f.service.previews(f.draft);assert.equal(f.sourceReads,1);
+ await writeFile(f.path('source.png'),Buffer.from('truncated original'));await assert.rejects(f.service.full(f.work));assert.equal(f.sourceReads,1);
 });

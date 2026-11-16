@@ -120,6 +120,23 @@ export type ReleaseOffer={status:string}|{status:string;snapshot:{offer:{benefit
 /** Bind every capability to the same live host, policy and durable authority as
  * the workflow. A missing capability must not authorize publication or synthesize
  * empty histories. Provider-specific review remains the provider's authority. */
+export interface ReleaseActivationReference {kind:string;id:string;revision:number;fingerprint:string}
+export interface ReleaseActivationOwnership {schemaVersion:1;fingerprint:string;references:ReleaseActivationReference[]}
+export interface ReleaseActivationResource {kind:'announcement'|'collection';id:string;revision:string;contentFingerprint:string;destination:string}
+export interface ReleaseActivationInput {creatorId:string;releaseId:string;draftId:string;releaseFingerprint:string;announcementReleaseId?:string;files:ReleasePrivateAnnouncementMedia[];ownership:ReleaseActivationOwnership}
+export interface PreparedReleaseActivation {
+ resources:ReleaseActivationResource[];activeMediaKeys:string[];deferredMediaKeys:string[];
+ /** Genuine current resource/source/safety/organization guards, prepared before
+  * the accepting transaction, then enlisted inside that SAME transaction. */
+ enlist():Promise<void>;
+ /** Actual idempotent visibility acceptance, gated again by the genuine resource
+  * authority. Owned bytes already exist; this is not provider dispatch. */
+ activate():Promise<void>;
+}
+export interface ReleaseAnnouncementActivation<C> {
+ stageOwnership(commit:C,input:{creatorId:string;releaseId:string;releaseFingerprint:string}):{commit:C;ownership:ReleaseActivationOwnership};
+ prepare(input:ReleaseActivationInput):Promise<PreparedReleaseActivation>;
+}
 export interface ContentReleaseHost<M extends ContentReleaseModels> {
  isNativeDestination(destination:string):boolean;
  nativeWorkDestination():M['publication']['destination'];
@@ -141,6 +158,14 @@ export interface ContentReleaseHost<M extends ContentReleaseModels> {
  stageAnnouncementMedia<T>(operation:()=>Promise<T>):Promise<{value:T;files:ReleasePrivateAnnouncementMedia[]}>;
  pinCollectionAnnouncementMedia(creatorId:string,collectionId:string,selection:AnnouncementMediaSelection,workIds:readonly string[],outputs:ReleaseOutput<M>[]):Promise<{blocks:ReleaseAnnouncementBlock[]}>;
  activateAnnouncementMedia(creatorId:string,files:ReleasePrivateAnnouncementMedia[]):Promise<void>;
+ /** Additive strong ordering. Existing hosts keep their legacy binding; a host
+  * that installs this protocol must materialize real resource identity before
+  * any public media activation. Old accepted rows are never upgraded by reads. */
+ announcementActivation?:ReleaseAnnouncementActivation<M['orchestrationCommit']>;
+ /** Physical immutable receipt/byte validation occurs before acceptance. The
+  * returned closure binds the same exact alias/source/safety authority inside
+  * the accepting transaction; it must perform no provider I/O there. */
+ prepareAnnouncementMediaAcceptance?(files:readonly ReleasePrivateAnnouncementMedia[]):Promise<{enlist():Promise<void>}>;
  readStagedAnnouncementMedia(file:ReleasePrivateAnnouncementMedia):Promise<Buffer>;
  readAnnouncementFile(key:string):Promise<{bytes:Buffer;mime:string;filename:string}>;
  readAnnouncementImage(key:string,maxBytes:number,mimes:string[],allowPrivate:boolean):Promise<{bytes:Buffer;mime:string}>;

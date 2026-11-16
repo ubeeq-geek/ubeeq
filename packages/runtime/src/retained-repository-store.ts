@@ -1,4 +1,5 @@
 import {AsyncLocalStorage} from 'node:async_hooks';
+import {encodeRetainedValue,decodeRetainedValue,type Header,type LegacyHeader,type Chunk} from './retained-value-codec.js';
 import {createHash} from 'node:crypto';
 import {MemoryCreatorContentStore,CreatorContentCommitError,publicationIdentityHash,validateUbeeqWorkPageOptions,ubeeqWorkSortKey,type UbeeqWorkPageOptions,type UbeeqWorkPage,type RetainedCreatorContentModels,type CreatorContentAssetCommit,type RetainedContentAtomic,type CreatorRecord,type HostRecord,type PersistenceTransaction,type TransactionRunner,type UbeeqRepositories} from '@ubeeq/persistence';
 import {assertPublicationDisclosureHistoryImmutable,PublicationImageError} from '@ubeeq/core';
@@ -45,7 +46,7 @@ const fields={works:['workId'],canonicalAssets:['assetId'],workAssets:['workId',
 type Field=keyof typeof fields;
 type Value=Record<string,any>;
 type Address={category:'canonical'|'command'|'entity';kind:string;key:string};
-type Stored={address:Address;row:HostRecord;payload:Value};
+type Stored={address:Address;row:HostRecord;payload:Value;chunks:HostRecord[]};
 type State={transaction:PersistenceTransaction;phase:'open'|'closing'|'closed';rollbackOnly:boolean;pending:number;creator:CreatorRecord;cohort:HostRecord;before:Map<string,Stored>;fields:Map<Field,Value[]>;extra:Map<string,{address:Address;payload:Value}>;actor?:string};
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const identity=(scope:RetainedRepositoryScope,address:Address|'cohort')=>'retained-'+hash([scope.instanceId,scope.tenantId,scope.creatorId,address]);
@@ -53,12 +54,22 @@ const addressKey=(address:Address)=>JSON.stringify([address.category,address.kin
 const inventory=(ids:Iterable<string>)=>{const values=[...ids].sort();return {count:values.length,hash:hash(values)};};
 const invalid=()=>new RetainedRepositoryError('retained_content_invalid','Retained content requires reconciliation.',503);
 const json=(value:unknown):Value=>{
- const encoded=JSON.stringify(value);if(!encoded || Buffer.byteLength(encoded)>300*1024)throw new RetainedRepositoryError('retained_content_too_large','This retained record exceeds its safe storage size.',413);
+ const encoded=JSON.stringify(value);if(!encoded)throw invalid();
  const copy:unknown=JSON.parse(encoded);if(!copy || typeof copy!=='object' || Array.isArray(copy))throw invalid();return copy as Value;
 };
+const physicalKey=(id:string)=>'physical:'+id;
 const home=(creator:CreatorRecord)=>({homeCellId:creator.homeCellId,dataHomeRegion:creator.dataHomeRegion,dataHomeAssignedAt:creator.dataHomeAssignedAt,routingRevision:creator.routingRevision});
 const cohortValue=(scope:RetainedRepositoryScope,ids:Iterable<string>)=>({schemaVersion:1,tenantId:scope.tenantId,creatorId:scope.creatorId,inventory:inventory(ids)});
 const requireScope=(scope:RetainedRepositoryScope)=>{if(Object.values(scope).some(value=>typeof value!=='string'||!value||value.length>200))throw invalid();};
+/** The actual adapter sizes its whole durable record. These are not caller
+ * budget flags. Final adapter transaction preflight independently checks the
+ * exact staged values/count/bytes before any physical accepting write. */
+const physicalStorage=(repositories:UbeeqRepositories,scope:RetainedRepositoryScope,creator:CreatorRecord,previous:ReadonlyMap<string,HostRecord>=new Map(),writing=true)=>({fits(id:string,key:string,value:Record<string,unknown>){
+ const repository=repositories.hostRecords;if(typeof repository?.physicalRecordFits!=='function')throw Error('The actual repository must expose its physical record sizing protocol.');const old=previous.get(id),timestamp=new Date().toISOString();
+ const candidate:HostRecord=old?{...old,value,...(writing?{revision:old.revision+1,updatedAt:timestamp}:{})}:{id,instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key,value,revision:1,createdAt:timestamp,updatedAt:timestamp};return repository.physicalRecordFits(candidate);
+}});
+const physicalPlan=(repositories:UbeeqRepositories,scope:RetainedRepositoryScope,creator:CreatorRecord,address:Address,payload:Value,previous:ReadonlyMap<string,HostRecord>=new Map())=>{const result=encodeRetainedValue(scope,address,payload,physicalStorage(repositories,scope,creator,previous));return {value:result.header,chunks:result.chunks};};
+
 
 /** Trusted birth hook ONLY, in the actual new-Creator creation transaction.
  * Existing Creators must migrate a complete inventory under a fenced writer.
@@ -66,6 +77,11 @@ const requireScope=(scope:RetainedRepositoryScope)=>{if(Object.values(scope).som
 export interface RetainedCreatorBirthEntity {readonly kind:string;readonly key:string;readonly value:Readonly<Record<string,unknown>>}
 /** Initial host entities and the cohort are each created exactly once. This is
  * genuine birth only, never an existing-Creator adoption or migration shortcut. */
+const actualRetainedBirths=new WeakMap<object,string>();
+/** Server-only in-process proof from this actual creation operation. Cloned
+ * JSON, an old revision-one row and a caller-supplied flag cannot supply it.
+ * The recipient must also enforce this exact still-live transaction handle. */
+export function assertRetainedCreatorBirth(creator:Readonly<CreatorRecord>,transaction:PersistenceTransaction):void {if(!creator||actualRetainedBirths.get(creator)!==transaction.id)throw new RetainedRepositoryError('retained_content_migration_required','The genuine current Creator birth or complete fenced historical migration is required.',503);}
 export async function createRetainedRepositoryCreator(repositories:UbeeqRepositories,record:Omit<CreatorRecord,'revision'|'createdAt'|'updatedAt'|'contentAuthority'>,tenantId:string,transaction:PersistenceTransaction,initialEntities:readonly RetainedCreatorBirthEntity[]=[]):Promise<CreatorRecord>{
  record=structuredClone(record);
  const scope={instanceId:record.instanceId,tenantId,creatorId:record.id,cellId:record.homeCellId,region:record.dataHomeRegion};requireScope(scope);
@@ -78,9 +94,14 @@ export async function createRetainedRepositoryCreator(repositories:UbeeqReposito
  });
  if(!repositories.hostRecords?.snapshot || await repositories.creators.get(record.id,{transaction}))throw invalid();
  const creator=await repositories.creators.create({...record,contentAuthority:'retained-v1'},{transaction});
- for(const {address,key,payload}of initial)await repositories.hostRecords.create({id:identity(scope,address),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key,value:{schemaVersion:1,...address,payload}},{transaction});
- await repositories.hostRecords.create({id:identity(scope,'cohort'),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key:'cohort',value:cohortValue(scope,initial.map(entry=>identity(scope,entry.address)))},{transaction});
- return creator;
+ const physicalIds:string[]=[];
+ for(const {address,key,payload}of initial){
+  const plan=physicalPlan(repositories,scope,creator,address,payload),id=identity(scope,address);physicalIds.push(id);
+  await repositories.hostRecords.create({id,instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key,value:plan.value},{transaction});
+  for(const chunk of plan.chunks){physicalIds.push(chunk.id);await repositories.hostRecords.create({id:chunk.id,instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key:physicalKey(chunk.id),value:chunk.value},{transaction});}
+ }
+ await repositories.hostRecords.create({id:identity(scope,'cohort'),instanceId:scope.instanceId,...home(creator),namespace,scopeId:creator.id,key:'cohort',value:cohortValue(scope,physicalIds)},{transaction});
+ actualRetainedBirths.set(creator,transaction.id);return creator;
 }
 
 /** Full retained JSON records live individually in the actual repositories.
@@ -107,6 +128,9 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   this.publicationAtomic={supportsConditionalTransactions:true,run:operation=>this.run(operation),active:()=>this.context.getStore()?.phase==='open',
    get:(kind,id)=>this.getEntity('command',this.commandKind(kind),id),list:kind=>this.listEntities('command',this.commandKind(kind)),put:(kind,id,value)=>this.putEntity('command',this.commandKind(kind),id,value),savePublication:publication=>this.upsertPublication(publication)};
  }
+ /** Actual target-adapter sizing preserves provider-specific original row
+  * contracts. It neither initializes data nor grants mutation authority. */
+ retainedOriginalJsonFits(value:Readonly<Record<string,unknown>>,managedByteLimit:number):boolean {const repository=this.repositories.hostRecords;if(!repository?.originalJsonFits)throw Error('The actual repository JSON sizing protocol is required.');return repository.originalJsonFits(value,managedByteLimit);}
  transaction():PersistenceTransaction|undefined{const state=this.context.getStore();return state?.phase==='open'?state.transaction:undefined;}
  private active():State{const state=this.context.getStore();if(!state||state.phase!=='open')throw Error('An active retained-content transaction is required.');return state;}
  private commandKind(kind:string):string{const prefix=`content-workflow:${this.scope.tenantId}:${this.scope.creatorId}:`;if(!kind.startsWith(prefix)||!/^[-a-zA-Z0-9_]{1,100}$/.test(kind.slice(prefix.length)))throw new RetainedRepositoryError('access_denied','Retained command scope denied.',403);return kind.slice(prefix.length);}
@@ -142,16 +166,25 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
    if(!cohort)throw new RetainedRepositoryError('retained_content_migration_required','This Creator needs a complete retained-content migration before using this writer.',503);
    if(cohort.key!=='cohort' || publicationIdentityHash(cohort.value)!==publicationIdentityHash(cohortValue(this.scope,rows.filter(row=>row!==cohort).map(row=>row.id))))throw invalid();
    const state:State={transaction,phase:'open',rollbackOnly:false,pending:0,creator,cohort,before:new Map(),fields:new Map((Object.keys(fields) as Field[]).map(field=>[field,[]])),extra:new Map()};owned=state;
+   const physicalRows=new Map<string,HostRecord>(),usedPhysical=new Set<string>();
    for(const row of rows){
     if(row.homeCellId!==creator.homeCellId || row.dataHomeRegion!==creator.dataHomeRegion || row.routingRevision!==creator.routingRevision || row.dataHomeAssignedAt!==creator.dataHomeAssignedAt)throw invalid();
-    if(row===cohort)continue;
+    if(row!==cohort&&row.value?.schemaVersion===2&&row.value?.physicalKind==='retained-json-chunk'){
+     if(row.key!==physicalKey(row.id)||physicalRows.has(row.id))throw invalid();physicalRows.set(row.id,row);
+    }
+   }
+   for(const row of rows){
+    if(row===cohort||physicalRows.has(row.id))continue;
     const value=row.value as Value,address:Address={category:value.category,kind:value.kind,key:value.key};
-    if(value.schemaVersion!==1 || !['canonical','command','entity'].includes(address.category) || typeof address.kind!=='string' || !address.kind || typeof address.key!=='string' || !address.key || row.key!==addressKey(address) || row.id!==identity(this.scope,address) || !value.payload || Array.isArray(value.payload) || typeof value.payload!=='object')throw invalid();
-    const key=addressKey(address);if(state.before.has(key))throw invalid();const payload=json(value.payload);state.before.set(key,{address,row,payload});
+    if(![1,2].includes(value.schemaVersion)||!['canonical','command','entity'].includes(address.category)||typeof address.kind!=='string'||!address.kind||typeof address.key!=='string'||!address.key||row.key!==addressKey(address)||row.id!==identity(this.scope,address))throw invalid();
+    let payload:Value;const chunks:HostRecord[]=[];
+    try{payload=decodeRetainedValue(this.scope,address,value as Header|LegacyHeader,id=>{const chunk=physicalRows.get(id);if(!chunk||usedPhysical.has(id))throw invalid();usedPhysical.add(id);chunks.push(chunk);return chunk.value;},physicalStorage(this.repositories,this.scope,creator,new Map(rows.map(value=>[value.id,value])),false));}catch{throw invalid();}
+    const key=addressKey(address);if(state.before.has(key))throw invalid();state.before.set(key,{address,row,payload,chunks});
     if(address.category==='canonical'){
      if(!Object.hasOwn(fields,address.kind))throw invalid();state.fields.get(address.kind as Field)!.push(payload);
     }else state.extra.set(key,{address,payload});
    }
+   if(usedPhysical.size!==physicalRows.size)throw invalid();
    return this.context.run(state,async()=>{
     const initial=this.encode(state);
     if(initial.size!==state.before.size || [...initial].some(([key,value])=>!state.before.has(key)||publicationIdentityHash(value.payload)!==publicationIdentityHash(state.before.get(key)!.payload)))throw invalid();
@@ -191,8 +224,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
  /** A domain maintenance adapter may authorize ONLY a narrowly validated delta.
   * The base store never grants a worker general Creator mutation authority. */
  protected mayCommitMaintenance(_changes:readonly RetainedRepositoryChange[]):boolean{return false;}
- /** Exact host-owned provider-effect move only. No current actor is invented;
-  * final mayCommitMaintenance still independently guards the complete delta. */
+ /** Exact host-owned provider-effect move; the final complete delta is independently guarded. */
  protected mayMoveRetainedEntityAsMaintenance(_input:Readonly<RetainedEntityMove>):boolean{return false;}
  protected mayAppendMaintenanceAudit(_event:Readonly<RetainedAuditEvent>):boolean{return false;}
  protected retainedEntityEntries<T>(kind:string):Array<{key:string;value:T}>{
@@ -218,14 +250,35 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
    const previous=state.before.get(key),next=after.get(key),address=next?.address??previous!.address;
    return {...address,...(previous?{previous:structuredClone(previous.payload)}:{}),...(next?{next:structuredClone(next.payload)}:{})};
   })))throw new RetainedRepositoryError('access_denied','An actual actor guard is required before changing retained content.',403);
-  for(const key of changed){
-   const before=state.before.get(key),next=after.get(key);
-   if(!next){await this.repositories.hostRecords!.remove(before!.row.id,before!.row.revision,{transaction:state.transaction});continue;}
-   const value={schemaVersion:1,...next.address,payload:next.payload};
-   if(before)await this.repositories.hostRecords!.update(before.row.id,before.row.revision,{value},{transaction:state.transaction});
-   else await this.repositories.hostRecords!.create({id:identity(this.scope,next.address),instanceId:this.scope.instanceId,...home(state.creator),namespace,scopeId:this.scope.creatorId,key,value},{transaction:state.transaction});
+  // Compute every encoding before the first repository write. Complete logical
+  // budgets remain the original domain/transport contract, not a physical-row cap.
+  const plans=new Map(changed.flatMap(key=>{const next=after.get(key);return next?[[key,physicalPlan(this.repositories,this.scope,state.creator,next.address,next.payload,new Map([...state.before.values()].flatMap(value=>[value.row,...value.chunks]).map(value=>[value.id,value])))] as const]:[];}));
+  const activeIds=new Set<string>();
+  for(const [key,next]of after){
+   const before=state.before.get(key);activeIds.add(identity(this.scope,next.address));
+   if(!changed.includes(key)){for(const chunk of before!.chunks)activeIds.add(chunk.id);continue;}
+   for(const chunk of plans.get(key)!.chunks)activeIds.add(chunk.id);
   }
-  await this.repositories.hostRecords!.update(state.cohort.id,state.cohort.revision,{value:cohortValue(this.scope,[...after.values()].map(entry=>identity(this.scope,entry.address)))},{transaction:state.transaction});
+  for(const key of changed){
+   const before=state.before.get(key),next=after.get(key),plan=plans.get(key);
+   if(!next){
+    for(const chunk of before!.chunks)await this.repositories.hostRecords!.remove(chunk.id,chunk.revision,{transaction:state.transaction});
+    await this.repositories.hostRecords!.remove(before!.row.id,before!.row.revision,{transaction:state.transaction});continue;
+   }
+   const kept=new Set(plan!.chunks.map(chunk=>chunk.id)),oldChunks=new Map((before?.chunks??[]).map(chunk=>[chunk.id,chunk]));
+   for(const chunk of before?.chunks??[])if(!kept.has(chunk.id))await this.repositories.hostRecords!.remove(chunk.id,chunk.revision,{transaction:state.transaction});
+   for(const chunk of plan!.chunks){
+    const old=oldChunks.get(chunk.id);
+    if(old){if(publicationIdentityHash(old.value)!==publicationIdentityHash(chunk.value))throw invalid();continue;}
+    await this.repositories.hostRecords!.create({id:chunk.id,instanceId:this.scope.instanceId,...home(state.creator),namespace,scopeId:this.scope.creatorId,key:physicalKey(chunk.id),value:chunk.value},{transaction:state.transaction});
+   }
+   if(before)await this.repositories.hostRecords!.update(before.row.id,before.row.revision,{value:plan!.value},{transaction:state.transaction});
+   else await this.repositories.hostRecords!.create({id:identity(this.scope,next.address),instanceId:this.scope.instanceId,...home(state.creator),namespace,scopeId:this.scope.creatorId,key,value:plan!.value},{transaction:state.transaction});
+  }
+  const nextCohort=cohortValue(this.scope,activeIds);
+  // Same-address/same-physical-inventory updates retain the cohort revision. The
+  // actual snapshot marker and each changed row's CAS still fence acceptance.
+  if(publicationIdentityHash(nextCohort)!==publicationIdentityHash(state.cohort.value))await this.repositories.hostRecords!.update(state.cohort.id,state.cohort.revision,{value:nextCohort},{transaction:state.transaction});
  }
  private async getEntity(category:'entity'|'command',kind:string,key:string):Promise<any>{const address={category,kind,key};return structuredClone(this.active().extra.get(addressKey(address))?.payload);}
  private async listEntities(category:'entity'|'command',kind:string):Promise<any[]>{return [...this.active().extra.values()].filter(entry=>entry.address.category===category&&entry.address.kind===kind).sort((a,b)=>a.address.key.localeCompare(b.address.key)).map(entry=>structuredClone(entry.payload));}

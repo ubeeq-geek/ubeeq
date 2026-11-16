@@ -155,6 +155,8 @@ export interface PublicationAdmissionResult {
 }
 
 export interface PublicationAdmissionPort {
+  /** Selected non-Work flows must deny when this companion is not installed. */
+  evaluateResource?: import('./resource-publication-admission.js').ResourcePublicationAdmissionPort['evaluateResource'];
   evaluatePublication(input: PublicationAdmissionEvaluationInput): Promise<PublicationAdmissionResult>;
 }
 
@@ -425,3 +427,5 @@ export const validateIntegrationConnectorManifest = (manifest: IntegrationConnec
 export class TenancyAdmissionError extends Error {
   constructor(readonly reasonCode: string, message: string) { super(message); this.name = 'TenancyAdmissionError'; }
 }
+
+export type {PublicationResource,ResourceAdmissionEvaluationInput,ResourcePublicationAdmissionPort} from './resource-publication-admission.js';

@@ -136,9 +136,17 @@ test('route composition refuses missing host capabilities and retains every nati
  const expected={
   get:['/workflows/:id/reviews/:reviewId/images/:representationId/:componentId','/intake-capabilities','/capabilities','/workflows','/collections','/standalone-images','/export','/workflows/:id','/workflows/:id/contents','/releases/:id','/presets','/presets/:id/versions'],
   patch:['/workflows/:id','/presets/:id'],
-  post:['/restore','/workflows','/workflows/:id/objects','/workflows/:id/uploads','/workflows/:id/objects/:objectId/complete','/workflows/:id/announcement-draft/review','/workflows/:id/announcement-draft','/workflows/:id/previews','/workflows/:id/review','/workflows/:id/release','/releases/:id/cancel','/workflows/:id/save','/workflows/:id/refresh-references','/workflows/:id/resume','/workflows/:id/apply-changes','/workflows/:id/cancel','/workflows/:id/preset','/workflows/:id/apply-preset','/workflows/:id/apply-reviewed-preset']
+  post:['/restore','/workflows','/workflows/:id/objects','/workflows/:id/uploads','/workflows/:id/objects/:objectId/complete','/workflows/:id/announcement-draft/review','/workflows/:id/announcement-draft','/workflows/:id/previews','/workflows/:id/review','/workflows/:id/release','/releases/:id/cancel','/releases/:id/resume','/workflows/:id/save','/workflows/:id/refresh-references','/workflows/:id/resume','/workflows/:id/apply-changes','/workflows/:id/cancel','/workflows/:id/preset','/workflows/:id/apply-preset','/workflows/:id/apply-reviewed-preset']
  };
  assert.deepEqual(routes.map(row=>row.join(' ')).sort(),Object.entries(expected).flatMap(([method,paths])=>paths.map(path=>method+' /api/studio/content'+path)).sort());
+});
+
+test('accepted release recovery keeps both HTTP aliases, current access and disabled-workflow recovery without another release command',async t=>{
+ const calls=[],f=await fixture(t,{bindings:{createRelease:()=>({async resumeAnnouncementActivation(creatorId,id){calls.push({creatorId,id});return {id,status:'needs_review'};}})}});f.disable();
+ for(const prefix of ['','/api']){const response=await f.request(prefix+url('/releases/accepted/resume'),'POST',{});assert.equal(response.status,200);assert.deepEqual(response.body,{id:'accepted',status:'needs_review'});}
+ assert.deepEqual(calls,[{creatorId:'creator',id:'accepted'},{creatorId:'creator',id:'accepted'}]);
+ assert.equal((await f.request(url('/releases/accepted/resume','other'),'POST',{})).status,403);assert.equal(calls.length,2);
+ const missing=await fixture(t);assert.equal((await missing.request(url('/releases/accepted/resume'),'POST',{})).status,503,'an absent actual recovery implementation remains unavailable');
 });
 
 test('core composition supplies actual adapters and enforces configured tenancy before an injected preparation host',async t=>{
@@ -158,4 +166,20 @@ test('core composition supplies actual adapters and enforces configured tenancy 
  assert.equal(tenancyCalls,2);assert.equal(hostCalls,0);
  const forged=await fetch(base+url('/workflows'),{headers:{'x-user-id':'owner'}});assert.equal(forged.status,401);
  await runtime.close();assert.equal(closed,1);
+});
+
+test('capability inventories and staged storage checks receive the same verified request',async t=>{
+ const observed=[];
+ const f=await fixture(t,{bindings:{
+  offerings:async(creator,request)=>{observed.push(['offers',creator,request]);return[];},
+  announcementDestinations:async(creator,request)=>{observed.push(['announcements',creator,request]);return[];},
+  verifyUploadStorage:async(request,creator)=>{observed.push(['storage',creator,request]);},
+  prepareUpload:unsupported,uploadDescriptor:unsupported,
+ }});
+ assert.equal((await f.request(url('/capabilities'))).status,200);
+ assert.equal(observed.length,2);assert.equal(observed[0][2],observed[1][2]);
+ for(const [kind,creator,request] of observed){assert.equal(creator,'creator');assert.equal(request.session.subject.id,'owner');assert.equal(request.incoming.headers.authorization,'Bearer verified');}
+ const started=await f.request(url('/workflows'),'POST',{operationId:'storage-context',entry:{intent:'work'}});assert.equal(started.status,200);
+ const staged=await f.request(url('/workflows/'+started.body.id+'/uploads'),'POST',{expectedRevision:started.body.revision,operationId:'prepare-storage',upload:{}});assert.equal(staged.status,503);
+ assert.equal(observed[2][0],'storage');assert.equal(observed[2][1],'creator');assert.equal(observed[2][2].session.subject.id,'owner');
 });

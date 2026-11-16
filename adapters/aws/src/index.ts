@@ -1,3 +1,6 @@
+export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession} from './global-snapshot-realm.js';
+import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
+import {dynamoItemFits} from './item-capacity.js';
 import {removeOwnedS3Version} from './owned-version-removal.js';
 import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
 import {cognitoUserBySubject} from './cognito-subject.js';
@@ -40,10 +43,10 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   const dynamo = new DynamoDBClient({ region: input.region }), s3 = new S3Client({ region: input.region }), sqs = new SQSClient({ region: input.region }); const jsonResponse = (statusCode: number, body: unknown): AwsFunctionUrlResult => ({ statusCode, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(body) });
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
-export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
+export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; globalSnapshotRealm?:GlobalSnapshotRealm; }
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
-  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void;
-  checkAbsent?: (table: string, key: Record<string, string>) => void;
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void|Promise<void>;
+  checkAbsent?: (table: string, key: Record<string, string>) => void|Promise<void>;
   snapshotRepository?<T>(table:string,repository:string):Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
   snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
   mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
@@ -57,10 +60,19 @@ const withoutUndefined = <T>(value: T): T => {
 };
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
+  failTransaction():void {this.dynamo.failTransaction?.();}
   readonly snapshot?:()=>Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {
-    if(dynamo.snapshotRepository&&supportsRepositorySnapshots(repository))this.snapshot=()=>dynamo.snapshotRepository!<T>(configuration.tableName,repository);
+    if(supportsRepositorySnapshots(repository)&&!dynamo.mutateRepository){
+      if(configuration.globalSnapshotRealm)requireGlobalSnapshotRealm(configuration.globalSnapshotRealm,dynamo,configuration.tableName);
+      this.dynamo=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}).client;
+    }
+    const actual=this.dynamo;
+    if(actual.snapshotRepository&&supportsRepositorySnapshots(repository))this.snapshot=()=>actual.snapshotRepository!<T>(configuration.tableName,repository);
   }
+  /** Fixed target-provider protocol; full repository envelope is measured. */
+  physicalRecordFits(record:T):boolean {return dynamoItemFits({pk:pk(this.repository,record.id),sk:'record',repository:this.repository,id:record.id,revision:record.revision,value:withoutUndefined(record)});}
+  originalJsonFits(value:Readonly<Record<string,unknown>>,managedByteLimit:number):boolean {if(!Number.isSafeInteger(managedByteLimit)||managedByteLimit<1)throw Error('An original managed row contract is required.');return Buffer.byteLength(JSON.stringify(value),'utf8')<=managedByteLimit;}
   private mutate<R>(operation:()=>Promise<R>):Promise<R>{
     return this.dynamo.mutateRepository&&supportsRepositorySnapshots(this.repository)?this.dynamo.mutateRepository(this.configuration.tableName,this.repository,operation):operation();
   }
@@ -78,17 +90,18 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
   async checkRevision(id: string, expectedRevision: number, options: { transaction: { id: string } }): Promise<void> {
     this.assertTransaction(options);
     if (!this.dynamo.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
-    this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
+    await this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
   }
   async checkAbsent(id: string, options: { transaction: { id: string } }): Promise<void> {
     this.assertTransaction(options);
     if (!this.dynamo.checkAbsent) throw new Error('Repository does not support commit-time absence guards.');
-    this.dynamo.checkAbsent(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' });
+    await this.dynamo.checkAbsent(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' });
   }
   async create(record: Omit<T, 'revision' | 'createdAt' | 'updatedAt'>, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
     const timestamp = now(), value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T;
     this.guard(undefined, value);
+    if(!this.physicalRecordFits(value)){this.dynamo.failTransaction?.();throw new Error('The full physical repository record exceeds the Dynamo item budget.');}
     try {
       await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, value.id), sk: 'record', repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) },
@@ -111,6 +124,7 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
     if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); }
     const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T;
     this.guard(current, value);
+    if(!this.physicalRecordFits(value)){this.dynamo.failTransaction?.();throw new Error('The full physical repository record exceeds the Dynamo item budget.');}
     try {
       await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, id), sk: 'record', repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) },
@@ -127,7 +141,8 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
 export const createDynamoPublicationCommandRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): PublicationCommandRepositories & UbeeqRepositories => {
-  const { client: dynamo, transaction } = createTransactionalDynamo(base);
+  if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
+  const { client: dynamo, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
   return protectCreatorContentAuthority({ ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
     claims: cellRepository(dynamo, config, 'publicationClaims'), operations: cellRepository(dynamo, config, 'publicationOperations'),
     outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') });
@@ -147,7 +162,8 @@ const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['tran
   remotePublicationReferences: repository(dynamo, config, 'remotePublicationReferences')
 });
 export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
-  const { client, transaction } = createTransactionalDynamo(base);
+  if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
+  const { client, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
   return dynamoRepositories(client, transaction, config);
 };
 
@@ -683,7 +699,7 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
 export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; subjectIdMode?:'legacy_username'|'canonical_sub'; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
-  const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
+  const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
   const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});

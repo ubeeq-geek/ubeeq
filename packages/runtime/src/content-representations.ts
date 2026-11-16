@@ -34,6 +34,10 @@ export interface ContentRepresentationStore<W extends PreparationWork,A extends 
 export interface ContentRepresentationHost<W extends PreparationWork,A extends PreparationAsset,S extends PreparationSourceFile & {premium?:boolean},F extends ContentRepresentationFile,M> {
  isNativeDestination(destination:string):boolean;
  prepareImageRenditions(work:W):Promise<Array<{assetId:string;file:F}>>;
+ /** Full manifests need integrity/custody, not decoder materialization. A host
+  * with real streamed integrity may install this additive capability; generated
+  * previews still call readPublishingSource and obey their decoder ceiling. */
+ inspectPublishingSource?(asset:A):Promise<void>;
  readPublishingSource(asset:A):Promise<Buffer>;
  originalFile(asset:A):F;
  inspectOriginal(file:S):Promise<string>;
@@ -48,6 +52,7 @@ export interface ContentRepresentationHost<W extends PreparationWork,A extends P
 /** Every output is immutable and private until an exact Publication binding is accepted. */
 export class ContentRepresentations<W extends PreparationWork,A extends PreparationAsset,S extends PreparationSourceFile & {premium?:boolean},F extends ContentRepresentationFile,M,C extends {tenantId:string}> {
     constructor(readonly store: ContentRepresentationStore<W,A,S>, readonly config:C, private readonly host:ContentRepresentationHost<W,A,S,F,M>) {
+        if(host.inspectPublishingSource!==undefined&&typeof host.inspectPublishingSource!=='function')throw new ContentPreparationError('unsupported_operation','Streamed source inspection requires its actual host capability.',503);
         for (const key of ['isNativeDestination','prepareImageRenditions','readPublishingSource','originalFile','inspectOriginal','creatorWatermark','watermarkOverlay','writePrivate','readPrivate','file','canReadRepresentation'] as const)
             if(typeof host?.[key]!=='function')throw new ContentPreparationError('unsupported_operation','Content representations require their actual private media, policy and rendering host.',503);
     }
@@ -67,8 +72,10 @@ export class ContentRepresentations<W extends PreparationWork,A extends Preparat
             if (!protectedOutput && typeof asset.metadata?.sourceFileId === 'string' && (await this.store.getSourceFileById?.(asset.metadata.sourceFileId))?.premium)
                 throw new ContentPreparationError('access_unresolved', 'This component has premium source-file protection. Use its offering or an approved preview.');
             const image = selected.find(row => row.assetId === asset.assetId);
-            if (!image)
-                await this.host.readPublishingSource(asset);
+            if (!image) {
+                if(this.host.inspectPublishingSource)await this.host.inspectPublishingSource(asset);
+                else await this.host.readPublishingSource(asset);
+            }
             assets.push({ id: asset.assetId, sourceAssetId: asset.assetId, sourceFileId: typeof asset.metadata?.sourceFileId === 'string' ? asset.metadata.sourceFileId : undefined, sourceChecksum: asset.checksumSha256!, kind: asset.kind, role: asset.attachment.role, caption: asset.attachment.caption, altText: asset.attachment.altText, recipe: { kind: 'independent' as const, regenerable: false as const }, file: image?.file ?? this.host.originalFile(asset) });
         }
         // Rich body assets must be among the approved components, never implicit references to private originals.

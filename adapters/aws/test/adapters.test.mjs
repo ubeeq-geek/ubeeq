@@ -41,6 +41,26 @@ class MemoryDynamo {
   values = new Map();
   async send(command) {
     const input = command.input;
+    if (command.constructor.name === 'TransactWriteCommand') {
+      const staged=new MemoryDynamo();staged.values=structuredClone(this.values);
+      const reasons=input.TransactItems.map(()=>({Code:'None'}));
+      for(let index=0;index<input.TransactItems.length;index++){
+        const entry=input.TransactItems[index];
+        try{
+          if(entry.ConditionCheck){
+            const check=entry.ConditionCheck,current=this.values.get(`${check.Key.pk}|${check.Key.sk}`);
+            const condition=check.ConditionExpression;
+            const accepted=condition==='attribute_not_exists(pk)'?!current:condition==='#version = :version'?current?.version===check.ExpressionAttributeValues[':version']:condition==='attribute_exists(pk) AND #revision = :revision'?current?.revision===check.ExpressionAttributeValues[':revision']:undefined;
+            assert.notEqual(accepted,undefined,'The contract fixture must understand the actual condition');
+            if(!accepted)throw Object.assign(Error('conditional conflict'),{name:'ConditionalCheckFailedException'});
+          }else await staged.send({constructor:{name:entry.Put?'PutCommand':'DeleteCommand'},input:entry.Put??entry.Delete});
+        }catch(error){
+          if(error.name!=='ConditionalCheckFailedException')throw error;
+          reasons[index]={Code:'ConditionalCheckFailed'};throw Object.assign(Error('atomic conditional conflict'),{name:'TransactionCanceledException',CancellationReasons:reasons});
+        }
+      }
+      this.values=staged.values;return {};
+    }
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
     if (command.constructor.name === "QueryCommand") {
       const partition = input.ExpressionAttributeValues[":pk"];
@@ -54,6 +74,7 @@ class MemoryDynamo {
       const key = `${input.Item.pk}|${input.Item.sk}`;
       const current = this.values.get(key);
       if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression === '#version = :version' && current?.version !== input.ExpressionAttributeValues[':version']) throw Object.assign(Error('snapshot conflict'),{name:'ConditionalCheckFailedException'});
       if (input.ConditionExpression?.includes("#revision") && (!current || current.revision !== input.ExpressionAttributeValues[":revision"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       if (input.ConditionExpression?.includes('#expiry') && (!current || current.value.state !== input.ExpressionAttributeValues[':leased'] || current.value.correlationId !== input.ExpressionAttributeValues[':owner'] || !(current.value.leaseExpiresAt > input.ExpressionAttributeValues[':now']))) throw Object.assign(new Error('lease conflict'), { name: 'ConditionalCheckFailedException' });
       if (input.ConditionExpression?.includes('#due') && (!current || current.value.cellId !== input.ExpressionAttributeValues[':cell'] || current.value.state !== input.ExpressionAttributeValues[':state'] || !(current.value[input.ExpressionAttributeNames['#due']] <= input.ExpressionAttributeValues[':now']))) throw Object.assign(new Error('claim conflict'), { name: 'ConditionalCheckFailedException' });

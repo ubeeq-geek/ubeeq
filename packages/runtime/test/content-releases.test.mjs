@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {installSqliteRetainedContentAtomic} from '@ubeeq/adapter-local';
 import {publicationIdentityHash} from '@ubeeq/persistence';
-import {defaultContentPreparation} from '@ubeeq/core';
+import {announcementDestinationKey,contentAnnouncementTrigger,defaultContentPreparation} from '@ubeeq/core';
 import {ContentReleaseService} from '../dist/content-releases.js';
 import {ContentWorkflowService} from '../dist/content-preparations.js';
 import {createContentPreparationWorker} from '../dist/content-worker.js';
@@ -143,4 +143,46 @@ test('cold-start recovery denial cannot starve a separately authorized due relea
  assert.equal((await f.store.publicationAtomic.get(kind(creatorId),blocked.id)).state,'accepted');
  assert.equal((await f.store.listPublicationsByWork(tenant,'work')).length,1);
  await assert.rejects(worker.runNextJob('next-poll'),/access denied/i);
+});
+
+
+// Neutral host PROTOCOL tests. SQLite is the actual durable accepting authority;
+// materialization/admission/visibility are explicit host-boundary unit commands.
+// These tests claim no Native, physical-public-media or external-provider acceptance.
+async function activationFixture(t){
+ const f=await fixture(t),binding={provider:'unit-community',accountId:'account',connectionId:'connection',targetId:'channel',postType:'message'},destination={communityDestinationId:'channel',destinationKey:announcementDestinationKey(binding),displayName:'Unit channel',available:true,binding},settings={...f.draft.settings,announce:{...f.draft.settings.announce,mode:'after_publication',destinationIds:['channel']}};
+ const trigger=contentAnnouncementTrigger(settings.announce,[{binding,settings:{destinationId:'channel'}}],'native'),release={...f.release,announcementActivationProtocol:1,announcementTrigger:trigger};
+ await f.store.publicationAtomic.run(async()=>{await f.store.publicationAtomic.put(kind(creatorId),f.draft.id,{...f.draft,settings});await f.store.publicationAtomic.put(kind(creatorId,'release'),release.id,release);await f.store.publicationAtomic.put('unit-policy','current',{enabled:true,revision:1});});
+ const control={failOwnership:false,failMaterialized:false,failAdmission:false,loseActivationReply:false,failFinalGuard:false,activationCalls:0},reads=[];
+ const compose=store=>{const current=f.make(store),atomic=store.publicationAtomic;
+  store.getCollectionOrganization=async()=>({revision:0,publications:[]});store.getAnnouncementOrchestration=async()=>null;
+  store.commitAnnouncementOrchestration=async commit=>{assert.ok(atomic.active());await atomic.put('unit-original-plan',commit.id,commit);if(control.failOwnership)throw Error('Real ownership transaction rejected');return true;};
+  current.host.announcementDestinations=async()=>[destination];current.host.nativeWorkAnnouncementBinding=()=>binding;current.host.collection=value=>value;current.host.announcementPlans=()=>({scope:()=>({tenantId:tenant,creatorId}),prepareRelease:async input=>({id:'original-plan',originalInput:input})});
+  current.host.prepareAnnouncementMediaAcceptance=async files=>{assert.equal(atomic.active(),false);const fingerprint=publicationIdentityHash(files);return{async enlist(){assert.ok(atomic.active());reads.push(fingerprint);}};};
+  current.host.announcementActivation={stageOwnership(commit,input){return{commit:{...commit,releaseIdentity:input},ownership:{schemaVersion:1,fingerprint:publicationIdentityHash([commit,input]),references:[{kind:'plan',id:commit.id,revision:1,fingerprint:publicationIdentityHash(commit)}]}};},async prepare(input){
+   assert.equal(atomic.active(),false);const plan=await atomic.get('unit-original-plan','original-plan');assert.ok(plan);assert.equal(plan.releaseIdentity.releaseId,input.releaseId);
+   await atomic.run(async()=>{const old=await atomic.get('unit-authoring','canonical-announcement');if(!old)await atomic.put('unit-authoring','canonical-announcement',{id:'canonical-announcement',originalPlanId:plan.id,body:work.body,ownedMedia:input.files,revision:1});});
+   const author=await atomic.get('unit-authoring','canonical-announcement');if(control.failMaterialized)throw Error('Interruption after actual durable materialization');if(control.failAdmission)throw Error('Current exact resource admission denied');
+   const resource={kind:'announcement',id:author.id,revision:String(author.revision),contentFingerprint:publicationIdentityHash(author),destination:'unit-community'};
+   return{resources:[resource],activeMediaKeys:[],deferredMediaKeys:input.files.map(file=>file.mediaKey),async enlist(){assert.ok(atomic.active());assert.deepEqual(await atomic.get('unit-authoring',author.id),author);assert.equal((await atomic.get('unit-policy','current')).enabled,true);assert.ok((await store.listCreatorMembers(creatorId)).some(member=>member.userId===actorId));if(control.failFinalGuard&&await atomic.get('unit-visibility',author.id))throw Error('Late exact accepting guard failed');},async activate(){assert.equal(atomic.active(),false);control.activationCalls++;await atomic.run(async()=>{const old=await atomic.get('unit-visibility',author.id);if(old)assert.equal(old.fingerprint,resource.contentFingerprint);else await atomic.put('unit-visibility',author.id,{id:author.id,fingerprint:resource.contentFingerprint});});if(control.loseActivationReply)throw Error('Lost unit visibility acceptance reply');}};
+  }};
+  return{...current,service:new ContentReleaseService(current.workflows,async()=>true,current.host,current.representations,{async tick(){const stored=await atomic.get(kind(creatorId,'release'),release.id);assert.equal(stored.state,'completed');assert.equal(stored.announcementActivation.phase,'media_activated');await atomic.run(async()=>{if(!await atomic.get('unit-dispatch',stored.id))await atomic.put('unit-dispatch',stored.id,{resourceId:'canonical-announcement'});});}})};
+ };
+ return{...f,release,control,compose,reads};
+}
+
+test('strong ordering rolls ownership rejection back before materialization or visibility',async t=>{
+ const f=await activationFixture(t);f.control.failOwnership=true;await f.compose(f.store).service.run(creatorId,'release');const reopened=f.attach(),release=await reopened.publicationAtomic.get(kind(creatorId,'release'),'release');assert.equal(release.state,'needs_review');assert.equal(release.announcementActivation,undefined);assert.equal(await reopened.publicationAtomic.get('unit-original-plan','original-plan'),undefined);assert.equal(await reopened.publicationAtomic.get('unit-authoring','canonical-announcement'),undefined);assert.equal(await reopened.publicationAtomic.get('unit-visibility','canonical-announcement'),undefined);assert.equal(f.control.activationCalls,0);f.control.failOwnership=false;await f.compose(reopened).service.resumeAnnouncementActivation(creatorId,'release');assert.equal((await reopened.publicationAtomic.get(kind(creatorId,'release'),'release')).state,'completed');
+});
+
+test('restart after materialization or denied admission keeps the original canonical resource private and resumes its exact identity',async t=>{
+ for(const failure of ['failMaterialized','failAdmission']){const f=await activationFixture(t);f.control[failure]=true;await f.compose(f.store).service.run(creatorId,'release');let reopened=f.attach(),release=await reopened.publicationAtomic.get(kind(creatorId,'release'),'release'),author=await reopened.publicationAtomic.get('unit-authoring','canonical-announcement');assert.equal(release.state,'needs_review');assert.equal(release.announcementActivation.phase,'ownership_accepted');assert.ok(author);assert.equal(await reopened.publicationAtomic.get('unit-visibility',author.id),undefined);assert.equal(f.control.activationCalls,0);f.control[failure]=false;await f.compose(reopened).service.resumeAnnouncementActivation(creatorId,'release');reopened=f.attach();assert.deepEqual(await reopened.publicationAtomic.get('unit-authoring',author.id),author);release=await reopened.publicationAtomic.get(kind(creatorId,'release'),'release');assert.equal(release.state,'completed');assert.equal(release.announcementActivation.resources[0].id,author.id);assert.equal((await reopened.publicationAtomic.get('unit-dispatch','release')).resourceId,author.id);}
+});
+
+test('lost visibility reply and final accepting failure recover the same phase and never dispatch before final guards',async t=>{
+ for(const failure of ['loseActivationReply','failFinalGuard']){const f=await activationFixture(t);f.control[failure]=true;await f.compose(f.store).service.run(creatorId,'release');let reopened=f.attach(),release=await reopened.publicationAtomic.get(kind(creatorId,'release'),'release'),author=await reopened.publicationAtomic.get('unit-authoring','canonical-announcement'),visibility=await reopened.publicationAtomic.get('unit-visibility',author.id);assert.equal(release.state,'needs_review');assert.equal(release.announcementActivation.phase,'admission_accepted');assert.ok(visibility);assert.equal(await reopened.publicationAtomic.get('unit-dispatch','release'),undefined);f.control[failure]=false;await f.compose(reopened).service.resumeAnnouncementActivation(creatorId,'release');reopened=f.attach();assert.deepEqual(await reopened.publicationAtomic.get('unit-authoring',author.id),author);assert.deepEqual(await reopened.publicationAtomic.get('unit-visibility',author.id),visibility);assert.equal((await reopened.publicationAtomic.get(kind(creatorId,'release'),'release')).state,'completed');assert.equal((await reopened.publicationAtomic.list('unit-dispatch')).length,1);}
+});
+
+test('an old accepted release cannot acquire fabricated ownership or activate media on read/retry',async t=>{
+ const f=await activationFixture(t);await f.store.publicationAtomic.run(async()=>{const old=await f.store.publicationAtomic.get(kind(creatorId,'release'),'release');delete old.announcementActivationProtocol;await f.store.publicationAtomic.put(kind(creatorId,'release'),'release',old);});await f.compose(f.store).service.run(creatorId,'release');const reopened=f.attach(),release=await reopened.publicationAtomic.get(kind(creatorId,'release'),'release');assert.equal(release.state,'needs_review');assert.equal(release.announcementActivation,undefined);assert.match(release.error,/migration/);assert.equal(f.control.activationCalls,0);assert.equal(await reopened.publicationAtomic.get('unit-authoring','canonical-announcement'),undefined);
 });

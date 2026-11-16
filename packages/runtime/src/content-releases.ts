@@ -3,7 +3,7 @@ import {contentAnnouncementTrigger,renderAnnouncementTemplate,defaultCollectionA
 import {publicationIdentityHash} from '@ubeeq/persistence';
 import {ContentPreparationError} from './content-preparations.js';
 import {contentPublicationBinding,type PreparedContentRepresentation} from './content-representations.js';
-import type {ContentReleaseModels,ContentReleaseWorkflow,ContentReleaseHost,ReleaseRepresentations,ReleaseAnnouncementBlock,ReleasePrivateAnnouncementMedia,ReleaseBaseline,ReleaseOffer,ReleaseValueReference} from './content-release-host.js';
+import type {ContentReleaseModels,ContentReleaseWorkflow,ContentReleaseHost,ReleaseRepresentations,ReleaseAnnouncementBlock,ReleasePrivateAnnouncementMedia,ReleaseBaseline,ReleaseOffer,ReleaseValueReference,ReleaseActivationOwnership,ReleaseActivationResource,PreparedReleaseActivation} from './content-release-host.js';
 export type * from './content-release-host.js';
 export interface PreparedRelease<M extends ContentReleaseModels> {
     id: string;
@@ -27,6 +27,8 @@ export interface PreparedRelease<M extends ContentReleaseModels> {
         follow_up: Record<string, ReleaseAnnouncementBlock[]>;
     };
     announcementMediaFiles?: ReleasePrivateAnnouncementMedia[];
+    announcementActivationProtocol?:1;
+    announcementActivation?:{schemaVersion:1;phase:'ownership_accepted'|'admission_accepted'|'media_activated';releaseFingerprint:string;ownership:ReleaseActivationOwnership;resources?:ReleaseActivationResource[];activeMediaKeys?:string[];deferredMediaKeys?:string[]};
     announcementMediaSources?: Record<string, string>;
     scheduledAt?: string;
     createdAt: string;
@@ -53,6 +55,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
     constructor(readonly workflows: ContentReleaseWorkflow<M>, readonly allowed: (work: M['work']) => Promise<boolean>, private readonly host:ContentReleaseHost<M>, representations:ReleaseRepresentations<M>, readonly runtime?:{tick():Promise<unknown>}) {
         const required=['isNativeDestination','nativeWorkDestination','nativeCollectionDestination','nativeWorkAnnouncementBinding','nativeCollectionAnnouncementBinding','collection','announcement','contentPublishing','resolvedContentOffer','validateNativeCollectionOffer','communityActorAllowed','announcementRules','announcementDestinations','announcementKnownLinks','parseAnnouncement','validateAnnouncement','announcementDocumentForDestination','stageAnnouncementMedia','pinCollectionAnnouncementMedia','activateAnnouncementMedia','readStagedAnnouncementMedia','readAnnouncementFile','readAnnouncementImage','evaluatePublicationPolicy','nativeWorkPublication','resolvedCollectionMembers','evaluateNativeCollectionPublication','announcementPlans','captureCollectionReleaseRequirements','readOrchestrationValue'] as const;
         if(required.some(key=>typeof host?.[key]!=='function')||typeof allowed!=='function'||!representations||['full','previews','read'].some(key=>typeof representations[key as keyof ReleaseRepresentations<M>]!=='function'))throw new ContentPreparationError('unsupported_operation','Content release requires its actual authenticated publishing, announcement and private media host.',503);
+        if(host.announcementActivation&&(typeof host.announcementActivation.stageOwnership!=='function'||typeof host.announcementActivation.prepare!=='function'||typeof host.prepareAnnouncementMediaAcceptance!=='function'))throw new ContentPreparationError('unsupported_operation','Strong announcement ordering requires actual pre-captured immutable media acceptance.',503);
         this.representations=representations;
     }
     private atomic() {
@@ -177,6 +180,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
                 outputs.push(binding.manifest);
         }
         const announcementPreviews = await this.stageDraftAnnouncement(draft, outputs, release);
+        if(this.host.announcementActivation)release.announcementActivationProtocol=1;
         release.announcementTrigger = contentAnnouncementTrigger({ ...draft.settings.announce, mode: 'draft' }, (await this.host.announcementDestinations(creatorId)).filter(option => option.available).map(option => ({ binding: option.binding, settings: { destinationId: option.communityDestinationId } })), 'native');
         if (Buffer.byteLength(JSON.stringify(release)) > 300000)
             throw new ContentPreparationError('preparation_too_large', 'Reduce the selected announcement media before reviewing.');
@@ -331,6 +335,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         const prepared = await this.workflows.review(creatorId, id, expectedRevision, action);
         const release: PreparedRelease<M> = { id: prepared.review.id, draftId: id, creatorId, actorId: actorId ?? draft.actorId, revision: draft.revision, reviewId: prepared.review.id, fingerprint: prepared.review.fingerprint, state: 'prepared', creatorFingerprint: publicationIdentityHash(await this.store.getCreatorById(creatorId)), blockRulesRevision: (await this.host.announcementRules()).revision, scheduledAt: draft.settings.releaseTime?.instant, createdAt: new Date().toISOString(), outputs, fullOutputs, publicationFingerprints, previousExposure: (await Promise.all(outputs.map(async (output) => (await this.store.listPublicationsByWork(this.config.tenantId, output.subject.id)).filter(p => this.host.isNativeDestination(p.destination) && p.status === 'live' && ['public', 'unlisted'].includes(p.visibility)).map(p => ({ workId: output.subject.id, revision: String(p.sync.localRevision ?? 'unknown'), publicationId: p.publicationId }))))).flat(), completed: [] };
         release.hierarchyFingerprint = hierarchyFingerprint;
+        if(this.host.announcementActivation)release.announcementActivationProtocol=1;
         release.connected = await this.host.contentPublishing()?.prepare(draft, outputs, fullOutputs, previews.outputs, release.actorId) ?? [];
         if (draft.settings.announce.mode !== 'off' && draft.settings.announce.destinationIds.length) {
             const plans = this.host.announcementPlans(), organization = await this.store.getCollectionOrganization(this.config.tenantId, creatorId);
@@ -410,6 +415,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         if (pending?.state === 'prepared' && pending.connected?.length)
             await this.host.contentPublishing()!.validate(pending.connected, pending.actorId);
         const atomic = this.atomic();
+        const mediaAcceptance=pending?.state==='prepared'?await this.prepareAnnouncementMediaAcceptance(pending):undefined;
         const release = await atomic.run(async () => {
             const digest = publicationIdentityHash([id, expectedRevision, reviewId, fingerprint]), previousReceipt = await atomic.get(this.workflows.kind(creatorId, 'release-receipt'), operationId);
             if (previousReceipt && previousReceipt.digest !== digest)
@@ -431,7 +437,10 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
                 if (publicationIdentityHash((await this.store.listPublicationsByWork(this.config.tenantId, workId)).filter(p => this.host.isNativeDestination(p.destination))) !== fingerprint)
                     throw new ContentPreparationError('review_stale', 'A selected Publication changed after review.');
             await this.checkOffer(creatorId, stored);
-            await this.checkPreparedAnnouncementMedia(creatorId, stored);
+            if(!pending||publicationIdentityHash(pending.announcementMediaFiles??[])!==publicationIdentityHash(stored.announcementMediaFiles??[]))
+                throw new ContentPreparationError('review_stale','The exact prepared media changed during acceptance.');
+            await this.checkPreparedAnnouncementMedia(creatorId, stored, false);
+            await mediaAcceptance?.enlist();
             await this.checkAnnouncementBindings(creatorId, stored);
             for (const ref of draft.units)
                 await this.workflows.target(creatorId, ref);
@@ -474,7 +483,13 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             throw new ContentPreparationError('not_found', 'The reviewed image is unavailable.', 404);
         return this.representations.read(manifest, componentId);
     }
-    private async checkPreparedAnnouncementMedia(creatorId: string, release: PreparedRelease<M>) {
+    private async prepareAnnouncementMediaAcceptance(release:PreparedRelease<M>){
+        if(this.atomic().active())throw new ContentPreparationError('unsupported_operation','Capture immutable media validation before entering acceptance.',503);
+        if(this.host.prepareAnnouncementMediaAcceptance){const prepared=await this.host.prepareAnnouncementMediaAcceptance(release.announcementMediaFiles??[]);if(typeof prepared?.enlist!=='function')throw new ContentPreparationError('unsupported_operation','Actual media acceptance guards are required.',503);return prepared;}
+        for(const file of release.announcementMediaFiles??[])await this.host.readStagedAnnouncementMedia(file);
+        return undefined;
+    }
+    private async checkPreparedAnnouncementMedia(creatorId: string, release: PreparedRelease<M>, readPhysical=true) {
         for (const [id, fingerprint] of Object.entries(release.announcementMediaSources ?? {})) {
             const current = id.startsWith('work:') ? await this.store.getWork(this.config.tenantId, id.slice(5)) : id.startsWith('collection:') ? await this.store.getCreatorCollection(this.config.tenantId, id.slice(11)) : await this.store.getCanonicalAsset(this.config.tenantId, id);
             if (id.startsWith('work:') && (!current || !await this.allowed(current as M['work'])))
@@ -483,7 +498,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             if (publicationIdentityHash(value) !== fingerprint)
                 throw new ContentPreparationError('review_stale', 'Selected announcement media changed. Prepare a fresh review.');
         }
-        for (const file of release.announcementMediaFiles ?? [])
+        if(readPhysical)for (const file of release.announcementMediaFiles ?? [])
             await this.host.readStagedAnnouncementMedia(file);
     }
     async status(creatorId: string, id: string) {
@@ -491,7 +506,7 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
         const release = await this.atomic().get(this.key(creatorId), id) as PreparedRelease<M> | undefined;
         if (!release)
             throw new ContentPreparationError('not_found', 'Release not found.', 404);
-        return { id: release.id, state: release.state, completed: release.completed.length, total: release.outputs.length, scheduledAt: release.scheduledAt, error: release.error, announcementReleaseId: release.announcementReleaseId, draft: await this.workflows.get(creatorId, release.draftId) };
+        return { id: release.id, state: release.state, completed: release.completed.length, total: release.outputs.length, scheduledAt: release.scheduledAt, error: release.error, announcementReleaseId: release.announcementReleaseId, announcementActivation:release.announcementActivation?{phase:release.announcementActivation.phase,resources:release.announcementActivation.resources}:undefined, draft: await this.workflows.get(creatorId, release.draftId) };
     }
     async cancel(creatorId: string, id: string, expectedRevision: number) {
         const atomic = this.atomic();
@@ -713,6 +728,10 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             announcementCommit = await plans.prepareRelease({ creatorId, actorId: release.actorId, collection: releasedCollection ?? descriptor, previousCollection: releasedCollection ?? descriptor, organization, previousOrganization: organization, operationKey: id, exactRequirements: requirements, memberWorkIds: draft.units.filter(u => u.kind === 'work').map(u => u.id), preparedMedia: release.announcementMedia, ...(releasedCollection ? { subjectBaseline: release.collectionBaselines?.[releasedCollection.collectionId] } : { subject, subjectBaseline: { stored, value } }), workIds: subject.ids, overrides: { initial: trigger, additions: { ...trigger } } });
             release.announcementReleaseId = publicationIdentityHash([plans.scope(creatorId), releasedCollection?.collectionId ?? scopeId, id]);
         }
+        if(this.host.announcementActivation&&(announcementCommit||release.announcementActivation||release.announcementMediaFiles?.length)){
+            await this.finishAnnouncementActivation(creatorId,id,release,draft,announcementCommit);
+            await this.runtime?.tick();return;
+        }
         // Publish only the reviewed immutable announcement copies, after explicit release approval.
         if (release.announcementMediaFiles?.length) {
             await this.checkPreparedAnnouncementMedia(creatorId, release);
@@ -743,6 +762,54 @@ export class ContentReleaseService<M extends ContentReleaseModels> {
             await atomic.put(this.workflows.kind(creatorId), draft.id, draft);
         });
         await this.runtime?.tick();
+    }
+    async resumeAnnouncementActivation(creatorId:string,id:string){
+        const atomic=this.atomic();
+        await atomic.run(async()=>{const release=await atomic.get(this.key(creatorId),id) as PreparedRelease<M>|undefined;
+            if(!release||release.announcementActivationProtocol!==1||(release.announcementActivation?release.announcementActivation.releaseFingerprint!==release.fingerprint:Boolean(release.announcementReleaseId))||!['accepted','needs_review'].includes(release.state))throw new ContentPreparationError('announcement_reconciliation_required','This release needs its original activation-phase provenance.',409);
+            if(!await this.actorAllowed(creatorId,release))throw new ContentPreparationError('access_denied','Current release actor access is required.',403);
+            const draft=await this.workflows.get(creatorId,release.draftId);if(draft.state!=='accepted')throw new ContentPreparationError('review_stale','The original accepted preparation changed.');
+            await atomic.put(this.key(creatorId),id,{...release,state:'accepted',error:undefined});
+        });
+        await this.run(creatorId,id);return this.status(creatorId,id);
+    }
+    private async finishAnnouncementActivation(creatorId:string,id:string,initial:PreparedRelease<M>,draft:ContentWorkflowDraft,commit:M['orchestrationCommit']|undefined){
+        const port=this.host.announcementActivation!,atomic=this.atomic();
+        if(initial.announcementActivationProtocol!==1)throw new ContentPreparationError('announcement_reconciliation_required','This older accepted release requires its actual announcement activation migration.',409);
+        const assertCurrent=async()=>{const release=await atomic.get(this.key(creatorId),id) as PreparedRelease<M>|undefined,currentDraft=await this.workflows.get(creatorId,initial.draftId);
+            if(!release||release.state!=='accepted'||release.fingerprint!==initial.fingerprint||publicationIdentityHash(currentDraft)!==publicationIdentityHash(draft)||publicationIdentityHash(await this.store.getCreatorById(creatorId))!==initial.creatorFingerprint||initial.blockRulesRevision!==(await this.host.announcementRules()).revision||!await this.actorAllowed(creatorId,release))throw new ContentPreparationError('review_stale','The exact original release or current authority changed before announcement activation.');
+            await this.checkAnnouncementBindings(creatorId,release);await this.checkOffer(creatorId,release);return release;
+        };
+        if(!initial.announcementActivation){
+            if(!commit)throw new ContentPreparationError('announcement_reconciliation_required','Actual announcement plan ownership is required before public activation.',409);
+            const staged=port.stageOwnership(commit,{creatorId,releaseId:id,releaseFingerprint:initial.fingerprint}),ownership=staged.ownership;
+            if(ownership.schemaVersion!==1||!/^[a-f0-9]{64}$/.test(ownership.fingerprint)||!ownership.references.length||ownership.references.some(row=>!row.id||!row.kind||!Number.isSafeInteger(row.revision)||row.revision<1||!/^[a-f0-9]{64}$/.test(row.fingerprint)))throw new ContentPreparationError('unsupported_operation','The host must identify the actual complete accepted announcement ownership.',503);
+            await atomic.run(async()=>{const release=await assertCurrent();if(release.announcementActivation)return;
+                await atomic.put(this.key(creatorId),id,{...release,announcementReleaseId:initial.announcementReleaseId,announcementActivation:{schemaVersion:1,phase:'ownership_accepted',releaseFingerprint:initial.fingerprint,ownership}});
+                if(!await this.store.commitAnnouncementOrchestration(staged.commit))throw new ContentPreparationError('revision_conflict','Original announcement ownership changed.');
+            });
+        }
+        const prepare=async()=>{const release=await atomic.get(this.key(creatorId),id) as PreparedRelease<M>,phase=release.announcementActivation;
+            if(!phase||phase.schemaVersion!==1||phase.releaseFingerprint!==initial.fingerprint)throw new ContentPreparationError('announcement_reconciliation_required','The actual accepted activation phase is missing.',409);
+            const prepared=await port.prepare({creatorId,releaseId:id,draftId:release.draftId,releaseFingerprint:release.fingerprint,announcementReleaseId:release.announcementReleaseId,files:release.announcementMediaFiles??[],ownership:phase.ownership});
+            const keys=(release.announcementMediaFiles??[]).map(file=>file.mediaKey),active=prepared.activeMediaKeys,deferred=prepared.deferredMediaKeys,all=[...active,...deferred];
+            if(typeof prepared.enlist!=='function'||typeof prepared.activate!=='function'||!Array.isArray(prepared.resources)||(active.length>0&&!prepared.resources.length)||prepared.resources.some(resource=>!['announcement','collection'].includes(resource.kind)||!resource.id||!resource.revision||!/^[a-f0-9]{64}$/.test(resource.contentFingerprint)||!resource.destination)||new Set(keys).size!==keys.length||new Set(all).size!==all.length||all.length!==keys.length||all.some(key=>!keys.includes(key)))throw new ContentPreparationError('unsupported_operation','Actual materialized resources and every owned active/deferred media key are required.',503);
+            if(phase.resources&&publicationIdentityHash([phase.resources,phase.activeMediaKeys,phase.deferredMediaKeys])!==publicationIdentityHash([prepared.resources,active,deferred]))throw new ContentPreparationError('review_stale','The materialized announcement resource or exact selected media changed.');return prepared;
+        };
+        let prepared=await prepare();
+        await atomic.run(async()=>{const release=await assertCurrent(),phase=release.announcementActivation!;await prepared.enlist();
+            if(!phase.resources)await atomic.put(this.key(creatorId),id,{...release,announcementActivation:{...phase,phase:'admission_accepted',resources:structuredClone(prepared.resources),activeMediaKeys:[...prepared.activeMediaKeys],deferredMediaKeys:[...prepared.deferredMediaKeys]}});
+        });
+        // Actual alias visibility is accepted under its own same-resource/current
+        // admission CAS. A lost reply is recovered by that original media journal.
+        await prepared.activate();
+        // Visibility acceptance changes actual repository revisions. Capture fresh
+        // guards again; the immutable resource/media identities must remain EXACT.
+        prepared=await prepare();
+        await atomic.run(async()=>{const release=await assertCurrent(),phase=release.announcementActivation!;await prepared.enlist();
+            const now=new Date().toISOString();await atomic.put(this.key(creatorId),id,{...release,announcementActivation:{...phase,phase:'media_activated'},state:'completed',completedAt:now,error:undefined});
+            await atomic.put(this.workflows.kind(creatorId),draft.id,{...draft,state:'completed',review:undefined,updatedAt:now});
+        });
     }
     /** One due release or pending cancellation per worker poll. Discovery is
      * read-only; run/cancel retain the existing durable claims and live guards. */

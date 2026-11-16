@@ -171,6 +171,12 @@ export class LocalSqliteDatabase {
 }
 
 class SqliteRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
+  /** Local stores complete JSON in one SQLite TEXT row. It has no Dynamo item
+   * cap; do not add 300KiB/chunks to valid Native-sized 1MiB logical records.
+   * SQLite itself owns its physical engine limits and atomic rollback. */
+  failTransaction():void {this.local.failTransaction();}
+  physicalRecordFits(record:T):boolean {return typeof JSON.stringify(record)==='string';}
+  originalJsonFits(value:Readonly<Record<string,unknown>>,_managedByteLimit:number):boolean {return typeof JSON.stringify(value)==='string';}
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
   private guard(previous:T|undefined,next:T|undefined){
     try {

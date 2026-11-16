@@ -114,7 +114,10 @@ test('missing raw inventory rows cause reconciliation instead of silently deleti
 
 test('a corrupt ownerless Work is rejected instead of disappearing from Creator inventory',async t=>{
  const f=await fixture(t),store=f.store();await store.asActor('actor',()=>store.createWork(work()));
- const row=(await f.repositories.hostRecords.snapshot()).items.find(row=>row.value.kind==='works'),value=structuredClone(row.value);delete value.payload.creatorId;
+ const row=(await f.repositories.hostRecords.snapshot()).items.find(row=>row.value.kind==='works');
+ // Exercise the still-supported original schema1 owner predicate. New inline
+ // corruption/checksum controls live in retained-physical-records.test.mjs.
+ const value={schemaVersion:1,category:row.value.category,kind:row.value.kind,key:row.value.key,payload:JSON.parse(row.value.json)};delete value.payload.creatorId;
  await f.repositories.hostRecords.update(row.id,row.revision,{value});
  await assert.rejects(store.listWorksByCreator('tenant','creator'),{code:'retained_content_invalid'});
 });
