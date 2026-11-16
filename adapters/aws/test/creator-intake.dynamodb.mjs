@@ -6,6 +6,7 @@ import { DynamoDBDocumentClient, ScanCommand, TransactWriteCommand } from '@aws-
 import { createDynamoRepositories } from '@ubeeq/adapter-aws';
 import { createIntakeCreator, persistIntakeCreator } from '../../../packages/runtime/dist/creator-intake.js';
 import { createRetainedRepositoryCreator } from '../../../packages/runtime/dist/retained-repository-store.js';
+import {finalizeRetainedCreatorRemoval} from '@ubeeq/persistence';
 
 const endpoint=process.env.TEST_DYNAMODB_ENDPOINT;
 if(!endpoint||!/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(endpoint))throw Error('An explicit loopback DynamoDB test endpoint is required.');
@@ -93,4 +94,28 @@ test('actual Dynamo existing Creator without an intake receipt never bootstraps 
   writes++;await f.repositories.hostRecords.create(birthHostRecord(f,id,'rich-profile',{invented:true}),{transaction:input.transaction});return existing;
  }),{code:'creator_intake_requires_reconciliation'});
  assert.equal(writes,0);assert.deepEqual(await f.repositories.creators.get(id),existing);assert.deepEqual(await f.rows(),before);
+});
+
+test('actual Dynamo finalization binds the host inventory and atomically retains the full original Creator archive',async t=>{
+ const f=await fixture(t),r=f.repositories;
+ const creator=await createIntakeCreator(r,f.input,(transaction,id)=>persistIntakeCreator(r,birthRecord(f,id),f.input.actorId,transaction,input=>createRetainedRepositoryCreator(r,input.record,'tenant',input.transaction)));
+ await assert.rejects(r.creators.remove(creator.id,creator.revision),{code:'creator_content_authority_conflict'});
+ const stale=await r.hostRecords.snapshot();
+ await f.independent.hostRecords.create(birthHostRecord(f,creator.id,'actual-later-domain-record',{creatorId:creator.id}));
+ const archive=birthHostRecord(f,creator.id,'actual-removal-archive',{creator});
+ await assert.rejects(finalizeRetainedCreatorRemoval(r,{expected:creator,authorize:async(_actual,transaction)=>{await stale.bind(transaction);await r.hostRecords.create(archive,{transaction});}}));
+ assert.deepEqual(await r.creators.get(creator.id),creator);assert.equal(await r.hostRecords.get(archive.id),undefined);
+ const current=await r.hostRecords.snapshot();
+ await finalizeRetainedCreatorRemoval(r,{expected:creator,authorize:async(actual,transaction)=>{assert.equal(Object.isFrozen(actual),true);assert.notEqual(actual,creator);assert.deepEqual(actual,creator);await current.bind(transaction);await r.hostRecords.create(archive,{transaction});}});
+ assert.equal(await r.creators.get(creator.id),undefined);assert.deepEqual((await r.hostRecords.get(archive.id)).value.creator,creator);
+});
+
+test('actual Dynamo caught removal on an independent coordinator poisons the accepting finalization and preserves its archive boundary',async t=>{
+ const f=await fixture(t),r=f.repositories;
+ const creator=await createIntakeCreator(r,f.input,(transaction,id)=>persistIntakeCreator(r,birthRecord(f,id),f.input.actorId,transaction,input=>createRetainedRepositoryCreator(r,input.record,'tenant',input.transaction)));
+ const remove=r.creators.remove.bind(r.creators);let rejected=false;
+ r.creators.remove=async(...args)=>{try{await f.independent.creators.remove(creator.id,creator.revision);}catch(error){assert.equal(error.code,'creator_content_authority_conflict');rejected=true;}return remove(...args);};
+ const archive=birthHostRecord(f,creator.id,'rejected-removal-archive',{creator});
+ await assert.rejects(finalizeRetainedCreatorRemoval(r,{expected:creator,authorize:async(_actual,transaction)=>{await r.hostRecords.create(archive,{transaction});}}));
+ assert.equal(rejected,true);assert.deepEqual(await r.creators.get(creator.id),creator);assert.equal(await r.hostRecords.get(archive.id),undefined);
 });

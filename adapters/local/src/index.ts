@@ -2,7 +2,7 @@ import {removeOwnedLocalVersion} from './owned-version-removal.js';
 import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
 import {LocalCustomerIdentities} from './customer-identities.js';
 import {LocalUploadStreamCustody} from './upload-stream-custody.js';
-import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError} from '@ubeeq/persistence';
+import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError,registerCreatorContentFinalizationRepository} from '@ubeeq/persistence';
 export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
 export { SqliteCommerceStore } from './commerce.js';
@@ -99,6 +99,10 @@ export class LocalSqliteDatabase {
     const context = this.transactionContext.getStore();
     if (!context?.active || context !== this.owner || context.id !== transaction.id) throw new Error('Transaction handle is not active on this repository context.');
   }
+  currentTransactionId():string|undefined {
+    const context=this.transactionContext.getStore();
+    return context?.active&&context===this.owner?context.id:undefined;
+  }
   failTransaction(): void {
     const context = this.transactionContext.getStore();
     if (context?.active) context.rollbackOnly = true;
@@ -180,7 +184,7 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
   private guard(previous:T|undefined,next:T|undefined){
     try {
-      if(this.repository==='creators')assertCreatorContentAuthorityChange(previous as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,next as unknown as import('@ubeeq/persistence').CreatorRecord|undefined);
+      if(this.repository==='creators')assertCreatorContentAuthorityChange(previous as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,next as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,{coordinator:this.local,transactionId:this.local.currentTransactionId()});
       if((compactCreatorContentRepositories as readonly string[]).includes(this.repository)){
         const read=(repository:string,id:string)=>{const row=this.local.database.prepare('SELECT payload FROM ubeeq_records WHERE repository = ? AND id = ?').get(repository,id) as {payload:string}|undefined;return row?JSON.parse(row.payload):undefined;};
         for(const value of [previous,next] as Array<Record<string,any>|undefined>){
@@ -320,7 +324,7 @@ export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqReposi
   transaction: local.transaction.bind(local),
   readScope:operation=>local.transaction(transaction=>operation(transaction)),
   hostRecords: cellRepository(local, "hostRecords"),
-  creators: cellRepository(local, "creators"), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
+  creators: registerCreatorContentFinalizationRepository(cellRepository(local, "creators"),local), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
   publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
   moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
   usageEvents: cellRepository(local, "usageEvents"), creditLots: cellRepository(local, "creditLots"), creditReservations: cellRepository(local, "creditReservations"), balances: cellRepository(local, "balances"),
