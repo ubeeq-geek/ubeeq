@@ -240,7 +240,12 @@ export interface StorageReservationClosure {
   observedAt: string;
 }
 
+/** Eligibility only. This never reserves bytes/credits, returns an execution
+ * receipt, initializes a balance/counter or replaces current source/role holds. */
+export interface UsageQuotaPolicyInput { creatorId:string; operation:string }
+
 export interface UsageQuotaPort {
+  checkCurrentPolicy?(input:UsageQuotaPolicyInput):Promise<UsageQuotaReservationResult>;
   checkAndReserveQuota(input: UsageQuotaReservationInput): Promise<UsageQuotaReservationResult>;
   /** Recheck current execution eligibility separately from an idempotent reservation receipt.
    * Recovery must still settle old reservations when new execution is no longer allowed. */
@@ -356,6 +361,7 @@ export const createPassThroughWatermarkPort = (options?: {
 });
 
 export const createUnmeteredUsageQuotaPort = (): UsageQuotaPort => ({
+  async checkCurrentPolicy() { return {allowed:true}; },
   async checkAndReserveQuota() {
     return { allowed: true };
   },
