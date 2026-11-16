@@ -240,6 +240,23 @@ export interface StorageReservationClosure {
   observedAt: string;
 }
 
+/** Trusted same-original-journal proof that its provider/computation/storage
+ * effect was NEVER invoked. This atomically fences a late same-key reserve and
+ * releases only its actual matching owned reservation, if any. It is neither a
+ * RESERVED receipt nor a measured zero-usage settlement. The host must retain
+ * the durable original intent and privately prove invocation was not issued;
+ * unknown already-issued effects must retain their original reservation. */
+export interface UnissuedReservationClosure {
+  creatorId:string;
+  operation:string;
+  idempotencyKey:string;
+  processingCreditsDelta:number;
+  storageBytesDelta:number;
+  deliveryBytesDelta:number;
+  proofId:string;
+  observedAt:string;
+}
+
 /** Eligibility only. This never reserves bytes/credits, returns an execution
  * receipt, initializes a balance/counter or replaces current source/role holds. */
 export interface UsageQuotaPolicyInput { creatorId:string; operation:string }
@@ -252,6 +269,7 @@ export interface UsageQuotaPort {
   checkCurrentAdmission?(input: Pick<UsageSettlementInput, 'creatorId' | 'operation' | 'idempotencyKey'>): Promise<UsageQuotaReservationResult>;
   recordUsageSettlement(input: UsageSettlementInput): Promise<void>;
   closeStorageReservation?(input: StorageReservationClosure): Promise<void>;
+  closeUnissuedReservation?(input:UnissuedReservationClosure):Promise<void>;
 }
 
 export type ConnectorCredentialSource = "operator_env" | "creator_secret" | "platform_managed";
@@ -367,6 +385,10 @@ export const createUnmeteredUsageQuotaPort = (): UsageQuotaPort => ({
   },
   async recordUsageSettlement() {
     // Self-hosted open-core instances do not meter SaaS platform plans or credits.
+  },
+  async closeUnissuedReservation() {
+    // Actual unmetered hosts retain no SaaS financial receipt; their original
+    // execution journal still owns and retains the authentic no-invocation proof.
   },
   async closeStorageReservation() {
     // The upload journal still retains its physical closure proof on unmetered hosts.
