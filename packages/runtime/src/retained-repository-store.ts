@@ -47,7 +47,7 @@ type Field=keyof typeof fields;
 type Value=Record<string,any>;
 type Address={category:'canonical'|'command'|'entity';kind:string;key:string};
 type Stored={address:Address;row:HostRecord;payload:Value;chunks:HostRecord[]};
-type State={transaction:PersistenceTransaction;phase:'open'|'closing'|'closed';rollbackOnly:boolean;pending:number;creator:CreatorRecord;cohort:HostRecord;before:Map<string,Stored>;fields:Map<Field,Value[]>;extra:Map<string,{address:Address;payload:Value}>;actor?:string};
+type State={transaction:PersistenceTransaction;phase:'open'|'closing'|'closed';rollbackOnly:boolean;pending:number;readOnlyDepth?:number;creator:CreatorRecord;cohort:HostRecord;before:Map<string,Stored>;fields:Map<Field,Value[]>;extra:Map<string,{address:Address;payload:Value}>;actor?:string};
 const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const identity=(scope:RetainedRepositoryScope,address:Address|'cohort')=>'retained-'+hash([scope.instanceId,scope.tenantId,scope.creatorId,address]);
 const addressKey=(address:Address)=>JSON.stringify([address.category,address.kind,address.key]);
@@ -120,7 +120,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   for(const field of Object.keys(fields) as Field[])Object.defineProperty(this,field,{configurable:true,enumerable:false,get:()=>this.active().fields.get(field)!,set:(value:Value[])=>{if(!Array.isArray(value))throw invalid();this.active().fields.set(field,value);}});
   const methods=new Map<string,Function>();
   for(const prototype of [MemoryCreatorContentStore.prototype,RepositoryRetainedContentStore.prototype])for(const name of Object.getOwnPropertyNames(prototype)){
-   if(name==='constructor'||name==='validatePublication'||name==='run'||name==='flush'||name==='authorizeActor'||name==='asActor')continue;
+   if(name==='constructor'||name==='validatePublication'||name==='run'||name==='readCurrent'||name==='flush'||name==='authorizeActor'||name==='asActor')continue;
    const method=Object.getOwnPropertyDescriptor(prototype,name)?.value;
    if(typeof method==='function' && method.constructor.name==='AsyncFunction' && !name.startsWith('_'))methods.set(name,method);
   }
@@ -137,7 +137,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
  async authorizeActor(actorId:string,access:RetainedRepositoryAccess='edit'):Promise<boolean>{
   if(typeof actorId!=='string'||!actorId)return false;
   return this.run(async()=>{
-   const state=this.active();if(access!=='read'&&'deletion' in state.creator&&state.creator.deletion)return false;
+   const state=this.active();if(state.readOnlyDepth&&access!=='read')this.rejectReadOnlyMutation(state);if(access!=='read'&&'deletion' in state.creator&&state.creator.deletion)return false;
    const role=await this.bindings.resolveActorRole(actorId,structuredClone(state.creator),state.transaction);
    const allowed=(access==='read'?['owner','admin','manager','editor','viewer']:access==='manage'?['owner','admin','manager']:['owner','admin','manager','editor']).includes(role??'');
    if(allowed && access!=='read'){
@@ -148,6 +148,21 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   });
  }
  async asActor<T>(actorId:string,operation:()=>Promise<T>,access:RetainedRepositoryAccess='edit'):Promise<T>{return this.run(async()=>{if(!await this.authorizeActor(actorId,access))throw new RetainedRepositoryError('access_denied','Current Creator access is required.',403);return operation();});}
+ /** A public read over the actual guarded retained cohort. It preserves the
+  * original transaction and snapshot/Creator fences, but cannot commit a
+  * canonical, entity or command change, even when nested in an actor scope.
+  * A rejected/swallowed mutation poisons that same accepting transaction. */
+ async readCurrent<T>(operation:(transaction:PersistenceTransaction)=>Promise<T>):Promise<T>{
+  if(typeof operation!=='function')throw invalid();
+  return this.run(async transaction=>{
+   const state=this.active(),fingerprint=()=>publicationIdentityHash([...this.encode(state)].sort(([a],[b])=>a<b?-1:a>b?1:0).map(([key,value])=>({key,payload:value.payload}))),before=fingerprint();
+   state.readOnlyDepth=(state.readOnlyDepth??0)+1;
+   try{const result=await operation(transaction);if(fingerprint()!==before)this.rejectReadOnlyMutation(state);return result;}
+   catch(error){state.rollbackOnly=true;throw error;}
+   finally{state.readOnlyDepth=(state.readOnlyDepth??1)-1;}
+  });
+ }
+ private rejectReadOnlyMutation(state:State):never{state.rollbackOnly=true;throw new RetainedRepositoryError('access_denied','A read-only retained scope cannot mutate original content, commands or audit history.',403);}
  protected async run<T>(operation:(transaction:PersistenceTransaction)=>Promise<T>):Promise<T>{
   const inherited=this.context.getStore();
   if(inherited){
@@ -231,7 +246,7 @@ export class RepositoryRetainedContentStore<M extends RetainedCreatorContentMode
   return [...this.active().extra.values()].filter(entry=>entry.address.category==='entity'&&entry.address.kind===kind).map(entry=>({key:entry.address.key,value:structuredClone(entry.payload) as T}));
  }
  protected async appendRetainedAudit(event:RetainedAuditEvent,subjectId?:string):Promise<void>{
-  const state=this.active(),copy=json(event);
+  const state=this.active();if(state.readOnlyDepth)this.rejectReadOnlyMutation(state);const copy=json(event);
   if(typeof event.auditId!=='string'||!event.auditId||typeof event.action!=='string'||!event.action||!Number.isFinite(Date.parse(event.createdAt)))throw invalid();
   if((!state.actor||state.actor!==event.actorUserId)&&!this.mayAppendMaintenanceAudit(structuredClone(event)))throw new RetainedRepositoryError('access_denied','An actual actor or a scoped maintenance intent must own this audit.',403);
   await this.repositories.auditEvents.create({id:event.auditId,instanceId:this.scope.instanceId,...home(state.creator),action:event.action,

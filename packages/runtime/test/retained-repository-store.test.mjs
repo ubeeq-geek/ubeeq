@@ -189,3 +189,19 @@ test('entity commands require current actor/scope and a rejected nested move rol
  await store.asActor('actor',async()=>{await store.removeRetainedEntity({kind,key:'old',expected:source});await store.createWork(work());});
  assert.equal(await store.getRetainedEntity(kind,'old'),undefined);assert.equal((await store.getWork('tenant','work')).title,work().title);
 });
+
+
+test('public readCurrent uses the actual complete guarded cohort and leaves canonical, opaque entity, command and audit history unchanged',async t=>{
+ const f=await fixture(t),store=f.store(),kind='content-workflow:tenant:creator:readonly';await store.asActor('actor',async()=>{await store.createWork(work());await store.putRetainedEntity(kind,'actual',{creatorId:'creator',opaque:{full:['retained']}});});
+ const before=(await f.repositories.hostRecords.snapshot()).items,audits=(await f.repositories.auditEvents.list({limit:100})).items;
+ const result=await store.readCurrent(async transaction=>{assert.equal(transaction.id,store.transaction().id);return{work:await store.getWork('tenant','work'),opaque:await store.getRetainedEntity(kind,'actual')};});
+ assert.deepEqual(result.work,work());assert.deepEqual(result.opaque,{creatorId:'creator',opaque:{full:['retained']}});assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,before);assert.deepEqual((await f.repositories.auditEvents.list({limit:100})).items,audits);
+});
+
+test('readCurrent rejects actual canonical and full opaque entity mutation even under a genuine outer owner scope',async t=>{
+ for(const mutation of ['canonical','entity','command']){const f=await fixture(t),store=f.store(),before=(await f.repositories.hostRecords.snapshot()).items;await assert.rejects(store.asActor('actor',()=>store.readCurrent(async()=>mutation==='canonical'?store.createWork(work()):mutation==='entity'?store.putRetainedEntity('actual-extra','state',{creatorId:'creator',opaque:{full:['must roll back']}}):store.publicationAtomic.put('content-workflow:tenant:creator:readonly-command','actual',{creatorId:'creator',opaque:{full:['must roll back']}}))),{code:'access_denied'});assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,before);assert.equal(await store.getWork('tenant','work'),null);}
+});
+
+test('catching a rejected readCurrent mutation cannot commit another change or a direct retained audit in the same accepting transaction',async t=>{
+ for(const mutation of ['canonical','audit']){const f=await fixture(t),store=f.store(),before=(await f.repositories.hostRecords.snapshot()).items;await assert.rejects(store.asActor('actor',async()=>{try{await store.readCurrent(async()=>mutation==='audit'?store.appendRetainedAudit({auditId:'denied-read-audit',actorUserId:'actor',action:'readonly.denied',createdAt:at}):store.createWork(work()));}catch(error){assert.equal(error.code,'access_denied');}await store.createWork(work('later'));}),/failed|read-only/i);assert.deepEqual((await f.repositories.hostRecords.snapshot()).items,before);assert.deepEqual((await f.repositories.auditEvents.list({limit:100})).items,[]);}
+});
