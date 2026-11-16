@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {SmugMugHttpGateway} from '../dist/index.js';
+const options=vault=>({apiKey:'actual-offline-key',apiSecret:'actual-offline-secret',callbackUrl:'https://app.unit.invalid/callback',vault});
+const user=(value={UserID:'actual-account',NickName:'Actual creator'})=>new Response(JSON.stringify({Response:{User:value}}),{headers:{'content-type':'application/json'}});
+
+test('actual SmugMug account readback signs one current saved-grant GET without token exchange or vault writes',async()=>{
+ const calls=[],vault={async get(reference){assert.equal(reference,'actual-credential');return{token:'actual-access-token',tokenSecret:'actual-access-secret'};},async put(){assert.fail('Readonly account lookup cannot put a credential.');},async replace(){assert.fail('Readonly account lookup cannot rotate a credential.');},async delete(){assert.fail('Readonly account lookup cannot revoke a credential.');}},gateway=new SmugMugHttpGateway({...options(vault),fetch:async(input,init)=>{calls.push({url:String(input),method:init.method});assert.equal(String(input),'https://api.smugmug.com/api/v2!authuser');assert.equal(init.method,'GET');assert.match(new Headers(init.headers).get('authorization'),/oauth_token="actual-access-token"/);assert.match(new Headers(init.headers).get('authorization'),/oauth_signature=/);return user();}});
+ assert.deepEqual(await gateway.account('actual-credential'),{credentialRef:'actual-credential',accountId:'actual-account',accountName:'Actual creator',capabilities:{inventory:true,originalDownloads:false,exif:true,passwordProtectedGalleries:false}});assert.equal(calls.length,1);
+});
+
+test('original completeAuthorization still exchanges exactly once, replaces its exact original reference, and projects the same authenticated account',async()=>{
+ const calls=[],replacements=[],vault={async get(reference){assert.equal(reference,'actual-original-ref');return{token:'actual-request-token',tokenSecret:'actual-request-secret'};},async replace(reference,credential){replacements.push({reference,credential});return reference;},async put(){assert.fail('Complete must retain the original stable reference.');},async delete(){assert.fail('Complete must not erase its original reference.');}},gateway=new SmugMugHttpGateway({...options(vault),fetch:async(input,init)=>{calls.push({url:String(input),method:init.method});if(String(input).endsWith('/getAccessToken')){assert.equal(init.method,'POST');assert.match(new Headers(init.headers).get('authorization'),/oauth_token="actual-request-token"/);assert.match(new Headers(init.headers).get('authorization'),/oauth_verifier="actual-verifier"/);return new Response('oauth_token=actual-access-token&oauth_token_secret=actual-access-secret');}assert.equal(String(input),'https://api.smugmug.com/api/v2!authuser');assert.match(new Headers(init.headers).get('authorization'),/oauth_token="actual-access-token"/);return user();}});
+ assert.equal((await gateway.completeAuthorization('actual-original-ref','actual-verifier')).accountId,'actual-account');assert.deepEqual(replacements,[{reference:'actual-original-ref',credential:{token:'actual-access-token',tokenSecret:'actual-access-secret'}}]);assert.equal(calls.filter(call=>call.method==='POST').length,1);assert.equal(calls.filter(call=>call.method==='GET').length,1);
+});
+
+test('missing saved credentials and malformed actual account identities refuse instead of inventing an account',async()=>{
+ let calls=0;const missing=new SmugMugHttpGateway({...options({async get(){return undefined;},async put(){assert.fail();},async replace(){assert.fail();},async delete(){assert.fail();}}),fetch:async()=>{calls++;return user();}});await assert.rejects(missing.account('missing'));assert.equal(calls,0);
+ const bad=new SmugMugHttpGateway({...options({async get(){return{token:'actual',tokenSecret:'actual-secret'};},async put(){assert.fail();},async replace(){assert.fail();},async delete(){assert.fail();}}),fetch:async()=>user({NickName:'No stable ID'})});await assert.rejects(bad.account('actual'));
+});
