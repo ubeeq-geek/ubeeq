@@ -712,8 +712,15 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 }
 
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
-export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; subjectIdMode?:'legacy_username'|'canonical_sub'; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; subjectIdMode?:'legacy_username'|'canonical_sub'; credentialSecretPrefix: string;
+  /** Reuse the actual configured Cognito adapter, including a live explicit
+   * principal-genesis lifetime. Namespace equality is checked before use. */
+  cognitoIdentity?: CognitoIdentity;
+  eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
+  const identity = configuration.cognitoIdentity ?? new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});
+  const principal = requireCognitoIdentityRealm(identity);
+  if(principal.userPoolId!==configuration.userPoolId||principal.clientId!==configuration.userPoolClientId||principal.subjectIdMode!==(configuration.subjectIdMode??'legacy_username'))throw new Error('The actual Cognito identity must match the configured principal namespace and subject mode.');
   const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
   // Jobs and canonical repositories must share the ACTUAL transaction context;
@@ -721,7 +728,6 @@ export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const coordinator=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}),repositories=dynamoRepositories(coordinator.client,coordinator.transaction,configuration);
   if(configuration.globalSnapshotRealm)repositoryRealms.set(repositories,configuration.globalSnapshotRealm);
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
-  const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});
   return {
     repositories, storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),

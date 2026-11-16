@@ -151,3 +151,15 @@ test('bounded repair durably advances beyond an earlier uncompleted session afte
  const f=await fixture(t);await f.initiate();const second=sourceFile('later',{storageKey:sourceFileOriginalObjectKey({...scope,fileId:'later'}),sizeBytes:bytes.length});await f.store.commitSourceFile({expected:null,file:second,audit:sourceAudit('later'),access:await f.store.captureSourceAccess('actor')});await f.initiate({fileId:'later'});await f.accept({fileId:'later'});await f.local.storage.complete({uploadId:(await f.initiate({fileId:'later'})).upload.uploadId,cellId:scope.cellId,creatorId:scope.creatorId,checksum,byteLength:bytes.length});
  await f.uploads.repair(1);f.restart();await f.uploads.repair(1);assert.equal((await f.store.getSourceFileById('later')).uploadState,'ready');assert.equal((await f.store.getSourceFileById('original')).uploadState,'pending');assert.equal(f.quota.settlements.size,1);
 });
+
+
+test('actual completion wins during original verification and the stale caller reopens the same immutable receipt',async t=>{
+ let winner,entered=false;const f=await fixture(t,{prepareCompletion:async(file,object)=>{
+  if(!entered){entered=true;winner=await f.complete();}
+  const actual=await f.local.storage.get(object);return {checksumSha256:createHash('sha256').update(actual.body).digest('hex'),sizeBytes:actual.body.length,metadata:file.metadata};
+ }});
+ await f.initiate();await f.accept();const loser=await f.complete();
+ assert.equal(winner.state,'completed');assert.equal(loser.state,'completed');assert.deepEqual(loser.object,winner.object);assert.equal(loser.file.revision,2);
+ assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);assert.equal(f.quota.settlements.size,1);
+ f.restart();assert.deepEqual((await f.complete()).object,winner.object);
+});

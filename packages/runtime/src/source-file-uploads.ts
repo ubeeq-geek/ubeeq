@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
-import {RepositoryRetainedSourceFiles,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
+import {RepositoryRetainedSourceFiles,SourceFileConflict,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
 import {RetainedRepositoryError} from './retained-repository-store.js';
 import {ownedEvidenceHash} from './owned-object-writes.js';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
@@ -11,7 +11,7 @@ import {StorageClosureOutbox} from './storage-closure-outbox.js';
 const namespace='runtime-source-file-upload';
 const instant=(value:unknown):value is string=>typeof value==='string'&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString()===value;
 const same=(a:unknown,b:unknown)=>ownedEvidenceHash(a)===ownedEvidenceHash(b);
-const conflict=(error:unknown)=>error instanceof Error&&['OptimisticConcurrencyError','UniqueConstraintError','ConditionalCheckFailedException','TransactionCanceledException'].includes(error.name);
+const conflict=(error:unknown)=>error instanceof SourceFileConflict||error instanceof SourceFileUploadError&&error.code==='upload_source_conflict'||error instanceof Error&&['OptimisticConcurrencyError','UniqueConstraintError','ConditionalCheckFailedException','TransactionCanceledException'].includes(error.name);
 const denied=(error:unknown)=>error instanceof RetainedRepositoryError&&error.code==='access_denied';
 /** Server-owned placement for NEW originals. Legacy keys are never rewritten. */
 export function sourceFileOriginalCreatorPrefix(input:{instanceId:string;cellId:string;creatorId:string}):string{
