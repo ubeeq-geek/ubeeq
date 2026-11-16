@@ -1,4 +1,4 @@
-export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession} from './global-snapshot-realm.js';
+export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {dynamoItemFits} from './item-capacity.js';
 import {removeOwnedS3Version} from './owned-version-removal.js';
@@ -44,7 +44,7 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
 export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; globalSnapshotRealm?:GlobalSnapshotRealm; }
-type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
+type Dynamo = AwsCommandClient & { enlistReadGuard?<T>(transaction:{id:string},operation:()=>Promise<T>):Promise<T>; assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void|Promise<void>;
   checkAbsent?: (table: string, key: Record<string, string>) => void|Promise<void>;
   snapshotRepository?<T>(table:string,repository:string):Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
@@ -140,12 +140,15 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
 
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
+const repositoryRealms=new WeakMap<object,GlobalSnapshotRealm>();
+export function requireRepositoryGlobalSnapshotRealm(repositories:UbeeqRepositories,realm:GlobalSnapshotRealm):void{if(repositoryRealms.get(repositories)!==realm)throw new Error('The actual repositories bound to the identical global snapshot realm are required.');}
 export const createDynamoPublicationCommandRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): PublicationCommandRepositories & UbeeqRepositories => {
   if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
   const { client: dynamo, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
-  return protectCreatorContentAuthority({ ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
+  const result:PublicationCommandRepositories & UbeeqRepositories=protectCreatorContentAuthority({ ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
     claims: cellRepository(dynamo, config, 'publicationClaims'), operations: cellRepository(dynamo, config, 'publicationOperations'),
     outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') });
+  if(config.globalSnapshotRealm)repositoryRealms.set(result,config.globalSnapshotRealm);return result;
 };
 const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => protectCreatorContentAuthority({ transaction,
   hostRecords: cellRepository(dynamo, config, 'hostRecords'),
@@ -164,7 +167,7 @@ const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['tran
 export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
   if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
   const { client, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
-  return dynamoRepositories(client, transaction, config);
+  const result=dynamoRepositories(client, transaction, config);if(config.globalSnapshotRealm)repositoryRealms.set(result,config.globalSnapshotRealm);return result;
 };
 
 /**
@@ -524,6 +527,10 @@ export class AwsJobQueue implements JobQueue {
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return this.publicJob(recovered); }
+  enlistLease(input:{id:string;cellId:string;leaseToken:string;attempt:number;leaseExpiresAt:string},transaction:{id:string}):Promise<void>{
+    if(!this.dynamo.enlistReadGuard){this.dynamo.failTransaction?.();return Promise.reject(new Error('The actual same-coordinator accepting job-lease capability is unavailable.'));}
+    return this.dynamo.enlistReadGuard(transaction,async()=>{const job=await this.jobs.get(input.id,{transaction});if(!job||!input.leaseToken||job.cellId!==input.cellId||job.state!=='leased'||job.correlationId?.split(':').at(-1)!==input.leaseToken||job.attempt!==input.attempt||job.leaseExpiresAt!==input.leaseExpiresAt||!Number.isFinite(Date.parse(input.leaseExpiresAt))||Date.parse(input.leaseExpiresAt)<=Date.now())throw new Error('The exact current job lease is required in the accepting transaction.');await this.jobs.checkRevision(job.id,job.revision,{transaction});});
+  }
   async get(id: string): Promise<DurableJob | undefined> { const job = await this.jobs.get(id); return job && this.publicJob(job); }
   async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.limit) || input.limit < 1) throw new Error('A cell and positive integer job limit are required.');
@@ -701,12 +708,16 @@ export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { re
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
   const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
   const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
+  // Jobs and canonical repositories must share the ACTUAL transaction context;
+  // a second coordinator over the same client cannot enlist dispatch leases.
+  const coordinator=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}),repositories=dynamoRepositories(coordinator.client,coordinator.transaction,configuration);
+  if(configuration.globalSnapshotRealm)repositoryRealms.set(repositories,configuration.globalSnapshotRealm);
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
   const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});
   return {
-    repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
+    repositories, storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),
-    jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
+    jobs: new AwsJobQueue(coordinator.client, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
     identity,
     ...(configuration.passwordAuthenticationEnabled ? { passwordAuthentication: { authenticate: (input: { email: string; password: string }) => identity.authenticateSession(input) } } : {}),
     credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)

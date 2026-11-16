@@ -558,6 +558,11 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
       return this.row(row);
     });
   }
+  async enlistLease(input:{id:string;cellId:string;leaseToken:string;attempt:number;leaseExpiresAt:string},transaction:{id:string}):Promise<void>{
+    try{this.local.assertTransaction(transaction);const row=this.local.database.prepare('SELECT * FROM ubeeq_jobs WHERE id = ?').get(input.id) as Record<string,unknown>|undefined;
+      if(!row||!input.leaseToken||row.cell_id!==input.cellId||row.state!=='leased'||row.lease_token!==input.leaseToken||row.attempt!==input.attempt||row.lease_expires_at!==input.leaseExpiresAt||!Number.isFinite(Date.parse(input.leaseExpiresAt))||Date.parse(input.leaseExpiresAt)<=Date.now())throw new Error('The exact current job lease is required in the accepting transaction.');
+    }catch(error){this.local.failTransaction();throw error;}
+  }
   async get(id: string): Promise<DurableJob | undefined> { return this.local.transaction(async()=>{const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined;}); }
   async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { return this.local.transaction(async()=>{const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row));}); }
   async schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }

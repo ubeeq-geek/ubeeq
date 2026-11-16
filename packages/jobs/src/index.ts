@@ -21,6 +21,9 @@ export interface JobQueue {
   cancel(input: { id: string; reason?: string }): Promise<void>;
   /** Atomically recover only retry_scheduled/dead_lettered jobs. Never revive cancellation, completion or an active lease. */
   recover(input: { id: string; availableAt?: string }): Promise<DurableJob>;
+  /** Enlists the exact private current lease into an existing same-store
+   * accepting transaction. A prior get() is not a dispatch/cancellation fence. */
+  enlistLease?(input:{id:string;cellId:string;leaseToken:string;attempt:number;leaseExpiresAt:string},transaction:{id:string}):Promise<void>;
   get(id: string): Promise<DurableJob | undefined>;
   list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]>;
 }

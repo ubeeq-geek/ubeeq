@@ -9,6 +9,7 @@ import {DynamoRepositorySnapshots,type SnapshotTransactionState} from './reposit
 import type {GlobalSnapshotRealm} from './global-snapshot-realm.js';
 
 type Dynamo = AwsCommandClient & { assertTransaction?: (transaction: PersistenceTransaction) => void; failTransaction?: () => void;
+  enlistReadGuard?<T>(transaction:PersistenceTransaction,operation:()=>Promise<T>):Promise<T>;
   checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void|Promise<void>;
   checkAbsent?: (table: string, key: Record<string, string>) => void|Promise<void>;
   snapshotRepository?<T>(table:string,repository:string):Promise<RepositorySnapshot<T>>;
@@ -43,6 +44,7 @@ export const createTransactionalDynamo = (base: Dynamo,options:{globalSnapshotRe
     }catch(error){state.failed=true;throw error;}finally{state.pendingGuards--;}
   };
   const client: Dynamo = {
+    enlistReadGuard:<T>(transaction:PersistenceTransaction,operation:()=>Promise<T>):Promise<T>=>{const state=context.getStore();if(!state?.active||state.id!==transaction.id){if(state)state.failed=true;return Promise.reject(new Error('The exact actual accepting coordinator is required.'));}state.pendingGuards++;return Promise.resolve().then(operation).catch(error=>{state.failed=true;throw error;}).finally(()=>{state.pendingGuards--;});},
     snapshotRepository:(table,repository)=>snapshots.capture(table,repository),
     snapshotPage:(table,repository,request)=>snapshots.list(table,repository,request),
     mutateRepository:(table,repository,operation)=>transaction(async()=>{

@@ -12,7 +12,7 @@ interface BlobRecord {checksum:string;byteLength:number;chunkCount:number;}
 /** Constant-size immutable manifests identify independently owned, verified chunks.
  * Removing a website's references never removes or refunds retained versions. */
 export class OwnedWebsiteBlobs implements WebsiteBlobStore {
-  constructor(private readonly repositories:UbeeqRepositories,private readonly writes:OwnedObjectWrites,private readonly storage:ObjectStorage,private readonly instanceId:string,private readonly cellId:string,private readonly bucket:string){
+  constructor(private readonly repositories:UbeeqRepositories,private readonly writes:OwnedObjectWrites,private readonly storage:ObjectStorage,private readonly instanceId:string,private readonly cellId:string,private readonly bucket:string,private readonly authority?:{beforeWrite(workspace:string):Promise<void>;accept<T>(workspace:string,operation:(transaction?:import('@ubeeq/persistence').PersistenceTransaction)=>Promise<T>):Promise<T>}){
     if(!repositories.hostRecords)throw new Error('Website bytes require durable object manifests.');
   }
   private id(workspace:string,checksum:string){
@@ -41,11 +41,16 @@ export class OwnedWebsiteBlobs implements WebsiteBlobStore {
     if(existing){if(this.value(existing,workspace,checksum).byteLength!==bytes.length)throw new WebsiteError('artifact_conflict','Website byte identity conflicts.');return;}
     let chunkCount=0;
     for(let offset=0;offset<bytes.length;offset+=WEBSITE_PREVIEW_CHUNK_BYTES){
-      const index=chunkCount;try{await this.writes.write({creatorId:workspace,operation:'website.blob',idempotencyKey:`${checksum}:${index}`,home:owner,bucket:this.bucket,kind:'exports',scope:'private',contentType:'application/octet-stream',body:bytes.subarray(offset,offset+WEBSITE_PREVIEW_CHUNK_BYTES),metadata:{checksum,index,byteLength:bytes.length}});}catch(error){if(error instanceof OwnedObjectQuotaError){if(error.reasonCode==='STORAGE_QUOTA_EXCEEDED')throw new WebsiteError('quota_exceeded','Website storage quota exceeded.');throw new WebsiteError('authorization_denied','Website changes are not currently permitted for this account.');}throw error;}
+      const index=chunkCount;await this.authority?.beforeWrite(workspace);try{await this.writes.write({creatorId:workspace,operation:'website.blob',idempotencyKey:`${checksum}:${index}`,home:owner,bucket:this.bucket,kind:'exports',scope:'private',contentType:'application/octet-stream',body:bytes.subarray(offset,offset+WEBSITE_PREVIEW_CHUNK_BYTES),metadata:{checksum,index,byteLength:bytes.length}});}catch(error){if(error instanceof OwnedObjectQuotaError){if(error.reasonCode==='STORAGE_QUOTA_EXCEEDED')throw new WebsiteError('quota_exceeded','Website storage quota exceeded.');throw new WebsiteError('authorization_denied','Website changes are not currently permitted for this account.');}throw error;}
       chunkCount++;
     }
     const value:BlobRecord={checksum,byteLength:bytes.length,chunkCount};
-    try{await this.repositories.hostRecords!.create({id,instanceId:this.instanceId,homeCellId:owner.homeCellId,dataHomeRegion:owner.dataHomeRegion,dataHomeAssignedAt:owner.dataHomeAssignedAt,routingRevision:owner.routingRevision,namespace:'runtime-website-blob',scopeId:workspace,key:checksum,value:value as unknown as Record<string,unknown>});}
+    const accept=async(transaction?:import('@ubeeq/persistence').PersistenceTransaction)=>{
+      const saved=await this.repositories.hostRecords!.get(id,transaction?{transaction}:undefined);
+      if(saved){if(JSON.stringify(this.value(saved,workspace,checksum))!==JSON.stringify(value))throw new WebsiteError('artifact_conflict','The original website blob manifest conflicts.');return;}
+      await this.repositories.hostRecords!.create({id,instanceId:this.instanceId,homeCellId:owner.homeCellId,dataHomeRegion:owner.dataHomeRegion,dataHomeAssignedAt:owner.dataHomeAssignedAt,routingRevision:owner.routingRevision,namespace:'runtime-website-blob',scopeId:workspace,key:checksum,value:value as unknown as Record<string,unknown>},transaction?{transaction}:undefined);
+    };
+    try{if(this.authority)await this.authority.accept(workspace,accept);else await accept();}
     catch(error){const saved=await this.repositories.hostRecords!.get(id);if(!saved||JSON.stringify(this.value(saved,workspace,checksum))!==JSON.stringify(value))throw error;}
   }
   private async chunk(workspace:string,manifest:BlobRecord,index:number){

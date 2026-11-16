@@ -13,6 +13,15 @@ export interface GlobalSnapshotRoot extends Record<string,unknown> {
  * object, configuration flag or claimed empty inventory is not a capability. */
 export interface GlobalSnapshotRealm {readonly tableName:string;readonly instanceId:string}
 export interface GlobalSnapshotSession {readonly client:DynamoDBDocumentClient;readonly realm:GlobalSnapshotRealm}
+export interface FreshGlobalSnapshotGenesis {readonly kind:'fresh-global-snapshot-genesis'}
+const freshGeneses=new WeakMap<object,{session:GlobalSnapshotSession;root:GlobalSnapshotRoot;active:boolean}>();
+/** Only the synchronous construction lifetime inside actual fresh CreateTable
+ * initialization may create new domain origins. Reopen never supplies this. */
+export function requireFreshGlobalSnapshotGenesis(proof:FreshGlobalSnapshotGenesis,session:GlobalSnapshotSession):Readonly<GlobalSnapshotRoot>{
+ const actual=proof&&typeof proof==='object'?freshGeneses.get(proof):undefined;
+ if(!actual?.active||actual.session!==session||actual.session.client!==session.client||actual.session.realm!==session.realm)throw new SnapshotProtocolError('A live actual fresh-table domain-birth lifetime is required.');
+ requireGlobalSnapshotRealm(session.realm,session.client,session.realm.tableName);return structuredClone(actual.root);
+}
 const realms=new WeakMap<object,{client:AwsCommandClient;root:GlobalSnapshotRoot}>();
 export class SnapshotProtocolError extends Error {
  readonly code='snapshot_protocol_migration_required';readonly status=503;
@@ -59,7 +68,7 @@ async function assertNoLegacyMarkers(client:AwsCommandClient,tableName:string):P
  * No in-place migration API is supplied until the host has an enforceable fence
  * for every older/raw writer. An uncertain provision is an operator recovery,
  * never a reason to treat ResourceInUse as successful genesis. */
-export async function createFreshGlobalSnapshotRealm(raw:DynamoDBClient,input:{tableName:string;instanceId:string}):Promise<GlobalSnapshotSession>{
+export async function createFreshGlobalSnapshotRealm(raw:DynamoDBClient,input:{tableName:string;instanceId:string;initialize?:(session:GlobalSnapshotSession,genesis:FreshGlobalSnapshotGenesis)=>Promise<void>}):Promise<GlobalSnapshotSession>{
  const client=DynamoDBDocumentClient.from(raw);
  if(typeof input.instanceId!=='string'||!input.instanceId||input.instanceId.length>200||typeof input.tableName!=='string'||!/^[A-Za-z0-9_.-]{3,255}$/.test(input.tableName))throw new SnapshotProtocolError('A fresh installation table and exact instance identity are required.');
  const created=await raw.send(new CreateTableCommand({TableName:input.tableName,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:['pk','sk','repository','id'].map(AttributeName=>({AttributeName,AttributeType:'S'})),GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));
@@ -68,7 +77,12 @@ export async function createFreshGlobalSnapshotRealm(raw:DynamoDBClient,input:{t
  if(!receipt?.TableArn||!receipt.CreationDateTime||description?.TableArn!==receipt.TableArn||description.CreationDateTime?.toISOString()!==receipt.CreationDateTime.toISOString()||description.TableStatus!=='ACTIVE')throw new SnapshotProtocolError('The actual CreateTable and active DescribeTable receipts must agree.');
  const root:GlobalSnapshotRoot={...globalSnapshotKey,schemaVersion:2,protocol:'global-v2',instanceId:input.instanceId,realmId:randomUUID(),version:randomUUID(),genesis:{kind:'fresh-owned-table',tableArn:description.TableArn,createdAt:description.CreationDateTime.toISOString(),provisioningId:randomUUID()}};
  await client.send(new PutCommand({TableName:input.tableName,Item:root,ConditionExpression:'attribute_not_exists(pk)'}));
- return reopen(raw,client,input);
+ const session:GlobalSnapshotSession={client,realm:authorize(client,input.tableName,root)};
+ const genesis=Object.freeze({kind:'fresh-global-snapshot-genesis' as const}),lifetime={session,root,active:true};freshGeneses.set(genesis,lifetime);
+ try{if(input.initialize)await input.initialize(session,genesis);}finally{lifetime.active=false;}
+ const finalRoot=await readGlobalSnapshotRoot(client,input.tableName,root),finalDescription=(await raw.send(new DescribeTableCommand({TableName:input.tableName}))).Table;
+ if(!finalRoot||finalDescription?.TableArn!==root.genesis.tableArn||finalDescription.CreationDateTime?.toISOString()!==root.genesis.createdAt)throw new SnapshotProtocolError('The initialized realm no longer belongs to its actual fresh physical table.');
+ await assertNoLegacyMarkers(client,input.tableName);return session;
 }
 /** Actual durable reopen. No absent-root fallback, marker migration or writable
  * configuration flag. The new process verifies the actual table's receipt. */

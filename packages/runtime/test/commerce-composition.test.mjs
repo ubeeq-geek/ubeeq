@@ -35,3 +35,16 @@ test('generic injected-adapter composition cannot silently allocate a Local Comm
  const directory=await fixture(t),local=createLocalAdapterSet(configuration(directory));t.after(()=>local.database.close());
  assert.throws(()=>createCoreRuntime({...configuration(directory),adapters:{repositories:local.repositories,storage:local.storage,uploads:local.storage,delivery:local.storage,jobs:local.jobs,identity:local.identity,localIdentity:local.identity,credentials:local.credentials},configureCommerce:actual=>{assert.equal(actual.local,undefined);assert.equal(actual.adapters.credentials,local.credentials);return {configuration:{...commerce(directory),vault:actual.adapters.credentials}};}}),/durable store/);assert.equal(existsSync(join(directory,'commerce.sqlite')),false);assert.equal(await local.identity.getAccount('absent'),undefined,'host-owned injected adapters remain open');
 });
+
+
+test('preparation sees the identical already-configured website and Commerce objects without another runtime',async t=>{
+ const directory=await fixture(t);let observed,configured=0;
+ const core=createCoreRuntime({...configuration(directory),configureCommerce:()=>{configured++;return {configuration:commerce(directory)};},contentPreparation:context=>{observed=context;}});t.after(()=>core.close());
+ assert.equal(configured,1);assert.ok(observed.commerce);assert.equal(observed.commerce,core.commerce);assert.equal(observed.website,core.website);assert.ok(observed.website.service);assert.ok(observed.website.persistence);assert.ok(observed.website.publishing);assert.equal(Object.isFrozen(observed.website),true);
+ await observed.commerce.service.beginEmailLogin('prepared-buyer@composition.test');assert.equal((await core.commerce.store.transaction(tx=>tx.list('login'))).length,1);
+});
+test('a failing preparation constructor closes actual previously-created owned services',async t=>{
+ const directory=await fixture(t);let observed;const failure=Error('Actual isolated preparation construction failure');
+ assert.throws(()=>createCoreRuntime({...configuration(directory),configureCommerce:()=>({configuration:commerce(directory)}),contentPreparation:context=>{observed=context;throw failure;}}),error=>error===failure);
+ assert.ok(observed.commerce);await assert.rejects(observed.commerce.store.transaction(tx=>tx.list('login')));await assert.rejects(observed.adapters.identity.getAccount('missing'));await assert.rejects(observed.website.persistence.getDocument('workspace','missing'));
+});

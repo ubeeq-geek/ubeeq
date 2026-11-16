@@ -75,6 +75,15 @@ export type ReferenceAdapterSet = {
 /** The host owns injected persistence/client lifecycles. Optional cache ports
  * support unmetered adapters; metered runtimes use their owned-write journal. */
 export interface RuntimeWebsitePersistence extends WebsiteStore,WebsiteHostingStore {
+  /** Optional concrete same-domain execution scope. Core supplies its actual
+   * verified identity/Creator and the original durable JobLease; the host may
+   * not infer an actor from a workspace or lend request-only roles to a worker. */
+  withWebsiteRequest?<T>(subject:NonNullable<Awaited<ReturnType<IdentityAdapter['verifySession']>>>['subject'],actor:import('@ubeeq/portability').WebsiteActor,operation:()=>Promise<T>,active?:()=>boolean):Promise<T>;
+  withWebsiteJob?<T>(lease:import('@ubeeq/jobs').JobLease,operation:()=>Promise<T>):Promise<T>;
+  withWebsitePolicy?<T>(workspaceId:string,subjectIds:readonly string[],operation:()=>Promise<T>):Promise<T>;
+  withWebsiteMaintenance?<T>(operation:()=>Promise<T>):Promise<T>;
+  assertWebsiteEffects?(workspaceId:string):Promise<void>;
+  acceptWebsiteEffects?<T>(workspaceId:string,operation:(transaction:import('@ubeeq/persistence').PersistenceTransaction)=>Promise<T>):Promise<T>;
   hostingOAuthStates?:import('@ubeeq/integrations').OAuthStateStore;
   getPublicRendition?(workspaceId:string,source:string):Promise<{bytes:Uint8Array;width:number;height:number}|undefined>;
   putPublicRendition?(workspaceId:string,source:string,image:{bytes:Uint8Array;width:number;height:number}):Promise<void>;
@@ -97,10 +106,21 @@ export interface ReferenceCommerceComposition {
  configuration:ReferenceCommerceConfiguration;
  dependencies?:Pick<ReferenceCommerceDependencies,'subject'|'customerSubject'|'customerCredential'|'creator'>;
 }
+/** The exact configured instances that Core itself mounts and executes. */
+export interface ReferenceWebsiteRuntime {
+ service:WebsiteService|undefined;persistence:RuntimeWebsitePersistence|undefined;publishing:WebsitePublishingService|undefined;
+ hostingConnections:WebsiteHostingConnections|undefined;hostingAdapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
+}
+/** Preparation is composed after the actual website and Commerce services, so
+ * a host can bind connected publishing without a second runtime or inventory. */
+export interface ReferenceContentPreparationContext {
+ adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string;
+ website:Readonly<ReferenceWebsiteRuntime>;commerce:ReturnType<typeof createReferenceCommerce>|undefined;
+}
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
   /** Retained host supplies its real store, services and feature drivers. Core
    * resolves the verified creator session before reading request input. */
-  contentPreparation?: (context:{adapters:ReferenceAdapterSet;hostPorts:HostExtensionRuntimePorts;instanceId:string;cellId:string;region:string})=>ContentPreparationRuntimeBindings;
+  contentPreparation?: (context:ReferenceContentPreparationContext)=>ContentPreparationRuntimeBindings;
 
   commerce?: ReferenceCommerceConfiguration;
   /** Synchronous trusted configuration using the actual already-created adapters.
@@ -189,7 +209,7 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
   };
 };
 
-export const createReferenceApi = (configuration: ReferenceApiConfiguration): { commerce?:ReturnType<typeof createReferenceCommerce>; server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
+export const createReferenceApi = (configuration: ReferenceApiConfiguration): { commerce?:ReturnType<typeof createReferenceCommerce>; website:Readonly<ReferenceWebsiteRuntime>; server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
   if(configuration.configureCommerce!==undefined&&(typeof configuration.configureCommerce!=='function'||configuration.commerce!==undefined))throw new Error('Configure one trusted Commerce composition or direct Commerce configuration.');
   if(configuration.createLocalAdapters!==undefined){
     if(typeof configuration.createLocalAdapters!=='function')throw new Error('Local adapter creation requires a trusted factory.');
@@ -294,18 +314,6 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   );
 
   const hostPorts = configuredHostPorts ?? createDefaultOpenCorePorts({ tenancyAndAccess: tenancy });
-  const preparationBindings=configuration.contentPreparation?.({adapters,hostPorts,instanceId:composition.configuration.instanceId,cellId,region});
-  if(preparationBindings && typeof preparationBindings.runNextJob!=='function'){
-    localAdapters?.database.close();
-    throw Error('Content preparation HTTP requires its durable recovery and release worker.');
-  }
-  if(preparationBindings?.createCreator!==undefined&&typeof preparationBindings.createCreator!=='function'){localAdapters?.database.close();throw Error('Retained Creator birth requires a trusted factory.');}
-  if(preparationBindings?.prepareCreatorCreation!==undefined&&(typeof preparationBindings.prepareCreatorCreation!=='function'||preparationBindings.createCreator!==undefined)){localAdapters?.database.close();throw Error('Retained Creator birth requires one trusted writer or pre-transaction preparation.');}
-  const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
-    if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
-    return preparationBindings.access(request,response,creatorId);
-  }},request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
-  const retainedSources=preparationBindings?.sourceFiles?createRetainedSourceFileNodeHandler(preparationBindings.sourceFiles,request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
   const usageOutbox = repositories.hostRecords ? new UsageSettlementOutbox(repositories, hostPorts.usageQuota, configuration.instanceId ?? 'local-reference', cellId) : undefined;
   const uploadAccountingAvailable=Boolean(repositories.hostRecords && adapters.uploads.seal && hostPorts.usageQuota.closeStorageReservation);
   if(configuration.requireUploadAccounting && !uploadAccountingAvailable){localAdapters?.database.close();throw new Error('Physical upload closure and terminal storage quota reservations are required.');}
@@ -481,7 +489,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     catch (error) { if (error instanceof AdmissionBlockedError) throw denied(); throw error; }
     return { work, assets, publications };
   };
-  const websiteBlobs=ownedObjectWrites?new OwnedWebsiteBlobs(repositories,ownedObjectWrites,adapters.storage,configuration.instanceId??'local-reference',cellId,cellId):undefined;
+  const websiteBlobs=ownedObjectWrites?new OwnedWebsiteBlobs(repositories,ownedObjectWrites,adapters.storage,configuration.instanceId??'local-reference',cellId,cellId,{beforeWrite:workspace=>websiteStore?.assertWebsiteEffects?.(workspace)??Promise.resolve(),accept:async(workspace,operation)=>websiteStore?.acceptWebsiteEffects?websiteStore.acceptWebsiteEffects(workspace,operation):operation()}):undefined;
   const suppliedWebsiteStore=typeof configuration.websitePersistence==='function'?configuration.websitePersistence({adapters,blobs:websiteBlobs}):configuration.websitePersistence;
   const localWebsiteStore=localAdapters&&!configuration.websiteService&&!suppliedWebsiteStore?new SqliteWebsiteStore(`${localConfiguration.dataDirectory}/websites.sqlite`,websiteBlobs):undefined;
   const websiteStore:RuntimeWebsitePersistence|undefined=suppliedWebsiteStore??localWebsiteStore;
@@ -650,6 +658,23 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     pruneCredentials: localAdapters&&!commerceConfiguration.vault ? (references,cutoff)=>localAdapters.credentials.pruneCommerceOrphans(references,cutoff) : undefined
   }) : undefined;
   }catch(error){localWebsiteStore?.close();localAdapters?.database.close();throw error;}
+  const website:Readonly<ReferenceWebsiteRuntime>=Object.freeze({service:websites,persistence:websiteStore,publishing,hostingConnections,hostingAdapters:Object.freeze([...hostingAdapters])});
+  const {preparationBindings,contentPreparation,retainedSources}=(()=>{
+   try{
+    const preparationBindings=configuration.contentPreparation?.({adapters,hostPorts,instanceId:composition.configuration.instanceId,cellId,region,website,commerce});
+    if(preparationBindings && typeof preparationBindings.runNextJob!=='function'){
+      throw Error('Content preparation HTTP requires its durable recovery and release worker.');
+    }
+    if(preparationBindings?.createCreator!==undefined&&typeof preparationBindings.createCreator!=='function'){throw Error('Retained Creator birth requires a trusted factory.');}
+    if(preparationBindings?.prepareCreatorCreation!==undefined&&(typeof preparationBindings.prepareCreatorCreation!=='function'||preparationBindings.createCreator!==undefined)){throw Error('Retained Creator birth requires one trusted writer or pre-transaction preparation.');}
+    const contentPreparation=preparationBindings?createContentPreparationNodeHandler({...preparationBindings,access:async(request,response,creatorId)=>{
+      if(!/^[A-Za-z0-9_-]{1,100}$/.test(creatorId)||!await tenancy.resolveCreatorRole(request.session.subject.id,creatorId))return false;
+      return preparationBindings.access(request,response,creatorId);
+    }},request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
+    const retainedSources=preparationBindings?.sourceFiles?createRetainedSourceFileNodeHandler(preparationBindings.sourceFiles,request=>session(request),{publicBaseUrl:configuration.publicBaseUrl}):undefined;
+    return {preparationBindings,contentPreparation,retainedSources};
+   }catch(error){commerce?.close();localWebsiteStore?.close();localAdapters?.database.close();throw error;}
+  })();
   let lastWebsitePolicyScan=0;
   let commerceTurn=true;
   const runCoreJob = async (workerId: string) => {
@@ -661,14 +686,14 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     // Recover policy changes from authoritative hold records, even if the process crashed after the hold committed.
     if(publishing&&websiteStore&&!configuration.websitePublishing&&Date.now()-lastWebsitePolicyScan>=5000){
       const subjects=(await allRecords(repositories.moderationHolds)).filter(h=>h.state==='active').map(h=>h.subjectId);
-      if(subjects.length)for(const creator of await allRecords(repositories.creators))if(creator.homeCellId===cellId)await publishing.suspendDependencies({workspaceId:creator.id,actorId:websitePolicyActor},subjects);
+      if(subjects.length)for(const creator of await allRecords(repositories.creators))if(creator.homeCellId===cellId){const suspend=()=>publishing.suspendDependencies({workspaceId:creator.id,actorId:websitePolicyActor},subjects);await (websiteStore.withWebsitePolicy?websiteStore.withWebsitePolicy(creator.id,subjects,suspend):suspend());}
       lastWebsitePolicyScan=Date.now();
     }
 
     if(publishing){
-      await publishing.recoverOutbox();
+      await (websiteStore?.withWebsiteMaintenance?websiteStore.withWebsiteMaintenance(()=>publishing.recoverOutbox()):publishing.recoverOutbox());
       const lease=await adapters.jobs.lease<{workspaceId:string;attemptId:string}>({cellId,types:['website.deploy'],leaseDurationSeconds:120,workerId});
-      if(lease){try{if(lease.job.cellId!==cellId)throw new Error('Foreign website deployment rejected.');const attempt=await publishing.execute(lease.job.payload.workspaceId,lease.job.payload.attemptId);
+      if(lease){try{if(lease.job.cellId!==cellId)throw new Error('Foreign website deployment rejected.');const deploy=()=>publishing.execute(lease.job.payload.workspaceId,lease.job.payload.attemptId);const attempt=await (websiteStore?.withWebsiteJob?websiteStore.withWebsiteJob(lease,deploy):deploy());
         if(['busy','unknown','verifying'].includes(attempt.state))await adapters.jobs.retry({id:lease.job.id,leaseToken:lease.leaseToken,retryAt:new Date(Date.now()+30000).toISOString(),error:{code:'website_reconciliation_pending',message:'Waiting for serving evidence or the prior writer.'}});
         else await adapters.jobs.complete({id:lease.job.id,leaseToken:lease.leaseToken});return {attempt};
       }catch(error){await adapters.jobs.retry({id:lease.job.id,leaseToken:lease.leaseToken,retryAt:new Date(Date.now()+30000).toISOString(),error:{code:'website_deployment_pending',message:'Hosting deployment requires recovery.'}});throw error;}}
@@ -679,7 +704,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (websiteLease) {
         try {
           if (websiteLease.job.cellId !== cellId) throw new Error('Foreign website job rejected.');
-          const build = await websites.execute(websiteLease.job.payload.workspaceId, websiteLease.job.payload.buildId);
+          const execute=()=>websites.execute(websiteLease.job.payload.workspaceId,websiteLease.job.payload.buildId);const build=await (websiteStore?.withWebsiteJob?websiteStore.withWebsiteJob(websiteLease,execute):execute());
           await adapters.jobs.complete({ id: websiteLease.job.id, leaseToken: websiteLease.leaseToken });
           return { build };
         } catch (error) {
@@ -831,6 +856,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         if (!websites) throw new HttpError(404, 'websites_unavailable', 'Website publishing is not configured.');
         const identity = await session(request), creator = await creatorFor(identity.subject.id);
         requireHomeCell({ cellId }, creator);
+        const websiteOperation=async()=>{
         if(url.pathname==='/v1/websites/hosting-connections'||url.pathname.startsWith('/v1/websites/hosting-connections/')){
           if(!hostingConnections||!websiteStore||!publishing)throw new HttpError(404,'hosting_unavailable','External hosting connections require installation configuration.');
           const result=await handleHostingConnectionRequest({actor:{actorId:identity.subject.id,workspaceId:creator.id},service:hostingConnections,store:websiteStore,publishing,adapters:hostingAdapters,parts:url.pathname.split('/').filter(Boolean).slice(2),method,body:()=>parseBody(request)});
@@ -856,6 +882,8 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         const result = await handleWebsiteRequest({ service: websites, actor: { actorId: identity.subject.id, workspaceId: creator.id }, request, response, url, body: () => parseBody(request) });
         if (!response.writableEnded) return json(response, method === 'POST'&&!url.pathname.endsWith('/preview-files') ? 202 : 200, { ...result as object, requestId }, requestId);
         return;
+        };
+        return await (websiteStore?.withWebsiteRequest?websiteStore.withWebsiteRequest(identity.subject,{actorId:identity.subject.id,workspaceId:creator.id},websiteOperation,()=>!request.aborted&&!response.destroyed&&!response.writableEnded):websiteOperation());
       }
 
       const routeMatch = url.pathname.match(/^\/v1\/routing\/creators\/([^/]+)$/);
@@ -1376,7 +1404,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   };
   let disposed = false;
   const dispose = () => { if (disposed) return; disposed = true; contentPreparation?.close(); localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
-  return { commerce, server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
+  return { commerce, website, server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
     if (!server.listening) { dispose(); resolve(); return; }
     server.close(error => { if (error) reject(error); else { dispose(); resolve(); } });
   }) };

@@ -57,6 +57,6 @@ export class RedditClient {
   async readPost(token: string, id: string) {
     if (!/^t3_[a-z0-9]+$/.test(id)) throw new RedditApiError('Invalid post ID.', 422);
     const data = await this.json(`https://oauth.reddit.com/api/info?id=${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` } });
-    return data.data?.children?.[0]?.data as { name: string; author: string; title: string; permalink: string; removed_by_category?: string; selftext?: string } | undefined;
+    return data.data?.children?.[0]?.data as { name: string; author: string; title: string; permalink: string; removed_by_category?: string; selftext?: string; url?: string; subreddit?: string; is_self?: boolean; over_18?: boolean; link_flair_template_id?: string } | undefined;
   }
 }
