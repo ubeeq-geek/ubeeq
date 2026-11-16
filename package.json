@@ -47,7 +47,7 @@
     "test:managed-retained-sources": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-sources.dynamodb.mjs",
     "test:managed-retained-repository": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-repository.dynamodb.mjs",
     "test:managed-snapshots": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/repository-snapshots.dynamodb.mjs",
-    "test:managed-source-uploads": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/source-file-uploads.dynamodb.mjs",
+    "test:managed-source-uploads": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/source-file-uploads.dynamodb.mjs adapters/aws/test/repository-read-scopes.dynamodb.mjs",
     "test:managed-source-http": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-source-http.dynamodb.mjs"
   },
   "devDependencies": {

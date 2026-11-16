@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { repositoryItems, type AssetRecord, type HostRecord, type UbeeqRepositories, type WorkRecord } from '@ubeeq/persistence';
+import { repositoryItems,withRepositoryRead, type AssetRecord, type HostRecord, type UbeeqRepositories, type WorkRecord } from '@ubeeq/persistence';
 import { cellScopedObjectKey, requireCreatorScopedObject, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation } from '@ubeeq/storage';
 import type { DurableJob, JobQueue } from '@ubeeq/jobs';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
@@ -280,7 +280,7 @@ export class UploadLifecycle {
   }
   async repair(limit=25): Promise<number> {
     let count=0, failure:unknown;
-    for await (const row of repositoryItems(request=>this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
+    for await (const row of repositoryItems(request=>withRepositoryRead(this.repositories,transaction=>this.records.list(request,{transaction})))) {
       if (row.instanceId!==this.instanceId || row.homeCellId!==this.cellId || row.namespace!==namespace) continue;
       const needsQueue=row.value.phase==='completed' && row.value.queueState==='pending';
       const needsClosure=this.accounting && row.value.accounting && (row.value.phase==='closing' || ['prepared','issued'].includes(row.value.phase as string) && Date.parse(row.value.expiresAt as string)<=Date.now());

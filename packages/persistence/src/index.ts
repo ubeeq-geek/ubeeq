@@ -195,6 +195,10 @@ export interface HostRecord extends RevisionedRecord, CellOwnedRecord {
 }
 export interface InstanceOperatorRecord extends RevisionedRecord { instanceId: string; actorId: string; }
 export interface UbeeqRepositories extends TransactionRunner {
+  /** Serialize an outside read when a provider shares one owned connection.
+   * The callback must only read records; it must not perform external I/O or
+   * accept domain writes. This is not an inventory or commit-time guard. */
+  readScope?<T>(operation:(transaction?:PersistenceTransaction)=>Promise<T>):Promise<T>;
   hostRecords?: RevisionedRepository<HostRecord>;
   instanceOperators?: RevisionedRepository<InstanceOperatorRecord>;
   creators: RevisionedRepository<CreatorRecord>;
@@ -220,6 +224,12 @@ export interface UbeeqRepositories extends TransactionRunner {
   importCheckpoints: RevisionedRepository<ImportCheckpointRecord>;
   federationActors: RevisionedRepository<FederationActorRecord>;
   remotePublicationReferences: RevisionedRepository<RemotePublicationReferenceRecord>;
+}
+
+/** Preserve each adapter's outside-read semantics. In particular, a paginated
+ * DynamoDB query must not be inserted into a write transaction. */
+export function withRepositoryRead<T>(repositories:UbeeqRepositories,operation:(transaction?:PersistenceTransaction)=>Promise<T>):Promise<T>{
+  return repositories.readScope?repositories.readScope(operation):operation();
 }
 
 /** Executable shared fixture for every adapter's revisioned repository implementation. */

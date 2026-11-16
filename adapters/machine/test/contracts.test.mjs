@@ -66,7 +66,7 @@ test("PostgreSQL repositories and queue satisfy shared durable contracts", { ski
   const repositories = createPostgresRepositories(database);
   try {
     await database.pool.query("TRUNCATE ubeeq_idempotency, ubeeq_records, ubeeq_jobs, ubeeq_sessions, ubeeq_accounts CASCADE");
-    for (const [name, repository] of Object.entries(repositories).filter(([name]) => name !== "transaction")) {
+    for (const [name, repository] of Object.entries(repositories).filter(([name]) => !["transaction","readScope"].includes(name))) {
       await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "machine", homeCellId: "cell-a", dataHomeRegion: "test", dataHomeAssignedAt: "2026-01-01T00:00:00.000Z", routingRevision: 1, contractValue: name }), change: () => ({ contractValue: `${name}-updated` }) });
       if (!["federationActors", "remotePublicationReferences", "instanceOperators"].includes(name)) await verifyCellScopedRepositoryContract({ repository, unscopedRepository: repository.repository, cellId: "cell-a" });
     }

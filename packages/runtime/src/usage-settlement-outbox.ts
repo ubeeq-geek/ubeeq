@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { repositoryItems, type AssetRecord, type CellOwnedRecord, type HostRecord, type PersistenceTransaction, type UbeeqRepositories } from '@ubeeq/persistence';
+import { repositoryItems,withRepositoryRead, type AssetRecord, type CellOwnedRecord, type HostRecord, type PersistenceTransaction, type UbeeqRepositories } from '@ubeeq/persistence';
 import type { UsageQuotaPort, UsageSettlementInput, UsageQuotaReservationInput } from '@ubeeq/extension-sdk';
 import type { DurableJob, JobQueue } from '@ubeeq/jobs';
 
@@ -63,7 +63,7 @@ export class UsageSettlementOutbox {
   }
   async drain(limit = 25): Promise<number> {
     let settled = 0;
-    for await (const record of repositoryItems(request => this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
+    for await (const record of repositoryItems(request => withRepositoryRead(this.repositories,transaction=>this.records.list(request,{transaction})))) {
       if (record.instanceId !== this.instanceId || record.homeCellId !== this.cellId || record.namespace !== namespace || record.value.state !== 'pending') continue;
       await this.deliver(record);
       if (++settled >= limit) break;
@@ -73,7 +73,7 @@ export class UsageSettlementOutbox {
   /** Recover expired final leases/cancellations even when the processor never reached its catch block. */
   async recoverTerminal(jobs: JobQueue, limit = 25): Promise<number> {
     let recovered = 0;
-    for await (const row of repositoryItems(request => this.repositories.transaction(transaction=>this.records.list(request,{transaction})))) {
+    for await (const row of repositoryItems(request => withRepositoryRead(this.repositories,transaction=>this.records.list(request,{transaction})))) {
       if (row.instanceId !== this.instanceId || row.homeCellId !== this.cellId || row.namespace !== reservationNamespace || row.value.state !== 'pending') continue;
       const intent = row.value as unknown as ReservationIntent;
       if (!intent.input?.idempotencyKey || row.id !== this.reservationId(row.scopeId, intent.input.idempotencyKey) || intent.input.creatorId !== row.scopeId || row.key !== intent.input.idempotencyKey) throw new Error('Invalid processing reservation intent.');
