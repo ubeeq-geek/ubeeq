@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {withRepositoryRead,repositoryItems, type CellOwnedRecord, type HostRecord, type UbeeqRepositories} from '@ubeeq/persistence';
+import {withRepositoryRead,repositoryItems, type CellOwnedRecord, type HostRecord, type PersistenceTransaction, type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey, requireCreatorScopedObject, writeBoundedUploadContent, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation, type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
@@ -86,20 +86,47 @@ export class OwnedObjectWrites {
   private proveObject(value: Intent, object: StoredObject) {
     if (!value.provider || !object.versionId || object.bucket !== value.provider.object.bucket || object.key !== value.object.key || object.contentType !== value.object.contentType || object.byteLength !== value.object.byteLength || object.checksum !== value.object.checksum || object.scope !== value.object.scope || !instant(object.writtenAt!)) throw new Error('Owned output physical receipt conflicts.');
   }
-  private async latest(input: OwnedObjectIdentity): Promise<HostRecord | undefined> {return withRepositoryRead(this.repositories,async()=>{
+  private async latest(input: OwnedObjectIdentity, transaction?: PersistenceTransaction): Promise<HostRecord | undefined> {
+    const read = async (id:string) => {
+      if (!transaction) return this.readRecord(id);
+      // An accepting caller needs the actual commit-time lineage, including
+      // missing generations. Ordinary managed point reads are not guards.
+      if (!this.records.checkRevision || !this.records.checkAbsent) throw new Error('Owned output metadata requires actual accepting repository guards.');
+      const row=await this.records.get(id,{transaction});
+      if (row) await this.records.checkRevision(row.id,row.revision,{transaction});
+      else await this.records.checkAbsent(id,{transaction});
+      return row;
+    };
+    const inspect=async()=>{
     for (let generation=0; generation<1000; generation++) {
-      const row = await this.readRecord(this.id(input,generation));
+      const row = await read(this.id(input,generation));
       if (!row) return undefined;
       const value = this.value(row);
       if (value.phase !== 'sealed') return row;
-      const next = await this.readRecord(this.id(input,generation+1));
+      const next = await read(this.id(input,generation+1));
       if (!next) return row;
       const following = this.value(next);
       if (following.previousProof !== (value.seal as {proofId:string}).proofId || following.requestHash !== value.requestHash) throw new Error('Owned output generations conflict.');
     }
     throw new Error('Owned output generation limit requires reconciliation.');
 
-    });}
+    };
+    return transaction ? inspect() : withRepositoryRead(this.repositories,inspect);
+  }
+  /** Read the original completed immutable receipt without attempting recovery,
+   * physical/provider IO, quota settlement, or any metadata mutation. Passing
+   * an actual accepting transaction binds every inspected generation/absence
+   * until that transaction commits. This grants no logical attachment access. */
+  async readCompleted(input:OwnedObjectIdentity,transaction?:PersistenceTransaction):Promise<OwnedObjectResult|undefined>{
+    try {
+      const row=await this.latest(input,transaction);if(!row)return;
+      const value=this.value(row);
+      if(value.phase==='completed')return {object:structuredClone(value.completedObject!),metadata:structuredClone(value.metadata)};
+    } catch(error) {
+      if(transaction)this.records.failTransaction?.();
+      throw error;
+    }
+  }
   private async deliver(row: HostRecord) {
     const value = this.value(row), id = value.usageIntentId ?? value.closureIntentId;
     if (!id) return;

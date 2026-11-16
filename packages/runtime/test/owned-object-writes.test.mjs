@@ -96,3 +96,37 @@ test('admission denial after reservation closes the unused hold before any provi
  assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_uploads').get().n,0);
  assert.equal((await f.rows()).find(row=>row.namespace==='runtime-owned-object').value.phase,'sealed');
 });
+
+
+test('completed metadata inspection preserves exact full custody without storage or quota effects, including after reopen',async t=>{
+ const f=await fixture(t),output=await f.writer.write({...f.input,metadata:{source:{id:'asset',version:'original'},unknown:{retained:['多字節',{future:true}]}}});
+ f.restart();
+ for(const key of ['initiate','recoverCompletion','complete','seal','accept','put','get'])if(typeof f.local.storage[key]==='function')f.local.storage[key]=async()=>{throw Error('Metadata inspection attempted physical IO: '+key);};
+ for(const key of ['checkAndReserveQuota','recordUsageSettlement','closeStorageReservation'])f.quota[key]=async()=>{throw Error('Metadata inspection attempted quota IO: '+key);};
+ assert.deepEqual(await f.writer.readCompleted(f.input),output);
+ await f.local.repositories.transaction(async tx=>assert.deepEqual(await f.writer.readCompleted(f.input,tx),output));
+ const copied=await f.writer.readCompleted(f.input);copied.metadata.unknown.retained.push('caller mutation');assert.deepEqual(await f.writer.readCompleted(f.input),output);
+ assert.equal(await f.writer.readCompleted({...f.input,creatorId:'foreign'}),undefined);
+});
+test('metadata inspection never closes an issued capability or initializes missing history',async t=>{
+ const f=await fixture(t);f.local.storage.accept=async()=>{throw Error('Physical body intentionally not sent');};await assert.rejects(f.writer.write(f.input),/intentionally/);
+ const before=await f.rows(),grants=f.grants.size;assert.equal(before.find(row=>row.namespace==='runtime-owned-object').value.phase,'issued');
+ assert.equal(await f.writer.readCompleted(f.input),undefined);assert.equal(await f.writer.readCompleted({...f.input,idempotencyKey:'missing'}),undefined);
+ assert.deepEqual(await f.rows(),before);assert.equal(f.grants.size,grants);assert.equal(f.closures.size,0);
+});
+test('accepting completed metadata uses the genuine transaction and makes caught corrupt receipt validation rollback-only',async t=>{
+ const f=await fixture(t);await f.writer.write(f.input);const row=(await f.rows()).find(row=>row.namespace==='runtime-owned-object');
+ await f.local.repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,completedObject:{...row.value.completedObject,checksum:'f'.repeat(64)}}});
+ await assert.rejects(f.local.repositories.transaction(async tx=>{
+  try{await f.writer.readCompleted(f.input,tx);}catch{}
+  await f.local.repositories.hostRecords.create({id:'must-rollback',instanceId:'instance',...home,namespace:'unit',scopeId:'creator',key:'must-rollback',value:{retained:true}},{transaction:tx});
+ }),/SQLite transaction is rollback-only after a nested failure/);
+ assert.equal(await f.local.repositories.hostRecords.get('must-rollback'),undefined);assert.equal((await f.local.repositories.hostRecords.get(row.id)).revision,row.revision+1);
+ await assert.rejects(f.writer.readCompleted(f.input,{id:'foreign-transaction'}),/transaction|scope/i);
+});
+test('completed metadata follows actual sealed generations and rejects a broken original predecessor proof',async t=>{
+ const f=await fixture(t),accept=f.local.storage.accept.bind(f.local.storage);f.local.storage.accept=async()=>{throw Error('No body');};await assert.rejects(f.writer.write(f.input),/No body/);await f.writer.recover(f.input);f.local.storage.accept=accept;const output=await f.writer.write(f.input);
+ assert.deepEqual(await f.writer.readCompleted(f.input),output);const next=(await f.rows()).find(row=>row.namespace==='runtime-owned-object'&&row.value.generation===1);assert.ok(next);
+ await f.local.repositories.hostRecords.update(next.id,next.revision,{value:{...next.value,previousProof:'not-the-actual-seal'}});
+ await assert.rejects(f.writer.readCompleted(f.input),/generations conflict/);
+});

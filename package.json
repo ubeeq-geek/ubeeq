@@ -47,7 +47,7 @@
     "test:managed-retained-sources": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-sources.dynamodb.mjs",
     "test:managed-retained-repository": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-repository.dynamodb.mjs",
     "test:managed-snapshots": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/repository-snapshots.dynamodb.mjs adapters/aws/test/global-snapshot-v2.dynamodb.mjs",
-    "test:managed-source-uploads": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/source-file-uploads.dynamodb.mjs adapters/aws/test/repository-read-scopes.dynamodb.mjs",
+    "test:managed-source-uploads": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/source-file-uploads.dynamodb.mjs adapters/aws/test/repository-read-scopes.dynamodb.mjs adapters/aws/test/owned-completed.dynamodb.mjs",
     "test:managed-source-http": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-source-http.dynamodb.mjs",
     "test:managed-job-acceptance": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/accepting-job-lease.dynamodb.mjs"
   },
