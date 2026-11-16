@@ -1,3 +1,4 @@
+export {DynamoCapacityError} from './item-capacity.js';
 export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {dynamoItemFits} from './item-capacity.js';
