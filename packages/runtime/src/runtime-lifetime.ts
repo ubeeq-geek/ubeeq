@@ -7,7 +7,7 @@ export class ReferenceRuntimeLifetime {
  private readonly entries=new AsyncLocalStorage<Entry>();
  private readonly idle:Array<()=>void>=[];private closing?:Promise<void>;
  get open(){return this.state==='open';}
- private live(entry:Entry){for(let current:Entry|undefined=entry;current;current=current.parent)if(!current.active)return false;return true;}
+ private live(entry:Entry){return entry.active;}
  get accepting(){const parent=this.entries.getStore();if(parent&&!this.live(parent))return false;return this.state==='open'||this.state==='closing'&&!!parent;}
  async run<Result>(operation:()=>Promise<Result>):Promise<Result>{
   if(!this.accepting)throw Error('The Core runtime is closing or closed, or its accepted operation ended.');
