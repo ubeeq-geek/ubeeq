@@ -30,18 +30,19 @@ test('original finalization and cold repair receive the immutable actual upload-
 /** A truthful quota-port unit fixture. Physical acceptance in these tests is
  * always the real LocalFilesystemStorage and SQLite provider, not this fixture. */
 function quotaPort(){
- const reservations=new Map(),settlements=new Map(),closures=new Map();let allowed=true,admitted=true,failSettlement=false,failClosure=false;
- return {reservations,settlements,closures,setAllowed(v){allowed=v;},setAdmitted(v){admitted=v;},setFailSettlement(v){failSettlement=v;},setFailClosure(v){failClosure=v;},
+ const reservations=new Map(),settlements=new Map(),closures=new Map(),removals=new Map();let allowed=true,admitted=true,failSettlement=false,failClosure=false,failRemoval=false;
+ return {reservations,settlements,closures,removals,setFailRemoval(v){failRemoval=v;},setAllowed(v){allowed=v;},setAdmitted(v){admitted=v;},setFailSettlement(v){failSettlement=v;},setFailClosure(v){failClosure=v;},
   async checkAndReserveQuota(input){if(closures.has(input.idempotencyKey))return {allowed:false,reasonCode:'CLOSED'};if(!allowed)return {allowed:false,reasonCode:'QUOTA_DENIED'};const previous=reservations.get(input.idempotencyKey);if(previous)assert.deepEqual(input,previous);reservations.set(input.idempotencyKey,structuredClone(input));return {allowed:true};},
   async checkCurrentAdmission(){return {allowed:admitted,reasonCode:admitted?undefined:'SUSPENDED'};},
   async recordUsageSettlement(input){if(failSettlement)throw Error('Quota settlement temporarily unavailable');assert.equal(closures.has(input.idempotencyKey),false);const reserve=reservations.get(input.idempotencyKey);assert.ok(reserve);assert.equal(input.storageBytesDelta,reserve.storageBytesDelta);const previous=settlements.get(input.idempotencyKey);if(previous)assert.deepEqual(input,previous);settlements.set(input.idempotencyKey,structuredClone(input));},
+  async recordOwnedStorageRemoval(input){if(failRemoval)throw Error('Original storage removal accounting temporarily unavailable');const original=settlements.get(input.originalIdempotencyKey);assert.ok(original);assert.equal(original.creatorId,input.creatorId);assert.equal(original.operation,input.operation);assert.equal(original.storageBytesDelta,input.storageBytesRemoved);const previous=removals.get(input.originalIdempotencyKey);if(previous)assert.deepEqual(input,previous);removals.set(input.originalIdempotencyKey,structuredClone(input));},
   async closeStorageReservation(input){if(failClosure)throw Error('Quota closure temporarily unavailable');assert.equal(settlements.has(input.idempotencyKey),false);const previous=closures.get(input.idempotencyKey);if(previous)assert.deepEqual(input,previous);closures.set(input.idempotencyKey,structuredClone(input));}
  };
 }
 async function fixture(t,options={}){
  const directory=await mkdtemp(join(tmpdir(),'source-original-upload-')),configuration={databasePath:join(directory,'sources.sqlite'),dataDirectory:directory,cellId:scope.cellId,publicBaseUrl:'http://127.0.0.1'};
  const quota=quotaPort();let local,store,lifecycle,now=new Date();
- const start=()=>{local=createLocalAdapterSet(configuration);store=sourceStore(local.repositories).store;lifecycle=new SourceFileUploads({repositories:local.repositories,uploads:local.storage,quota,files:store,bucket:scope.cellId,now:()=>now,prepareCompletion:async(file,object)=>{const loaded=await local.storage.get(object);assert.equal(loaded.object.versionId,object.versionId);assert.equal(file.storageKey,object.key);return {checksumSha256:createHash('sha256').update(loaded.body).digest('hex'),sizeBytes:loaded.body.byteLength,metadata:file.metadata};},...options});};start();
+ const start=()=>{local=createLocalAdapterSet(configuration);store=sourceStore(local.repositories).store;lifecycle=new SourceFileUploads({repositories:local.repositories,uploads:local.storage,removal:local.storage,quota,files:store,bucket:scope.cellId,now:()=>now,prepareCompletion:async(file,object)=>{const loaded=await local.storage.get(object);assert.equal(loaded.object.versionId,object.versionId);assert.equal(file.storageKey,object.key);return {checksumSha256:createHash('sha256').update(loaded.body).digest('hex'),sizeBytes:loaded.body.byteLength,metadata:file.metadata};},...options});};start();
  t.after(async()=>{local.database.close();await rm(directory,{recursive:true,force:true});});
  await local.repositories.transaction(tx=>createRetainedRepositoryCreator(local.repositories,creatorInput,scope.tenantId,tx));await local.repositories.hostRecords.create(actorRecord);
  const file=sourceFile('original',{storageKey:sourceFileOriginalObjectKey({...scope,fileId:'original'}),sizeBytes:bytes.length});
@@ -162,4 +163,50 @@ test('actual completion wins during original verification and the stale caller r
  assert.equal(winner.state,'completed');assert.equal(loser.state,'completed');assert.deepEqual(loser.object,winner.object);assert.equal(loser.file.revision,2);
  assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);assert.equal(f.quota.settlements.size,1);
  f.restart();assert.deepEqual((await f.complete()).object,winner.object);
+});
+
+
+// NEW authored cleanup controls, UNRUN. Actual Local versioned filesystem and
+// permanent upload seals; quotaPort is the explicitly declared unit protocol.
+test('cancelled completed original purges only its exact Local payload and keeps the permanent capability seal and full positive receipt',async t=>{
+ const f=await fixture(t),issued=await f.initiate();await f.accept();const cancelled=await f.cancel(),object=cancelled.object;assert.equal(cancelled.file.uploadState,'cancelled');assert.equal(cancelled.state,'retained');assert.ok(object.versionId);const original=[...f.quota.settlements.values()][0];
+ const result=await f.uploads.purgeCancelled('original');assert.deepEqual(result,{state:'removed',bytesRemoved:bytes.length,usagePending:false});await assert.rejects(f.local.storage.get(object));assert.deepEqual([...f.quota.settlements.values()][0],original);assert.equal(f.quota.removals.size,1);
+ await assert.rejects(f.local.storage.accept({uploadId:issued.upload.uploadId,cellId:scope.cellId,creatorId:scope.creatorId,body:bytes,operation:'upload_content'}));
+ const first=(await f.journal()).value.removal;assert.equal(first.proof.fence.kind,'local-upload-seal');assert.ok(first.accountedAt);assert.equal(first.request.object.versionId,object.versionId);assert.deepEqual(await f.uploads.readPhysicalReceipt('original'),object,'original receipt remains historical evidence');
+ f.restart();await f.uploads.purgeCancelled('original');assert.equal(f.quota.removals.size,1);assert.deepEqual((await f.journal()).value.removal,first);assert.equal((await f.store.getSourceFileById('original')).uploadState,'cancelled');
+});
+test('never-completed cancellation retains its real zero-byte upload closure without a fabricated negative byte adjustment',async t=>{
+ const f=await fixture(t),issued=await f.initiate();const cancelled=await f.cancel();assert.equal(cancelled.state,'sealed');const seal=(await f.journal()).value.seal;assert.deepEqual(await f.uploads.purgeCancelled('original'),{state:'sealed',bytesRemoved:0,usagePending:false});assert.deepEqual((await f.journal()).value.seal,seal);assert.equal(f.quota.removals.size,0);assert.equal(f.quota.settlements.size,0);assert.equal(f.quota.closures.size,1);await assert.rejects(f.local.storage.accept({uploadId:issued.upload.uploadId,cellId:scope.cellId,creatorId:scope.creatorId,body:bytes,operation:'upload_content'}));
+});
+test('lost accounting acknowledgement replays the persisted exact absence proof after actual payload deletion and restart',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();const cancelled=await f.cancel();f.quota.setFailRemoval(true);await assert.rejects(f.uploads.purgeCancelled('original'),/accounting temporarily unavailable/);const persisted=(await f.journal()).value.removal;assert.ok(persisted.proof);assert.equal(persisted.accountedAt,undefined);await assert.rejects(f.local.storage.get(cancelled.object));f.restart();f.quota.setFailRemoval(false);await f.uploads.purgeCancelled('original');assert.deepEqual((await f.journal()).value.removal.proof,persisted.proof);assert.equal([...f.quota.removals.values()][0].proofId,persisted.proof.proofId);assert.equal(f.quota.removals.size,1);
+});
+test('revoked initiating actor cannot regain access while actual cancelled-byte facts can still close physically and financially',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();await f.cancel();await f.revoke();await assert.rejects(f.complete());assert.equal((await f.uploads.purgeCancelled('original')).state,'removed');assert.equal(f.quota.removals.size,1);assert.equal((await f.store.getSourceFileById('original')).uploadState,'cancelled');await assert.rejects(f.accept());
+});
+test('uncancelled completed or pending originals cannot enter cleanup and no exact-version deletion is inferred from absence',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();await assert.rejects(f.uploads.purgeCancelled('original'),{code:'upload_not_cancelled'});assert.equal(f.quota.removals.size,0);await f.complete();await assert.rejects(f.uploads.purgeCancelled('original'),{code:'upload_not_cancelled'});assert.equal(f.quota.removals.size,0);assert.deepEqual((await f.local.storage.get(await f.uploads.readPhysicalReceipt('original'))).body,bytes);await assert.rejects(f.uploads.purgeCancelled('missing'),{code:'upload_not_found'});
+});
+
+
+// NEW accepting-scope regressions, authored UNRUN. No readCurrent write is used.
+test('cancelled cleanup journal acceptance preserves full current Source/cancellation and uses the actual transaction without a synthetic actor',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();await f.cancel();const source=await f.store.getSourceFileById('original'),journal=await f.journal();let entered=false;
+ await f.store.withCancelledSourceMetadata('original',async(file,transaction)=>{entered=true;assert.equal(Object.isFrozen(file),true);assert.deepEqual(file,source);assert.equal(f.store.transaction().id,transaction.id);const row=await f.local.repositories.hostRecords.get(journal.id,{transaction});await f.local.repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,cleanupScopeOpaque:{keep:'actual unknown JSON'}}},{transaction});});
+ assert.equal(entered,true);assert.deepEqual(await f.store.getSourceFileById('original'),source);assert.equal((await f.journal()).value.cleanupScopeOpaque.keep,'actual unknown JSON');
+ // The ordinary current read API still rejects actual retained mutation.
+ await assert.rejects(f.store.readCurrent(()=>f.store.putRetainedEntity('unowned-extra','attempt',{creatorId:scope.creatorId})));assert.equal(await f.store.getRetainedEntity('unowned-extra','attempt'),undefined);
+});
+test('cleanup metadata cannot checkpoint an uncancelled Source or hide a canonical cancellation revision mutation in the same transaction',async t=>{
+ const f=await fixture(t);await f.initiate();let entered=false;await assert.rejects(f.store.withCancelledSourceMetadata('original',async()=>{entered=true;}),/actual cancelled original/);assert.equal(entered,false);await f.cancel();const source=await f.store.getSourceFileById('original'),journal=await f.journal(),audits=await f.audits();
+ await assert.rejects(f.store.withCancelledSourceMetadata('original',async(file,transaction)=>{const row=await f.local.repositories.hostRecords.get(journal.id,{transaction});await f.local.repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,forbiddenCheckpoint:true}},{transaction});await f.store.commitSourceCleanup({expected:file,now:new Date().toISOString(),nextAttemptAt:new Date(Date.now()+60000).toISOString()});}),/cannot mutate|cannot commit/);
+ assert.deepEqual(await f.store.getSourceFileById('original'),source);assert.deepEqual(await f.journal(),journal);assert.deepEqual(await f.audits(),audits);
+});
+test('actual purge prepares and checkpoints outside provider IO and never calls readCurrent for a HostRecord write',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();await f.cancel();const original=f.store.readCurrent.bind(f.store);f.store.readCurrent=async()=>{throw Error('Cleanup may not use the read-only transaction API.');};try{assert.equal((await f.uploads.purgeCancelled('original')).state,'removed');assert.equal(f.quota.removals.size,1);}finally{f.store.readCurrent=original;}
+});
+
+
+test('bounded original repair resumes the genuine persisted removal proof and reports terminal accounted cancellation as idle after restart',async t=>{
+ const f=await fixture(t);await f.initiate();await f.accept();await f.cancel();f.quota.setFailRemoval(true);await assert.rejects(f.uploads.purgeCancelled('original'),/accounting temporarily unavailable/);const proof=(await f.journal()).value.removal.proof;f.restart();f.quota.setFailRemoval(false);assert.equal(await f.uploads.repair(1),1);assert.deepEqual((await f.journal()).value.removal.proof,proof);assert.ok((await f.journal()).value.removal.accountedAt);assert.equal(f.quota.removals.size,1);assert.equal(await f.uploads.repair(1),0);f.restart();assert.equal(await f.uploads.repair(1),0);
 });

@@ -261,6 +261,18 @@ export interface UnissuedReservationClosure {
  * receipt, initializes a balance/counter or replaces current source/role holds. */
 export interface UsageQuotaPolicyInput { creatorId:string; operation:string }
 
+/** Trusted immutable-version absence, backed by the original SETTLED storage-only
+ * receipt. This releases exactly that whole stored amount ONCE, without a new
+ * reserve, credit, admission success or rewriting the original usage event. */
+export interface OwnedStorageRemoval {
+ creatorId:string;
+ operation:string;
+ originalIdempotencyKey:string;
+ storageBytesRemoved:number;
+ proofId:string;
+ observedAt:string;
+}
+
 export interface UsageQuotaPort {
   checkCurrentPolicy?(input:UsageQuotaPolicyInput):Promise<UsageQuotaReservationResult>;
   checkAndReserveQuota(input: UsageQuotaReservationInput): Promise<UsageQuotaReservationResult>;
@@ -270,6 +282,7 @@ export interface UsageQuotaPort {
   recordUsageSettlement(input: UsageSettlementInput): Promise<void>;
   closeStorageReservation?(input: StorageReservationClosure): Promise<void>;
   closeUnissuedReservation?(input:UnissuedReservationClosure):Promise<void>;
+  recordOwnedStorageRemoval?(input:OwnedStorageRemoval):Promise<void>;
 }
 
 export type ConnectorCredentialSource = "operator_env" | "creator_secret" | "platform_managed";
@@ -392,6 +405,10 @@ export const createUnmeteredUsageQuotaPort = (): UsageQuotaPort => ({
   },
   async closeStorageReservation() {
     // The upload journal still retains its physical closure proof on unmetered hosts.
+  },
+  async recordOwnedStorageRemoval() {
+    // Genuine unmetered hosts have no SaaS storage balance to debit. The
+    // original upload journal still retains its exact physical absence proof.
   }
 });
 

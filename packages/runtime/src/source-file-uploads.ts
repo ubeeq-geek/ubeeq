@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
-import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
+import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,ownedVersionFingerprint,validateOwnedVersionAbsence,type OwnedVersionRemovalAdapter,type OwnedVersionRemovalRequest,type OwnedVersionAbsenceProof,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {RepositoryRetainedSourceFiles,SourceFileConflict,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
 import {RetainedRepositoryError} from './retained-repository-store.js';
@@ -31,6 +31,7 @@ interface Session {
   object:StoredObject;phase:'prepared'|'issued'|'closing'|'sealed'|'retained'|'completed';reservation:'pending'|'reserved';
   provider?:UploadInitiation;closingAt?:string;completedObject?:StoredObject;seal?:UploadSealResult;
   usageIntentId?:string;closureIntentId?:string;
+  removal?:{schemaVersion:1;targetFingerprint:string;requestedAt:string;cancellation:{requestedAt:string;requestedByUserId:string};request:OwnedVersionRemovalRequest;proof?:OwnedVersionAbsenceProof;accountedAt?:string};
 }
 export interface SourceFileCompletionPreparation {
   checksumSha256:string;sizeBytes:number;metadata?:RetainedSourceFile['metadata'];
@@ -41,7 +42,9 @@ export interface SourceFileUploadOptions<M extends RetainedCreatorContentModels,
   repositories:UbeeqRepositories;uploads:UploadAdapter&Partial<UploadContentAdapter>&Partial<UploadContentStreamAdapter>;quota:UsageQuotaPort;
   files:RepositoryRetainedSourceFiles<M,F>;
   /** Fixed private provider bucket, never a client-selected bucket. */
-  bucket:string;now?:()=>Date;expiresInMilliseconds?:number;
+  bucket:string;
+  /** Actual immutable provider removal capability, not a key-only delete. */
+  removal?:OwnedVersionRemovalAdapter;now?:()=>Date;expiresInMilliseconds?:number;
   /** Read/verify the exact original and run the actual type-specific decoder,
    * credentials and idempotent owned rendition path before metadata acceptance.
    * Provider effects happen before the accepting repository transaction. */
@@ -89,6 +92,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
       ||['retained','completed'].includes(value.phase)&&(!value.completedObject||!value.usageIntentId)||value.phase==='sealed'&&!value.closureIntentId||value.phase==='closing'&&!instant(value.closingAt)||value.phase==='sealed'&&value.seal?.state!=='sealed')throw Error('Original upload evidence requires reconciliation.');
     if(value.provider)this.proveProvider(value,value.provider);
     if(value.completedObject)this.proveObject(value,value.completedObject);
+    if(value.removal){const removal=value.removal;if(removal.schemaVersion!==1||!instant(removal.requestedAt)||!instant(removal.cancellation?.requestedAt)||!removal.cancellation.requestedByUserId||!value.provider||!value.completedObject||!['completed','retained'].includes(value.phase)||removal.request.cellId!==this.cellId||removal.request.creatorId!==value.creatorId||!same(removal.request.upload,value.provider)||!same(removal.request.object,value.completedObject)||removal.targetFingerprint!==ownedVersionFingerprint(removal.request)||removal.proof&&removal.accountedAt!==undefined&&!instant(removal.accountedAt)||removal.accountedAt&&!removal.proof)throw Error('Original removal evidence requires reconciliation.');if(removal.proof)validateOwnedVersionAbsence(removal.request,removal.proof);}
     requireCreatorScopedObject(value.object.key,{cellId:this.cellId,creatorId:value.creatorId});
     return value;
   }
@@ -330,6 +334,54 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     });
     return this.result(await this.close(row));
   }
+  /** A known physical result is checkpointed under a fresh real cancelled
+   * Source/cohort/home scope, not a cached human request or a read-only scope.
+   * Only this exact private upload journal changes; no provider IO is inside. */
+  private async mutateCleanup(fileId:string,change:(value:Session)=>Session):Promise<HostRecord>{
+    for(let attempt=0;attempt<5;attempt++)try{
+      return await this.files.withCancelledSourceMetadata(fileId,async(_file,transaction)=>{
+        const row=await this.read(fileId,transaction),value=change(this.value(row));
+        if(same(value,row.value))return row;
+        return this.records.update(row.id,row.revision,{value:value as unknown as Record<string,unknown>},{transaction});
+      });
+    }catch(error){if(!conflict(error)||attempt===4)throw error;}
+    throw Error('The original cleanup metadata checkpoint requires reconciliation.');
+  }
+  /** Maintenance only: remove an already-cancelled owned payload version.
+   * Cancellation is irreversible in the SourceFile authority. Its immutable
+   * upload receipt, permanent capability fence and financial history remain.
+   * No current/saved human is fabricated to recover issued physical facts. */
+  async purgeCancelled(fileId:string):Promise<{state:'sealed'|'removed';bytesRemoved:number;usagePending:boolean}>{
+    this.outsideTransaction();
+    let row=await this.read(fileId),value=this.value(row),file=await this.file(fileId);this.matchFile(value,file);
+    if(file.uploadState!=='cancelled'||!file.cancellation||!instant(file.cancellation.requestedAt)||!file.cancellation.requestedByUserId)throw new SourceFileUploadError('upload_not_cancelled',409,'Only an actual cancelled original can be cleaned up.');
+    const cancellation={requestedAt:file.cancellation.requestedAt,requestedByUserId:file.cancellation.requestedByUserId};
+    row=await this.close(row);value=this.value(row);
+    if(value.phase==='sealed'){if(await this.deliver(row))throw new SourceFileUploadError('upload_accounting_pending',503,'The original physical closure still awaits its actual accounting receipt.');return{state:'sealed',bytesRemoved:0,usagePending:false};}
+    if(!value.provider||!value.completedObject||!['retained','completed'].includes(value.phase))throw Error('The actual completed cancelled payload requires reconciliation.');
+    if(!this.options.removal?.removeOwnedVersion||!this.options.quota.recordOwnedStorageRemoval)throw new SourceFileUploadError('original_cleanup_unavailable',503,'Actual immutable removal and original-settlement-backed storage accounting are required.');
+    // Settle the genuine saved positive byte fact before any corresponding
+    // negative removal. An ambiguous settlement cannot be treated as zero.
+    if(await this.deliver(row))throw new SourceFileUploadError('upload_accounting_pending',503,'The actual stored-original usage receipt must settle before removal.');
+    const request:OwnedVersionRemovalRequest={object:structuredClone(value.completedObject),upload:structuredClone(value.provider),cellId:this.cellId,creatorId:value.creatorId},targetFingerprint=ownedVersionFingerprint(request);
+    row=await this.files.withCancelledSourceMetadata(fileId,async(actual,transaction)=>{
+      const current=await this.read(fileId,transaction),saved=this.value(current);this.matchFile(saved,actual);
+      if(actual.uploadState!=='cancelled'||!actual.cancellation||!same(cancellation,{requestedAt:actual.cancellation.requestedAt,requestedByUserId:actual.cancellation.requestedByUserId}))throw new SourceFileUploadError('upload_source_conflict',409,'The original cancellation changed before cleanup.');
+      if(saved.removal){if(saved.removal.targetFingerprint!==targetFingerprint||!same(saved.removal.cancellation,cancellation))throw Error('The original owned removal identity changed.');return current;}
+      return this.records.update(current.id,current.revision,{value:{...current.value,removal:{schemaVersion:1,targetFingerprint,requestedAt:this.now().toISOString(),cancellation,request}}},{transaction});
+    });value=this.value(row);
+    if(!value.removal)throw Error('The original removal intent was not retained.');
+    if(!value.removal.proof){
+      const proof=await this.options.removal.removeOwnedVersion(request);validateOwnedVersionAbsence(request,proof);
+      row=await this.mutateCleanup(fileId,current=>{if(!current.removal||current.removal.targetFingerprint!==targetFingerprint||!same(current.removal.request,request))throw Error('The genuine original removal checkpoint changed.');return current.removal.proof?current:{...current,removal:{...current.removal,proof}};});value=this.value(row);
+    }
+    const removal=value.removal;if(!removal?.proof)throw Error('The actual immutable-version absence proof is required.');
+    if(!removal.accountedAt){
+      await this.options.quota.recordOwnedStorageRemoval({creatorId:value.creatorId,operation:'upload.original',originalIdempotencyKey:this.usageKey(row),storageBytesRemoved:request.object.byteLength,proofId:removal.proof.proofId,observedAt:removal.proof.observedAt});
+      row=await this.mutateCleanup(fileId,current=>{if(!current.removal?.proof||!same(current.removal.proof,removal.proof))throw Error('The actual original removal accounting proof changed.');return current.removal.accountedAt?current:{...current,removal:{...current.removal,accountedAt:this.now().toISOString()}};});
+    }
+    return{state:'removed',bytesRemoved:request.object.byteLength,usagePending:false};
+  }
   /** Trusted host receipt lookup only. This is not original-delivery authority.
    * Consumers still require current SourceFile/Creator and safety access. */
   async readPhysicalReceipt(fileId:string):Promise<StoredObject|undefined>{
@@ -362,6 +414,8 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const candidates=rows.filter(row=>{
       if(row.namespace!==namespace||row.instanceId!==this.instanceId||row.homeCellId!==this.cellId||row.scopeId!==this.files.scope.creatorId)return false;
       const value=this.value(row);
+      if(value.removal?.accountedAt)return false;
+      if(value.removal)return true;
       if(value.phase==='prepared'&&value.expiresAt>this.now().toISOString())return false;
       if(value.phase==='sealed'||value.phase==='completed')return indexed.get((value.usageIntentId??value.closureIntentId)!)?.value.state==='pending';
       return true;
@@ -369,7 +423,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const after=cursor?.value.after as string|undefined;
     const selected=[...candidates.filter(row=>!after||row.id>after),...candidates.filter(row=>after&&row.id<=after)].slice(0,limit);
     let failure:unknown;
-    for(const row of selected){try{await this.recover(this.value(row).fileId);}catch(error){failure??=error;}}
+    for(const row of selected){try{const value=this.value(row);if(value.removal)await this.purgeCancelled(value.fileId);else await this.recover(value.fileId);}catch(error){failure??=error;}}
     if(selected.length){
       const last=selected.at(-1)!,value={schemaVersion:1,after:last.id};
       try{

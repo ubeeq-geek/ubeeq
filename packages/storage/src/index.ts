@@ -43,6 +43,8 @@ export interface StreamingObjectStorage {
   openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectReadStream>;
 }
 export interface ObjectStorage {
+  /** Exact immutable-version deletion plus permanent capability fence. */
+  removeOwnedVersion?:import('./owned-version-removal.js').OwnedVersionRemovalAdapter['removeOwnedVersion'];
   openReadStream?:StreamingObjectStorage['openReadStream'];
   openRangeReader?:RangeObjectStorage['openRangeReader'];
   put(input: { object: StoredObject; body: Uint8Array }): Promise<void>;

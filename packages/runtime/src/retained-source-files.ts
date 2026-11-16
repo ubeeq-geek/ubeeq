@@ -151,6 +151,22 @@ export class RepositoryRetainedSourceFiles<M extends RetainedCreatorContentModel
       await this.appendRetainedAudit(prepared.audit,prepared.file.fileId);
     });
   }
+  /** Accept ORIGINAL cleanup journal metadata in the actual Creator/cohort/
+   * home transaction. This is deliberately not readCurrent: its server callback
+   * can checkpoint the existing immutable upload/removal HostRecord, but cannot
+   * mutate the SourceFile/cancellation or obtain ordinary human write authority.
+   * Keep this a normal Promise-returning method: callback arguments must not be
+   * passed through the generic async domain-method DTO cloner. */
+  withCancelledSourceMetadata<T>(fileId:string,operation:(file:Readonly<F>,transaction:PersistenceTransaction)=>Promise<T>):Promise<T>{
+    if(typeof fileId!=='string'||!fileId||typeof operation!=='function')throw new SourceFileConflict('An actual cancelled original and server metadata operation are required.');
+    return this.run(async transaction=>{
+      const file=await this.getSourceFileById(fileId);
+      if(!file||file.fileId!==fileId||file.creatorId!==this.scope.creatorId||file.uploadState!=='cancelled'||!Number.isSafeInteger(file.revision)||Number(file.revision)<1||!file.cancellation||typeof file.cancellation.requestedByUserId!=='string'||!file.cancellation.requestedByUserId||!Number.isFinite(Date.parse(file.cancellation.requestedAt)))throw new SourceFileConflict('The actual cancelled original requires reconciliation.');
+      const expected=structuredClone(file),result=await operation(Object.freeze(structuredClone(file)),transaction);
+      if(!sameSourceFile(await this.getSourceFileById(fileId),expected))throw new SourceFileConflict('Cleanup metadata cannot mutate the original SourceFile or its cancellation.');
+      return result;
+    });
+  }
   async listSourceCleanupJobs(now:string,limit:number):Promise<SourceCleanupJob[]>{
     if(!Number.isFinite(Date.parse(now))||!Number.isSafeInteger(limit)||limit<1||limit>100)throw new SourceFileConflict('Invalid cleanup page.');
     return (await this.listSourceFilesByCreatorId(this.scope.creatorId)).flatMap(file=>{const due=cleanupDueAt(file);return due&&due<=now?[{fileId:file.fileId,nextAttemptAt:due}]:[];})
