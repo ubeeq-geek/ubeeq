@@ -265,7 +265,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   const adapters: ReferenceAdapterSet = configuration.adapters ?? {
     repositories: localAdapters!.repositories, storage: localAdapters!.storage, uploads: localAdapters!.storage,
     delivery: localAdapters!.storage, jobs: localAdapters!.jobs, identity: localAdapters!.identity,
-    localIdentity: localAdapters!.identity, federation: localAdapters!.federation,
+    localIdentity: localAdapters!.identity, federation: localAdapters!.federation, credentials: localAdapters!.credentials,
   };
   try{
   const composition = composeReferenceApplication({

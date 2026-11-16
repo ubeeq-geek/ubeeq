@@ -43,6 +43,7 @@ test('host infrastructure shares concrete connections, vault, authorization and 
       constructed.push('website');
       assert.equal(context.persistence, store);
       assert.equal(context.adapters.repositories, local.repositories);
+      assert.equal(context.adapters.credentials, local.credentials, 'The actual same configured Local vault must reach each Core website factory.');
       const unavailable = async () => { throw Error('No website snapshot/release is selected in this HTTP composition control.'); };
       website = new WebsiteService({
         store,
@@ -63,6 +64,7 @@ test('host infrastructure shares concrete connections, vault, authorization and 
       constructed.push('hosting');
       composed++;
       assert.equal(context.adapters.repositories, local.repositories);
+      assert.equal(context.adapters.credentials, local.credentials, 'The actual same configured Local vault must reach each Core website factory.');
       assert.equal(context.persistence, store);
       selectedService = context.service;
       return Object.freeze({connections, adapters: Object.freeze([native, pages]), nativeAdapters: Object.freeze([native])});
@@ -72,6 +74,7 @@ test('host infrastructure shares concrete connections, vault, authorization and 
       assert.equal(context.service, website);
       assert.equal(context.persistence, store);
       assert.equal(context.adapters.repositories, local.repositories);
+      assert.equal(context.adapters.credentials, local.credentials, 'The actual same configured Local vault must reach each Core website factory.');
       assert.equal(context.hostingConnections, connections);
       assert.deepEqual(context.hostingAdapters, [native, pages]);
       const unavailable = async () => { throw Error('No deployment is selected in this HTTP composition control.'); };
