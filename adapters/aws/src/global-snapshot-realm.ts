@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
-import {CreateTableCommand,DescribeTableCommand,waitUntilTableExists,type DynamoDBClient} from '@aws-sdk/client-dynamodb';
+import {OwnedAwsClientLifetime} from './owned-client-lifetime.js';
+import {CreateTableCommand,DescribeTableCommand,waitUntilTableExists,DynamoDBClient} from '@aws-sdk/client-dynamodb';
 import {DynamoDBDocumentClient,GetCommand,PutCommand,ScanCommand} from '@aws-sdk/lib-dynamodb';
 import type {AwsCommandClient} from './client-port.js';
 
@@ -93,4 +94,16 @@ async function reopen(raw:DynamoDBClient,client:DynamoDBDocumentClient,input:{ta
  const description=(await raw.send(new DescribeTableCommand({TableName:input.tableName}))).Table;
  if(description?.TableArn!==root.genesis.tableArn||description.CreationDateTime?.toISOString()!==root.genesis.createdAt)throw new SnapshotProtocolError('The snapshot genesis belongs to another physical table.');
  await assertNoLegacyMarkers(client,input.tableName);return {client,realm:authorize(client,input.tableName,root)};
+}
+
+/** Actual SDK-owned ordinary reopen. This creates no table/root or principal
+ * authority; the original opener must validate existing complete global-v2
+ * history. Pure data configuration avoids lending a foreign SDK client class.
+ * Its caller closes this owner AFTER every borrower finishes with the session. */
+export async function openOwnedGlobalSnapshotRealm(input:{region:string;tableName:string;instanceId:string;endpoint?:string;credentials?:{accessKeyId:string;secretAccessKey:string;sessionToken?:string}}):Promise<GlobalSnapshotSession&{close():Promise<void>}>{
+ if(!input.region||input.region.trim()!==input.region)throw Error('An explicit actual snapshot region is required.');
+ const lifetime=new OwnedAwsClientLifetime(),raw=lifetime.own(new DynamoDBClient({region:input.region,...(input.endpoint?{endpoint:input.endpoint}:{}),...(input.credentials?{credentials:input.credentials}:{})}));
+ raw.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+ try{const session=await openGlobalSnapshotRealm(raw,{tableName:input.tableName,instanceId:input.instanceId});return Object.freeze({...session,close:()=>lifetime.close()});}
+ catch(error){try{await lifetime.close();}catch{}throw error;}
 }

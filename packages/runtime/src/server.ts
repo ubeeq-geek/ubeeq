@@ -1,3 +1,4 @@
+import {ReferenceRuntimeLifetime} from './runtime-lifetime.js';
 import {createRetainedSourceFileNodeHandler} from './retained-source-http.js';
 import {createContentPreparationNodeHandler,type ContentPreparationRuntimeBindings} from './content-preparation-node.js';
 import { TenancyAdmissionError } from '@ubeeq/extension-sdk';
@@ -60,6 +61,9 @@ const parseBody = async (request: IncomingMessage): Promise<Record<string, unkno
 });
 
 export type ReferenceAdapterSet = {
+  /** Concrete adapter-set resource owner. Core calls this only with the
+   * explicit runtime ownership configuration; injected sets default to host. */
+  close?():Promise<void>;
   repositories: UbeeqRepositories;
   storage: ObjectStorage;
   uploads: UploadAdapter & Partial<UploadContentAdapter>;
@@ -72,7 +76,7 @@ export type ReferenceAdapterSet = {
   federation?: FederationSignatureVerifier & FederationReplayStore & { keyId: string; publicKey: string };
 };
 
-/** The host owns injected persistence/client lifecycles. Optional cache ports
+/** Injected lifetimes default to host ownership; an actual runtime transfer is explicit. Optional cache ports
  * support unmetered adapters; metered runtimes use their owned-write journal. */
 export interface RuntimeWebsitePersistence extends WebsiteStore,WebsiteHostingStore {
   /** Optional concrete same-domain execution scope. Core supplies its actual
@@ -184,6 +188,9 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   /** Host-selected lease for bounded native decoding; defaults to 60 seconds. */
   processingLeaseSeconds?: number;
   adapters?: ReferenceAdapterSet;
+  /** Explicit transfer of this actual injected set's resource lifetime only.
+   * Omitted/host preserves caller ownership. Runtime requires its real close. */
+  adapterOwnership?:'host'|'runtime';
   /** Trusted synchronous local composition before the concrete local constructor.
    * The returned set remains runtime-owned, including SQLite defaults and close.
    * Cannot be combined with the host-owned generic adapters path. */
@@ -233,12 +240,13 @@ export const referenceApiConfigurationFromEnvironment = (environment: NodeJS.Pro
   };
 };
 
-export const createReferenceApi = (configuration: ReferenceApiConfiguration): { commerce?:ReturnType<typeof createReferenceCommerce>; website:Readonly<ReferenceWebsiteRuntime>; server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; close(): Promise<void> } => {
+export const createReferenceApi = (configuration: ReferenceApiConfiguration): { commerce?:ReturnType<typeof createReferenceCommerce>; website:Readonly<ReferenceWebsiteRuntime>; server: Server; handle(request: IncomingMessage, response: ServerResponse): Promise<void>; runNextJob(workerId: string): Promise<unknown>; resolveConnectorAppCredentials(input: { actorUserId: string; creatorId: string; provider: string }): ReturnType<HostExtensionRuntimePorts["connectorAppCredentials"]["resolveOAuthClient"]>; runOperation<Result>(operation:()=>Promise<Result>):Promise<Result>; close(): Promise<void> } => {
   if(configuration.configureCommerce!==undefined&&(typeof configuration.configureCommerce!=='function'||configuration.commerce!==undefined))throw new Error('Configure one trusted Commerce composition or direct Commerce configuration.');
   if(configuration.createLocalAdapters!==undefined){
     if(typeof configuration.createLocalAdapters!=='function')throw new Error('Local adapter creation requires a trusted factory.');
     if(configuration.adapters!==undefined)throw new Error('Choose either runtime-owned local adapter creation or host-owned adapters.');
   }
+  if(configuration.adapterOwnership!==undefined&&!['host','runtime'].includes(configuration.adapterOwnership)||configuration.adapterOwnership==='runtime'&&(!configuration.adapters||typeof configuration.adapters.close!=='function'))throw new Error('Runtime adapter ownership requires the actual injected set and its concrete close operation.');
   const cellId = configuration.cellId ?? "local-single-cell";
   const region = configuration.region ?? "local";
   const processingLeaseSeconds=configuration.processingLeaseSeconds??60;
@@ -259,6 +267,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     delivery: localAdapters!.storage, jobs: localAdapters!.jobs, identity: localAdapters!.identity,
     localIdentity: localAdapters!.identity, federation: localAdapters!.federation,
   };
+  try{
   const composition = composeReferenceApplication({
     instanceId: configuration.instanceId ?? "local-reference",
     cell: { id: cellId, region, operator: configuration.operator ?? "self-hosted" },
@@ -843,7 +852,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
   };
 
   let preparationTurn=true;
-  const runNextJob=async(workerId:string)=>{
+  const runNextJobOpen=async(workerId:string)=>{
     if(!preparationBindings)return runCoreJob(workerId);
     const first=preparationTurn;preparationTurn=!preparationTurn;
     const runPreparation=()=>preparationBindings.runNextJob(workerId),runCore=()=>runCoreJob(workerId);
@@ -859,7 +868,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     if(failed)throw failure;
   };
 
-  const handle = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
+  const handleOpen = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const requestId = request.headers["x-request-id"]?.toString() || randomUUID();
     try {
       const url = new URL(request.url ?? "/", configuration.publicBaseUrl);
@@ -1442,16 +1451,33 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       json(response, status, { error: { code, message, requestId, ...(details ? { details } : {}) } }, requestId);
     }
   };
-  const server = createServer((request, response) => { void handle(request, response); });
-  const resolveConnectorAppCredentials = async (input: { actorUserId: string; creatorId: string; provider: string }) => {
+  const lifetime=new ReferenceRuntimeLifetime();
+  const handle=async(request:IncomingMessage,response:ServerResponse):Promise<void>=>{
+    if(!lifetime.accepting){if(!response.destroyed&&!response.writableEnded){response.statusCode=503;response.setHeader('Content-Type','application/json; charset=utf-8');response.setHeader('Cache-Control','no-store');response.end(JSON.stringify({error:{code:'runtime_closed',message:'The Core runtime is closing or closed.'}}));}return;}
+    return lifetime.run(()=>handleOpen(request,response));
+  };
+  const runNextJob=(workerId:string)=>lifetime.run(()=>runNextJobOpen(workerId));
+  const server = createServer((request, response) => { void handle(request, response).catch(error=>{if(!response.destroyed)response.destroy(error instanceof Error?error:undefined);}); });
+  const resolveConnectorAppCredentials = (input: { actorUserId: string; creatorId: string; provider: string }) => lifetime.run(async()=>{
     const role = await tenancy.resolveCreatorRole(input.actorUserId, input.creatorId);
     if (!role || !['owner', 'admin'].includes(role)) throw new HttpError(403, 'connector_access_denied', 'Creator management access is required.');
     return hostPorts.connectorAppCredentials.resolveOAuthClient(input.provider, input.creatorId);
-  };
-  let disposed = false;
-  const dispose = () => { if (disposed) return; disposed = true; contentPreparation?.close(); localWebsiteStore?.close(); commerce?.close(); localAdapters?.database.close(); };
-  return { commerce, website, server, handle, runNextJob, resolveConnectorAppCredentials, close: () => new Promise((resolve, reject) => {
-    if (!server.listening) { dispose(); resolve(); return; }
-    server.close(error => { if (error) reject(error); else { dispose(); resolve(); } });
+  });
+  let disposal:Promise<void>|undefined;
+  const dispose=()=>disposal??=(async()=>{
+    let failed=false,failure:unknown;
+    for(const close of [()=>contentPreparation?.close(),()=>localWebsiteStore?.close(),()=>commerce?.close(),()=>localAdapters?.database.close(),()=>configuration.adapterOwnership==='runtime'?adapters.close?.():undefined])try{await close();}catch(error){if(!failed){failed=true;failure=error;}}
+    if(failed)throw failure;
+  })();
+  return { commerce, website, server, handle, runNextJob, resolveConnectorAppCredentials, runOperation:<Result>(operation:()=>Promise<Result>)=>lifetime.run(operation), close:()=>lifetime.close(async()=>{
+    let failed=false,failure:unknown;
+    if(server.listening)try{await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));}catch(error){failed=true;failure=error;}
+    try{await dispose();}catch(error){if(!failed){failed=true;failure=error;}}if(failed)throw failure;
   }) };
+  }catch(error){
+    // The synchronous constructor retains its original error. Start only real
+    // resource cleanup; no domain/provider action or guessed close callback.
+    if(configuration.adapterOwnership==='runtime')try{void Promise.resolve(adapters.close?.()).catch(()=>{});}catch{}
+    try{localAdapters?.database.close();}catch{}throw error;
+  }
 };

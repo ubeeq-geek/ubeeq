@@ -1,6 +1,7 @@
+import {OwnedAwsClientLifetime} from './owned-client-lifetime.js';
 import {openOwnedS3Ranges} from './original-ranges.js';
 export {DynamoCapacityError} from './item-capacity.js';
-export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
+export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,openOwnedGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {dynamoItemFits} from './item-capacity.js';
 import {removeOwnedS3Version} from './owned-version-removal.js';
@@ -721,11 +722,17 @@ export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { re
   cognitoIdentity?: CognitoIdentity;
   eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
-  const identity = configuration.cognitoIdentity ?? new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});
+  const lifetime=new OwnedAwsClientLifetime();
+  try{
+  const identity = configuration.cognitoIdentity ?? (()=>{const client=lifetime.own(new CognitoIdentityProviderClient({region:configuration.region}));client.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});return new CognitoIdentity(client,configuration.userPoolId,configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});})();
   const principal = requireCognitoIdentityRealm(identity);
   if(principal.userPoolId!==configuration.userPoolId||principal.clientId!==configuration.userPoolClientId||principal.subjectIdMode!==(configuration.subjectIdMode??'legacy_username'))throw new Error('The actual Cognito identity must match the configured principal namespace and subject mode.');
-  const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
-  const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
+  const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):(()=>{const raw=lifetime.own(new DynamoDBClient({region:configuration.region})),client=DynamoDBDocumentClient.from(raw);client.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});return client;})();
+  const s3=lifetime.own(new S3Client({region:configuration.region})),sqs=lifetime.own(new SQSClient({region:configuration.region})),events=lifetime.own(new EventBridgeClient({region:configuration.region})),secrets=lifetime.own(new SecretsManagerClient({region:configuration.region}));
+  s3.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  sqs.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  events.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  secrets.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
   // Jobs and canonical repositories must share the ACTUAL transaction context;
   // a second coordinator over the same client cannot enlist dispatch leases.
   const coordinator=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}),repositories=dynamoRepositories(coordinator.client,coordinator.transaction,configuration);
@@ -737,8 +744,12 @@ export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
     jobs: new AwsJobQueue(coordinator.client, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
     identity,
     ...(configuration.passwordAuthenticationEnabled ? { passwordAuthentication: { authenticate: (input: { email: string; password: string }) => identity.authenticateSession(input) } } : {}),
-    credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
+    credentials: new SecretsManagerCredentialVault(secrets, configuration.credentialSecretPrefix),
+    /** Only clients constructed above belong to this set. The actual supplied
+     * Cognito identity/global snapshot session remain caller-owned and usable. */
+    close:()=>lifetime.close()
   };
+  }catch(error){void lifetime.close().catch(()=>{});throw error;}
 };
 export { DynamoSmugMugRepository } from './smugmug-repository.js';
 export { createS3PublicDerivativeStore, type PublicDerivativeStore } from './public-derivative-storage.js';
