@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {WebsiteError, WEBSITE_PREVIEW_CHUNK_BYTES} from '@ubeeq/core';
-import type {HostRecord, UbeeqRepositories, WebsiteBlobStore} from '@ubeeq/persistence';
+import {withRepositoryRead,type HostRecord,type UbeeqRepositories,type WebsiteBlobStore,type PersistenceTransaction} from '@ubeeq/persistence';
 import {requireCreatorScopedObject, type ObjectStorage, type StoredObject} from '@ubeeq/storage';
 import {OwnedObjectWrites,OwnedObjectQuotaError} from './owned-object-writes.js';
 
@@ -19,8 +19,8 @@ export class OwnedWebsiteBlobs implements WebsiteBlobStore {
     if(!workspace||!/^[a-f0-9]{64}$/.test(checksum))throw new WebsiteError('invalid_media','Website byte identity is required.');
     return 'website-blob-'+digest(Buffer.from(JSON.stringify([this.instanceId,this.cellId,workspace,checksum])));
   }
-  private async owner(workspace:string){
-    const creator=await this.repositories.creators.get(workspace);
+  private async owner(workspace:string,transaction?:PersistenceTransaction){
+    const creator=transaction?await this.repositories.creators.get(workspace,{transaction}):await withRepositoryRead(this.repositories,current=>this.repositories.creators.get(workspace,{transaction:current}));
     if(!creator||creator.instanceId!==this.instanceId||creator.homeCellId!==this.cellId)throw new WebsiteError('foreign_reference','Website bytes belong to another workspace or cell.');
     return creator;
   }
@@ -30,14 +30,14 @@ export class OwnedWebsiteBlobs implements WebsiteBlobStore {
     return value;
   }
   private async manifest(workspace:string,checksum:string){
-    await this.owner(workspace);const row=await this.repositories.hostRecords!.get(this.id(workspace,checksum));return row?this.value(row,workspace,checksum):undefined;
+    return withRepositoryRead(this.repositories,async transaction=>{await this.owner(workspace,transaction);const row=await this.repositories.hostRecords!.get(this.id(workspace,checksum),{transaction});return row?this.value(row,workspace,checksum):undefined;});
   }
   async put(workspace:string,checksum:string,bytes:Uint8Array):Promise<void>{
     if(bytes.length>maxBytes)throw new WebsiteError('invalid_media','Website bytes are oversized.');
     bytes=Uint8Array.from(bytes);
     const owner=await this.owner(workspace),id=this.id(workspace,checksum);
     if(digest(bytes)!==checksum)throw new WebsiteError('invalid_media','Website bytes are oversized or changed.');
-    const existing=await this.repositories.hostRecords!.get(id);
+    const existing=await withRepositoryRead(this.repositories,transaction=>this.repositories.hostRecords!.get(id,{transaction}));
     if(existing){if(this.value(existing,workspace,checksum).byteLength!==bytes.length)throw new WebsiteError('artifact_conflict','Website byte identity conflicts.');return;}
     let chunkCount=0;
     for(let offset=0;offset<bytes.length;offset+=WEBSITE_PREVIEW_CHUNK_BYTES){
@@ -45,13 +45,14 @@ export class OwnedWebsiteBlobs implements WebsiteBlobStore {
       chunkCount++;
     }
     const value:BlobRecord={checksum,byteLength:bytes.length,chunkCount};
-    const accept=async(transaction?:import('@ubeeq/persistence').PersistenceTransaction)=>{
+    const accept=async(transaction?:PersistenceTransaction):Promise<void>=>{
+      if(!transaction)return this.repositories.transaction(current=>accept(current));
       const saved=await this.repositories.hostRecords!.get(id,transaction?{transaction}:undefined);
       if(saved){if(JSON.stringify(this.value(saved,workspace,checksum))!==JSON.stringify(value))throw new WebsiteError('artifact_conflict','The original website blob manifest conflicts.');return;}
       await this.repositories.hostRecords!.create({id,instanceId:this.instanceId,homeCellId:owner.homeCellId,dataHomeRegion:owner.dataHomeRegion,dataHomeAssignedAt:owner.dataHomeAssignedAt,routingRevision:owner.routingRevision,namespace:'runtime-website-blob',scopeId:workspace,key:checksum,value:value as unknown as Record<string,unknown>},transaction?{transaction}:undefined);
     };
-    try{if(this.authority)await this.authority.accept(workspace,accept);else await accept();}
-    catch(error){const saved=await this.repositories.hostRecords!.get(id);if(!saved||JSON.stringify(this.value(saved,workspace,checksum))!==JSON.stringify(value))throw error;}
+    try{if(this.authority)await this.authority.accept(workspace,accept);else await this.repositories.transaction(transaction=>accept(transaction));}
+    catch(error){const saved=await withRepositoryRead(this.repositories,transaction=>this.repositories.hostRecords!.get(id,{transaction}));if(!saved||JSON.stringify(this.value(saved,workspace,checksum))!==JSON.stringify(value))throw error;}
   }
   private async chunk(workspace:string,manifest:BlobRecord,index:number){
     const saved=await this.writes.recover({creatorId:workspace,operation:'website.blob',idempotencyKey:`${manifest.checksum}:${index}`});

@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type UbeeqRepositories} from '@ubeeq/persistence';
+import {withRepositoryRead,repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type UbeeqRepositories} from '@ubeeq/persistence';
 import type {StorageReservationClosure,UsageQuotaPort} from '@ubeeq/extension-sdk';
 const namespace='runtime-storage-closure';
 const fingerprint=(input:StorageReservationClosure)=>{
@@ -32,12 +32,12 @@ export class StorageClosureOutbox{
   async deliver(row:HostRecord):Promise<void>{
     const intent=this.validate(row);if(intent.state==='closed')return;
     await this.quota.closeStorageReservation!(intent.input);
-    try{await this.records.update(row.id,row.revision,{value:{...row.value,state:'closed'}});}
-    catch(error){const saved=await this.records.get(row.id);if(!saved || this.validate(saved).state!=='closed' || this.validate(saved).fingerprint!==intent.fingerprint)throw error;}
+    try{await this.repositories.transaction(transaction=>this.records.update(row.id,row.revision,{value:{...row.value,state:'closed'}},{transaction}));}
+    catch(error){const saved=await withRepositoryRead(this.repositories,transaction=>this.records.get(row.id,{transaction}));if(!saved || this.validate(saved).state!=='closed' || this.validate(saved).fingerprint!==intent.fingerprint)throw error;}
   }
   async drain(limit=25):Promise<number>{
     let count=0,failure:unknown;
-    for await(const row of repositoryItems(request=>this.records.list(request))){
+    for await(const row of repositoryItems(request=>withRepositoryRead(this.repositories,transaction=>this.records.list(request,{transaction})))){
       if(row.namespace!==namespace || row.instanceId!==this.instanceId || row.homeCellId!==this.cellId || row.value.state!=='pending')continue;
       try{await this.deliver(row);}catch(error){failure??=error;}
       if(++count>=limit)break;

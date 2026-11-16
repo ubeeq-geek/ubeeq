@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {repositoryItems, type CellOwnedRecord, type HostRecord, type UbeeqRepositories} from '@ubeeq/persistence';
+import {withRepositoryRead,repositoryItems, type CellOwnedRecord, type HostRecord, type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey, requireCreatorScopedObject, writeBoundedUploadContent, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation, type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
@@ -46,6 +46,11 @@ export class OwnedObjectWrites {
     this.usage = new UsageSettlementOutbox(repositories,quota,instanceId,cellId);
     this.closures = new StorageClosureOutbox(repositories,quota,instanceId,cellId);
   }
+  /** Adapter readScope queues Local metadata only; managed point reads retain
+   * their ordinary semantics. No physical upload/seal/quota call is enclosed. */
+  private readRecord(id:string){return withRepositoryRead(this.repositories,transaction=>this.records.get(id,{transaction}));}
+  private createRecord(input:Parameters<NonNullable<UbeeqRepositories['hostRecords']>['create']>[0]){return this.repositories.transaction(transaction=>this.records.create(input,{transaction}));}
+  private updateRecord(id:string,revision:number,patch:Parameters<NonNullable<UbeeqRepositories['hostRecords']>['update']>[2]){return this.repositories.transaction(transaction=>this.records.update(id,revision,patch,{transaction}));}
   private base(input: OwnedObjectIdentity) {
     if ([input.creatorId,input.operation,input.idempotencyKey].some(value=>typeof value!=='string'||!value.trim()||value.length>200)) throw new Error('Owned object identity is required.');
     return hash([this.instanceId,this.cellId,input.creatorId,input.operation,input.idempotencyKey]);
@@ -81,23 +86,24 @@ export class OwnedObjectWrites {
   private proveObject(value: Intent, object: StoredObject) {
     if (!value.provider || !object.versionId || object.bucket !== value.provider.object.bucket || object.key !== value.object.key || object.contentType !== value.object.contentType || object.byteLength !== value.object.byteLength || object.checksum !== value.object.checksum || object.scope !== value.object.scope || !instant(object.writtenAt!)) throw new Error('Owned output physical receipt conflicts.');
   }
-  private async latest(input: OwnedObjectIdentity): Promise<HostRecord | undefined> {
+  private async latest(input: OwnedObjectIdentity): Promise<HostRecord | undefined> {return withRepositoryRead(this.repositories,async()=>{
     for (let generation=0; generation<1000; generation++) {
-      const row = await this.records.get(this.id(input,generation));
+      const row = await this.readRecord(this.id(input,generation));
       if (!row) return undefined;
       const value = this.value(row);
       if (value.phase !== 'sealed') return row;
-      const next = await this.records.get(this.id(input,generation+1));
+      const next = await this.readRecord(this.id(input,generation+1));
       if (!next) return row;
       const following = this.value(next);
       if (following.previousProof !== (value.seal as {proofId:string}).proofId || following.requestHash !== value.requestHash) throw new Error('Owned output generations conflict.');
     }
     throw new Error('Owned output generation limit requires reconciliation.');
-  }
+
+    });}
   private async deliver(row: HostRecord) {
     const value = this.value(row), id = value.usageIntentId ?? value.closureIntentId;
     if (!id) return;
-    const intent = await this.records.get(id);
+    const intent = await this.readRecord(id);
     if (!intent || intent.scopeId !== value.creatorId || (intent.value.input as {idempotencyKey?:string})?.idempotencyKey !== this.usageKey(row)) throw new Error('Owned output accounting intent requires reconciliation.');
     try {if (value.usageIntentId) await this.usage.deliver(intent); else await this.closures.deliver(intent);} catch {/* The receipt and independently replayable intent are already committed. */}
   }
@@ -115,7 +121,7 @@ export class OwnedObjectWrites {
         }); break;
       } catch (error) {if (!conflict(error) || attempt===4) throw error;}
     }
-    const saved = (await this.records.get(initial.id))!, value = this.value(saved);
+    const saved = (await this.readRecord(initial.id))!, value = this.value(saved);
     await this.deliver(saved);
     return {object:structuredClone(value.completedObject!),metadata:structuredClone(value.metadata)};
   }
@@ -124,8 +130,8 @@ export class OwnedObjectWrites {
     for (let attempt=0; attempt<5; attempt++) {
       if (['completed','sealed'].includes(value.phase)) {await this.deliver(row); return;}
       if (value.phase === 'closing') break;
-      try {row=await this.records.update(row.id,row.revision,{value:{...row.value,phase:'closing',closingAt:new Date().toISOString()}});value=this.value(row);break;}
-      catch(error) {row=(await this.records.get(row.id))!;value=this.value(row);if(!conflict(error)||attempt===4)throw error;}
+      try {row=await this.updateRecord(row.id,row.revision,{value:{...row.value,phase:'closing',closingAt:new Date().toISOString()}});value=this.value(row);break;}
+      catch(error) {row=(await this.readRecord(row.id))!;value=this.value(row);if(!conflict(error)||attempt===4)throw error;}
     }
     if (value.phase !== 'closing') throw new Error('Owned output closure is pending.');
     const seal: UploadSealResult = value.provider ? await this.uploads.seal!({uploadId:value.provider.uploadId,cellId:this.cellId,creatorId:value.creatorId}) : {state:'sealed',proofId:hash([row.id,'never-issued',value.closingAt]),closedAt:value.closingAt!};
@@ -143,13 +149,13 @@ export class OwnedObjectWrites {
         });break;
       } catch(error){if(!conflict(error)||attempt===4)throw error;}
     }
-    await this.deliver((await this.records.get(row.id))!);
+    await this.deliver((await this.readRecord(row.id))!);
   }
   /** Reconcile a prior attempt without regenerating or repeating provider work. */
   async recover(input: OwnedObjectIdentity): Promise<OwnedObjectResult | undefined> {
     let row=await this.latest(input);if(!row)return;
     let value=this.value(row);
-    if (!['completed','sealed'].includes(value.phase)) {await this.close(row);row=(await this.records.get(row.id))!;value=this.value(row);}
+    if (!['completed','sealed'].includes(value.phase)) {await this.close(row);row=(await this.readRecord(row.id))!;value=this.value(row);}
     await this.deliver(row);
     if(value.phase==='completed')return {object:structuredClone(value.completedObject!),metadata:structuredClone(value.metadata)};
   }
@@ -159,32 +165,32 @@ export class OwnedObjectWrites {
     const requestHash=hash([input.bucket,input.contentType,body.byteLength,checksum,input.scope,input.kind,metadata]);
     let row=await this.latest(input), value=row?this.value(row):undefined;
     if(value && value.requestHash!==requestHash)throw new Error('Owned output request identity conflicts.');
-    if(row && value && (value.phase==='closing'||!['completed','sealed'].includes(value.phase)&&Date.parse(value.expiresAt)<=Date.now())){await this.close(row);row=(await this.records.get(row.id))!;value=this.value(row);}
+    if(row && value && (value.phase==='closing'||!['completed','sealed'].includes(value.phase)&&Date.parse(value.expiresAt)<=Date.now())){await this.close(row);row=(await this.readRecord(row.id))!;value=this.value(row);}
     if(value?.phase==='completed'){await this.deliver(row!);return {object:structuredClone(value.completedObject!),metadata:structuredClone(value.metadata)};}
     if(!row || value?.phase==='sealed') {
       if(row)await this.deliver(row);
       const generation=value?value.generation+1:0;
       if(generation>=1000)throw new Error('Owned output generation limit requires reconciliation.');
       const intent:Intent={creatorId:input.creatorId,operation:input.operation,idempotencyKey:input.idempotencyKey,generation,...(value?.seal?.state==='sealed'?{previousProof:value.seal.proofId}:{}),requestHash,metadata,phase:'prepared',expiresAt:new Date(Date.now()+15*60_000).toISOString(),object:{bucket:input.bucket,key:this.objectKey({...input,generation},input.kind),contentType:input.contentType,byteLength:body.byteLength,checksum,scope:input.scope}};
-      try {row=await this.records.create({id:this.id(input,generation),instanceId:this.instanceId,namespace,scopeId:input.creatorId,key:input.idempotencyKey,homeCellId:input.home.homeCellId,dataHomeRegion:input.home.dataHomeRegion,dataHomeAssignedAt:input.home.dataHomeAssignedAt,routingRevision:input.home.routingRevision,value:intent as unknown as Record<string,unknown>});}
-      catch(error){row=await this.records.get(this.id(input,generation));if(!row)throw error;}
+      try {row=await this.createRecord({id:this.id(input,generation),instanceId:this.instanceId,namespace,scopeId:input.creatorId,key:input.idempotencyKey,homeCellId:input.home.homeCellId,dataHomeRegion:input.home.dataHomeRegion,dataHomeAssignedAt:input.home.dataHomeAssignedAt,routingRevision:input.home.routingRevision,value:intent as unknown as Record<string,unknown>});}
+      catch(error){row=await this.readRecord(this.id(input,generation));if(!row)throw error;}
       value=this.value(row);if(value.requestHash!==requestHash)throw new Error('Owned output request identity conflicts.');
     }
     const reservation=await this.quota.checkAndReserveQuota({creatorId:input.creatorId,operation:input.operation,idempotencyKey:this.usageKey(row!),storageBytesDelta:body.byteLength});
     if(!reservation.allowed){await this.close(row!);throw new OwnedObjectQuotaError(reservation.reasonCode??'Output storage quota exceeded.','reservation');}
     // This re-read fences a late reserve or capability reply after closure.
-    row=(await this.records.get(row!.id))!;value=this.value(row);
+    row=(await this.readRecord(row!.id))!;value=this.value(row);
     if(value.phase==='completed')return this.commitObject(row,value.completedObject!);
     if(!['prepared','issued'].includes(value.phase))throw new Error('Owned output was closed. Retry the same operation.');
     if(this.quota.checkCurrentAdmission){const current=await this.quota.checkCurrentAdmission({creatorId:input.creatorId,operation:input.operation,idempotencyKey:this.usageKey(row)});if(!current.allowed){await this.close(row);throw new OwnedObjectQuotaError(current.reasonCode??'Output storage admission denied.','admission');}}
     if(!value.provider){
       const provider=await this.uploads.initiate({object:structuredClone(value.object),checksumAlgorithm:'sha256',expiresAt:value.expiresAt,idempotencyKey:row.id});this.proveProvider(value,provider);
       for(let attempt=0;attempt<5;attempt++){
-        row=(await this.records.get(row.id))!;value=this.value(row);
+        row=(await this.readRecord(row.id))!;value=this.value(row);
         if(value.phase==='completed')return this.commitObject(row,value.completedObject!);
         if(!['prepared','issued'].includes(value.phase))throw new Error('Owned output was closed before capability publication.');
         if(value.provider)break;
-        try{row=await this.records.update(row.id,row.revision,{value:{...row.value,phase:'issued',provider}});value=this.value(row);break;}
+        try{row=await this.updateRecord(row.id,row.revision,{value:{...row.value,phase:'issued',provider}});value=this.value(row);break;}
         catch(error){if(!conflict(error)||attempt===4)throw error;}
       }
     }
@@ -202,7 +208,7 @@ export class OwnedObjectWrites {
   }
   async repair(limit=25):Promise<number>{
     let count=0,failure:unknown;
-    for await(const row of repositoryItems(request=>this.records.list(request))){
+    for await(const row of repositoryItems(request=>withRepositoryRead(this.repositories,transaction=>this.records.list(request,{transaction})))){
       if(row.namespace!==namespace||row.instanceId!==this.instanceId||row.homeCellId!==this.cellId)continue;
       const value=this.value(row);
       if(!['closing'].includes(value.phase)&&!(['prepared','issued'].includes(value.phase)&&Date.parse(value.expiresAt)<=Date.now()))continue;
