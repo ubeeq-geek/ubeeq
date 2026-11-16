@@ -1,3 +1,4 @@
+import {openOwnedS3Ranges} from './original-ranges.js';
 export {DynamoCapacityError} from './item-capacity.js';
 export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
 import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
@@ -322,6 +323,7 @@ export class AwsMigrationControlWorker {
 }
 
 export class S3ObjectStorage implements ObjectStorage {
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){return openOwnedS3Ranges(this.s3,{bucket:this.bucket,cellId:this.cellId,keyPrefix:this.keyPrefix},input);}
   removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedS3Version(this.s3,{bucket:this.bucket,cellId:this.cellId,keyPrefix:this.keyPrefix},input);}
   constructor(private readonly s3: AwsCommandClient, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
   private objectKey(key: string): string { return this.keyPrefix && !key.startsWith(`${this.keyPrefix}/`) ? `${this.keyPrefix}/${key}` : key; }

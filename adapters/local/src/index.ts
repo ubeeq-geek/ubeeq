@@ -1,3 +1,4 @@
+import {openOwnedLocalRanges} from './original-ranges.js';
 import {removeOwnedLocalVersion} from './owned-version-removal.js';
 import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
 import {LocalCustomerIdentities} from './customer-identities.js';
@@ -332,6 +333,7 @@ export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqReposi
 });
 
 export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, UploadContentStreamAdapter, DeliveryAdapter {
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){return openOwnedLocalRanges(this.local,input);}
   removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedLocalVersion(this.local,input);}
   private readonly uploadCustody:LocalUploadStreamCustody;
   constructor(private readonly local: LocalSqliteDatabase) {

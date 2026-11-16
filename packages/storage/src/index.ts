@@ -27,12 +27,24 @@ export interface StoredObjectReadStream {
   /** Dispose the provider body even when the consumer stops before iteration. */
   close():Promise<void>;
 }
+/** Bounded random access to one actual immutable version. Opening grants no
+ * publication/access authority; the domain caller retains that responsibility. */
+export interface StoredObjectRangeReader {
+  readonly object:StoredObject;
+  /** Exact positive range; at most 8 MiB per call, never a whole-video buffer. */
+  read(offset:number,length:number):Promise<Uint8Array>;
+  close():Promise<void>;
+}
+export interface RangeObjectStorage {
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectRangeReader>;
+}
 export interface StreamingObjectStorage {
   /** Exact immutable version only; never silently read the latest key. */
   openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectReadStream>;
 }
 export interface ObjectStorage {
   openReadStream?:StreamingObjectStorage['openReadStream'];
+  openRangeReader?:RangeObjectStorage['openRangeReader'];
   put(input: { object: StoredObject; body: Uint8Array }): Promise<void>;
   get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }>;
   remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void>;
