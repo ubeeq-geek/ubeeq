@@ -120,10 +120,16 @@ export interface ReferenceWebsiteHostingInfrastructure {
  readonly adapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
  readonly nativeAdapters:readonly NativeWebsiteHostingAdapter[];
 }
-export interface ReferenceWebsiteHostingCompositionContext {
+export interface ReferenceWebsiteServiceCompositionContext {
  readonly adapters:ReferenceAdapterSet;
  readonly persistence:RuntimeWebsitePersistence|undefined;
+}
+export interface ReferenceWebsiteHostingCompositionContext extends ReferenceWebsiteServiceCompositionContext {
  readonly service:WebsiteService|undefined;
+}
+export interface ReferenceWebsitePublishingCompositionContext extends ReferenceWebsiteHostingCompositionContext {
+ readonly hostingConnections:WebsiteHostingConnections|undefined;
+ readonly hostingAdapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
 }
 /** Preparation is composed after the actual website and Commerce services, so
  * a host can bind connected publishing without a second runtime or inventory. */
@@ -193,11 +199,11 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   diagnostics?: readonly DependencyDiagnostic[];
   /** Optional host-composed deterministic activity interface; no LLM service. */
   /** Trusted product composition may supply catalogue/rendition and policy ports. */
-  websiteService?: WebsiteService;
+  websiteService?: WebsiteService|((context:ReferenceWebsiteServiceCompositionContext)=>WebsiteService);
   websitePersistence?: RuntimeWebsitePersistence | ((context:{adapters:ReferenceAdapterSet;blobs?:WebsiteBlobStore})=>RuntimeWebsitePersistence);
   websiteHostingAdapters?:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
   websitePreviewMaxFileBytes?:number;
-  websitePublishing?: WebsitePublishingService;
+  websitePublishing?: WebsitePublishingService|((context:ReferenceWebsitePublishingCompositionContext)=>WebsitePublishingService);
   /** Complete host-composed infrastructure. A trusted synchronous factory may
    * use the actual adapters, persistence and service after their construction.
    * Core uses the exact returned instances throughout HTTP and worker handling. */
@@ -558,7 +564,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     })();
     renditionFlights.set(key,value);void value.finally(()=>renditionFlights.delete(key)).catch(()=>{});return value;
   };
-  const websites = configuration.websiteService ?? (websiteStore ? new WebsiteService({
+  const configuredWebsiteService=(()=>{try{
+    const supplied=configuration.websiteService;
+    const service=typeof supplied==='function'?supplied({adapters,persistence:websiteStore}):supplied;
+    if(supplied!==undefined&&(!service||typeof service.get!=='function'||typeof service.execute!=='function'))throw new WebsiteError('invalid_website_service','Website composition must synchronously return its concrete service.');
+    return service;
+  }catch(error){localWebsiteStore?.close();localAdapters?.database.close();throw error;}})();
+  const websites = configuredWebsiteService ?? (websiteStore ? new WebsiteService({
     store: websiteStore,
     previewMaxFileBytes:configuration.websitePreviewMaxFileBytes,
     creatorIdentityAllowed: async (actor, identityId) => identityId === actor.workspaceId,
@@ -661,7 +673,13 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     }}));
   }
   const websitePolicyActor='website-policy:'+cellId;
-  const publishing=configuration.websitePublishing??(websiteStore&&websites?new WebsitePublishingService({websites,store:websiteStore,artifacts:websiteStore,adapters:hostingAdapters,
+  const configuredWebsitePublishing=(()=>{try{
+    const supplied=configuration.websitePublishing;
+    const service=typeof supplied==='function'?supplied({adapters,persistence:websiteStore,service:websites,hostingConnections,hostingAdapters:Object.freeze([...hostingAdapters])}):supplied;
+    if(supplied!==undefined&&(!service||typeof service.choices!=='function'||typeof service.execute!=='function'))throw new WebsiteError('invalid_website_publishing','Website composition must synchronously return its concrete publisher.');
+    return service;
+  }catch(error){localWebsiteStore?.close();localAdapters?.database.close();throw error;}})();
+  const publishing=configuredWebsitePublishing??(websiteStore&&websites?new WebsitePublishingService({websites,store:websiteStore,artifacts:websiteStore,adapters:hostingAdapters,
     authorize:async(actor,action,target)=>{const creator=await repositories.creators.get(actor.workspaceId);if(actor.actorId===websitePolicyActor&&action==='publish'&&target&&creator?.homeCellId===cellId)return;if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);},
     enqueue:async payload=>{await adapters.jobs.enqueue({cellId,type:'website.deploy',payload,idempotencyKey:payload.idempotencyKey,maxAttempts:20});},
     audit:async event=>{await audit({action:event.action,actorId:event.actor.actorId,subjectId:event.targetId??event.intentId??event.actor.workspaceId,payload:{generation:event.generation,digest:event.digest,result:event.result}});}

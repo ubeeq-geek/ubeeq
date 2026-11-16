@@ -6,12 +6,14 @@ import {tmpdir} from 'node:os';
 import {createLocalAdapterSet, NativeWebsiteHostingAdapter, SqliteWebsiteStore} from '@ubeeq/adapter-local';
 import {WebsiteError} from '@ubeeq/core';
 import {WebsiteHostingConnections, CloudflarePagesWebsiteHostingAdapter} from '@ubeeq/integrations';
+import {WebsiteService, WebsitePublishingService} from '@ubeeq/portability';
 import {createReferenceApi} from '../dist/index.js';
 
 test('host infrastructure shares concrete connections, vault, authorization and adapters with real HTTP dispatch', async t => {
   const root = await mkdtemp(join(tmpdir(), 'hosting-infrastructure-'));
   const store = new SqliteWebsiteStore(join(root, 'websites.sqlite'));
-  let local, connections, pages, native, selectedService, composed = 0;
+  let local, connections, pages, native, selectedService, composed = 0, website, publisher;
+  const constructed = [];
   const authorized = [];
   const noProvider = async () => { throw Error('This local composition control must not call a provider.'); };
   const configuration = {
@@ -37,12 +39,48 @@ test('host infrastructure shares concrete connections, vault, authorization and 
       return local;
     },
     websitePersistence: () => store,
+    websiteService: context => {
+      constructed.push('website');
+      assert.equal(context.persistence, store);
+      assert.equal(context.adapters.repositories, local.repositories);
+      const unavailable = async () => { throw Error('No website snapshot/release is selected in this HTTP composition control.'); };
+      website = new WebsiteService({
+        store,
+        membership: async actor => {
+          const creator = await local.repositories.creators.get(actor.workspaceId);
+          return creator?.subjectId === actor.actorId ? {workspaceId: creator.id, userId: actor.actorId, role: 'owner', status: 'active'} : undefined;
+        },
+        creatorIdentityAllowed: async (actor, id) => {
+          const creator = await local.repositories.creators.get(id);
+          return id === actor.workspaceId && creator?.subjectId === actor.actorId;
+        },
+        capabilities: unavailable, resolveSnapshot: unavailable, evaluateRelease: unavailable,
+        dependenciesEligible: unavailable, enqueue: unavailable, audit: unavailable,
+      });
+      return website;
+    },
     websiteHostingInfrastructure: context => {
+      constructed.push('hosting');
       composed++;
       assert.equal(context.adapters.repositories, local.repositories);
       assert.equal(context.persistence, store);
       selectedService = context.service;
       return Object.freeze({connections, adapters: Object.freeze([native, pages]), nativeAdapters: Object.freeze([native])});
+    },
+    websitePublishing: context => {
+      constructed.push('publisher');
+      assert.equal(context.service, website);
+      assert.equal(context.persistence, store);
+      assert.equal(context.adapters.repositories, local.repositories);
+      assert.equal(context.hostingConnections, connections);
+      assert.deepEqual(context.hostingAdapters, [native, pages]);
+      const unavailable = async () => { throw Error('No deployment is selected in this HTTP composition control.'); };
+      publisher = new WebsitePublishingService({websites: website, store, artifacts: store, adapters: context.hostingAdapters,
+        authorize: async actor => {
+          const creator = await local.repositories.creators.get(actor.workspaceId);
+          if (creator?.subjectId !== actor.actorId) throw new WebsiteError('authorization_denied', 'Current owner required.');
+        }, enqueue: unavailable, audit: unavailable});
+      return publisher;
     },
   };
   const runtime = createReferenceApi(configuration);
@@ -50,6 +88,9 @@ test('host infrastructure shares concrete connections, vault, authorization and 
   assert.equal(runtime.website.hostingConnections, connections);
   assert.equal(composed, 1);
   assert.equal(runtime.website.service, selectedService);
+  assert.equal(runtime.website.service, website);
+  assert.equal(runtime.website.publishing, publisher);
+  assert.deepEqual(constructed, ['website', 'hosting', 'publisher']);
   assert.ok(selectedService);
   assert.deepEqual(runtime.website.hostingAdapters, [native, pages]);
   assert.equal(runtime.website.hostingAdapters[0], native);
