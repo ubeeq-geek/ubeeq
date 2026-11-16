@@ -11,7 +11,7 @@ import {createReferenceApi} from '../dist/index.js';
 test('host infrastructure shares concrete connections, vault, authorization and adapters with real HTTP dispatch', async t => {
   const root = await mkdtemp(join(tmpdir(), 'hosting-infrastructure-'));
   const store = new SqliteWebsiteStore(join(root, 'websites.sqlite'));
-  let local, connections, pages, native;
+  let local, connections, pages, native, selectedService, composed = 0;
   const authorized = [];
   const noProvider = async () => { throw Error('This local composition control must not call a provider.'); };
   const configuration = {
@@ -34,14 +34,23 @@ test('host infrastructure shares concrete connections, vault, authorization and 
       });
       pages = new CloudflarePagesWebsiteHostingAdapter({credential: c => connections.credential(c), probe: noProvider, fetch: noProvider});
       native = new NativeWebsiteHostingAdapter({id: 'host-native', root: join(root, 'hosting'), publicUrlTemplate: 'https://unit.test/sites/{site}/', persistent: true, writerMode: 'single'}, noProvider);
-      configuration.websiteHostingInfrastructure = Object.freeze({connections, adapters: Object.freeze([native, pages]), nativeAdapters: Object.freeze([native])});
       return local;
     },
     websitePersistence: () => store,
+    websiteHostingInfrastructure: context => {
+      composed++;
+      assert.equal(context.adapters.repositories, local.repositories);
+      assert.equal(context.persistence, store);
+      selectedService = context.service;
+      return Object.freeze({connections, adapters: Object.freeze([native, pages]), nativeAdapters: Object.freeze([native])});
+    },
   };
   const runtime = createReferenceApi(configuration);
   t.after(async () => { await runtime.close(); store.close(); await rm(root, {recursive: true, force: true}); });
   assert.equal(runtime.website.hostingConnections, connections);
+  assert.equal(composed, 1);
+  assert.equal(runtime.website.service, selectedService);
+  assert.ok(selectedService);
   assert.deepEqual(runtime.website.hostingAdapters, [native, pages]);
   assert.equal(runtime.website.hostingAdapters[0], native);
   assert.equal(runtime.website.hostingAdapters[1], pages);

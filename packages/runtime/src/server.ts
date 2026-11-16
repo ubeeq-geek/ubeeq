@@ -120,6 +120,11 @@ export interface ReferenceWebsiteHostingInfrastructure {
  readonly adapters:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
  readonly nativeAdapters:readonly NativeWebsiteHostingAdapter[];
 }
+export interface ReferenceWebsiteHostingCompositionContext {
+ readonly adapters:ReferenceAdapterSet;
+ readonly persistence:RuntimeWebsitePersistence|undefined;
+ readonly service:WebsiteService|undefined;
+}
 /** Preparation is composed after the actual website and Commerce services, so
  * a host can bind connected publishing without a second runtime or inventory. */
 export interface ReferenceContentPreparationContext {
@@ -193,9 +198,10 @@ export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfigura
   websiteHostingAdapters?:readonly import('@ubeeq/core').WebsiteHostingAdapter[];
   websitePreviewMaxFileBytes?:number;
   websitePublishing?: WebsitePublishingService;
-  /** Complete host-composed infrastructure. When supplied, Core uses these
-   * exact instances instead of constructing additional hosting adapters. */
-  websiteHostingInfrastructure?:Readonly<ReferenceWebsiteHostingInfrastructure>;
+  /** Complete host-composed infrastructure. A trusted synchronous factory may
+   * use the actual adapters, persistence and service after their construction.
+   * Core uses the exact returned instances throughout HTTP and worker handling. */
+  websiteHostingInfrastructure?:Readonly<ReferenceWebsiteHostingInfrastructure>|((context:ReferenceWebsiteHostingCompositionContext)=>Readonly<ReferenceWebsiteHostingInfrastructure>);
   nativeWebsiteProfiles?: readonly NativeWebsiteHostingProfile[];
   /** Explicit outbound policy is required before any external hosting connection is enabled. */
   websiteHostingExternal?:{authorizeUrl:(url:URL)=>Promise<void>;authorizeSftpHost:(host:string,port:number)=>Promise<void>;netlify?:{clientId:string;redirectUri:string}};
@@ -242,13 +248,6 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     credentialEncryptionKey: configuration.credentialEncryptionKey,
   };
   const localAdapters = configuration.adapters ? undefined : (configuration.createLocalAdapters ?? createLocalAdapterSet)(localConfiguration);
-  const hostingInfrastructure=configuration.websiteHostingInfrastructure;
-  try{
-    if(hostingInfrastructure){
-      if(hostingInfrastructure.nativeAdapters.some(adapter=>!hostingInfrastructure.adapters.includes(adapter)))throw new WebsiteError('hosting_adapter_mismatch','Native serving adapters must be the same instances used for publishing.');
-      if(new Set(hostingInfrastructure.adapters.map(adapter=>adapter.id)).size!==hostingInfrastructure.adapters.length)throw new WebsiteError('duplicate_hosting_adapter','Each hosting adapter must have a unique identifier.');
-    }
-  }catch(error){localAdapters?.database.close();throw error;}
   const adapters: ReferenceAdapterSet = configuration.adapters ?? {
     repositories: localAdapters!.repositories, storage: localAdapters!.storage, uploads: localAdapters!.storage,
     delivery: localAdapters!.storage, jobs: localAdapters!.jobs, identity: localAdapters!.identity,
@@ -634,6 +633,16 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     audit: async event => { await audit({ action: event.action, actorId: event.actor.actorId, subjectId: event.websiteId, payload: { buildId: event.buildId, artifactDigest: event.artifactDigest, result: event.result } }); }
   }) : undefined);
   const nativeProfiles=configuration.nativeWebsiteProfiles??[];
+  const hostingInfrastructure=(()=>{try{
+    const supplied=configuration.websiteHostingInfrastructure;
+    const infrastructure=typeof supplied==='function'?supplied({adapters,persistence:websiteStore,service:websites}):supplied;
+    if(supplied!==undefined){
+      if(!infrastructure||!Array.isArray(infrastructure.adapters)||!Array.isArray(infrastructure.nativeAdapters))throw new WebsiteError('invalid_hosting_infrastructure','Hosting composition must synchronously return concrete adapter collections.');
+      if(infrastructure.nativeAdapters.some(adapter=>!infrastructure.adapters.includes(adapter)))throw new WebsiteError('hosting_adapter_mismatch','Native serving adapters must be the same instances used for publishing.');
+      if(new Set(infrastructure.adapters.map(adapter=>adapter.id)).size!==infrastructure.adapters.length)throw new WebsiteError('duplicate_hosting_adapter','Each hosting adapter must have a unique identifier.');
+    }
+    return infrastructure;
+  }catch(error){localWebsiteStore?.close();localAdapters?.database.close();throw error;}})();
   const nativeProbe=createHostingPublicProbe({authorizeUrl:async url=>{if(!nativeProfiles.some(p=>{const template=new URL(p.publicUrlTemplate.replace('{site}','a'.repeat(32)));return url.origin===template.origin;}))throw new WebsiteError('unsafe_probe','Public probe origin is outside the administrator profiles.');}});
   const nativeHosting=hostingInfrastructure?[...hostingInfrastructure.nativeAdapters]:nativeProfiles.map(p=>new NativeWebsiteHostingAdapter(p,nativeProbe));
   const authorizeHostingManager=async(actor:{workspaceId:string;actorId:string})=>{const creator=await repositories.creators.get(actor.workspaceId);if(!creator||creator.subjectId!==actor.actorId||creator.homeCellId!==cellId)throw new WebsiteError('authorization_denied','Current website owner authority is required.');await requireCreatorWritable(creator);};
