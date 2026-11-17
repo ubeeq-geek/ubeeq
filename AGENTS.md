@@ -21,7 +21,7 @@
 
 # Downstream compatibility
 
-- When changing a published contract, identify affected consumers in `ubeeq-commercial`, `eversally-platform`, `nightframe-platform`, and `brightpush-platform`.
+- When changing a published contract, identify affected consumers in the shared commercial layer and private product repositories using their compatibility manifests.
 - Do not silently update downstream compatibility pins from this repository. Record the required companion work in the pull request.
 - Preserve public-package boundaries with `npm run check:public-boundary`, `npm run check:adapter-contracts`, and `npm run check:publish-workflow` when relevant.
 

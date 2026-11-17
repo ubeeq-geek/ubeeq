@@ -165,7 +165,20 @@ export class LocalSqliteDatabase {
     this.owner = context;
     try {
       return await this.transactionContext.run(context, async () => {
-        this.database.exec('BEGIN IMMEDIATE');
+        // SQLite's synchronous busy handler cannot let another connection in
+        // this process finish its awaited callback. Acquire asynchronously,
+        // keeping the same five-second bound and original native busy error.
+        const deadline = Date.now() + 5000;
+        for (;;) {
+          this.database.exec('PRAGMA busy_timeout = 0');
+          let busy: unknown;
+          try { this.database.exec('BEGIN IMMEDIATE'); }
+          catch (error) { busy = error; }
+          finally { this.database.exec('PRAGMA busy_timeout = 5000'); }
+          if (!busy) break;
+          if ((busy as {errcode?:number}).errcode !== 5 || Date.now() >= deadline) throw busy;
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
         try {
           const result = await operation({ id: context.id });
           if (context.rollbackOnly) throw new Error('SQLite transaction is rollback-only after a nested failure.');

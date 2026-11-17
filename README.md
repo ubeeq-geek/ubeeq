@@ -68,6 +68,15 @@ remain as backward-compatible aliases.
 - `@ubeeq/deployment-machine-compact` — neutral configuration for a compact, single-cell machine deployment.
 - `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
 - `@ubeeq/api` — startup validation for extension compatibility.
+- `@ubeeq/audience` — mailing lists, free offers, bookings and client galleries.
+- `@ubeeq/commerce` — customer commerce contracts and domain services.
+- `@ubeeq/commerce-runtime` — neutral storefront, account and checkout composition.
+- `@ubeeq/connector-reference` — shared connector implementations and reconciliation.
+- `@ubeeq/media-sharp` — image processing and text-watermark adapter.
+- `@ubeeq/media-ffmpeg` — audio/video processing adapter.
+- `@ubeeq/portability` — creator archive import/export and validation.
+- `@ubeeq/runtime` — composed creator API, publishing and worker runtime.
+- `@ubeeq/studio-ui` — unbranded creator views and host extension slots.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
 - `apps/reference-api` — runnable local API reference for the creator-to-public-Work flow.
 
