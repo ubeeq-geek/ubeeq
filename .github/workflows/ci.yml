@@ -5,9 +5,17 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     services:
       dynamodb:
         # Official DynamoDB Local 3.3.2 multi-platform manifest, pinned by digest.
