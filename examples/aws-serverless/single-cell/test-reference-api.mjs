@@ -1,8 +1,9 @@
+import {readReferenceOperator,releaseCreatedReferenceOperator} from './owned-reference-operator.mjs';
 /** Opt-in AWS example flow: Cognito bearer auth -> API Gateway -> direct S3 -> SQS worker -> publication -> delivery. */
 import { createHash, randomUUID } from "node:crypto";
-import { CognitoIdentityProviderClient, InitiateAuthCommand } from "@aws-sdk/client-cognito-identity-provider";
+import { CognitoIdentityProviderClient, InitiateAuthCommand, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { DeleteCommand, DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 
 const required = ["UBEEQ_AWS_API_URL", "UBEEQ_AWS_REGION", "UBEEQ_AWS_RECORDS_TABLE", "UBEEQ_AWS_OBJECT_BUCKET", "UBEEQ_AWS_USER_POOL_CLIENT_ID", "UBEEQ_AWS_TEST_USERNAME", "UBEEQ_AWS_TEST_PASSWORD"];
@@ -16,7 +17,8 @@ if (missing.length) {
   const marker = `aws-api-e2e-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
   const s3 = new S3Client({ region });
-  const created = new Set(); let object;
+  const created = new Set(); let object, operatorFixture;
+  const instanceId=process.env.UBEEQ_AWS_INSTANCE_ID ?? "aws-reference";
   const call = async (path, { method = "GET", token, body } = {}) => {
     const response = await fetch(`${apiUrl}${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = response.status === 204 ? undefined : await response.json();
@@ -26,9 +28,15 @@ if (missing.length) {
     const auth = await new CognitoIdentityProviderClient({ region }).send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID, AuthParameters: { USERNAME: process.env.UBEEQ_AWS_TEST_USERNAME, PASSWORD: process.env.UBEEQ_AWS_TEST_PASSWORD } }));
     const token = auth.AuthenticationResult?.AccessToken;
     if (!token) throw new Error("Cognito did not return an access token for the disposable test identity.");
+    const actualUser=await new CognitoIdentityProviderClient({region}).send(new GetUserCommand({AccessToken:token}));
+    const beforeOperator=await readReferenceOperator(dynamo,process.env.UBEEQ_AWS_RECORDS_TABLE,instanceId);
     const creator = await call("/v1/creators", { method: "POST", token, body: { handle: marker, displayName: "AWS API E2E" } });
     if (creator.response.status !== 201) throw new Error(`Creator creation failed: ${JSON.stringify(creator.value)}`);
     created.add(creator.value.creator.id);
+    if(creator.value.creator.instanceId!==instanceId)throw Error("The reference test instance ID does not match the configured API.");
+    const actorId=creator.value.creator.subjectId;
+    if(!actorId||![actualUser.Username,actualUser.UserAttributes?.find(attribute=>attribute.Name==="sub")?.Value].includes(actorId))throw Error("The created fixture does not belong to the authenticated Cognito user.");
+    operatorFixture={tableName:process.env.UBEEQ_AWS_RECORDS_TABLE,instanceId,actorId,creatorId:creator.value.creator.id,before:beforeOperator,created:await readReferenceOperator(dynamo,process.env.UBEEQ_AWS_RECORDS_TABLE,instanceId)};
     const work = await call("/v1/works", { method: "POST", token, body: { title: marker } });
     if (work.response.status !== 201) throw new Error(`Work creation failed: ${JSON.stringify(work.value)}`);
     created.add(work.value.work.id);
@@ -69,5 +77,11 @@ if (missing.length) {
       }
       cursor = scanned.LastEvaluatedKey;
     } while (cursor);
+    if(operatorFixture){
+      const remaining=await dynamo.send(new GetCommand({TableName:operatorFixture.tableName,Key:{pk:`creators#${operatorFixture.creatorId}`,sk:"record"},ConsistentRead:true}));
+      if(remaining.Item)throw Error("Owned Creator fixture cleanup failed; its operator claim was retained.");
+      const released=await releaseCreatedReferenceOperator(dynamo,operatorFixture);
+      if(!released&&operatorFixture.before===undefined)throw Error("The owned operator fixture changed during teardown; its claim was retained.");
+    }
   }
 }

@@ -74,3 +74,5 @@ npm run test:aws --workspace @ubeeq/reference-api
 It creates a marked creator/work/object set, verifies direct upload through delivery, and removes only that test data afterward.
 
 See [MIGRATION.md](MIGRATION.md) for the supported local SQLite/filesystem migration path.
+
+The opt-in reference HTTP acceptance flow uses disposable Creator content. Its operator-claim teardown is conditional: it removes only a claim absent before this test, created for its authenticated Cognito actor, still byte-for-byte unchanged, and only after its Creator record is gone. Existing or foreign operator claims are retained; the runtime's single-operator admission rule is never reset to make a test pass. If the deployed API uses a custom instance ID, set `UBEEQ_AWS_INSTANCE_ID` to that same configured value when invoking the acceptance flow.
