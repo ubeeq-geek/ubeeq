@@ -12,9 +12,9 @@ disabled/compromised accounts are suspended, and archived accounts are closed.
 Missing users return no account. Unknown, malformed or unavailable provider
 evidence fails closed. Provider timestamps are preserved when present.
 
-The API and durable-worker roles need `cognito-idp:AdminGetUser` on their
+The API and durable-worker roles need `cognito-idp:AdminGetUser` and `cognito-idp:AdminListGroupsForUser` on their
 configured user-pool ARN. The single-cell deployment grants this read only to
-those two roles; the synthesized-policy test verifies both the action and ARN
+those two roles; the synthesized-policy test verifies both actions and the ARN
 scope. Hosts with separately managed IAM must supply the equivalent scoped
 permission before adopting the adapter. No broader user-administration grant is
 required by account lookup.
@@ -64,3 +64,25 @@ organization and creator setup, a queued job fenced after actual user disablemen
 no reserved or consumed credits, preserved original input, reauthentication and provider
 sign-out revocation. Its core/quota data used disposable local SQLite; it does not
 certify deployed managed persistence or paid credit delivery.
+
+## Live validation role
+
+The GitHub development validation role executes the identity adapter directly,
+separately from Lambda. It needs both read actions above on each exact source and
+destination user-pool ARN in addition to its existing disposable-user lifecycle
+permissions. Granting permissions to the Lambda roles does not grant them to the
+workflow role. Do not use a wildcard user-pool resource or substitute session
+claims when these reads fail.
+
+The multi-cell workflow preflights both reads after creating its disposable users
+and before executing the adapter/HTTP suites. AWS then reports the concrete
+failing operation rather than the adapter's deliberately generic unavailable
+account error. Cleanup still runs on failure. Updating this workflow or the CDK
+source does not modify the separately administered validation-role policy.
+
+Post-merge run `44127300281` passed the first cell's isolated queue conformance
+and then failed at account-status lookup. This is evidence of progress past the
+queue failure, not a complete two-cell live pass. The next run must qualify both
+identity-read preflight and the complete adapter/HTTP suites.
+
+The [AdminListGroupsForUser API](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AdminListGroupsForUser.html) requires IAM authorization independently of user access tokens.
