@@ -33,8 +33,13 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: ubeeq-dev-multi-cell-live
+  cancel-in-progress: false
+
 jobs:
   live-validation:
+    timeout-minutes: 90
     # This environment contains non-production values only:
     # UBEEQ_DEV_LIVE_ROLE_ARN and UBEEQ_DEV_AWS_ACCOUNT_ID.
     environment: ubeeq-dev-multi-cell-live

@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "synth": "cdk synth",
-    "deploy": "cdk deploy"
+    "deploy": "cdk deploy",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "aws-cdk-lib": "^2.131.0",

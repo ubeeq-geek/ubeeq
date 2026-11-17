@@ -104,8 +104,9 @@ Ubeeq separates reusable provider adapters from runnable deployment models:
 - **Compact machine cell** — [`deployments/machine/compact`](deployments/machine/compact): a low-operations, cloud-free, single authoritative cell. [`examples/machine/compact`](examples/machine/compact) runs the reference API, creator workspace, and operations workspace with Compose.
 - **AWS serverless single-cell** — [`deployments/aws-serverless/single-cell`](deployments/aws-serverless/single-cell): Lambda/API Gateway, DynamoDB, S3, SQS, Cognito, and optional CloudFront for one scalable regional cell.
 - **AWS serverless multi-cell** — [`deployments/aws-serverless/multi-cell`](deployments/aws-serverless/multi-cell): optional routing/migration control-plane infrastructure that composes independent single cells; it does not create a global mutable data plane.
-- **Scalable machine single-cell** — [`deployments/machine/scalable-single-cell`](deployments/machine/scalable-single-cell) composes PostgreSQL and an S3-compatible object store through `@ubeeq/adapter-machine`; its remaining identity and deployment composition work is tracked with that profile.
-- **Future profiles** — `deployments/machine/scalable-multi-cell` and `deployments/kubernetes/scalable-*` reserve provider-neutral multi-cell and Kubernetes paths.
+- **Scalable machine single-cell reference** — [`examples/machine/scalable-single-cell`](examples/machine/scalable-single-cell) contains the runnable reference composition. [`deployments/machine/scalable-single-cell`](deployments/machine/scalable-single-cell) is a README-only deployment-module placeholder; identity and operational qualification remain incomplete.
+- **Kubernetes single-cell reference** — [`deployments/kubernetes/scalable-single-cell`](deployments/kubernetes/scalable-single-cell) contains checked manifests. Manifest validation is distinct from a cluster deployment rehearsal.
+- **Design-only multi-cell profiles** — `deployments/machine/scalable-multi-cell` and `deployments/kubernetes/scalable-multi-cell` contain README plans, with no deployable module.
 
 [`deployments/machine/compact/reference-config.json`](deployments/machine/compact/reference-config.json) is the product-neutral starting point for compact machine configuration. It contains neither hosted product settings nor credentials.
 
