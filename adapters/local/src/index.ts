@@ -446,11 +446,13 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
     });
   }
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
+    return this.local.transaction(async()=>{
     const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at, s.account_scope_at_issue FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string; account_scope_at_issue:string } | undefined;
     if (!row || row.expires_at <= now()) return undefined;
     const subject = await this.getAuthorizationSubject(row.account_id);
     if (!subject || subject.accountScope!==row.account_scope_at_issue) return undefined;
     return { id: row.id, subject, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
+    });
   }
   async withVerifiedSession<T>(input:{credential:string;audience?:string},operation:(session:AuthenticatedSession,transaction:import('@ubeeq/auth').CustomerIdentityTransaction)=>Promise<T>):Promise<T|undefined>{
     return this.local.transaction(async transaction=>{
@@ -458,8 +460,9 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
       return operation(session,transaction);
     });
   }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return this.local.transaction(async()=>{ const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }); }
   async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    return this.local.transaction(async()=>{
     const row = this.local.database.prepare('SELECT id, email, status, account_scope, roles_json, scopes_json, email_verified FROM ubeeq_accounts WHERE id = ?').get(subjectId) as { id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string; email_verified:number } | undefined;
     if (!row || row.status !== 'active') return undefined;
     if (row.id !== subjectId || !['creator_operator', 'customer_account'].includes(row.account_scope)) throw new Error('Local authorization evidence is unavailable.');
@@ -470,6 +473,7 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
       return result;
     };
     return { id: row.id, email: row.email, ...(row.email_verified===1?{emailVerified:true}:{}), accountScope: row.account_scope as AuthorizationSubject['accountScope'], roles: values(row.roles_json), scopes: values(row.scopes_json) };
+    });
   }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> {
