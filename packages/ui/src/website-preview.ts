@@ -45,15 +45,23 @@ export const websitePreviewLoadingMarkup = `<style>
 </style><main id="website-preview-loading" class="website-preview-loading" aria-busy="true"><span class="website-preview-spinner" aria-hidden="true"></span><h1>Opening website preview</h1><p id="website-preview-status" role="status" aria-live="polite">Preparing your saved pages and images…</p><p>This tab will show your website when it is ready.</p></main>`;
 export const websitePreviewLoadingHtml = () => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Opening website preview</title></head><body>${websitePreviewLoadingMarkup}</body></html>`;
 
+/** An opaque caller namespace isolates temporary browser previews. It is never
+ * an authorization grant; hosts retain their genuine current access checks. */
+export interface WebsitePreviewScope{namespace:string;embedded?:boolean;context?:Readonly<Record<string,string>>;}
+export interface WebsitePreviewRecord{id:string;html:string;createdAt:number;expiresAt:number;namespace?:string;context?:Readonly<Record<string,string>>;}
+export function validateWebsitePreviewScope(scope:WebsitePreviewScope|undefined):void{
+ if(scope===undefined)return;
+ if(!scope||scope.embedded!==undefined&&typeof scope.embedded!=='boolean'||typeof scope.namespace!=='string'||!/^[A-Za-z0-9_-]{1,180}$/.test(scope.namespace)||scope.context!==undefined&&(typeof scope.context!=='object'||Array.isArray(scope.context)||Object.keys(scope.context).length>20||Object.entries(scope.context).some(([key,value])=>!/^[A-Za-z][\w-]{0,79}$/.test(key)||typeof value!=='string'||value.length>2000)))throw new Error('The website preview scope is invalid.');
+}
 /** Trusted shell only: page content stays in an opaque-origin sandbox; validated provider players are hosted separately by this shell. */
 export interface WebsitePreviewContext {
-  websiteKey:string;revision:number;refreshChannel:string;editorUrl:string;pagePaths:Record<string,string>;
+  websiteKey:string;revision:number;embedded?:boolean;refreshChannel:string;editorUrl:string;pagePaths:Record<string,string>;
 }
-export const websitePreviewKey=(site:{workspaceId:string;id:string})=>'ubeeq.website-preview:'+site.workspaceId+':'+site.id;
+export const websitePreviewKey=(site:{workspaceId:string;id:string},namespace?:string)=>namespace?'ubeeq.website-preview:scoped:'+JSON.stringify([namespace,site.workspaceId,site.id]):'ubeeq.website-preview:'+site.workspaceId+':'+site.id;
 /** Only revision information crosses tabs. The website content stays in its sandbox. */
-export function notifyWebsitePreviewSaved(site:{workspaceId:string;id:string;revision:number}):void {
+export function notifyWebsitePreviewSaved(site:{workspaceId:string;id:string;revision:number},namespace?:string):void {
   if(typeof window==='undefined'||!Number.isSafeInteger(site.revision))return;
-  const key=websitePreviewKey(site);
+  const key=websitePreviewKey(site,namespace);
   try{const previous=Number(localStorage.getItem(key));if(previous>=site.revision)return;localStorage.setItem(key,String(site.revision));}catch{}
   try{const channel=new BroadcastChannel(key);channel.postMessage({type:'saved',revision:site.revision});channel.close();}catch{}
 }
@@ -223,7 +231,7 @@ function runWebsitePreview(files:Record<string,string>,initial:string,nonce:stri
       control=new BroadcastChannel(context.refreshChannel);control.onmessage=event=>{const data=event.data;if(!pending||data?.requestId!==pending)return;
         if(data.type==='offer'&&!chosen&&typeof data.providerId==='string'&&/^[a-f0-9-]{36}$/.test(data.providerId)){chosen=data.providerId;const request=new BroadcastChannel(context.websiteKey+':requests');request.postMessage({type:'refresh-accept',requestId:pending,providerId:chosen});request.close();}
         else if(data.type==='progress'){clearTimeout(timer);timer=setTimeout(()=>failed('The update is taking longer than expected. Try again or open the website editor.'),25*60*1000);message.textContent=data.message||'Updating preview…';}
-        else if(data.type==='ready'&&typeof data.id==='string'&&/^[a-f0-9-]{36}$/.test(data.id)){clearTimeout(timer);const next=new URL(location.href);next.searchParams.set('id',data.id);next.hash='';location.replace(next.href);}
+        else if(data.type==='ready'&&typeof data.id==='string'&&/^[a-f0-9-]{36}$/.test(data.id)){clearTimeout(timer);if(context.embedded&&parent!==window){parent.postMessage({type:'ubeeq-website-preview-ready',id:data.id},new URL(context.editorUrl).origin);return;}const next=new URL(location.href);next.searchParams.set('id',data.id);next.hash='';location.replace(next.href);}
         else if(data.type==='error'&&typeof data.message==='string')failed(data.message);
       };
     }catch{}
@@ -248,9 +256,22 @@ export const websitePreviewHtml = (files:Record<string,string>,initial='index.ht
 };
 
 /** Temporary local preview cache, shared with the standalone preview document. */
-export const saveWebsitePreview = async (html:string):Promise<string> => {
+export const saveWebsitePreview = async (html:string,scope?:WebsitePreviewScope,signal?:AbortSignal):Promise<string> => {
+  validateWebsitePreviewScope(scope);
+  const cancelled=()=>new Error('This website preview is no longer active.');
+  if(signal?.aborted)throw cancelled();
   const id=crypto.randomUUID(),now=Date.now();
   const db=await new Promise<IDBDatabase>((resolve,reject)=>{const request=indexedDB.open('ubeeq-website-previews-v1',1);request.onupgradeneeded=()=>request.result.createObjectStore('previews',{keyPath:'id'});request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(new Error('Browser storage is unavailable for website previews.'));});
-  try{await new Promise<void>((resolve,reject)=>{const tx=db.transaction('previews','readwrite'),store=tx.objectStore('previews'),rows:{id:string;createdAt:number}[]=[];const cursor=store.openCursor();cursor.onsuccess=()=>{const row=cursor.result;if(row){if(row.value.expiresAt<=now)row.delete();else rows.push({id:row.value.id,createdAt:row.value.createdAt});row.continue();}else{for(const row of rows.sort((a,b)=>b.createdAt-a.createdAt).slice(2))store.delete(row.id);store.put({id,html,createdAt:now,expiresAt:now+30*60*1000});}};tx.oncomplete=()=>resolve();tx.onerror=tx.onabort=()=>reject(new Error('Unable to store the temporary preview. Check available browser storage.'));});}finally{db.close();}
+  try{await new Promise<void>((resolve,reject)=>{
+    if(signal?.aborted){reject(cancelled());return;}
+    const tx=db.transaction('previews','readwrite'),store=tx.objectStore('previews'),rows:{id:string;createdAt:number}[]=[];
+    const cleanup=()=>signal?.removeEventListener('abort',abort);
+    const abort=()=>{try{tx.abort();}catch{/* A completed transaction cannot be aborted. */}cleanup();reject(cancelled());};
+    signal?.addEventListener('abort',abort,{once:true});
+    tx.oncomplete=()=>{cleanup();signal?.aborted?reject(cancelled()):resolve();};
+    tx.onerror=tx.onabort=()=>{cleanup();reject(signal?.aborted?cancelled():new Error('Unable to store the temporary preview. Check available browser storage.'));};
+    if(signal?.aborted){abort();return;}
+    const cursor=store.openCursor();cursor.onsuccess=()=>{if(signal?.aborted)return;const row=cursor.result;if(row){if(row.value.expiresAt<=now)row.delete();else if(row.value.namespace===scope?.namespace)rows.push({id:row.value.id,createdAt:row.value.createdAt});row.continue();}else{for(const row of rows.sort((a,b)=>b.createdAt-a.createdAt).slice(2))store.delete(row.id);store.put({id,html,createdAt:now,expiresAt:now+30*60*1000,...(scope?{namespace:scope.namespace,...(scope.context?{context:{...scope.context}}:{})}:{})});}};
+  });}finally{db.close();}
   return id;
 };

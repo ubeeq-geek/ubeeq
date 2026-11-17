@@ -1,1 +1,1 @@
-export {commerceHtml,commerceJavaScript} from '@ubeeq/commerce-runtime';
+export * from '@ubeeq/runtime/commerce-page';

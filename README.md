@@ -107,3 +107,7 @@ Rekognition Image moderation-label and face-age-range capabilities, see
 ## Portable reference-instance plan
 
 The staged implementation plan for the local reference instance, durable adapters, optional AWS composition, and compatibility gates is in [`docs/portable-reference-instance-implementation-plan.md`](docs/portable-reference-instance-implementation-plan.md).
+
+## License
+
+Ubeeq is licensed under the [MIT License](LICENSE). Workspace packages include the same license. Third-party components retain their own licenses and notices.

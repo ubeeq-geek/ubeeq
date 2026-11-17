@@ -13,7 +13,7 @@ test('publication keys survive restart, reject changed requests and never republ
   const start = async () => {
     local = createLocalAdapterSet(configuration);
     const identity = { verifySession: async ({ credential }) => ({ id: credential, subject: { id: credential, roles: [], scopes: [] } }) };
-    api = createReferenceApi({ publicBaseUrl: 'http://127.0.0.1:0', cellId: 'cell', adapters: { repositories: local.repositories, storage: local.storage, uploads: local.storage, delivery: local.storage, jobs: local.jobs, identity } });
+    api = createReferenceApi({ publicBaseUrl: 'http://127.0.0.1:0', cellId: 'cell', tenancyMode: 'multi_tenant_saas', adapters: { repositories: local.repositories, storage: local.storage, uploads: local.storage, delivery: local.storage, jobs: local.jobs, identity } });
     await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   };
   const request = async (path, body, key, actor = 'owner') => {

@@ -58,3 +58,28 @@ test('embedding response function runs without browser URL globals at the edge',
  const response=await apply({headers:{host:{value:'site.example'}}},{headers:{}},async()=>JSON.stringify({state:'active',frameAncestors:'https://parent.example'}));
  assert.equal(response.headers['content-security-policy'].value,'frame-ancestors https://parent.example');
 });
+
+
+test('AWS prepared media is not routable through an existing site before guarded activation and uses fresh KVS ETags',async()=>{
+ const data=new Map(),objects=new Map();let etag=0,duringGrant;
+ const target={id:'target',workspaceId:'w',accountId:'account',remoteId:hash(JSON.stringify(['w','target'])).slice(0,32),ownershipMarker:'owner',publicUrl:'https://one.example/',basePath:'/',config:{}};
+ const kvs={send:async command=>{const x=command.input;switch(command.constructor.name){case 'GetKeyCommand':if(!data.has(x.Key))throw Object.assign(Error('missing'),{name:'ResourceNotFoundException'});return {Value:data.get(x.Key)};case 'DescribeKeyValueStoreCommand':return {ETag:String(etag)};case 'UpdateKeysCommand':assert.equal(x.IfMatch,String(etag));etag++;for(const p of x.Puts)data.set(p.Key,p.Value);if(duringGrant&&x.Puts.some(p=>p.Key.startsWith('asset:'))){const run=duringGrant;duringGrant=undefined;run();etag++;}return {};default:throw Error(command.constructor.name);}}};
+ const s3={send:async command=>{const x=command.input;if(command.constructor.name==='PutObjectCommand'){objects.set(x.Key,x);return {}; }const object=objects.get(x.Key);if(!object)throw Object.assign(Error('missing'),{name:'NotFound'});return {ChecksumSHA256:object.ChecksumSHA256,ContentLength:object.Body.length};}};
+ const adapter=new AwsWebsiteHostingAdapter({id:'p',accountId:'account',bucket:'b',keyValueStoreArn:'arn'},{s3,kvs,inspect:async()=>({privateBucket:true,originAccessControl:true,hostnameAssociated:true,functionAssociated:true}),probe:async()=>({})});
+ const make=(name,generation)=>({target,generation,artifact:{digest:hash(name),files:new Map([['assets/'+hash(name)+'.jpg',Buffer.from(name)],['index.html',Buffer.from(name)]])},checkpoint:{},beforeActivation:async()=>{}});
+ const first=make('old',1);first.checkpoint=await adapter.prepare(first);await adapter.activate(first);target.activeReleaseId=first.artifact.digest;target.activeGeneration=1;
+ const next=make('next',2),asset=[...next.artifact.files.keys()][0],route=()=>routeAwsWebsite({uri:'/'+asset,headers:{host:{value:'one.example'}}},async key=>data.get(key),hash);
+ next.checkpoint=await adapter.prepare(next);assert.ok(objects.has('sites/'+target.remoteId+'/'+asset));assert.equal((await route()).statusCode,404);
+ next.beforeActivation=async()=>{throw Error('approval revoked');};await assert.rejects(adapter.activate(next),/approval revoked/);assert.equal((await route()).statusCode,404);
+ next.beforeActivation=async()=>{};await adapter.activate(next);assert.equal((await route()).uri,'/sites/'+target.remoteId+'/'+asset);
+ target.activeReleaseId=next.artifact.digest;target.activeGeneration=2;
+ const active=data.get('host:one.example');
+ for(const mode of ['suspend','drift']){
+  const candidate=make(mode,3);candidate.checkpoint=await adapter.prepare(candidate);
+  duringGrant=()=>mode==='suspend'?data.set('deny:'+target.remoteId,'1'):data.set('host:one.example',JSON.stringify({owner:'new-owner',site:target.remoteId,generation:3}));
+  await assert.rejects(adapter.activate(candidate),{code:mode==='suspend'?'serving_suspended':'remote_drift'});
+  if(mode==='suspend')assert.equal(data.get('host:one.example'),active);
+  else assert.equal(JSON.parse(data.get('host:one.example')).owner,'new-owner');
+  data.delete('deny:'+target.remoteId);data.set('host:one.example',active);
+ }
+});

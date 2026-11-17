@@ -1,7 +1,13 @@
+export * from './customer-identity.js';
+export * from './email-verification.js';
 /** An authenticated principal expressed without identity-provider assumptions. */
 export * from "./request-identity.js";
+export * from "./single-operator-tenancy.js";
 export { LocalSlidingWindowRateLimiter } from './local-rate-limit.js';
 export interface AuthorizationSubject {
+  email?: string;
+  emailVerified?: boolean;
+  accountScope?: import("@ubeeq/extension-sdk").PrincipalAccountScope;
   id: string;
   roles: readonly string[];
   scopes?: readonly string[];
@@ -34,8 +40,21 @@ export interface CreatorDelegation {
 
 /** Provider-neutral boundary for local, OIDC, and future cloud identity adapters. */
 export interface IdentityAdapter {
+  readonly emailVerification?:import('./email-verification.js').AccountEmailVerificationPort;
+  /** Actual persisted customer lifecycle; absent means unavailable, never Local fallback. */
+  readonly customerAccounts?:import('./customer-identity.js').CustomerIdentityProvider;
   verifySession(input: { credential: string; audience?: string }): Promise<AuthenticatedSession | undefined>;
+  /** Optional REAL provider-local accepting session transaction. Rechecks the
+   * persisted credential/revocation/current subject while the callback joins
+   * same-database policy and accepts a derived session. No managed/network
+   * implementation may claim this without an actual provider-local fence. */
+  withVerifiedSession?<T>(input:{credential:string;audience?:string},operation:(session:AuthenticatedSession,transaction:import('./customer-identity.js').CustomerIdentityTransaction)=>Promise<T>):Promise<T|undefined>;
   getAccount(subjectId: string): Promise<IdentityAccount | undefined>;
+  /** Current provider authority for a saved actor, without reusing session claims.
+   * Missing/inactive accounts return undefined; unavailable evidence must fail
+   * closed. Callers must not replace missing evidence with saved session claims.
+   * This live lookup does not promise a database transaction guard. */
+  getAuthorizationSubject?(subjectId: string): Promise<AuthorizationSubject | undefined>;
   listDelegations(input: { creatorId: string; subjectId: string; at: string }): Promise<readonly CreatorDelegation[]>;
   beginVerification?(input: { accountId: string; channel: string }): Promise<void>;
   completeVerification?(input: { accountId: string; proof: string }): Promise<void>;
@@ -48,6 +67,15 @@ export interface IdentityAdapter {
 export interface PasswordIdentityAdapter extends IdentityAdapter {
   register(input: { email: string; password: string }): Promise<IdentityAccount>;
   authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }>;
+}
+
+/** Password sign-in can exist without promising local account registration. */
+export type PasswordAuthenticationPort = Pick<PasswordIdentityAdapter, 'authenticate'>;
+export class PasswordAuthenticationError extends Error {
+  constructor(readonly code: 'invalid_credentials' | 'authentication_challenge_required' | 'identity_provider_unavailable') {
+    super(code === 'invalid_credentials' ? 'Sign-in could not be completed with these credentials.' : code === 'authentication_challenge_required' ? 'Complete the required account confirmation, password reset or sign-in challenge before signing in.' : 'Sign-in is temporarily unavailable.');
+    this.name = 'PasswordAuthenticationError';
+  }
 }
 
 /** Executable baseline shared by OIDC/Cognito and password-capable identity adapters. */

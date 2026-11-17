@@ -1,7 +1,7 @@
 import {saveWebsitePreviewDrafts} from './website-preview-drafts.js';
 import {attachWebsiteDragScroll} from './website-drag-scroll.js';
 import {moveWebsiteGallery,removeWebsitePage} from './website-page-actions.js';
-import {readWebsitePreviewArchive,websitePreviewHtml,websitePreviewEmbeds,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,type WebsitePreviewContext} from './website-preview.js';
+import {readWebsitePreviewArchive,websitePreviewHtml,websitePreviewEmbeds,saveWebsitePreview,websitePreviewLoadingHtml,notifyWebsitePreviewSaved,websitePreviewKey,validateWebsitePreviewScope,type WebsitePreviewScope,type WebsitePreviewContext} from './website-preview.js';
 import {createWebsitePreviewFileBroker,validateWebsitePreviewManifest,type WebsitePreviewManifest,type WebsitePreviewFiles,type WebsitePreviewSource} from './website-preview-files.js';
 import { websiteEmbedCode, websiteFrameAncestors, WEBSITE_THEMES, WEBSITE_INTENTS, WEBSITE_PAGE_TEMPLATES, websiteRoutes, websiteMenuParent, websiteMenuOrder, type WebsiteDestination, type WebsiteHostingTarget, type HostingCapabilities, type WebsitePage, type EntityId, type Website, type WebsiteDocument } from '@ubeeq/core';
 export interface WebsiteCatalogueOption {workId?:string;id:string;title:string;premium?:boolean;preferLocal?:boolean;destination?:Extract<WebsiteDestination,{mode:'connected'}>;destinationLabel?:string;}
@@ -43,9 +43,9 @@ export interface WebsiteWorkspaceClient {
   /** Returns an authorized generated HTML document. The iframe is always sandboxed. */
   preview(id: string,file?:string): Promise<string>;
 }
-export interface WebsiteWorkspaceOptions { hostingSetupUrl?:string; hostingDestinationSetupUrl?:(target:WebsiteHostingTarget)=>string; initialHostingTargetId?:string; hostingPlatformIcons?:Readonly<Partial<Record<string,{path:string;viewBox?:string}>>>; initialTab?:'Settings'|'Pages'|'Layout'|'Appearance'|'Galleries'|'Publishing'; studioName?:string; onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
+export interface WebsiteWorkspaceOptions { previewScope?:WebsitePreviewScope; hostingSetupUrl?:string; hostingDestinationSetupUrl?:(target:WebsiteHostingTarget)=>string; initialHostingTargetId?:string; hostingPlatformIcons?:Readonly<Partial<Record<string,{path:string;viewBox?:string}>>>; initialTab?:'Settings'|'Pages'|'Layout'|'Appearance'|'Galleries'|'Publishing'; studioName?:string; onBusyChange?:(busy:boolean)=>void; onUnsavedChangesChange?:(dirty:boolean)=>void; emptyHostingMessage?:string; formatDate?:(instant:string)=>string; previewPath?:string; exportEnabled?:boolean; destinationModes?: readonly ('local'|'manual'|'connected')[]; showAssetIds?: boolean; }
 type PreviewClient=Pick<WebsiteWorkspaceClient,'get'|'builds'|'build'|'requestBuild'|'previewSite'|'previewManifest'|'previewFiles'>;
-const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(message:string)=>void=()=>{},closed:()=>boolean=()=>false,fallback=false)=>{
+const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(message:string)=>void=()=>{},closed:()=>boolean=()=>false,fallback=false,scope?:WebsitePreviewScope)=>{
     const saved=await client.get(),selected=saved.pages.find(p=>p.id===(pageId??saved.homePageId)),page=fallback&&selected?.state!=='ready'?saved.pages.find(p=>p.id===saved.homePageId):selected;
     if(!page||page.state!=='ready')throw new Error('Save this page as Ready before previewing it.');
     let buildId:string|undefined;
@@ -73,23 +73,40 @@ const prepareWebsitePreview=async(client:PreviewClient,pageId?:string,progress:(
       const manifest=validateWebsitePreviewManifest(await client.previewManifest(buildId));
       const paths=[...new Set(['index.html',initial,'assets/theme.css','assets/gallery-viewer.js'].filter(path=>Object.hasOwn(manifest.files,path)))];
       const loaded=await client.previewFiles(buildId,paths);if(loaded.digest!==manifest.digest||paths.some(path=>typeof loaded.files[path]!=='string'))throw new Error('Invalid website preview response.');
-      files=loaded.files;source={buildId,manifest,channel:websitePreviewKey(saved)+':requests'};
+      files=loaded.files;source={buildId,manifest,channel:websitePreviewKey(saved,scope?.namespace)+':requests'};
     }else{
       if(!client.previewSite)throw new Error('Complete website previews are unavailable in this client.');
       files=await readWebsitePreviewArchive(await client.previewSite(buildId));
     }
     return {saved,buildId,files,initial,source};
 };
-const previewProviders=new Map<string,{channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string;broker:ReturnType<typeof createWebsitePreviewFileBroker>}>();
-const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient,source?:WebsitePreviewSource)=>{
+type PreviewProvider={channel:BroadcastChannel;client:PreviewClient;sourceUrl:string;id:string;closed:boolean;controller:AbortController;namespace?:string;broker:ReturnType<typeof createWebsitePreviewFileBroker>};
+const previewProviders=new Map<string,PreviewProvider>();
+type NamespaceLifetime={controller:AbortController;pending:number};
+const previewNamespaceLifetimes=new Map<string,NamespaceLifetime>();
+const forgetUnusedNamespace=(namespace:string|undefined)=>{if(namespace){const lifetime=previewNamespaceLifetimes.get(namespace);if(lifetime&&!lifetime.pending&&![...previewProviders.values()].some(provider=>provider.namespace===namespace))previewNamespaceLifetimes.delete(namespace);}};
+const beginPreviewLifetime=(namespace:string|undefined,signal?:AbortSignal)=>{
+  let lifetime=namespace?previewNamespaceLifetimes.get(namespace):undefined;
+  if(namespace&&!lifetime){lifetime={controller:new AbortController(),pending:0};previewNamespaceLifetimes.set(namespace,lifetime);}
+  if(lifetime)lifetime.pending++;
+  const controller=new AbortController(),cancel=()=>controller.abort(),sources=[signal,lifetime?.controller.signal].filter((value):value is AbortSignal=>!!value);
+  for(const source of sources){if(source.aborted)cancel();else source.addEventListener('abort',cancel,{once:true});}
+  return {signal:controller.signal,release(){for(const source of sources)source.removeEventListener('abort',cancel);if(lifetime)lifetime.pending--;forgetUnusedNamespace(namespace);}};
+};
+/** Release actual client/broker references when their editor or host scope ends. */
+export function disposeWebsitePreviewNamespace(namespace:string):void{previewNamespaceLifetimes.get(namespace)?.controller.abort();previewNamespaceLifetimes.delete(namespace);for(const[key,provider]of previewProviders)if(provider.namespace===namespace){provider.closed=true;provider.controller.abort();provider.channel.close();previewProviders.delete(key);}}
+function releaseWebsitePreviewProvider(site:Website,client:PreviewClient,namespace?:string):void{const key=websitePreviewKey(site,namespace),provider=previewProviders.get(key);if(provider?.client===client){provider.closed=true;provider.controller.abort();provider.channel.close();previewProviders.delete(key);forgetUnusedNamespace(namespace);}}
+const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClient,source?:WebsitePreviewSource,scope?:WebsitePreviewScope)=>{
   if(typeof window==='undefined'||typeof BroadcastChannel==='undefined')return;
-  const key=websitePreviewKey(saved),previous=previewProviders.get(key);
+  validateWebsitePreviewScope(scope);
+  const key=websitePreviewKey(saved,scope?.namespace),previous=previewProviders.get(key);
   if(previous){previous.client=client;previous.sourceUrl=sourceUrl;if(source)previous.broker.register(source.buildId,source.manifest);return;}
-  const provider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID(),broker:createWebsitePreviewFileBroker((buildId,paths,progress)=>previewProviders.get(key)!.client.previewFiles!(buildId,paths,progress))};
+  const provider:PreviewProvider={channel:new BroadcastChannel(key+':requests'),client,sourceUrl,id:crypto.randomUUID(),closed:false,controller:new AbortController(),namespace:scope?.namespace,broker:createWebsitePreviewFileBroker((buildId,paths,progress)=>{if(provider.closed)throw new Error('Keep the website editor open to load this preview.');return provider.client.previewFiles!(buildId,paths,progress);})};
   if(source)provider.broker.register(source.buildId,source.manifest);
   const offers=new Map<string,{replyTo:string;pageId?:string;path?:string;expires:number}>();
-  const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
+  const send=(replyTo:string,requestId:string,type:string,extra:Record<string,unknown>={})=>{if(provider.closed)return;const reply=new BroadcastChannel(replyTo);reply.postMessage({type,requestId,...extra});reply.close();};
   provider.channel.onmessage=async event=>{
+    if(provider.closed)return;
     const data=event.data;if(typeof data?.requestId!=='string'||!/^[a-f0-9-]{36}$/.test(data.requestId))return;
     if(data.type==='file-request'){
       if(typeof data.replyTo!=='string'||!/^ubeeq\.website-preview\.files:[a-f0-9-]{36}$/.test(data.replyTo)||typeof data.buildId!=='string'||typeof data.path!=='string'||data.path.length>2000)return;
@@ -107,35 +124,43 @@ const registerPreviewProvider=(saved:Website,sourceUrl:string,client:PreviewClie
     const reply=(type:string,extra:Record<string,unknown>={})=>send(offer.replyTo,data.requestId,type,extra);
     try{
       reply('progress',{message:'Preparing the latest saved preview…'});
-      const result=await prepareWebsitePreview(provider.client,offer.pageId,message=>reply('progress',{message}),undefined,true);
-      if(websitePreviewKey(result.saved)!==key)throw Error('This website is no longer available in the editor.');
-      const nextContext=makePreviewContext(result.saved,provider.sourceUrl,offer.replyTo);
+      const result=await prepareWebsitePreview(provider.client,offer.pageId,message=>reply('progress',{message}),undefined,true,scope);
+      if(websitePreviewKey(result.saved,scope?.namespace)!==key)throw Error('This website is no longer available in the editor.');
+      if(provider.closed)return;
+      const nextContext=makePreviewContext(result.saved,provider.sourceUrl,offer.replyTo,scope?.namespace,scope?.embedded);
       if(result.source)provider.broker.register(result.buildId,result.source.manifest);
       const initial=!offer.pageId&&offer.path?.endsWith('.html')&&Object.hasOwn(result.source?.manifest.files??result.files,offer.path)?offer.path:result.initial;
       if(result.source&&!Object.hasOwn(result.files,initial)){const loaded=await provider.client.previewFiles!(result.buildId,[initial]);if(loaded.digest!==result.source.manifest.digest)throw new Error('Preview changed during retrieval.');Object.assign(result.files,loaded.files);}
-      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext,result.source));notifyWebsitePreviewSaved(result.saved);reply('ready',{id});
+      if(provider.closed)return;
+      const id=await saveWebsitePreview(websitePreviewHtml(result.files,initial,nextContext,result.source),previewRecordScope(scope,result.saved),provider.controller.signal);if(provider.closed)return;notifyWebsitePreviewSaved(result.saved,scope?.namespace);reply('ready',{id});
     }catch(error){reply('error',{message:error instanceof Error?error.message:'The latest preview could not be prepared. Try again.'});}
   };
   previewProviders.set(key,provider);
-  if(previewProviders.size>30){const oldest=previewProviders.keys().next().value!;previewProviders.get(oldest)?.channel.close();previewProviders.delete(oldest);}
+  if(previewProviders.size>30){const oldest=previewProviders.keys().next().value!;const evicted=previewProviders.get(oldest);if(evicted){evicted.closed=true;evicted.controller.abort();evicted.channel.close();}previewProviders.delete(oldest);forgetUnusedNamespace(evicted?.namespace);}
 };
-const makePreviewContext=(saved:Website,sourceUrl:string,refreshChannel='ubeeq.website-preview.refresh:'+crypto.randomUUID()):WebsitePreviewContext=>{
+const previewRecordScope=(scope:WebsitePreviewScope|undefined,saved:Website):WebsitePreviewScope|undefined=>scope?{...scope,context:{...scope.context,websiteId:saved.id,workspaceId:saved.workspaceId}}:undefined;
+const makePreviewContext=(saved:Website,sourceUrl:string,refreshChannel='ubeeq.website-preview.refresh:'+crypto.randomUUID(),namespace?:string,embedded?:boolean):WebsitePreviewContext=>{
   const editor=new URL(sourceUrl);editor.searchParams.set('websiteId',saved.id);
-  return {websiteKey:websitePreviewKey(saved),revision:saved.revision,refreshChannel,editorUrl:editor.href,pagePaths:Object.fromEntries([...websiteRoutes(saved)].map(([id,route])=>[id,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html']))};
+  return {websiteKey:websitePreviewKey(saved,namespace),revision:saved.revision,...(embedded?{embedded:true}:{}),refreshChannel,editorUrl:editor.href,pagePaths:Object.fromEntries([...websiteRoutes(saved)].map(([id,route])=>[id,route==='/'?'index.html':decodeURIComponent(route.slice(1))+'index.html']))};
 };
 export {notifyWebsitePreviewSaved} from './website-preview.js';
-export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string):Promise<string> => {
-  popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
-  const progress=(message:string)=>{const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
+export type {WebsitePreviewScope,WebsitePreviewRecord} from './website-preview.js';
+export const openWebsitePreview = async (client:PreviewClient,popup:Window,sourceUrl:string,pageId?:string,previewPath?:string,scope?:WebsitePreviewScope,signal?:AbortSignal):Promise<string> => {
+  validateWebsitePreviewScope(scope);
+  const lifetime=beginPreviewLifetime(scope?.namespace,signal),current=()=>{if(lifetime.signal.aborted)throw new Error('This website preview is no longer active.');};
+  const cancel=()=>{if(!popup.closed)popup.close();};lifetime.signal.addEventListener('abort',cancel,{once:true});if(lifetime.signal.aborted)cancel();
+  const progress=(message:string)=>{if(lifetime.signal.aborted||popup.closed)return;const status=popup.document.getElementById('website-preview-status');if(status)status.textContent=message;};
   try{
-    const {saved,buildId,files,initial,source}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed);
-    registerPreviewProvider(saved,sourceUrl,client,source);
-    const context=previewPath?makePreviewContext(saved,sourceUrl):undefined;
-    const html=websitePreviewHtml(files,initial,context,source);notifyWebsitePreviewSaved(saved);
+    current();popup.opener=null;popup.document.open();popup.document.write(websitePreviewLoadingHtml());popup.document.close();
+    const {saved,buildId,files,initial,source}=await prepareWebsitePreview(client,pageId,progress,()=>popup.closed||lifetime.signal.aborted,false,scope);
+    current();if(popup.closed)return buildId;
+    registerPreviewProvider(saved,sourceUrl,client,source,scope);
+    const context=previewPath?makePreviewContext(saved,sourceUrl,undefined,scope?.namespace,scope?.embedded):undefined;
+    const html=websitePreviewHtml(files,initial,context,source);notifyWebsitePreviewSaved(saved,scope?.namespace);
     if(popup.closed)return buildId;
-    if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');target.searchParams.set('id',await saveWebsitePreview(html));if(!popup.closed)popup.location.replace(target.href);}else{popup.document.open();popup.document.write(html);popup.document.close();}
+    if(previewPath){const target=new URL(previewPath,sourceUrl);if(target.origin!==new URL(sourceUrl).origin)throw new Error('The preview page must use the same origin.');current();target.searchParams.set('id',await saveWebsitePreview(html,previewRecordScope(scope,saved),lifetime.signal));current();if(!popup.closed)popup.location.replace(target.href);}else{current();popup.document.open();popup.document.write(html);popup.document.close();}
     return buildId;
-  }catch(error){if(!popup.closed)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}
+  }catch(error){if(!popup.closed&&!lifetime.signal.aborted)popup.document.body.textContent=error instanceof Error?error.message:'Unable to open preview.';throw error;}finally{lifetime.signal.removeEventListener('abort',cancel);lifetime.release();}
 };
 export interface WebsiteGalleryLinkEditorProps {
   saveSuggestionUrl?:(id:string,url:string,expectedUrl:string)=>Promise<{url:string}>;
@@ -148,6 +173,7 @@ export type MountWebsiteGalleryWorks=(host:HTMLElement,props:WebsiteGalleryWorks
 export type MountWebsiteGalleryLinkEditor=(host:HTMLElement,props:WebsiteGalleryLinkEditorProps)=>(()=>void);
 /** Shared editor injection keeps the authoritative block format and existing editor. */
 export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspaceClient, mountEditor: (host: HTMLElement, document: WebsiteDocument, onChange: (document: WebsiteDocument) => void) => (() => void), options: WebsiteWorkspaceOptions = {}, mountSettings?: (host:HTMLElement)=>(()=>void), mountLinks?:MountWebsiteGalleryLinkEditor, mountWorks?:MountWebsiteGalleryWorks) => {
+  const previewController=new AbortController();
   const d=root.ownerDocument;
   let site: Website, disposed=false, cleanupEditor: (()=>void)|undefined, cleanupSettings:(()=>void)|undefined, currentBuild:string|undefined,selectedPage:string|undefined,pageSelectorExpanded=true,renderGeneration=0;
   const cleanupLinks:(()=>void)[]=[];
@@ -204,7 +230,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
     if(move){let framing=position??{x:.5,y:.5};preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;for(const axis of ['x','y'] as const){const l=element('label',label+(axis==='x'?' horizontal position':' vertical position')),range=element('input');range.type='range';range.min='0';range.max='1';range.step='.01';range.value=String(framing[axis]);range.oninput=()=>{framing={...framing,[axis]:Number(range.value)};move(framing);preview.style.objectPosition=`${framing.x*100}% ${framing.y*100}%`;};l.append(range);box.append(l);}}
     parent.append(box);if(value&&client.mediaPreview)void client.mediaPreview(value).then(url=>preview.src=url).catch(error=>{status.textContent=String(error);});
   };
-  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);savedSite=JSON.stringify(site);notifyWebsitePreviewSaved(site);for(const input of Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')))input.dataset.websiteDraftInitial=input.value;reportDirty();status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
+  const save=async()=>{if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before saving.');const expected=site.revision;site=await client.save({...site,revision:expected+1},expected);savedSite=JSON.stringify(site);notifyWebsitePreviewSaved(site,options.previewScope?.namespace);for(const input of Array.from(root.querySelectorAll<HTMLInputElement|HTMLTextAreaElement>('[data-website-draft-initial]')))input.dataset.websiteDraftInitial=input.value;reportDirty();status.textContent=`Website revision ${site.revision} saved. Build a new candidate to update the export.`;};
   const win=d.defaultView;let measureFrame=0;
   const measurePages=()=>{const selector=root.querySelector<HTMLElement>('.website-page-selector');if(!selector||selector.hidden||!win)return;const top=Math.max(0,selector.getBoundingClientRect().top);selector.style.setProperty('--website-selector-height',`${Math.max(160,win.innerHeight-top-24)}px`);const first=selector.querySelector<HTMLElement>('button');if(first)selector.parentElement?.style.setProperty('--website-selector-first-center',`${first.getBoundingClientRect().top-selector.getBoundingClientRect().top+selector.scrollTop+first.offsetHeight/2}px`);};
   const scheduleMeasure=()=>{if(win&&!measureFrame)measureFrame=win.requestAnimationFrame(()=>{measureFrame=0;measurePages();});};win?.addEventListener('resize',scheduleMeasure);win?.addEventListener('scroll',scheduleMeasure,true);
@@ -222,7 +248,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
           await save();await show(activeTab);
         }catch(error){await show(activeTab);throw error;}finally{root.inert=wasInert;}
       }
-      currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath);status.textContent='Preview opened in a new tab using saved changes.';
+      currentBuild=await openWebsitePreview(client,popup,win!.location.href,pageId,options.previewPath,options.previewScope,previewController.signal);status.textContent='Preview opened in a new tab using saved changes.';
     }catch(error){popup.close();throw error;}finally{previewPending=false;reportDirty();}
   };
   const show=async(tab:string)=>{
@@ -347,7 +373,7 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
             if(uploads||client.pendingUploads?.())throw new Error('Wait for image uploads to finish before deleting a page.');
             const draft=removeWebsitePage(site,page.id,replacement),baseline=JSON.parse(savedSite) as Website,expected=baseline.revision;
             const saved=await client.save({...removeWebsitePage(baseline,page.id,replacement),revision:expected+1},expected);
-            site={...draft,revision:saved.revision};savedSite=JSON.stringify(saved);notifyWebsitePreviewSaved(saved);
+            site={...draft,revision:saved.revision};savedSite=JSON.stringify(saved);notifyWebsitePreviewSaved(saved,options.previewScope?.namespace);
             if(!site.pages.some(candidate=>candidate.documentId===page.documentId)){documentDrafts.delete(page.documentId);documentBaselines.delete(page.documentId);}
             if(selectedPage===page.id)selectedPage=site.homePageId;
             status.textContent='Page “'+page.title+'” deleted. Publish again to update the live website.';reportDirty();await show('Pages');
@@ -642,6 +668,6 @@ export const createWebsiteWorkspace = (root: HTMLElement, client: WebsiteWorkspa
   for(const tab of ['Settings','Pages','Layout','Appearance','Galleries','Preview',...(options.exportEnabled===false&&!client.hostingChoices?[]:['Publishing'])]){const choice=tab==='Preview'?previewButton('Preview',()=>site.homePageId):button(tab,async()=>{if(!disposed)await show(tab);});choice.dataset.websiteTool=tab;tabs.append(choice);}
   const measureTools=()=>{if(win){const height=win.getComputedStyle(tabs).position==='sticky'?tabs.getBoundingClientRect().height:0;root.style.setProperty('--website-tools-height',`${height}px`);scheduleMeasure();}};
   const toolsObserver=typeof ResizeObserver==='undefined'?undefined:new ResizeObserver(measureTools);toolsObserver?.observe(tabs);measureTools();
-  const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);notifyWebsitePreviewSaved(value);if(win)registerPreviewProvider(value,win.location.href,client);await show(options.initialTab??'Pages');}}).catch(error=>{status.textContent=String(error);});
-  return {ready,destroy(){disposed=true;toolsObserver?.disconnect();root.style.removeProperty('--website-tools-height');root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();for(const cleanup of cleanupLinks.splice(0))cleanup();root.replaceChildren();}};
+  const ready=client.get().then(async value=>{if(!disposed){site=value;savedSite=JSON.stringify(value);notifyWebsitePreviewSaved(value,options.previewScope?.namespace);if(win)registerPreviewProvider(value,win.location.href,client,undefined,options.previewScope);await show(options.initialTab??'Pages');}}).catch(error=>{status.textContent=String(error);});
+  return {ready,destroy(){disposed=true;previewController.abort();if(site)releaseWebsitePreviewProvider(site,client,options.previewScope?.namespace);toolsObserver?.disconnect();root.style.removeProperty('--website-tools-height');root.removeEventListener('input',scheduleDirty);root.removeEventListener('change',scheduleDirty);stopPublishingPoll();for(const close of dialogs.values())close();dialogs.clear();win?.removeEventListener('resize',scheduleMeasure);win?.removeEventListener('scroll',scheduleMeasure,true);if(measureFrame)win?.cancelAnimationFrame(measureFrame);for(const observer of imageObservers)observer.disconnect();cleanupEditor?.();cleanupSettings?.();for(const cleanup of cleanupLinks.splice(0))cleanup();root.replaceChildren();}};
 };

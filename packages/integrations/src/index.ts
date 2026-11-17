@@ -317,7 +317,7 @@ export { VimeoUploadClient, type VimeoUploadTicket } from './vimeo-upload-client
 export { transferVimeoUpload, type VimeoUploadSource, type VimeoUploadTransferPort } from './vimeo-upload-transfer.js';
 export { FlickrClient, type FlickrOAuthCredentials, type FlickrInventoryPage, type FlickrRequestLimits } from './flickr-client.js';
 export { normalizeFlickrPhoto, normalizeFlickrProviderPhoto, flickrTextContent, type FlickrManifestPhoto } from './flickr-metadata.js';
-export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewayOptions, type SmugMugOAuthCredential } from './smugmug-gateway.js';
+export { SmugMugHttpGateway, type SmugMugCredentialVault, type SmugMugHttpGatewayOptions, type SmugMugOAuthCredential, type SmugMugAuthorizedAccount, type SmugMugImageMetadata } from './smugmug-gateway.js';
 export type { SmugMugCapabilities, SmugMugRemoteCollection, SmugMugRemoteImage, SmugMugInventoryPage, SmugMugGateway } from './smugmug-contracts.js';
 export * from './smugmug-migration.js';
 export * from './public-derivative-publication.js';
@@ -347,3 +347,25 @@ export * from './website-hosting-connections.js';
 
 export * from './website-hosting-hostinger.js';
 export * from './collection-release-completion.js';
+
+export * from './connector-credentials.js';
+export * from './local-connector-tables.js';
+export * from './instagram.js';
+export * from './instagram-provider.js';
+export * from './tumblr.js';
+export * from './patreon.js';
+export * from './patreon-policy.js';
+export * from './patreon-downloads.js';
+export * from './fanvue.js';
+export * from './bluesky.js';
+export * from './bluesky-announcement.js';
+export * from './facebook.js';
+export * from './linkedin.js';
+export * from './wordpress-client.js';
+export * from './ghost-client.js';
+export * from './discord-publishing.js';
+export * from './persistentMessagingWorker.js';
+export * from './externalSyncEngine.js';
+export * from './integrationPreflight.js';
+export * from './integrationReconciliation.js';
+

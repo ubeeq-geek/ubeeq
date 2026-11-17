@@ -87,12 +87,12 @@ test('library publication shares atomic receipts without copying Works or exposi
     const first = await create(async (_work, assets) => { selected = assets; }).service.publish(input);
     assert.equal(first.idempotent, false);
     assert.equal(first.work.id, 'work'); assert.equal(first.work.workId, 'work');
-    assert.equal(first.work.revision, 2); assert.equal(first.work.status, 'published');
+    assert.equal(first.work.revision, 2); assert.equal(first.work.status, 'ready');
     assert.deepEqual(first.work.body, work.body); assert.deepEqual(first.work.slugHistory, work.slugHistory);
     assert.equal(selected[0].id, 'asset'); assert.equal(selected[0].storage.key, 'selected-preview');
     assert.equal(selected[0].objectVersion, 'preview-v1');
     assert.equal(JSON.stringify(selected).includes('private-original'), false);
-    assert.equal((await new LocalCreatorLibraryStore(local.database).getWork('tenant', 'work')).status, 'published');
+    assert.equal((await new LocalCreatorLibraryStore(local.database).getWork('tenant', 'work')).status, 'ready');
     assert.deepEqual((await local.repositories.works.list({ limit: 100 })).items, []);
     assert.deepEqual((await local.repositories.assets.list({ limit: 100 })).items, []);
     local.database.database.close(); local = createLocalAdapterSet(configuration);

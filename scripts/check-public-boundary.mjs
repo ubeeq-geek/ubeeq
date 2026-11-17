@@ -4,7 +4,7 @@ import { join, relative } from "node:path";
 const root = new URL("..", import.meta.url).pathname;
 const ignored = new Set([".git", "node_modules", "dist"]);
 const self = "scripts/check-public-boundary.mjs";
-const protectedNames = ["eversally", "nightframe"];
+const protectedNames = ["eversally", "nightframe", "brightpush"];
 // Public Ubeeq contains no product runtime code, defaults, or product-facing
 // documentation. This boundary-design record is intentionally the one
 // exception: it documents how separately owned private UI extensions relate to

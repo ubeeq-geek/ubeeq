@@ -17,7 +17,7 @@ export interface WebsiteActor { actorId: string; workspaceId: string; }
 export interface WebsiteServicePorts {
   store: WebsiteStore;
   membership(actor: WebsiteActor): Promise<WorkspaceMembership | undefined>;
-  creatorIdentityAllowed(actor: WebsiteActor, creatorIdentityId: string): Promise<boolean>;
+  creatorIdentityAllowed(actor: WebsiteActor, creatorIdentityId: string, websiteId?:string): Promise<boolean>;
   capabilities(actor: WebsiteActor): Promise<WebsiteCapabilities>;
   resolveSnapshot(actor: WebsiteActor, website: Website): Promise<WebsiteSnapshot>;
   evaluateRelease(input: { actor: WebsiteActor; action: 'build' | 'preview' | 'export' | 'publish'; dependencies: readonly WebsiteDependency[]; websiteId: string }): Promise<WebsiteReleaseDecision>;
@@ -62,7 +62,7 @@ export class WebsiteService {
     const site=await this.get(actor,websiteId);
     if(site.revision!==expectedRevision)throw new WebsiteError('revision_conflict','Website changed before publication review.');
     await this.authorize(actor,'publish',[websiteId]);
-    for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
+    for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id,site.id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
     const limits=await this.ports.capabilities(actor),raw=await this.ports.resolveSnapshot(actor,structuredClone(site));
     validateWebsiteSnapshotBudget(raw,limits);
     if(websiteFingerprint(raw.website)!==websiteFingerprint(site))throw new WebsiteError('snapshot_changed','Publication source changed during capture.');
@@ -73,7 +73,7 @@ export class WebsiteService {
   }
   async authorizePublication(actor:WebsiteActor,websiteId:string,creatorIdentityId:string,dependencies:readonly WebsiteDependency[]) {
     await this.authorize(actor,'publish',this.resources(websiteId,dependencies));
-    if(!await this.ports.creatorIdentityAllowed(actor,creatorIdentityId))throw new WebsiteError('foreign_reference','Publishing identity is unavailable.');
+    if(!await this.ports.creatorIdentityAllowed(actor,creatorIdentityId,websiteId))throw new WebsiteError('foreign_reference','Publishing identity is unavailable.');
     const decision=await this.decision(actor,'publish',websiteId,dependencies);
     if(!await this.ports.dependenciesEligible(actor,dependencies))throw new WebsiteError('dependency_restricted','Pinned publication sources are no longer eligible.');
     return decision;
@@ -97,13 +97,13 @@ export class WebsiteService {
     if('deletedAt' in candidate)throw new WebsiteError('invalid_website','Website deletion requires the delete operation.');
     await this.authorize(actor,'edit',[candidate.id,...candidate.pages.map(p=>p.documentId)]);
     if(candidate.workspaceId!==actor.workspaceId || candidate.revision!==expectedRevision+1) throw new WebsiteError('revision_conflict','Website workspace or revision does not match.');
-    if(!await this.ports.creatorIdentityAllowed(actor,candidate.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is outside this workspace.');
+    if(!await this.ports.creatorIdentityAllowed(actor,candidate.creatorIdentityId,candidate.id)) throw new WebsiteError('foreign_reference','Publishing identity is outside this workspace.');
     websiteRoutes({...candidate,redirects:[]});
     const old=await this.ports.store.getWebsite(actor.workspaceId,site.id);
     if(old&&old.revision!==expectedRevision)throw new WebsiteError('revision_conflict','Website changed before saving. Reload and try again.');
     candidate.redirects=websiteHistoricalRedirects(candidate,old,old?await this.ports.publishedWebsites?.(actor,candidate.id)??[]:[]);
     websiteRoutes(candidate);
-    for(const id of candidate.contributingCreatorIds??[])if(!old?.contributingCreatorIds?.includes(id)&&!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is unavailable or not authorized.');
+    for(const id of candidate.contributingCreatorIds??[])if(!old?.contributingCreatorIds?.includes(id)&&!await this.ports.creatorIdentityAllowed(actor,id,candidate.id))throw new WebsiteError('foreign_reference','A contributing creator identity is unavailable or not authorized.');
     for(const page of candidate.pages) {
       const document=await this.ports.store.getDocument(actor.workspaceId,page.documentId);
       if(!document || document.workspaceId!==actor.workspaceId) throw new WebsiteError('missing_document','Save the page document in this workspace first.');
@@ -160,8 +160,8 @@ export class WebsiteService {
       const site=await this.get(actor,build.websiteId), caps=await this.ports.capabilities(actor);
       if(!caps.export) throw new WebsiteError('export_unavailable','Export is disabled.');
       if(site.revision!==build.websiteRevision) throw new WebsiteError('revision_conflict','Requested website revision is no longer current.');
-      if(!await this.ports.creatorIdentityAllowed(actor,site.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is no longer available in this workspace.');
-      for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
+      if(!await this.ports.creatorIdentityAllowed(actor,site.creatorIdentityId,site.id)) throw new WebsiteError('foreign_reference','Publishing identity is no longer available in this workspace.');
+      for(const id of site.contributingCreatorIds??[])if(!await this.ports.creatorIdentityAllowed(actor,id,site.id))throw new WebsiteError('foreign_reference','A contributing creator identity is no longer authorized.');
       const resolved=await this.ports.resolveSnapshot(actor,structuredClone(site));
       validateWebsiteSnapshotBudget(resolved,caps);
       const snapshot=structuredClone(resolved);
@@ -216,7 +216,7 @@ export class WebsiteService {
   private async artifact(actor: WebsiteActor, buildId: string, action: 'preview' | 'export') {
     const build=await this.build(actor,buildId);
     await this.authorize(actor,action==='export'?'export':'view',this.resources(build.websiteId,build.dependencies));
-    if(!await this.ports.creatorIdentityAllowed(actor,build.creatorIdentityId)) throw new WebsiteError('foreign_reference','Publishing identity is no longer available in this workspace.');
+    if(!await this.ports.creatorIdentityAllowed(actor,build.creatorIdentityId,build.websiteId)) throw new WebsiteError('foreign_reference','Publishing identity is no longer available in this workspace.');
     if(build.state!=='ready' || !build.artifactDigest || build.invalidated) throw new WebsiteError('artifact_unavailable','A ready, eligible immutable artifact is required.');
     if(Date.parse(build.expiresAt)<=this.now().getTime()) throw new WebsiteError('artifact_expired','Build artifact retention has expired.');
     if(action==='export' && !(await this.ports.capabilities(actor)).export) throw new WebsiteError('export_unavailable','Export is disabled.');
@@ -246,7 +246,7 @@ export class WebsiteService {
     const build=await this.build(actor,buildId);
     if(build.state!=='ready'||!build.artifactDigest||build.invalidated)throw new WebsiteError('artifact_unavailable','A ready, eligible immutable artifact is required.');
     if(Date.parse(build.expiresAt)<=this.now().getTime())throw new WebsiteError('artifact_expired','Build artifact retention has expired.');
-    if(!await this.ports.creatorIdentityAllowed(actor,build.creatorIdentityId))throw new WebsiteError('foreign_reference','Publishing identity is no longer available.');
+    if(!await this.ports.creatorIdentityAllowed(actor,build.creatorIdentityId,build.websiteId))throw new WebsiteError('foreign_reference','Publishing identity is no longer available.');
     await this.decision(actor,'preview',build.websiteId,build.dependencies);
     if(!await this.ports.dependenciesEligible(actor,build.dependencies))throw new WebsiteError('dependency_restricted','This preview is no longer eligible.');
     return build;

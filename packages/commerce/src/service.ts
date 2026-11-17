@@ -1,8 +1,9 @@
+import {isDeepStrictEqual} from 'node:util';
 import {customerReturnPath} from './customerReturnPath.js';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { CommerceError, currencyExponent, subscriptionPeriodEnd, type Audit, type Benefit, type Checkout, type Claim, type CommerceStore,
   type CommerceTransaction, type Customer, type DeliveryJob, type Environment, type Offer, type Payment,
-  type PrivateAsset, type RecordBase, type Scope } from './model.js';
+  type PrivateAsset, type RecordBase, type Scope, type MemberAccount } from './model.js';
 
 export interface CommerceMemberAccount {commerceSubjectId?:string;userId:string;username:string;displayName:string;email:string;passwordSetupRequired:boolean;}
 export interface CreatorActor { subjectId: string; ownerId: string; }
@@ -199,7 +200,13 @@ export class CommerceService {
     return {token:sessionId+'.'+secret,expiresAt};
   }
   async attachAccountCustomer(subjectId:string,accountUserId:string,address:string){const normalized=email(address);await this.store.transaction(tx=>{const customer=this.customer(tx,subjectId);if(customer.accountUserId&&customer.accountUserId!==accountUserId)throw new CommerceError('account_identity_conflict',409);customer.accountUserId=accountUserId;customer.verifiedEmails=[...new Set([...customer.verifiedEmails,normalized])];tx.put('customer',customer);});}
-  async issueAccountSession(commerceSubjectId:string,accountUserId:string){return this.store.transaction(tx=>{const customer=this.customer(tx,commerceSubjectId);if(customer.accountUserId!==accountUserId)throw new CommerceError('account_identity_conflict',403);return this.createSession(tx,customer,'password');});}
+  async issueAccountSession(commerceSubjectId:string,accountUserId:string,expectedMember?:MemberAccount){return this.store.transaction(tx=>{
+    // Host password proof/profile/member policy encloses this actual Commerce
+    // accepting write. Compare the full real Member in THIS transaction too;
+    // separate provider/Commerce databases are not a cross-provider transaction.
+    if(expectedMember){const current=tx.get('memberAccount',expectedMember.id);if(!current||current.userId!==accountUserId||current.commerceSubjectId!==commerceSubjectId||!isDeepStrictEqual(current,expectedMember))throw new CommerceError('account_identity_conflict',409);}
+    const customer=this.customer(tx,commerceSubjectId);if(customer.accountUserId!==accountUserId)throw new CommerceError('account_identity_conflict',403);return this.createSession(tx,customer,'password');
+  });}
   async accountSession(credential:string){
     if(credential.length>1000)return undefined;const [id,secret,extra]=credential.split('.');if(!id||!secret||extra)return undefined;
     return this.store.transaction(tx=>{const session=tx.get('session',id);if(!session?.accountUserId||session.expiresAt<=this.now()||!safeEqual(session.tokenHash,hash(secret)))return undefined;const customer=tx.get('customer',session.customerId);if(!customer||customer.erasedAt||customer.accountUserId!==session.accountUserId)return undefined;return {userId:session.accountUserId,commerceSubjectId:customer.subjectId,assurance:session.assurance??'email',issuedAt:session.createdAt,expiresAt:session.expiresAt};});

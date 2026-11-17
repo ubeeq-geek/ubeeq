@@ -8,7 +8,10 @@ import { publicationIdentityHash, type PublicationRemoteBinding } from './public
 import { OptimisticConcurrencyError, repositoryItems, type AuditEventRecord, type CellOwnedRecord, type PersistenceTransaction,
   type PublicationRecord, type RevisionedRecord, type RevisionedRepository, type TransactionRunner, type WorkRecord } from './index.js';
 
-export interface ManagedPublicationRecord extends PublicationRecord {
+/** The managed command view preserves the full canonical publication lifecycle.
+ * Compact PublicationRecord and its ordinary HTTP contract remain unchanged. */
+export interface ManagedPublicationRecord extends Omit<PublicationRecord,'status'> {
+  status: import('@ubeeq/core').PublicationStatus;
   copy?: import('@ubeeq/core').PublicationCopyIdentity;
   executionPolicy?: { schemaVersion: 1; adaptationReceiptId: string };
   creatorId?: string;
