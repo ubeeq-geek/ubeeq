@@ -191,5 +191,9 @@
         "dist/retained-value-codec.d.ts"
       ]
     }
+  },
+  "private": false,
+  "publishConfig": {
+    "access": "public"
   }
 }

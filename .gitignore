@@ -10,3 +10,6 @@ examples/machine/scalable-single-cell/.env
 
 # Generated CDK synthesis output
 cdk.out/
+
+# Locally prepared, unpublished release archives
+.release-artifacts/

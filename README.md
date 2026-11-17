@@ -121,3 +121,5 @@ The staged implementation plan for the local reference instance, durable adapter
 ## License
 
 Ubeeq is licensed under the [MIT License](LICENSE). Workspace packages include the same license. Third-party components retain their own licenses and notices.
+
+Public npm packages have not yet been published. Exact source commits and verified archive hashes identify current downstream builds. See [release preparation](RELEASE.md) for the complete package inventory and unpublished candidate manifest.
