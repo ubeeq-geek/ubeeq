@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import {request as nodeRequest} from 'node:http';
 import {setTimeout as delay} from 'node:timers/promises';
 import {inspectStoredObjectStream} from '@ubeeq/storage';
 import {sourceFileStreamFixture} from './source-file-stream-fixture.mjs';
+// Physical assertions use a separate read-only observer while the HTTP handler
+// may own the adapter connection across awaited transaction work.
+function observe(f,sql){const db=new DatabaseSync(f.local.database.configuration.databasePath,{readOnly:true});try{return db.prepare(sql).get();}finally{db.close();}}
 const block=Buffer.alloc(64*1024,0x2c);
 function sha(size){const hash=createHash('sha256');for(let remaining=size;remaining>0;remaining-=Math.min(remaining,block.length))hash.update(block.subarray(0,Math.min(remaining,block.length)));return hash.digest('hex');}
 async function* body(size){for(let remaining=size;remaining>0;remaining-=Math.min(remaining,block.length))yield block.subarray(0,Math.min(remaining,block.length));}
@@ -13,7 +17,7 @@ const begin=(f,size)=>f.request('/studio/files/uploads',{method:'POST',body:inpu
 const transfer=(f,upload,size,stream=body(size))=>f.request(upload.uploadPath,{method:'PUT',stream,headers:{...upload.requiredHeaders,'content-length':String(size)}});
 test('actual authenticated 129 MiB Local HTTP original streams before any Work and completes/reopens the same receipt',async t=>{
  const size=129*1024*1024+9,f=await sourceFileStreamFixture(t),prepared=await begin(f,size);assert.equal(prepared.status,201,JSON.stringify(prepared.body));assert.equal(prepared.body.requiresAuth,true);assert.equal((await transfer(f,prepared.body,size)).status,204);
- assert.equal(f.local.database.database.prepare('SELECT body FROM ubeeq_uploads').get().body,null);await f.restart();
+ assert.equal(observe(f,'SELECT body FROM ubeeq_uploads').body,null);await f.restart();
  const completed=await f.request(`/studio/files/${prepared.body.file.fileId}/complete`,{method:'POST'});assert.equal(completed.status,200,JSON.stringify(completed.body));assert.equal(completed.body.uploadState,'ready');assert.equal(completed.body.metadata.streamVerified,true);assert.deepEqual(completed.body.opaque,{retained:['full','source','JSON']});
  const receipt=await f.uploads.readPhysicalReceipt(prepared.body.file.fileId);assert.deepEqual(await inspectStoredObjectStream(f.local.storage,receipt,size),{checksumSha256:sha(size),sizeBytes:size});assert.equal(f.settlements.size,1);assert.equal([...f.settlements.values()][0].storageBytesDelta,size);assert.equal(f.closures.size,0);
  assert.deepEqual((await f.local.repositories.works.list({limit:100})).items,[]);assert.deepEqual((await f.local.repositories.assets.list({limit:100})).items,[]);await f.restart();assert.deepEqual(await f.uploads.readPhysicalReceipt(prepared.body.file.fileId),receipt);assert.equal((await f.request(`/studio/files/${prepared.body.file.fileId}/complete`,{method:'POST'})).status,200);assert.equal(f.settlements.size,1);
@@ -28,17 +32,17 @@ test('configured genuine Local metadata allowance may exceed managed single-PUT 
 });
 test('real HTTP checksum failure never marks source ready, creates physical receipt or charges nonexistent accepted bytes',async t=>{
  const f=await sourceFileStreamFixture(t),size=block.length*2,prepared=await begin(f,size),wrong=(async function*(){yield Buffer.alloc(block.length);yield Buffer.alloc(block.length);})();
- const result=await transfer(f,prepared.body,size,wrong);assert.equal(result.status,409,JSON.stringify(result.body));assert.equal(result.body.code,'upload_content_conflict');assert.equal((await f.files.getSourceFileById(prepared.body.file.fileId)).uploadState,'pending');assert.equal(await f.uploads.readPhysicalReceipt(prepared.body.file.fileId),undefined);assert.equal(f.settlements.size,0);assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_stream_custody').get().n,0);
+ const result=await transfer(f,prepared.body,size,wrong);assert.equal(result.status,409,JSON.stringify(result.body));assert.equal(result.body.code,'upload_content_conflict');assert.equal((await f.files.getSourceFileById(prepared.body.file.fileId)).uploadState,'pending');assert.equal(await f.uploads.readPhysicalReceipt(prepared.body.file.fileId),undefined);assert.equal(f.settlements.size,0);assert.equal(observe(f,'SELECT COUNT(*) AS n FROM ubeeq_upload_stream_custody').n,0);
  assert.equal((await transfer(f,prepared.body,size)).status,204);assert.equal((await f.request(`/studio/files/${prepared.body.file.fileId}/complete`,{method:'POST'})).status,200);
 });
 test('a real disconnected HTTP sender leaves no accepted original and can retry its same issued session',async t=>{
  const f=await sourceFileStreamFixture(t),size=block.length*3,prepared=await begin(f,size),pending=nodeRequest(f.origin+prepared.body.uploadPath,{method:'PUT',headers:{authorization:'Bearer '+f.token,...prepared.body.requiredHeaders,'content-length':String(size)}});
  pending.on('error',()=>{});pending.flushHeaders();pending.write(block);
- for(let i=0;i<100&&!f.local.database.database.prepare('SELECT id FROM ubeeq_upload_stream_custody').get();i++)await delay(10);
- assert.equal(f.local.database.database.prepare('SELECT state FROM ubeeq_upload_stream_custody').get()?.state,'receiving');
+ for(let i=0;i<500&&!observe(f,'SELECT state FROM ubeeq_upload_stream_custody');i++)await delay(10);
+ assert.equal(observe(f,'SELECT state FROM ubeeq_upload_stream_custody')?.state,'receiving');
  const closed=new Promise(resolve=>pending.once('close',resolve));pending.destroy();await closed;
- for(let i=0;i<100&&f.local.database.database.prepare('SELECT id FROM ubeeq_upload_stream_custody').get();i++)await delay(10);
- assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_stream_custody').get().n,0);assert.equal((await f.files.getSourceFileById(prepared.body.file.fileId)).uploadState,'pending');assert.equal(await f.uploads.readPhysicalReceipt(prepared.body.file.fileId),undefined);assert.equal(f.settlements.size,0);
+ for(let i=0;i<100&&observe(f,'SELECT id FROM ubeeq_upload_stream_custody');i++)await delay(10);
+ assert.equal(observe(f,'SELECT COUNT(*) AS n FROM ubeeq_upload_stream_custody').n,0);assert.equal((await f.files.getSourceFileById(prepared.body.file.fileId)).uploadState,'pending');assert.equal(await f.uploads.readPhysicalReceipt(prepared.body.file.fileId),undefined);assert.equal(f.settlements.size,0);
  assert.equal((await transfer(f,prepared.body,size)).status,204);assert.equal((await f.request(`/studio/files/${prepared.body.file.fileId}/complete`,{method:'POST'})).status,200);
 });
 test('failed finalization and actual identity revocation retain and charge the exact stream receipt across restart',async t=>{
@@ -56,7 +60,7 @@ test('fixture shutdown closes and drains an unfinished HTTP sender before dispos
  const f=await sourceFileStreamFixture(t),size=block.length*3,prepared=await begin(f,size);
  const pending=nodeRequest(f.origin+prepared.body.uploadPath,{method:'PUT',headers:{authorization:'Bearer '+f.token,...prepared.body.requiredHeaders,'content-length':String(size)}});
  pending.on('error',()=>{});const closed=new Promise(resolve=>pending.once('close',resolve));t.after(()=>pending.destroy());pending.flushHeaders();pending.write(block);
- for(let i=0;i<100&&!f.local.database.database.prepare('SELECT id FROM ubeeq_upload_stream_custody').get();i++)await delay(10);
- assert.equal(f.local.database.database.prepare('SELECT state FROM ubeeq_upload_stream_custody').get()?.state,'receiving');
+ for(let i=0;i<500&&!observe(f,'SELECT state FROM ubeeq_upload_stream_custody');i++)await delay(10);
+ assert.equal(observe(f,'SELECT state FROM ubeeq_upload_stream_custody')?.state,'receiving');
  await f.close();await closed;await f.close();
 });
