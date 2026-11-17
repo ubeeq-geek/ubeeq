@@ -7,7 +7,7 @@ import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { AwsServerlessSingleCellStack } from '../dist/lib/aws-serverless-single-cell-stack.js';
 
-test('API and worker account-status permission is scoped to their configured user pool', async () => {
+test('API and worker account-status and group permissions are scoped to their configured user pool', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'identity-policy-'));
   try {
     const asset = join(directory, 'lambda');
@@ -28,7 +28,7 @@ test('API and worker account-status permission is scoped to their configured use
     assert.equal(grants.length, 2);
     for (const { statement, roles } of grants) {
       assert.equal(statement.Effect, 'Allow');
-      assert.deepEqual(statement.Action, 'cognito-idp:AdminGetUser');
+      assert.deepEqual([...statement.Action].sort(), ['cognito-idp:AdminGetUser', 'cognito-idp:AdminListGroupsForUser']);
       assert.deepEqual(statement.Resource, { 'Fn::GetAtt': [pool, 'Arn'] });
       assert.equal(roles.length, 1);
       assert.match(roles[0].Ref, /Reference(Api|Worker)ServiceRole/);

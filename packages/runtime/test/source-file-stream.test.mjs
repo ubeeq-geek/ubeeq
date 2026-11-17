@@ -51,3 +51,12 @@ test('cancel after actual streamed acceptance preserves charged original custody
  const cancelled=await f.request(`/studio/files/${prepared.body.file.fileId}/cancel`,{method:'POST',body:{expectedRevision:1}});assert.equal(cancelled.status,200);assert.equal(cancelled.body.cleanup,'retained');assert.equal(cancelled.body.file.uploadState,'cancelled');assert.equal(f.settlements.size,1);assert.equal(f.closures.size,0);
  const receipt=await f.uploads.readPhysicalReceipt(prepared.body.file.fileId);await f.restart();assert.deepEqual((await f.uploads.recover(prepared.body.file.fileId)).object,receipt);assert.equal((await f.request(`/studio/files/${prepared.body.file.fileId}/download`)).status,409);assert.equal((await f.files.getSourceFileById(prepared.body.file.fileId)).uploadState,'cancelled');
 });
+
+test('fixture shutdown closes and drains an unfinished HTTP sender before disposing its database', {timeout:10000}, async t=>{
+ const f=await sourceFileStreamFixture(t),size=block.length*3,prepared=await begin(f,size);
+ const pending=nodeRequest(f.origin+prepared.body.uploadPath,{method:'PUT',headers:{authorization:'Bearer '+f.token,...prepared.body.requiredHeaders,'content-length':String(size)}});
+ pending.on('error',()=>{});const closed=new Promise(resolve=>pending.once('close',resolve));t.after(()=>pending.destroy());pending.flushHeaders();pending.write(block);
+ for(let i=0;i<100&&!f.local.database.database.prepare('SELECT id FROM ubeeq_upload_stream_custody').get();i++)await delay(10);
+ assert.equal(f.local.database.database.prepare('SELECT state FROM ubeeq_upload_stream_custody').get()?.state,'receiving');
+ await f.close();await closed;await f.close();
+});
