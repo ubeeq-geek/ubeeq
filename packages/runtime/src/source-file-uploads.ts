@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
+import {withRepositoryRead,repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,ownedVersionFingerprint,validateOwnedVersionAbsence,type OwnedVersionRemovalAdapter,type OwnedVersionRemovalRequest,type OwnedVersionAbsenceProof,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {RepositoryRetainedSourceFiles,SourceFileConflict,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
@@ -103,8 +103,12 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const {versionId,writtenAt,...facts}=object;
     if(!value.provider||!versionId||!instant(writtenAt)||!same(facts,value.object))throw Error('Original upload physical receipt conflicts.');
   }
+  /** Queue ordinary Local metadata reads behind their real connection owner.
+   * A caller's accepting transaction remains explicit; physical IO and quota
+   * delivery are never enclosed by this metadata-only read scope. */
+  private readRecord(id:string){return withRepositoryRead(this.options.repositories,transaction=>this.records.get(id,{transaction}));}
   private async read(fileId:string,transaction?:PersistenceTransaction):Promise<HostRecord>{
-    const row=await this.records.get(this.id(fileId),{transaction});
+    const row=transaction?await this.records.get(this.id(fileId),{transaction}):await this.readRecord(this.id(fileId));
     if(!row)throw new SourceFileUploadError('upload_not_found',404,'This original has no owned upload session.');
     this.value(row);return row;
   }
@@ -124,7 +128,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   private completion(value:Session){return {uploadId:value.provider!.uploadId,cellId:this.cellId,creatorId:value.creatorId,checksum:value.object.checksum!,byteLength:value.object.byteLength};}
   private async deliver(row:HostRecord):Promise<boolean>{
     const value=this.value(row),id=value.usageIntentId??value.closureIntentId;if(!id)return false;
-    const intent=await this.records.get(id);
+    const intent=await this.readRecord(id);
     if(!intent||intent.scopeId!==value.creatorId||(intent.value.input as {idempotencyKey?:string})?.idempotencyKey!==this.usageKey(row))throw Error('Original accounting intent requires reconciliation.');
     try{if(value.usageIntentId)await this.usage.deliver(intent);else await this.closures.deliver(intent);return false;}catch{return true;}
   }
@@ -385,12 +389,12 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   /** Trusted host receipt lookup only. This is not original-delivery authority.
    * Consumers still require current SourceFile/Creator and safety access. */
   async readPhysicalReceipt(fileId:string):Promise<StoredObject|undefined>{
-    const row=await this.records.get(this.id(fileId));if(!row)return;const value=this.value(row);return value.completedObject?structuredClone(value.completedObject):undefined;
+    const row=await this.readRecord(this.id(fileId));if(!row)return;const value=this.value(row);return value.completedObject?structuredClone(value.completedObject):undefined;
   }
   /** Dispatch managed sessions here instead of a legacy all-version purger,
    * which would remove the current upload fence. */
   async owns(fileId:string):Promise<boolean>{
-    const row=await this.records.get(this.id(fileId));if(!row)return false;this.value(row);return true;
+    const row=await this.readRecord(this.id(fileId));if(!row)return false;this.value(row);return true;
   }
   /** Maintenance rechecks the saved actor before any ordinary source mutation.
    * Physical settlement/closure itself must also survive actor revocation. */
@@ -407,9 +411,12 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   async repair(limit=25):Promise<number>{
     if(!Number.isSafeInteger(limit)||limit<1||limit>100)throw Error('Original upload repair limit is invalid.');
     const cursorId='source-upload-repair-'+ownedEvidenceHash([this.instanceId,this.cellId,this.files.scope.tenantId,this.files.scope.creatorId]);
-    const cursor=await this.records.get(cursorId);
+    const cursor=await this.readRecord(cursorId);
     if(cursor&&(cursor.namespace!==namespace+'-repair'||cursor.instanceId!==this.instanceId||cursor.homeCellId!==this.cellId||cursor.scopeId!==this.files.scope.creatorId||cursor.value.schemaVersion!==1||typeof cursor.value.after!=='string'))throw Error('Original repair cursor requires reconciliation.');
-    const rows:HostRecord[]=[];for await(const row of repositoryItems(request=>this.records.list(request)))rows.push(row);
+    const rows:HostRecord[]=[];
+    for await(const row of repositoryItems(request=>withRepositoryRead(
+      this.options.repositories,transaction=>this.records.list(request,{transaction})
+    )))rows.push(row);
     const indexed=new Map(rows.map(row=>[row.id,row]));
     const candidates=rows.filter(row=>{
       if(row.namespace!==namespace||row.instanceId!==this.instanceId||row.homeCellId!==this.cellId||row.scopeId!==this.files.scope.creatorId)return false;
