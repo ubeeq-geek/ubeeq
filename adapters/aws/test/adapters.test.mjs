@@ -508,3 +508,14 @@ test('AWS first lease retains an unclaimed legacy request trace without changing
   assert.equal(lease.job.correlationId,'legacy-request');assert.equal((await queue.get(job.id)).correlationId,'legacy-request');
   await queue.complete({id:job.id,leaseToken:lease.leaseToken});
 });
+
+
+test('queue conformance isolates each run from retained jobs in the legacy contract cell', async () => {
+ const queue=new AwsJobQueue(new MemoryDynamo(),{tableName:'records'},{send:async()=>({})},'https://queue.test/jobs');
+ const old=await queue.enqueue({cellId:'contract-cell',type:'contract',idempotencyKey:'retained-old-live-run',payload:{retained:true},maxAttempts:3});
+ await assert.rejects(verifyJobQueueContract(queue,'another-shared-run'),/queued work is not leasable/);
+ const retained=await queue.get(old.id);
+ await verifyJobQueueContract(queue,'isolated-run',{cellId:'isolated-live-cell',foreignCellId:'isolated-foreign-cell'});
+ assert.deepEqual(await queue.get(old.id),retained,'Conformance must not consume or delete another run’s work.');
+ await assert.rejects(verifyJobQueueContract(queue,'invalid-cells',{cellId:'same',foreignCellId:'same'}),/distinct cells/);
+});

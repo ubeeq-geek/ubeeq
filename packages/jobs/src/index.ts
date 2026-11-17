@@ -30,14 +30,17 @@ export interface JobQueue {
 export interface Scheduler { schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void>; cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void>; }
 
 /** Executable baseline for every durable queue adapter. */
-export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "queue-contract-job"): Promise<void> => {
-  const created = await queue.enqueue({ cellId: "contract-cell", type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
-  const repeated = await queue.enqueue({ cellId: "contract-cell", type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
+export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "queue-contract-job", cells: { cellId?: string; foreignCellId?: string } = {}): Promise<void> => {
+  const cellId = cells.cellId ?? "contract-cell";
+  const foreignCellId = cells.foreignCellId ?? "foreign-cell";
+  if (!cellId.trim() || !foreignCellId.trim() || cellId === foreignCellId) throw new Error("Queue conformance requires two distinct cells.");
+  const created = await queue.enqueue({ cellId, type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
+  const repeated = await queue.enqueue({ cellId, type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
   if (created.id !== repeated.id) throw new Error("Job queue contract violation: enqueue must retain idempotency keys.");
-  const foreign = await queue.enqueue({ cellId: "foreign-cell", type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
+  const foreign = await queue.enqueue({ cellId: foreignCellId, type: "contract", payload: { value: 1 }, idempotencyKey, maxAttempts: 3 });
   if (foreign.id === created.id) throw new Error("Job queue contract violation: idempotency keys must be isolated by cell.");
-  if ((await queue.list({ cellId: "contract-cell", limit: 10 })).some((job) => job.id === foreign.id)) throw new Error("Job queue contract violation: list exposed another cell's work.");
-  const lease = await queue.lease({ cellId: "contract-cell", types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });
+  if ((await queue.list({ cellId, limit: 10 })).some((job) => job.id === foreign.id)) throw new Error("Job queue contract violation: list exposed another cell's work.");
+  const lease = await queue.lease({ cellId, types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });
   if (!lease || lease.job.id !== created.id || lease.job.state !== "leased") throw new Error("Job queue contract violation: queued work is not leasable.");
   if (lease.job.attempt !== created.attempt + 1) throw new Error("Job queue contract violation: claiming work must count its attempt.");
   await queue.retry({ id: created.id, leaseToken: lease.leaseToken, error: { code: "temporary", message: "retry" }, retryAt: new Date(Date.now() - 1_000).toISOString() });
@@ -45,27 +48,27 @@ export const verifyJobQueueContract = async (queue: JobQueue, idempotencyKey = "
   if ((await queue.get(created.id))?.attempt !== lease.job.attempt) throw new Error("Job queue contract violation: retry must not count another execution attempt.");
   const recovered = await queue.recover({ id: created.id });
   if (recovered.state !== "queued") throw new Error("Job queue contract violation: recovery must return work to queued state.");
-  const finalLease = await queue.lease({ cellId: "contract-cell", types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });
+  const finalLease = await queue.lease({ cellId, types: ["contract"], leaseDurationSeconds: 60, workerId: "contract-worker" });
   if (!finalLease) throw new Error("Job queue contract violation: recovered work is not leasable.");
   await queue.complete({ id: created.id, leaseToken: finalLease.leaseToken });
-  if ((await queue.get(created.id))?.state !== "completed" || !(await queue.list({ cellId: "contract-cell", states: ["completed"], limit: 10 })).some((job) => job.id === created.id)) throw new Error("Job queue contract violation: completion is not observable.");
+  if ((await queue.get(created.id))?.state !== "completed" || !(await queue.list({ cellId, states: ["completed"], limit: 10 })).some((job) => job.id === created.id)) throw new Error("Job queue contract violation: completion is not observable.");
   for (const state of ['completed', 'cancelled'] as const) {
-    const target = state === 'completed' ? created : await queue.enqueue({ cellId: 'contract-cell', type: 'contract', payload: {}, idempotencyKey: `${idempotencyKey}:cancelled`, maxAttempts: 3 });
+    const target = state === 'completed' ? created : await queue.enqueue({ cellId, type: 'contract', payload: {}, idempotencyKey: `${idempotencyKey}:cancelled`, maxAttempts: 3 });
     if (state === 'cancelled') await queue.cancel({ id: target.id });
     let rejected = false;
     try { await queue.recover({ id: target.id }); } catch { rejected = true; }
     if (!rejected || (await queue.get(target.id))?.state !== state) throw new Error(`Job queue contract violation: recovery revived ${state} work.`);
   }
-  const bounded = await queue.enqueue({ cellId: 'contract-cell', type: 'contract-budget', payload: {}, idempotencyKey: `${idempotencyKey}:budget`, maxAttempts: 2 });
+  const bounded = await queue.enqueue({ cellId, type: 'contract-budget', payload: {}, idempotencyKey: `${idempotencyKey}:budget`, maxAttempts: 2 });
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const claimed = await queue.lease({ cellId: 'contract-cell', types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' });
+    const claimed = await queue.lease({ cellId, types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' });
     if (!claimed || claimed.job.id !== bounded.id || claimed.job.attempt !== attempt) throw new Error('Job queue contract violation: retry budget did not retain claim count.');
     const error = { code: 'temporary', message: 'bounded failure' };
     await queue.retry({ id: bounded.id, leaseToken: claimed.leaseToken, error, retryAt: new Date(Date.now() - 1_000).toISOString() });
     const stored = await queue.get(bounded.id);
     if (stored?.state !== (attempt === 2 ? 'dead_lettered' : 'retry_scheduled') || stored.attempt !== attempt || stored.lastError?.code !== error.code || stored.leaseExpiresAt) throw new Error('Job queue contract violation: exhausted retries must retain the error and dead-letter without another attempt.');
   }
-  if (await queue.lease({ cellId: 'contract-cell', types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' })) throw new Error('Job queue contract violation: an exhausted job was automatically leased again.');
+  if (await queue.lease({ cellId, types: ['contract-budget'], leaseDurationSeconds: 60, workerId: 'contract-worker' })) throw new Error('Job queue contract violation: an exhausted job was automatically leased again.');
 };
 
 export class ForeignCellJobError extends Error {

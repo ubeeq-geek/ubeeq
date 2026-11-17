@@ -28,6 +28,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      TEST_FFMPEG_PATH: /usr/bin/ffmpeg
+      TEST_FFPROBE_PATH: /usr/bin/ffprobe
       TEST_DYNAMODB_ENDPOINT: http://127.0.0.1:8000
       UBEEQ_POSTGRES_TEST_URL: postgresql://ubeeq:ubeeq@localhost:5432/ubeeq_contract
     steps:
@@ -36,7 +38,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Install native media test tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - run: npm ci
+      - run: npm run check:licenses
       - run: npm run build
       - run: npm test
       - run: npm run test:managed-retained-sources
