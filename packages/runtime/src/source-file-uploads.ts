@@ -251,11 +251,40 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     for(let attempt=0;attempt<5;attempt++){try{return await this.options.repositories.transaction(save);}catch(error){if(!conflict(error)||attempt===4)throw error;}}
     throw Error('Original physical receipt requires reconciliation.');
   }
+  /** The reserved-execution port correctly rejects an already settled key.
+   * A completed original may still need its Source metadata accepted. Only
+   * this same actual journal's full acknowledged storage fact can enter that
+   * recovery path; eligibility remains a distinct current policy decision. */
+  private async finalizationAdmission(original:HostRecord,object:StoredObject):Promise<{allowed:boolean;settled?:{journal:HostRecord;intent:HostRecord}}>{
+    const initial=this.value(original);this.proveObject(initial,object);
+    const admission=await this.options.quota.checkCurrentAdmission?.({creatorId:initial.creatorId,operation:'upload.original',idempotencyKey:this.usageKey(original)});
+    if(!admission||admission.allowed)return {allowed:true};
+    const journal=await this.read(initial.fileId),current=this.value(journal);
+    const identity=(value:Session)=>{const {phase,completedObject,usageIntentId,...immutable}=value;return immutable;};
+    if(!same(identity(initial),identity(current))||!same(this.home(original),this.home(journal))||journal.createdAt!==original.createdAt)throw new SourceFileUploadError('upload_source_conflict',409,'The original upload lineage changed before factual finalization.');
+    if(!['retained','completed'].includes(current.phase)||!current.completedObject||!same(current.completedObject,object)||!current.usageIntentId||current.closureIntentId||current.seal||current.removal)return {allowed:false};
+    const input={creatorId:current.creatorId,operation:'upload.original',idempotencyKey:this.usageKey(journal),storageBytesDelta:object.byteLength,observedAt:object.writtenAt!};
+    const id=createHash('sha256').update(JSON.stringify([this.instanceId,'runtime-usage-settlement',input.creatorId,input.idempotencyKey])).digest('hex');
+    if(current.usageIntentId!==id)return {allowed:false};
+    const intent=await this.readRecord(id),fingerprint=JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,0,input.storageBytesDelta,0,input.observedAt]);
+    if(!intent||intent.id!==id||intent.namespace!=='runtime-usage-settlement'||intent.instanceId!==this.instanceId||intent.scopeId!==current.creatorId||intent.key!==input.idempotencyKey||!same(this.home(intent),this.home(journal))||!Number.isSafeInteger(intent.revision)||intent.revision<1||intent.value.state!=='settled'||intent.value.fingerprint!==fingerprint||!same(intent.value.input,input))return {allowed:false};
+    const policy=this.options.quota.checkCurrentPolicy;if(!policy)return {allowed:false};
+    const decision=await policy.call(this.options.quota,{creatorId:current.creatorId,operation:'upload.original'});
+    return decision.allowed?{allowed:true,settled:{journal:structuredClone(journal),intent:structuredClone(intent)}}:{allowed:false};
+  }
+  private async bindFinalizationSettlement(proof:{journal:HostRecord;intent:HostRecord},transaction:PersistenceTransaction):Promise<void>{
+    const expected=this.value(proof.journal),journal=await this.read(expected.fileId,transaction),intent=await this.records.get(proof.intent.id,{transaction});
+    if(!same(journal,proof.journal)||!intent||!same(intent,proof.intent))throw new SourceFileUploadError('upload_source_conflict',409,'The exact acknowledged original fact changed before metadata acceptance.');
+    const check=this.records.checkRevision;if(!check)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual acknowledged original receipt revision guard is required.');
+    await check.call(this.records,intent.id,intent.revision,{transaction});
+    // writePhysical supplies the real conditional write for this exact journal;
+    // do not condition-check and write that same physical item twice.
+  }
   private async finish(row:HostRecord,object:StoredObject,propagateAccess:boolean):Promise<HostRecord>{
     const value=this.value(row);this.proveObject(value,object);
     for(let attempt=0;attempt<5;attempt++){try{
-      const admission=await this.options.quota.checkCurrentAdmission?.({creatorId:value.creatorId,operation:'upload.original',idempotencyKey:this.usageKey(row)});
-      if(admission&&!admission.allowed)return this.writePhysical(row,object,false);
+      const admission=await this.finalizationAdmission(row,object);
+      if(!admission.allowed)return this.writePhysical(row,object,false);
       const snapshot=await this.files.asActor(value.actorId,async()=>{
         await this.files.captureSourceAccess(value.actorId);const file=await this.file(value.fileId);this.matchFile(value,file);return file;
       });
@@ -271,7 +300,13 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
           ||prepared.metadata!==undefined&&(!prepared.metadata||Array.isArray(prepared.metadata)||typeof prepared.metadata!=='object'||Object.values(prepared.metadata).some(item=>item!==null&&(!['string','number','boolean'].includes(typeof item)||typeof item==='number'&&!Number.isFinite(item)))))throw new SourceFileUploadError('original_finalization_conflict',409,'Verified original metadata differs from its physical receipt.');
         for(const [key,item] of Object.entries(snapshot.metadata??{}))if(!Object.hasOwn(prepared.metadata??{},key)||!same(prepared.metadata![key],item))throw new SourceFileUploadError('original_metadata_conflict',409,'Original finalization must preserve its existing metadata.');
       }
+      // Decoder/rendition IO may have overlapped a factual outbox delivery or
+      // current policy change. Reopen the actual original fact after that IO.
+      const finalAdmission=await this.finalizationAdmission(row,object);
+      if(!finalAdmission.allowed)return this.writePhysical(row,object,false);
       return await this.files.asActor(value.actorId,async()=>{
+        const transaction=this.files.transaction();if(!transaction)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual Source metadata transaction is required.');
+        if(finalAdmission.settled)await this.bindFinalizationSettlement(finalAdmission.settled,transaction);
         const access=await this.files.captureSourceAccess(value.actorId),file=await this.file(value.fileId);this.matchFile(value,file);
         if(file.uploadState==='cancelled')return this.writePhysical(row,object,false);
         if(!same(file,snapshot))throw new SourceFileUploadError('upload_source_conflict',409,'Original metadata changed while its bytes were being verified. Retry completion.');
