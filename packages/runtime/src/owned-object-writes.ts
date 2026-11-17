@@ -239,6 +239,58 @@ export class OwnedObjectWrites {
     await this.deliver(row);
     if(value.phase==='completed')return {object:structuredClone(value.completedObject!),metadata:structuredClone(value.metadata)};
   }
+  /** A failed old body may observe an independently accepted successor, but
+   * only as a factual read. It never revives that old physical capability or
+   * issues/settles/closes any generation. Ordinary return/denial paths precede it. */
+  private async completedSuccessor(initial:HostRecord,restriction:Readonly<OwnedObjectWriteRestriction>|undefined):Promise<OwnedObjectResult|undefined>{
+    const original=this.value(initial),policy=this.quota.checkCurrentPolicy;
+    if(!policy)return;
+    const active=()=>{if(restriction)this.assertPhysical(restriction);};
+    active();const initialPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});active();if(initialPolicy.allowed!==true)return;
+    const home=(row:CellOwnedRecord)=>({homeCellId:row.homeCellId,dataHomeRegion:row.dataHomeRegion,dataHomeAssignedAt:row.dataHomeAssignedAt,routingRevision:row.routingRevision});
+    const immutable=(value:Intent)=>{const {phase,closingAt,seal,completedObject,usageIntentId,closureIntentId,...identity}=value;return identity;};
+    const request=(value:Intent)=>{const {key,...object}=value.object;return{creatorId:value.creatorId,operation:value.operation,idempotencyKey:value.idempotencyKey,requestHash:value.requestHash,metadata:value.metadata,object};};
+    const capture=()=>withRepositoryRead(this.repositories,async transaction=>{
+      const read=(id:string)=>this.records.get(id,{transaction});
+      let row=await read(initial.id);if(!row)return;
+      let value=this.value(row);
+      if(value.phase!=='sealed'||hash(immutable(value))!==hash(immutable(original))||hash(home(row))!==hash(home(initial))||row.createdAt!==initial.createdAt)return;
+      const rows:HostRecord[]=[];
+      for(let generation=original.generation;generation<1000;generation++){
+        if(value.generation!==generation||hash(home(row))!==hash(home(initial))||hash(request(value))!==hash(request(original))||value.provider&&hash(value.provider.object)!==hash(value.object))return;
+        rows.push(row);
+        if(value.phase==='completed'){
+          if(generation===original.generation||!value.provider||!value.completedObject||!value.usageIntentId||value.seal!==undefined||value.closureIntentId!==undefined)return;
+          const writtenAt=value.completedObject.writtenAt;if(typeof writtenAt!=='string')return;
+          const input={creatorId:value.creatorId,operation:value.operation,idempotencyKey:this.usageKey(row),storageBytesDelta:value.completedObject.byteLength,observedAt:writtenAt};
+          const id=createHash('sha256').update(JSON.stringify([this.instanceId,'runtime-usage-settlement',input.creatorId,input.idempotencyKey])).digest('hex'),intent=await read(id);
+          if(!intent||intent.id!==value.usageIntentId||intent.namespace!=='runtime-usage-settlement'||intent.instanceId!==this.instanceId||intent.scopeId!==input.creatorId||intent.key!==input.idempotencyKey||hash(home(intent))!==hash(home(initial))||!['pending','settled'].includes(String(intent.value.state))||hash(intent.value.input)!==hash(input)||intent.value.fingerprint!==JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,0,input.storageBytesDelta,0,input.observedAt]))return;
+          return{rows,row,value};
+        }
+        if(value.phase!=='sealed'||value.completedObject!==undefined||value.usageIntentId!==undefined||value.seal?.state!=='sealed'||!value.provider||!value.seal.proofId?.trim()||value.seal.proofId.length>200||!instant(value.seal.closedAt)||!value.closureIntentId)return;
+        if(value.seal.retainedFence&&(value.seal.retainedFence.bucket!==value.provider.object.bucket||value.seal.retainedFence.key!==value.object.key||!value.seal.retainedFence.versionId||value.seal.retainedFence.byteLength!==0||value.seal.retainedFence.scope!=='private'||value.seal.retainedFence.writtenAt!==value.seal.closedAt))return;
+        const input={creatorId:value.creatorId,operation:value.operation,idempotencyKey:this.usageKey(row),reservedBytes:value.object.byteLength,proofId:value.seal.proofId,observedAt:value.seal.closedAt};
+        const id='storage-close-'+createHash('sha256').update(JSON.stringify(['runtime-storage-closure',this.instanceId,input.creatorId,input.idempotencyKey])).digest('hex'),intent=await read(id);
+        if(!intent||intent.id!==value.closureIntentId||intent.namespace!=='runtime-storage-closure'||intent.instanceId!==this.instanceId||intent.scopeId!==input.creatorId||intent.key!==input.idempotencyKey||hash(home(intent))!==hash(home(initial))||!['pending','closed'].includes(String(intent.value.state))||hash(intent.value.input)!==hash(input)||intent.value.fingerprint!==JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,input.reservedBytes,input.proofId,input.observedAt]))return;
+        const following=await read(this.id(original,generation+1));if(!following)return;
+        const next=this.value(following);if(next.generation!==generation+1||next.previousProof!==value.seal.proofId)return;
+        row=following;value=next;
+      }
+    });
+    // Validation failures cannot yield a successful fallback. These scopes
+    // perform metadata reads only; repository rollback-only state is unchanged.
+    let before:Awaited<ReturnType<typeof capture>>;try{before=await capture();}catch{active();return;}active();if(!before)return;
+    const provider=before.value.provider,checksum=before.value.object.checksum;if(!provider||typeof checksum!=='string')return;
+    let physical:StoredObject|undefined;
+    try{physical=await this.uploads.recoverCompletion!({uploadId:provider.uploadId,cellId:this.cellId,creatorId:original.creatorId,checksum,byteLength:before.value.object.byteLength});}catch{active();return;}
+    active();if(!physical||hash(physical)!==hash(before.value.completedObject))return;
+    this.proveObject(before.value,physical);
+    let after:Awaited<ReturnType<typeof capture>>;try{after=await capture();}catch{active();return;}active();if(!after||hash(after.rows)!==hash(before.rows))return;
+    const finalPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});active();if(finalPolicy.allowed!==true)return;
+    // Exact terminal rows and actual immutable provider bytes were re-read;
+    // pending/settled outbox acknowledgment is never inferred or delivered.
+    return{object:structuredClone(physical),metadata:structuredClone(after.value.metadata)};
+  }
   async write(input: OwnedObjectWrite): Promise<OwnedObjectResult> {
     const restriction=this.restrictions(input);
     if(input.home.homeCellId!==this.cellId || !input.bucket || !input.contentType.trim() || !['private','restricted','public'].includes(input.scope) || input.body.byteLength<=0) throw new Error('Invalid owned output request.');
@@ -318,7 +370,7 @@ export class OwnedObjectWrites {
     }
     const completion={uploadId:value.provider!.uploadId,cellId:this.cellId,creatorId:input.creatorId,checksum,byteLength:body.byteLength};
     const recovered=await this.uploads.recoverCompletion!(completion);if(recovered)return this.commitObject(row,recovered);
-    let writeError:unknown,bodyPermit:{cancelled:boolean}|undefined;
+    let writeError:unknown,writeFailed=false,bodyPermit:{cancelled:boolean}|undefined;
     if(restriction){
       row=await this.updateRecord(row.id,row.revision,{value:{...row.value,bodyInvocation:{id:randomUUID(),preparedAt:new Date().toISOString()}}});value=this.value(row);bodyPermit={cancelled:false};this.bodies.set(row.id,bodyPermit);
       try{await this.beforePhysical(restriction);}catch(error){this.bodies.delete(row.id);return this.denyPhysical(row,error);}
@@ -327,13 +379,13 @@ export class OwnedObjectWrites {
     let lifetimeDenied=false,lifetimeError:unknown;
     try {
       await writeBoundedUploadContent({uploads:this.uploads,upload:value.provider!,cellId:this.cellId,creatorId:input.creatorId,body,...(restriction?{assertNewPhysicalWriteActive:()=>{try{if(bodyPermit?.cancelled)throw new Error('The original owned body invocation was cancelled.');if(Date.parse(bodyExpiresAt)<=Date.now())throw new Error('The original owned body capability expired.');this.assertPhysical(restriction);}catch(error){lifetimeDenied=true;lifetimeError=error;throw error;}}}:{})});
-    }catch(error){writeError=error;}
+    }catch(error){writeFailed=true;writeError=error;}
     finally{if(bodyPermit)this.bodies.delete(row.id);}
     if(lifetimeDenied&&restriction)return this.denyPhysical(row,lifetimeError);
     let object:StoredObject|undefined;
-    try{object=writeError ? await this.uploads.recoverCompletion!(completion) : await this.uploads.complete(completion);}
-    catch(error){object=await this.uploads.recoverCompletion!(completion);if(!object)throw error;}
-    if(!object)throw writeError??new Error('Output upload requires recovery.');
+    try{object=writeFailed ? await this.uploads.recoverCompletion!(completion) : await this.uploads.complete(completion);}
+    catch(error){object=await this.uploads.recoverCompletion!(completion);if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;}throw error;}}
+    if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;throw writeError;}throw new Error('Output upload requires recovery.');}
     return this.commitObject(row,object);
   }
   async repair(limit=25):Promise<number>{

@@ -310,3 +310,56 @@ test('a different current Source checksum cannot report the original completed w
 test('a genuinely completed other original cannot replace a missing winner for the requested pending Source',async t=>{
  const race=await sealedRenditionWinner(t,'other');await assert.rejects(race.f.complete(),/Upload scope does not match the authenticated creator and cell/);const{winner}=race.observed();assert.equal(winner.file.fileId,'other');assert.equal(winner.state,'completed');assert.equal((await race.f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await race.f.journal()).value.phase,'retained');assert.equal((await race.f.audits()).filter(row=>row.action==='source_file.upload.completed'&&row.subjectId==='original').length,0);
 });
+
+
+// A completed Owned output is a factual rendition result even while its
+// independent Source finisher is held outside the actual Source commit.
+test('the original Source finisher uses its genuinely completed same-request Owned successor before the independent Source commits',async t=>{
+ let first=true,owned,replacement,replacementSettled=false,oldUploadId,oldBodyError;
+ let enteredBody,releaseBody,enteredReplacement,releaseReplacement;
+ const bodyReady=new Promise(resolve=>{enteredBody=resolve;}),bodyGate=new Promise(resolve=>{releaseBody=resolve;});
+ const replacementReady=new Promise(resolve=>{enteredReplacement=resolve;}),replacementGate=new Promise(resolve=>{releaseReplacement=resolve;});
+ const order=[],derivative=Buffer.from('Actual completed successor before Source commit '+checksum);
+ const identity=file=>({creatorId:scope.creatorId,operation:'asset.rendition',idempotencyKey:'actual-owned-successor-before-source:'+file.fileId});
+ const request=(file,object,home)=>({...identity(file),home,bucket:scope.cellId,kind:'renditions',scope:'private',contentType:'application/octet-stream',body:derivative,metadata:{sourceFileId:file.fileId,sourceChecksum:object.checksum,opaque:{preserved:['future',17]}}});
+ const f=await fixture(t,{prepareCompletion:async(file,object)=>{
+  const loaded=await f.local.storage.get(object);assert.deepEqual(loaded.body,bytes);const home=await f.local.repositories.creators.get(scope.creatorId);
+  if(first){
+   first=false;const stale=owned.write(request(file,object,home));void stale.catch(()=>{});
+   try{
+    await Promise.race([bodyReady,stale.then(()=>{throw Error('The actual old body never reached its held Local invocation.');})]);
+    replacement=f.complete();void replacement.then(()=>{replacementSettled=true;},()=>{replacementSettled=true;});
+    await Promise.race([replacementReady,replacement.then(()=>{throw Error('The independent Source bypassed its post-output gate.');})]);
+    releaseBody();const output=await stale;
+    assert.deepEqual((await f.local.storage.get(output.object)).body,derivative);assert.deepEqual(output.metadata.opaque,{preserved:['future',17]});
+    order.push('original-owned-successor-returned');
+   }finally{releaseBody();await stale.catch(()=>{});}
+  }else{
+   const existing=await owned.recover(identity(file)),output=existing??await owned.write(request(file,object,home));
+   assert.deepEqual((await f.local.storage.get(output.object)).body,derivative);assert.equal(f.store.transaction(),undefined);
+   order.push('replacement-output-completed');enteredReplacement();await replacementGate;
+  }
+  return{checksumSha256:createHash('sha256').update(loaded.body).digest('hex'),sizeBytes:loaded.body.byteLength,metadata:file.metadata};
+ }});
+ owned=new OwnedObjectWrites(f.local.repositories,f.local.storage,f.quota,scope.instanceId,scope.cellId);
+ await f.initiate();await f.accept();const accept=f.local.storage.accept.bind(f.local.storage);let held=false;
+ t.mock.method(f.local.storage,'accept',async input=>{if(!held){held=true;oldUploadId=input.uploadId;assert.equal(input.creatorId,scope.creatorId);assert.equal(input.cellId,scope.cellId);enteredBody();await bodyGate;}try{return await accept(input);}catch(error){if(input.uploadId===oldUploadId)oldBodyError=error;throw error;}});
+ let result;
+ try{
+  result=await f.complete();order.push('original-source-committed');
+  assert.equal(replacementSettled,false,'The original caller commits while the independent Source acceptance remains held.');
+  assert.equal(result.state,'completed');assert.equal(result.file.uploadState,'ready');assert.equal(result.file.revision,2);
+  assert.match(oldBodyError.message,/Upload scope does not match the authenticated creator and cell/);
+  assert.equal((await f.journal()).value.phase,'completed');assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+  const generations=(await f.local.repositories.hostRecords.list({limit:100})).items.filter(row=>row.namespace==='runtime-owned-object').sort((a,b)=>a.value.generation-b.value.generation);
+  assert.deepEqual(generations.map(row=>row.value.phase),['sealed','completed']);assert.equal(generations[1].value.previousProof,generations[0].value.seal.proofId);
+  assert.equal(f.local.database.database.prepare('SELECT id FROM ubeeq_uploads WHERE id=?').get(oldUploadId),undefined);
+  assert.ok(f.local.database.database.prepare('SELECT id FROM ubeeq_upload_seals WHERE id=?').get(oldUploadId));
+ }finally{releaseBody();releaseReplacement();await replacement?.catch(()=>{});}
+ const independent=await replacement;assert.equal(independent.state,'completed');assert.deepEqual(independent.object,result.object);
+ assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+ assert.equal([...f.quota.reservations.values()].filter(value=>value.operation==='upload.original').length,1);
+ const charges=[...f.quota.settlements.values()].filter(value=>value.operation==='upload.original');assert.equal(charges.length,1);assert.equal(charges[0].storageBytesDelta,bytes.length);
+ assert.deepEqual((await f.local.storage.get(result.object)).body,bytes);assert.deepEqual(order,['replacement-output-completed','original-owned-successor-returned','original-source-committed']);
+ f.restart();assert.deepEqual((await f.complete()).object,result.object);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+});
