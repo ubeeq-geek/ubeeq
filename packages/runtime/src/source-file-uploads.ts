@@ -1,4 +1,6 @@
 import {createHash} from 'node:crypto';
+import {performance} from 'node:perf_hooks';
+import {setTimeout as delay} from 'node:timers/promises';
 import {OptimisticConcurrencyError,UniqueConstraintError,withRepositoryRead,repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,ownedVersionFingerprint,validateOwnedVersionAbsence,type OwnedVersionRemovalAdapter,type OwnedVersionRemovalRequest,type OwnedVersionAbsenceProof,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
@@ -7,8 +9,11 @@ import {RetainedRepositoryError} from './retained-repository-store.js';
 import {ownedEvidenceHash} from './owned-object-writes.js';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
+import {sourceCompletionAttempt,endSourceCompletionAttempt,sourceCompletionPreparation,hasRetiredOwnedError,consumeRetiredOwnedError} from './source-completion-observation.js';
 
 const namespace='runtime-source-file-upload';
+const winnerObservationMilliseconds=5_000,winnerObservationIntervalMilliseconds=25;
+const winnerReadChanged=Symbol('actual Source winner read changed');
 const instant=(value:unknown):value is string=>typeof value==='string'&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString()===value;
 const same=(a:unknown,b:unknown)=>ownedEvidenceHash(a)===ownedEvidenceHash(b);
 const conflict=(error:unknown)=>error instanceof SourceFileConflict||error instanceof SourceFileUploadError&&error.code==='upload_source_conflict'||error instanceof Error&&['OptimisticConcurrencyError','UniqueConstraintError','ConditionalCheckFailedException','TransactionCanceledException'].includes(error.name);
@@ -296,7 +301,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     // writePhysical supplies the real conditional write for this exact journal;
     // do not condition-check and write that same physical item twice.
   }
-  private async finish(row:HostRecord,object:StoredObject,propagateAccess:boolean):Promise<HostRecord>{
+  private async finish(row:HostRecord,object:StoredObject,propagateAccess:boolean,observation?:{attempt:ReturnType<typeof sourceCompletionAttempt>;state:{started:boolean}}):Promise<HostRecord>{
     const value=this.value(row);this.proveObject(value,object);
     for(let attempt=0;attempt<5;attempt++){try{
       const admission=await this.finalizationAdmission(row,object);
@@ -311,7 +316,8 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
         // Do not hold a repository transaction while reading/decoding an original
         // or writing provider-owned renditions. Their real owner journals recover
         // those side effects if accepting source metadata later fails.
-        prepared=await this.options.prepareCompletion(structuredClone(snapshot),structuredClone(object),Object.freeze({actorId:value.actorId}));
+        const prepare=()=>this.options.prepareCompletion(structuredClone(snapshot),structuredClone(object),Object.freeze({actorId:value.actorId}));
+        prepared=observation?await sourceCompletionPreparation(observation.attempt,{repositories:this.options.repositories,uploads:this.options.uploads,journal:row,object,actorId:value.actorId},prepare):await prepare();
         if(!prepared||Object.keys(prepared).some(key=>!['checksumSha256','sizeBytes','metadata'].includes(key))||prepared.checksumSha256!==object.checksum||prepared.sizeBytes!==object.byteLength
           ||prepared.metadata!==undefined&&(!prepared.metadata||Array.isArray(prepared.metadata)||typeof prepared.metadata!=='object'||Object.values(prepared.metadata).some(item=>item!==null&&(!['string','number','boolean'].includes(typeof item)||typeof item==='number'&&!Number.isFinite(item)))))throw new SourceFileUploadError('original_finalization_conflict',409,'Verified original metadata differs from its physical receipt.');
         for(const [key,item] of Object.entries(snapshot.metadata??{}))if(!Object.hasOwn(prepared.metadata??{},key)||!same(prepared.metadata![key],item))throw new SourceFileUploadError('original_metadata_conflict',409,'Original finalization must preserve its existing metadata.');
@@ -337,8 +343,17 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     }catch(error){
       // Physical ownership/usage must survive a failed SourceFile transaction,
       // including loss of its initiating actor. This never mutates SourceFiles.
-      const retained=await this.writePhysical(row,object,false);await this.deliver(retained);
+      // Latch before factual retention IO: its own real metadata collision must
+      // not replace retired evidence and restart physical preparation outside.
+      const retired=!!observation&&hasRetiredOwnedError(observation.attempt,error);
+      if(retired&&observation)observation.state.started=true;
+      let retained:HostRecord;
+      try{retained=await this.writePhysical(row,object,false);await this.deliver(retained);}
+      catch(retentionError){if(retired&&completionRepositoryConflict(retentionError))throw error;throw retentionError;}
       if(!propagateAccess&&denied(error))return retained;
+      // A retired physical body is not a fresh decoder command, even when the
+      // actual provider error happens to be a typed repository conflict.
+      if(retired)throw error;
       if(conflict(error)&&attempt<4)continue;
       throw error;
     }}
@@ -347,7 +362,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
   /** A stale decoder/rendition attempt is not permission to reuse its closed
    * output capability. Only the independently accepted SAME original may be
    * returned here, through fresh current Source and policy read authority. */
-  private async completedSourceWinner(original:HostRecord,object:StoredObject,actorId:string):Promise<SourceFileUploadResult<F>|undefined>{
+  private async completedSourceWinner(original:HostRecord,object:StoredObject,actorId:string,observing=false):Promise<SourceFileUploadResult<F>|undefined>{
     const initial=this.value(original);this.proveObject(initial,object);if(initial.actorId!==actorId)return undefined;
     const journal=await this.read(initial.fileId),current=this.value(journal),identity=(value:Session)=>{const {phase,completedObject,usageIntentId,...immutable}=value;return immutable;};
     if(current.phase!=='completed'||current.closureIntentId||current.seal||current.removal||!current.completedObject||!same(current.completedObject,object)||!same(identity(initial),identity(current))||!same(this.home(original),this.home(journal))||original.createdAt!==journal.createdAt)return undefined;
@@ -361,7 +376,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const policy=this.options.quota.checkCurrentPolicy;if(!policy||!(await policy.call(this.options.quota,{creatorId:current.creatorId,operation:input.operation})).allowed)return undefined;
     return this.files.asActor<SourceFileUploadResult<F>|undefined>(actorId,async()=>{
       await this.files.captureSourceAccess(actorId);const transaction=this.files.transaction();if(!transaction)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual current Source metadata read is required.');
-      const actual=await this.read(current.fileId,transaction),actualIntent=await this.records.get(intent.id,{transaction});if(!same(actual,journal)||!actualIntent||!same(actualIntent,intent))throw new SourceFileUploadError('upload_source_conflict',409,'The accepted original changed before its factual response.');
+      const actual=await this.read(current.fileId,transaction),actualIntent=await this.records.get(intent.id,{transaction});if(!same(actual,journal)||!actualIntent||!same(actualIntent,intent)){if(observing)throw winnerReadChanged;throw new SourceFileUploadError('upload_source_conflict',409,'The accepted original changed before its factual response.');}
       const file=await this.file(current.fileId);this.matchFile(current,file);if(file.uploadState!=='ready'||file.checksumSha256!==object.checksum||!Number.isSafeInteger(file.revision)||!file.revision)return undefined;
       const audit=await this.files.getSourceFileAudit('source-completed-'+ownedEvidenceHash([journal.id,object.versionId])),detail=audit?.detail;
       if(!audit||audit.action!=='source_file.upload.completed'||audit.actorUserId!==actorId||!detail||typeof detail!=='object'||Array.isArray(detail)||!('fileId'in detail)||detail.fileId!==current.fileId||!('creatorId'in detail)||detail.creatorId!==current.creatorId||!('objectVersion'in detail)||detail.objectVersion!==object.versionId||!('uploadState'in detail)||detail.uploadState!=='ready'||!('revision'in detail)||typeof detail.revision!=='number'||!Number.isSafeInteger(detail.revision)||detail.revision<1||detail.revision>file.revision)return undefined;
@@ -370,6 +385,38 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
       // write, settlement IO, charge, output retry or old-generation reuse.
       return {file:structuredClone(file),state:'completed',object:structuredClone(physical),usagePending:intent.value.state!=='settled'};
     });
+  }
+  /** Observe an independently finishing original, including the real interval
+   * after retirement but before its successor exists. No preparation, physical
+   * recovery of outputs, settlement, or Source metadata writes occur here. */
+  private async observeRetiredSourceWinner(original:HostRecord,object:StoredObject,actorId:string,error:unknown):Promise<SourceFileUploadResult<F>>{
+    const initial=this.value(original);this.proveObject(initial,object);
+    const identity=(value:Session)=>{const {phase,completedObject,usageIntentId,...immutable}=value;return immutable;};
+    const deadline=performance.now()+winnerObservationMilliseconds;
+    // The elapsed deadline and finite read count both bound observation. An
+    // already accepted repository read drains normally rather than being lost.
+    for(let observation=0;observation<=winnerObservationMilliseconds/winnerObservationIntervalMilliseconds;observation++){
+      if(performance.now()>=deadline)break;
+      try{
+        await this.currentCompletionRetryPolicy();
+        await this.files.asActor(actorId,async()=>{
+          await this.files.captureSourceAccess(actorId);const transaction=this.files.transaction();if(!transaction)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual current Source metadata read is required.');
+          const journal=await this.read(initial.fileId,transaction),current=this.value(journal),file=await this.file(initial.fileId);
+          if(current.actorId!==actorId||initial.actorId!==actorId)throw new SourceFileUploadError('upload_identity_conflict',403,'The original upload must be completed by its initiating actor.');
+          if(!same(identity(initial),identity(current))||!same(this.home(original),this.home(journal))||original.createdAt!==journal.createdAt||current.completedObject&&!same(current.completedObject,object))throw new SourceFileUploadError('upload_source_conflict',409,'The original upload changed during completion observation.');
+          this.matchFile(current,file);
+          if(current.closureIntentId||current.seal||current.removal||!['issued','retained','completed'].includes(current.phase)||!['pending','ready'].includes(String(file.uploadState)))throw new SourceFileUploadError('upload_not_pending',409,'This original upload is cancelled or closed.');
+        });
+        const winner=await this.completedSourceWinner(original,object,actorId,true);if(winner)return winner;
+      }catch(currentError){
+        // Only real read-guard collisions, or this helper's exact changed
+        // snapshot, stay within observation. They never re-enter preparation.
+        if(currentError!==winnerReadChanged&&!completionRepositoryConflict(currentError))throw currentError;
+      }
+      const remaining=deadline-performance.now();if(remaining<=0)break;
+      await delay(Math.min(winnerObservationIntervalMilliseconds,remaining));
+    }
+    throw error;
   }
   private async currentCompletionRetryPolicy():Promise<void>{
     const policy=this.options.quota.checkCurrentPolicy;
@@ -398,18 +445,26 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     // Only stricter caller-side recovery eligibility; never a body field,
     // persisted permission, or a way to disable this command's own retries.
     const requireCurrentPolicy=recovery?.requireCurrentPolicy===true;
+    const observationState={started:false};
     for(let attempt=0;attempt<5;attempt++){
       try{
-        const recovering=requireCurrentPolicy||attempt>0,result=await this.completeOnce(command,recovering);
+        const recovering=requireCurrentPolicy||attempt>0,result=await this.completeOnce(command,recovering,observationState);
         // A completed phase is factual, not a current policy grant. A result
         // guard conflict must not turn a later policy denial into success.
-        if(recovering)return await this.currentCompletionRetryResult(command,result);
+        // An observed winner already ended with current original policy and
+        // the full accepting Source/receipt/audit read inside its read budget.
+        // Do not add a second, unbudgeted result read after that final proof.
+        if(recovering&&!observationState.started)return await this.currentCompletionRetryResult(command,result);
         return result;
-      }catch(error){if(!completionRepositoryConflict(error)||attempt===4)throw error;}
+      }catch(error){
+        // This same command can never re-enter physical preparation after
+        // observation, including a trailing stricter-policy result read race.
+        if(observationState.started||!completionRepositoryConflict(error)||attempt===4)throw error;
+      }
     }
     throw new SourceFileUploadError('upload_recovery_pending',409,'Original completion requires reconciliation.');
   }
-  private async completeOnce(input:{actorId:string;fileId:string},retrying:boolean):Promise<SourceFileUploadResult<F>>{
+  private async completeOnce(input:{actorId:string;fileId:string},retrying:boolean,observationState:{started:boolean}):Promise<SourceFileUploadResult<F>>{
     this.outsideTransaction();
     const row=await this.files.asActor(input.actorId,async()=>{
       await this.files.captureSourceAccess(input.actorId);const row=await this.read(input.fileId,this.files.transaction()!),value=this.value(row);
@@ -422,8 +477,22 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const value=this.value(row),completion=this.completion(value);
     let object=value.completedObject??await this.options.uploads.recoverCompletion!(completion);
     if(!object){try{object=await this.options.uploads.complete(completion);}catch(error){object=await this.options.uploads.recoverCompletion!(completion);if(!object)throw error;}}
-    let saved:HostRecord;try{saved=await this.finish(row,object,true);}catch(error){const winner=await this.completedSourceWinner(row,object,input.actorId);if(winner)return winner;throw error;}
-    return this.result(saved);
+    const observation=sourceCompletionAttempt();
+    try{
+      let saved:HostRecord;
+      try{saved=await this.finish(row,object,true,{attempt:observation,state:observationState});}
+      catch(error){
+        if(consumeRetiredOwnedError(observation,error)){
+          observationState.started=true;
+          return await this.observeRetiredSourceWinner(row,object,input.actorId,error);
+        }
+        // A nonconditional retention/current-authority failure after the latch
+        // remains that failure; it cannot be replaced by a cached winner.
+        if(observationState.started)throw error;
+        const winner=await this.completedSourceWinner(row,object,input.actorId);if(winner)return winner;throw error;
+      }
+      return await this.result(saved);
+    }finally{endSourceCompletionAttempt(observation);}
   }
   private async close(initial:HostRecord):Promise<HostRecord>{
     let row=await this.mutate(this.value(initial).fileId,value=>['completed','retained','sealed','closing'].includes(value.phase)?value:{...value,phase:'closing',closingAt:this.now().toISOString()}),value=this.value(row);

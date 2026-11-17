@@ -498,3 +498,109 @@ test('revocation during the retry final allowed policy await cannot return its e
   assert.deepEqual((await f.local.storage.get(row.value.completedObject)).body,bytes);assert.equal(f.local.database.database.prepare("SELECT COUNT(*) AS n FROM ubeeq_upload_completions WHERE state='completed'").get().n,1);
   f.restart();await assert.rejects(f.complete(),{code:'access_denied',status:403});assert.deepEqual(await f.journal(),row);assert.deepEqual(await f.audits(),audits);assert.deepEqual(await f.uploads.readPhysicalReceipt('original'),row.value.completedObject);assert.equal(f.quota.settlements.size,1);
 });
+
+// Corrected-behavior controls: two real Source/Owned instances and connections,
+// no recursive same-instance complete, synthetic retirement error or frame API.
+import {withRepositoryRead as retiredRepositoryRead} from '@ubeeq/persistence';
+const retiredDeferred=()=>{let resolve;return{promise:new Promise(done=>{resolve=done;}),resolve};};
+const retiredBefore=(signal,observed,message)=>Promise.race([signal.promise,observed.then(value=>{throw value.error??Error(message);})]);
+async function retiredObservationRace(t,{gap=false,readConflict=false}={}){
+ const signals=Object.fromEntries(['oldBody','nextBody','gap','observe','secondObserve','oldError','revoked'].map(key=>[key,retiredDeferred()])),releaseOld=retiredDeferred(),releaseNext=retiredDeferred(),releaseGap=retiredDeferred();
+ let firstOwned,firstPrepare,oldCall,nextCall,oldProviderError,oldSettled=false,oldPrepareCalls=0,nextPrepareCalls=0,observationTurns=0,guardConflicts=0,oldCapability,nextCapability,revokeRequested=false;
+ const derivative=Buffer.from('Real retired-observation derivative '+checksum),key=(file,object)=>({creatorId:scope.creatorId,operation:'asset.rendition',idempotencyKey:'retired-observe:'+createHash('sha256').update(JSON.stringify([file.fileId,object])).digest('hex')}),request=(file,object,creator)=>({...key(file,object),home:creator,bucket:scope.cellId,kind:'renditions',scope:'private',contentType:'application/octet-stream',body:derivative,metadata:{sourceFileId:file.fileId,source:object,opaque:['完整',{future:true}]}});
+ const f=await fixture(t,{prepareCompletion:(...args)=>firstPrepare(...args)}),second=createLocalAdapterSet({...f.local.database.configuration});let opened=true;
+ const closeSecond=()=>{if(opened){opened=false;second.database.close();}},closeFirst=f.local.database.close.bind(f.local.database);f.local.database.close=()=>{closeSecond();return closeFirst();};t.after(closeSecond);
+ const secondStore=sourceStore(second.repositories).store,secondOwned=new OwnedObjectWrites(second.repositories,second.storage,f.quota,scope.instanceId,scope.cellId);firstOwned=new OwnedObjectWrites(f.local.repositories,f.local.storage,f.quota,scope.instanceId,scope.cellId);
+ const prepare=(local,owned,isOld)=>async(file,object)=>{
+  if(isOld){oldPrepareCalls++;assert.equal(oldPrepareCalls,1,'Observation must not re-enter physical preparation.');}else nextPrepareCalls++;
+  const original=await local.storage.get(object);assert.deepEqual(original.body,bytes);const home=await local.repositories.creators.get(scope.creatorId),recovered=await owned.recover(key(file,object));
+  if(!isOld&&gap&&!recovered){signals.gap.resolve();await releaseGap.promise;}
+  const output=recovered??await owned.write(request(file,object,home));assert.deepEqual((await local.storage.get(output.object)).body,derivative);
+  return{checksumSha256:createHash('sha256').update(original.body).digest('hex'),sizeBytes:original.body.byteLength,metadata:file.metadata};
+ };
+ firstPrepare=prepare(f.local,firstOwned,true);const nextUploads=new SourceFileUploads({repositories:second.repositories,uploads:second.storage,files:secondStore,quota:f.quota,bucket:scope.cellId,prepareCompletion:prepare(second,secondOwned,false)});
+ await f.initiate();await f.accept();const oldAccept=f.local.storage.accept.bind(f.local.storage),nextAccept=second.storage.accept.bind(second.storage);
+ const oldAcceptMock=t.mock.method(f.local.storage,'accept',async value=>{assert.equal(oldCapability,undefined,'No new old-owner body invocation is allowed.');oldCapability=value;signals.oldBody.resolve();await releaseOld.promise;try{return await oldAccept(value);}catch(error){oldProviderError=error;signals.oldError.resolve();throw error;}});
+ t.mock.method(second.storage,'accept',async value=>{assert.equal(nextCapability,undefined,'There is one real successor body invocation.');nextCapability=value;signals.nextBody.resolve();await releaseNext.promise;return nextAccept(value);});
+ const policy=f.quota.checkCurrentPolicy.bind(f.quota);t.mock.method(f.quota,'checkCurrentPolicy',async input=>{const result=await policy(input);if(oldProviderError&&!oldSettled&&input.operation==='upload.original'){if(revokeRequested){revokeRequested=false;await second.repositories.transaction(async transaction=>{const actor=await second.repositories.hostRecords.get(actorRecord.id,{transaction});await second.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,active:false}},{transaction});});signals.revoked.resolve();}observationTurns++;signals.observe.resolve();if(observationTurns>=2)signals.secondObserve.resolve();}return result;});
+ if(readConflict){const snapshot=f.local.repositories.hostRecords.snapshot.bind(f.local.repositories.hostRecords);t.mock.method(f.local.repositories.hostRecords,'snapshot',async()=>{const actual=await snapshot();if(observationTurns&&guardConflicts===0&&!oldSettled){guardConflicts++;const actor=await second.repositories.hostRecords.get(actorRecord.id);await second.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,actualObservationRace:true}});}return actual;});}
+ const observe=promise=>promise.then(value=>({value}),error=>({error}));
+ const start=async()=>{oldCall=observe(f.complete());void oldCall.then(()=>{oldSettled=true;});await retiredBefore(signals.oldBody,oldCall,'Old body did not enter real storage.');nextCall=observe(nextUploads.complete({actorId:'actor',fileId:'original'}));await retiredBefore(gap?signals.gap:signals.nextBody,nextCall,'The genuine independent successor did not enter its pending gate.');};
+ const cleanup=async()=>{releaseOld.resolve();releaseGap.resolve();releaseNext.resolve();await Promise.allSettled([oldCall,nextCall].filter(Boolean));};
+ return{f,second,secondStore,nextUploads,signals,start,cleanup,releaseOld:releaseOld.resolve,releaseNext:()=>{releaseGap.resolve();releaseNext.resolve();},releaseGap:releaseGap.resolve,request,key,get oldCall(){return oldCall;},get nextCall(){return nextCall;},get error(){return oldProviderError;},get settled(){return oldSettled;},get prepares(){return{old:oldPrepareCalls,next:nextPrepareCalls};},get observations(){return observationTurns;},get guardConflicts(){return guardConflicts;},revoke(){revokeRequested=true;return signals.revoked.promise;},restoreOldAccept(){assert.equal(oldSettled,true,'The original command must fully end before its body guard is removed.');oldAcceptMock.mock.restore();},async audits(){return retiredRepositoryRead(f.local.repositories,async transaction=>(await f.local.repositories.auditEvents.list({limit:100,transaction})).items);},async generations(){return retiredRepositoryRead(f.local.repositories,async transaction=>(await f.local.repositories.hostRecords.list({limit:100,transaction})).items.filter(row=>row.namespace==='runtime-owned-object').sort((a,b)=>a.value.generation-b.value.generation));}};
+}
+async function assertRetiredWinner(r,old,next){
+ assert.equal(old.error,undefined);assert.equal(next.error,undefined);assert.equal(old.value.state,'completed');assert.equal(next.value.state,'completed');assert.deepEqual(old.value.file,next.value.file);assert.deepEqual(old.value.object,next.value.object);assert.equal(old.value.file.uploadState,'ready');assert.equal(old.value.file.revision,2);assert.equal(old.value.file.checksumSha256,checksum);assert.deepEqual(old.value.file.opaque,r.f.file.opaque);
+ assert.equal(r.prepares.old,1);assert.equal(r.prepares.next,1);const rows=await r.generations();assert.deepEqual(rows.map(row=>row.value.phase),['sealed','completed']);assert.equal(rows[1].value.previousProof,rows[0].value.seal.proofId);assert.deepEqual(rows[1].value.metadata.opaque,['完整',{future:true}]);assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);assert.equal([...r.f.quota.reservations.values()].filter(row=>row.operation==='upload.original').length,1);assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='upload.original').length,1);assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='asset.rendition').length,1);assert.equal(r.f.quota.closures.size,1);assert.deepEqual((await r.f.local.storage.get(old.value.object)).body,bytes);
+}
+
+test('retired body observation stays pending/read-only through an issued successor and actual Source snapshot conflict, then both owners return the one winner',{timeout:15_000},async t=>{
+ const r=await retiredObservationRace(t,{readConflict:true});try{await r.start();const before=await r.generations();assert.deepEqual(before.map(row=>row.value.phase),['sealed','issued']);assert.equal(before[1].value.completedObject,undefined);r.releaseOld();await retiredBefore(r.signals.secondObserve,r.oldCall,'The old owner did not retain its readonly observation after a real read conflict.');assert.equal(r.settled,false);assert.equal(r.guardConflicts,1);assert.equal(r.prepares.old,1);assert.deepEqual(await r.generations(),before);assert.equal((await r.f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);r.releaseNext();await assertRetiredWinner(r,await r.oldCall,await r.nextCall);}finally{await r.cleanup();}
+});
+test('retired observation permits a genuine SEALED closure with no next generation yet, without inferring future success',{timeout:15_000},async t=>{
+ const r=await retiredObservationRace(t,{gap:true});try{await r.start();const before=await r.generations();assert.deepEqual(before.map(row=>row.value.phase),['sealed']);r.releaseOld();await retiredBefore(r.signals.observe,r.oldCall,'The original retired-error proof incorrectly required a successor already to exist.');assert.equal(r.settled,false);assert.deepEqual(await r.generations(),before);assert.equal((await r.f.store.getSourceFileById('original')).uploadState,'pending');r.releaseNext();await assertRetiredWinner(r,await r.oldCall,await r.nextCall);}finally{await r.cleanup();}
+});
+test('retired observation exhausts its finite readonly budget with the same original error and cannot lend/copy/reuse that evidence',{timeout:20_000},async t=>{
+ const r=await retiredObservationRace(t);try{await r.start();r.releaseOld();await retiredBefore(r.signals.observe,r.oldCall,'The real retired error was not observed.');const before=await r.generations(),outcome=await r.oldCall;assert.equal(outcome.error,r.error);assert.equal(outcome.value,undefined);assert.ok(r.observations>=2);assert.equal(r.prepares.old,1);assert.deepEqual(await r.generations(),before);assert.equal((await r.f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='upload.original').length,1);
+  r.restoreOldAccept();
+  for(const mode of ['reused','copied','other-source']){let thrown=false,afterThrowPolicies=0;const failure=mode==='copied'?Object.assign(Error(r.error.message),{name:r.error.name}):r.error,id=mode==='other-source'?'actual-other-source':'original';if(id!=='original'){const file=sourceFile(id,{storageKey:sourceFileOriginalObjectKey({...scope,fileId:id}),sizeBytes:bytes.length});await r.f.store.commitSourceFile({expected:null,file,audit:sourceAudit('actual-other-observation-source','actor',{detail:{fileId:id,creatorId:scope.creatorId}}),access:await r.f.store.captureSourceAccess('actor')});await r.f.uploads.initiate({actorId:'actor',fileId:id,checksumSha256:checksum});await r.f.uploads.accept({actorId:'actor',fileId:id,body:bytes});}
+   const policy=r.f.quota.checkCurrentPolicy.bind(r.f.quota);r.f.quota.checkCurrentPolicy=async input=>{if(thrown&&input.operation==='upload.original')afterThrowPolicies++;return policy(input);};const other=new SourceFileUploads({repositories:r.f.local.repositories,uploads:r.f.local.storage,files:r.f.store,quota:r.f.quota,bucket:scope.cellId,prepareCompletion:async()=>{thrown=true;throw failure;}});await assert.rejects(other.complete({actorId:'actor',fileId:id}),error=>error===failure);assert.equal(afterThrowPolicies,0,'A reused/copied/lent error must not start another observation.');r.f.quota.checkCurrentPolicy=policy;
+  }
+ }finally{await r.cleanup();}
+});
+for(const mode of ['actor','policy','source-tuple'])test(`retired observation honors actual current ${mode} change while the successor remains held`,{timeout:15_000},async t=>{
+ const r=await retiredObservationRace(t);try{await r.start();r.releaseOld();await retiredBefore(r.signals.observe,r.oldCall,'The genuine pending observation did not begin.');if(mode==='actor')await r.revoke();else if(mode==='policy')r.f.quota.setAdmitted(false);else{const file=await r.f.store.getSourceFileById('original');await r.f.store.commitSourceFile({expected:file,file:{...file,mimeType:'application/pdf',revision:file.revision+1},audit:sourceAudit('actual-observation-source-change','actor',{action:'source_file.updated'}),access:await r.f.store.captureSourceAccess('actor')});}const result=await r.oldCall;assert.ok(result.error);assert.equal(result.value,undefined);assert.equal(result.error.status,mode==='source-tuple'?409:403);if(mode==='actor')assert.equal(result.error.code,'access_denied');assert.equal(r.prepares.old,1);assert.equal((await r.f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='upload.original').length,1);}finally{await r.cleanup();}
+});
+for(const mode of ['chain','foreign-provider'])test(`a corrupt genuine retired ${mode} does not acquire observation authority`,{timeout:15_000},async t=>{
+ const r=await retiredObservationRace(t);try{await r.start();const rows=await r.generations(),selected=mode==='chain'?rows[1]:rows[0];await r.second.repositories.hostRecords.update(selected.id,selected.revision,{value:mode==='chain'?{...selected.value,previousProof:'not-the-real-previous-seal'}:{...selected.value,provider:{...selected.value.provider,object:{...selected.value.provider.object,key:'cells/foreign/creators/another/renditions/foreign'}}}});r.releaseOld();const result=await r.oldCall;assert.equal(result.error,r.error);assert.equal(result.value,undefined);assert.equal(r.observations,0);assert.equal(r.prepares.old,1);assert.equal((await r.f.store.getSourceFileById('original')).uploadState,'pending');}finally{await r.cleanup();}
+});
+test('an unmarked decoder error with the same scope-message text never starts retired observation',{timeout:10_000},async t=>{
+ const failure=Error('Upload scope does not match the authenticated creator and cell.');let prepares=0,afterThrowPolicies=0,thrown=false;const f=await fixture(t,{prepareCompletion:async()=>{prepares++;thrown=true;throw failure;}}),policy=f.quota.checkCurrentPolicy.bind(f.quota);f.quota.checkCurrentPolicy=async input=>{if(thrown&&input.operation==='upload.original')afterThrowPolicies++;return policy(input);};await f.initiate();await f.accept();await assert.rejects(f.complete(),error=>error===failure);assert.equal(prepares,1);assert.equal(afterThrowPolicies,0);assert.equal((await f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);assert.equal(f.quota.settlements.size,1);
+});
+
+
+// Real read-policy guard failure after the obsolete Local body has already
+// failed. This is a repository-produced exception, not a synthesized CAS name.
+test('a genuine Owned factual-policy snapshot collision preserves the retired body error without physical reprepare',{timeout:15_000},async t=>{
+ const {OptimisticConcurrencyError}=await import('@ubeeq/persistence');
+ const r=await retiredObservationRace(t),policy=r.f.quota.checkCurrentPolicy.bind(r.f.quota);
+ let armed=false,collisions=0,policyError;
+ t.mock.method(r.f.quota,'checkCurrentPolicy',async input=>{
+  const actual=await policy(input);
+  if(r.error&&input.operation==='asset.rendition'&&!armed){
+   armed=true;assert.equal(actual.allowed,true,'Keep the actual financial policy allowed; only its read guard races.');
+   assert.equal(r.f.store.transaction(),undefined,'The factual fallback policy read must occur outside Source metadata acceptance.');
+   const snapshot=await r.f.local.repositories.hostRecords.snapshot();
+   await r.second.repositories.transaction(async transaction=>{
+    const actor=await r.second.repositories.hostRecords.get(actorRecord.id,{transaction});
+    assert.equal(actor.value.active,true);
+    await r.second.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,actualOwnedPolicyReadRace:1}},{transaction});
+   });
+   try{
+    await r.f.local.repositories.transaction(transaction=>snapshot.bind(transaction));
+   }catch(error){
+    assert.ok(error instanceof OptimisticConcurrencyError,'The real stale complete-repository snapshot must reject its actual accepting guard.');
+    collisions++;policyError=error;throw error;
+   }
+   assert.fail('The actual stale policy snapshot unexpectedly accepted after the independent writer committed.');
+  }
+  return actual;
+ });
+ try{
+  await r.start();const before=await r.generations();assert.deepEqual(before.map(row=>row.value.phase),['sealed','issued']);
+  r.releaseOld();
+  await retiredBefore(r.signals.secondObserve,r.oldCall,'The policy read collision substituted a retry signal or ended the genuine retired-error observation.');
+  assert.equal(collisions,1);assert.ok(policyError instanceof OptimisticConcurrencyError);assert.notEqual(policyError,r.error);
+  assert.match(r.error.message,/Upload scope does not match the authenticated creator and cell/);
+  assert.equal(r.settled,false);assert.equal(r.prepares.old,1);assert.deepEqual(await r.generations(),before);
+  assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);
+  const actor=await retiredRepositoryRead(r.f.local.repositories,transaction=>r.f.local.repositories.hostRecords.get(actorRecord.id,{transaction}));
+  assert.equal(actor.value.active,true);assert.equal(actor.value.actualOwnedPolicyReadRace,1);
+  r.releaseNext();const old=await r.oldCall,next=await r.nextCall;await assertRetiredWinner(r,old,next);
+  assert.equal(collisions,1);assert.equal(r.prepares.old,1);assert.equal(r.prepares.next,1);
+  r.restoreOldAccept();const replay=await r.f.complete();assert.deepEqual(replay.object,old.value.object);
+  assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+  assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='upload.original').length,1);
+  t.diagnostic(JSON.stringify({actualPolicyGuardError:policyError.name,actualOldBodyError:r.error.message,guardCollisions:collisions,oldPreparations:r.prepares.old,independentPreparations:r.prepares.next,completionAudits:1,originalCharges:1}));
+ }finally{await r.cleanup();}
+});

@@ -1,9 +1,10 @@
 import {createHash,randomUUID} from 'node:crypto';
-import {withRepositoryRead,repositoryItems, type CellOwnedRecord, type HostRecord, type PersistenceTransaction, type UbeeqRepositories} from '@ubeeq/persistence';
+import {OptimisticConcurrencyError,UniqueConstraintError,withRepositoryRead,repositoryItems, type CellOwnedRecord, type HostRecord, type PersistenceTransaction, type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey, requireCreatorScopedObject, writeBoundedUploadContent, type StoredObject, type UploadAdapter, type UploadContentAdapter, type UploadInitiation, type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {UsageSettlementOutbox} from './usage-settlement-outbox.js';
 import {StorageClosureOutbox} from './storage-closure-outbox.js';
+import {captureSourceCompletionPreparation,recordRetiredOwnedError} from './source-completion-observation.js';
 
 const thenable=(value:unknown):value is PromiseLike<unknown>=>!!value&&typeof value==='object'&&'then'in value&&typeof value.then==='function';
 const namespace = 'runtime-owned-object';
@@ -17,6 +18,21 @@ const canonical = (value: unknown): unknown => {
 export const ownedEvidenceHash = (value: unknown) => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 const hash = ownedEvidenceHash;
 const conflict = (error: unknown) => /conflict|revision|conditional|already exists|transaction.*cancel/i.test(String(error));
+/** A factual read collision must not replace an already failed physical body
+ * with a new metadata-retry signal. This performs no retry or permission test. */
+const recoveryReadConflict=(error:unknown):boolean=>{
+  if(error instanceof OptimisticConcurrencyError||error instanceof UniqueConstraintError)return true;
+  if(!(error instanceof Error)||error.name!=='TransactionCanceledException')return false;
+  const reasons:unknown=Object.getOwnPropertyDescriptor(error,'CancellationReasons')?.value;
+  if(!Array.isArray(reasons)||!reasons.length||reasons.length>100)return false;
+  let conditional=false;
+  for(const reason of reasons){
+    if(!reason||typeof reason!=='object'||Array.isArray(reason))return false;
+    const code:unknown=Object.getOwnPropertyDescriptor(reason,'Code')?.value;
+    if(code==='ConditionalCheckFailed')conditional=true;else if(code!=='None')return false;
+  }
+  return conditional;
+};
 /** A host quota decision is distinct from an uncertain provider write. */
 export class OwnedObjectQuotaError extends Error {
   constructor(readonly reasonCode:string,readonly stage:'reservation'|'admission'){super(reasonCode);this.name='OwnedObjectQuotaError';}
@@ -246,7 +262,9 @@ export class OwnedObjectWrites {
     const original=this.value(initial),policy=this.quota.checkCurrentPolicy;
     if(!policy)return;
     const active=()=>{if(restriction)this.assertPhysical(restriction);};
-    active();const initialPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});active();if(initialPolicy.allowed!==true)return;
+    active();let initialPolicy:Awaited<ReturnType<NonNullable<UsageQuotaPort['checkCurrentPolicy']>>>;
+    try{initialPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});}catch(error){active();if(recoveryReadConflict(error))return;throw error;}
+    active();if(initialPolicy.allowed!==true)return;
     const home=(row:CellOwnedRecord)=>({homeCellId:row.homeCellId,dataHomeRegion:row.dataHomeRegion,dataHomeAssignedAt:row.dataHomeAssignedAt,routingRevision:row.routingRevision});
     const immutable=(value:Intent)=>{const {phase,closingAt,seal,completedObject,usageIntentId,closureIntentId,...identity}=value;return identity;};
     const request=(value:Intent)=>{const {key,...object}=value.object;return{creatorId:value.creatorId,operation:value.operation,idempotencyKey:value.idempotencyKey,requestHash:value.requestHash,metadata:value.metadata,object};};
@@ -286,12 +304,74 @@ export class OwnedObjectWrites {
     active();if(!physical||hash(physical)!==hash(before.value.completedObject))return;
     this.proveObject(before.value,physical);
     let after:Awaited<ReturnType<typeof capture>>;try{after=await capture();}catch{active();return;}active();if(!after||hash(after.rows)!==hash(before.rows))return;
-    const finalPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});active();if(finalPolicy.allowed!==true)return;
+    let finalPolicy:Awaited<ReturnType<NonNullable<UsageQuotaPort['checkCurrentPolicy']>>>;
+    try{finalPolicy=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});}catch(error){active();if(recoveryReadConflict(error))return;throw error;}
+    active();if(finalPolicy.allowed!==true)return;
     // Exact terminal rows and actual immutable provider bytes were re-read;
     // pending/settled outbox acknowledgment is never inferred or delivered.
     return{object:structuredClone(physical),metadata:structuredClone(after.value.metadata)};
   }
+  /** An old body may fail between the real seal and the birth of a successor.
+   * Record only that retired fact for its actual Source preparation caller.
+   * This does not wait, return bytes, or promise that another owner will finish. */
+  private async retiredSourceError(initial:HostRecord,restriction:Readonly<OwnedObjectWriteRestriction>|undefined,frame:ReturnType<typeof captureSourceCompletionPreparation>,error:unknown):Promise<void>{
+    if(!frame||!error||typeof error!=='object')return;
+    const original=this.value(initial),policy=this.quota.checkCurrentPolicy;if(!policy||original.phase!=='issued'||!original.provider)return;
+    const active=()=>{if(restriction)this.assertPhysical(restriction);};
+    active();let decision:Awaited<ReturnType<NonNullable<UsageQuotaPort['checkCurrentPolicy']>>>;
+    try{decision=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});}catch(error){active();if(recoveryReadConflict(error))return;throw error;}
+    active();if(decision.allowed!==true)return;
+    const home=(row:CellOwnedRecord)=>({homeCellId:row.homeCellId,dataHomeRegion:row.dataHomeRegion,dataHomeAssignedAt:row.dataHomeAssignedAt,routingRevision:row.routingRevision});
+    const immutable=(value:Intent)=>{const {phase,closingAt,seal,completedObject,usageIntentId,closureIntentId,...identity}=value;return identity;};
+    const request=(value:Intent)=>{const {key,...object}=value.object;return{creatorId:value.creatorId,operation:value.operation,idempotencyKey:value.idempotencyKey,requestHash:value.requestHash,metadata:value.metadata,object};};
+    const capture=()=>withRepositoryRead(this.repositories,async transaction=>{
+      const read=(id:string)=>this.records.get(id,{transaction});
+      let row=await read(initial.id);if(!row)return;
+      let value=this.value(row);
+      if(value.phase!=='sealed'||hash(immutable(value))!==hash(immutable(original))||hash(home(row))!==hash(home(initial))||row.createdAt!==initial.createdAt)return;
+      const rows:HostRecord[]=[];
+      for(let generation=original.generation;generation<1000;generation++){
+        if(value.generation!==generation||hash(home(row))!==hash(home(initial))||hash(request(value))!==hash(request(original))||value.provider&&hash(value.provider.object)!==hash(value.object))return;
+        rows.push(row);
+        // The chain may advance while policy is read. This validates a stored
+        // completed candidate's accounting identity; it returns no output and
+        // never substitutes that candidate for the Source's actual original.
+        if(value.phase==='completed'){
+          if(generation===original.generation||!value.provider||!value.completedObject||!value.usageIntentId||value.seal!==undefined||value.closureIntentId!==undefined)return;
+          const writtenAt=value.completedObject.writtenAt;if(typeof writtenAt!=='string')return;
+          const input={creatorId:value.creatorId,operation:value.operation,idempotencyKey:this.usageKey(row),storageBytesDelta:value.completedObject.byteLength,observedAt:writtenAt};
+          const id=createHash('sha256').update(JSON.stringify([this.instanceId,'runtime-usage-settlement',input.creatorId,input.idempotencyKey])).digest('hex'),intent=await read(id);
+          if(!intent||intent.id!==value.usageIntentId||intent.namespace!=='runtime-usage-settlement'||intent.instanceId!==this.instanceId||intent.scopeId!==input.creatorId||intent.key!==input.idempotencyKey||hash(home(intent))!==hash(home(initial))||!['pending','settled'].includes(String(intent.value.state))||hash(intent.value.input)!==hash(input)||intent.value.fingerprint!==JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,0,input.storageBytesDelta,0,input.observedAt]))return;
+          rows.push(intent);return rows;
+        }
+        if(value.phase!=='sealed'){
+          if(generation===original.generation||!['prepared','issued','closing'].includes(value.phase)||value.completedObject!==undefined||value.usageIntentId!==undefined||value.seal!==undefined||value.closureIntentId!==undefined)return;
+          return rows;
+        }
+        if(value.completedObject!==undefined||value.usageIntentId!==undefined||value.seal?.state!=='sealed'||!value.provider||!value.seal.proofId?.trim()||value.seal.proofId.length>200||!instant(value.seal.closedAt)||!value.closureIntentId)return;
+        if(value.seal.retainedFence&&(value.seal.retainedFence.bucket!==value.provider.object.bucket||value.seal.retainedFence.key!==value.object.key||!value.seal.retainedFence.versionId||value.seal.retainedFence.byteLength!==0||value.seal.retainedFence.scope!=='private'||value.seal.retainedFence.writtenAt!==value.seal.closedAt))return;
+        const input={creatorId:value.creatorId,operation:value.operation,idempotencyKey:this.usageKey(row),reservedBytes:value.object.byteLength,proofId:value.seal.proofId,observedAt:value.seal.closedAt};
+        const id='storage-close-'+createHash('sha256').update(JSON.stringify(['runtime-storage-closure',this.instanceId,input.creatorId,input.idempotencyKey])).digest('hex'),intent=await read(id);
+        if(!intent||intent.id!==value.closureIntentId||intent.namespace!=='runtime-storage-closure'||intent.instanceId!==this.instanceId||intent.scopeId!==input.creatorId||intent.key!==input.idempotencyKey||hash(home(intent))!==hash(home(initial))||!['pending','closed'].includes(String(intent.value.state))||hash(intent.value.input)!==hash(input)||intent.value.fingerprint!==JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,input.reservedBytes,input.proofId,input.observedAt]))return;
+        rows.push(intent);
+        const next=await read(this.id(original,generation+1));if(!next)return rows;
+        const following=this.value(next);if(following.generation!==generation+1||following.previousProof!==value.seal.proofId)return;
+        row=next;value=following;
+      }
+    });
+    let before:Awaited<ReturnType<typeof capture>>;try{before=await capture();}catch{active();return;}active();if(!before)return;
+    let current:Awaited<ReturnType<NonNullable<UsageQuotaPort['checkCurrentPolicy']>>>;
+    try{current=await policy.call(this.quota,{creatorId:original.creatorId,operation:original.operation});}catch(error){active();if(recoveryReadConflict(error))return;throw error;}
+    active();if(current.allowed!==true)return;
+    let after:Awaited<ReturnType<typeof capture>>;try{after=await capture();}catch{active();return;}active();if(!after||hash(before[0])!==hash(after[0]))return;
+    // A real closure acknowledgment may progress pending→closed while the
+    // successor is born. Its full immutable input/home remains the same fact.
+    const closureIdentity=(row:HostRecord)=>{const {revision,updatedAt,value,...identity}=row;const {state,...facts}=value;return{...identity,value:facts};};
+    if(hash(closureIdentity(before[1]))!==hash(closureIdentity(after[1])))return;
+    recordRetiredOwnedError(frame,error);
+  }
   async write(input: OwnedObjectWrite): Promise<OwnedObjectResult> {
+    const sourcePreparation=captureSourceCompletionPreparation(this.repositories,this.uploads,input.creatorId,input.home);
     const restriction=this.restrictions(input);
     if(input.home.homeCellId!==this.cellId || !input.bucket || !input.contentType.trim() || !['private','restricted','public'].includes(input.scope) || input.body.byteLength<=0) throw new Error('Invalid owned output request.');
     const body=Uint8Array.from(input.body), checksum=createHash('sha256').update(body).digest('hex'), metadata=JSON.parse(JSON.stringify(canonical(input.metadata??{}))) as Record<string,unknown>;
@@ -384,8 +464,8 @@ export class OwnedObjectWrites {
     if(lifetimeDenied&&restriction)return this.denyPhysical(row,lifetimeError);
     let object:StoredObject|undefined;
     try{object=writeFailed ? await this.uploads.recoverCompletion!(completion) : await this.uploads.complete(completion);}
-    catch(error){object=await this.uploads.recoverCompletion!(completion);if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;}throw error;}}
-    if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;throw writeError;}throw new Error('Output upload requires recovery.');}
+    catch(error){object=await this.uploads.recoverCompletion!(completion);if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;await this.retiredSourceError(row,restriction,sourcePreparation,error);}throw error;}}
+    if(!object){if(writeFailed){const successor=await this.completedSuccessor(row,restriction);if(successor)return successor;await this.retiredSourceError(row,restriction,sourcePreparation,writeError);throw writeError;}throw new Error('Output upload requires recovery.');}
     return this.commitObject(row,object);
   }
   async repair(limit=25):Promise<number>{
