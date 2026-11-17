@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import type {AssetRecord, HostRecord, UbeeqRepositories} from '@ubeeq/persistence';
+import {withRepositoryRead, type AssetRecord, type HostRecord, type UbeeqRepositories} from '@ubeeq/persistence';
 import type {MediaProcessor, ProcessedRendition} from '@ubeeq/processing';
 import {cellScopedObjectKey, requireCreatorScopedObject, type ObjectStorage, type StoredObject} from '@ubeeq/storage';
 import {ownedEvidenceHash as hash, type OwnedObjectWrites} from './owned-object-writes.js';
@@ -33,7 +33,8 @@ export async function persistProcessedOutputs(input:{
   const identity={creatorId:asset.creatorId,operation:'asset.rendition',idempotencyKey:usageKey};
   const binding=hash([asset.instanceId,asset.homeCellId,asset.dataHomeRegion,asset.dataHomeAssignedAt,asset.routingRevision,asset.creatorId,asset.id,asset.objectVersion,asset.checksum,asset.mimeType,source,usageKey,...(primaryScope==='public'?[]:[{primaryScope}])]);
   const id=`processed-outputs-${hash([asset.instanceId,asset.homeCellId,asset.creatorId,usageKey])}`;
-  let row=await records?.get(id);
+  const readRecord=()=>records?withRepositoryRead(repositories,transaction=>records.get(id,{transaction})):Promise.resolve(undefined);
+  let row=await readRecord();
   const read=(record:HostRecord):Journal=>{
     const value=record.value as unknown as Journal;
     if(record.namespace!==namespace||record.instanceId!==asset.instanceId||record.homeCellId!==asset.homeCellId||record.scopeId!==asset.creatorId||record.key!==usageKey
@@ -69,10 +70,17 @@ export async function persistProcessedOutputs(input:{
     prove(journal!.plan,key,object);
     if(!records){journal!.objects[key]=object;return;}
     for(let attempt=0;attempt<5;attempt++){
-      row=(await records.get(id))!;const current=read(row), previous=current.objects[key];
-      if(previous){if(hash(previous)!==hash(object))throw new Error('Processed output immutable versions conflict.');journal=current;return;}
-      try{row=await records.update(id,row.revision,{value:{...row.value,objects:{...current.objects,[key]:object}}});journal=read(row);return;}
-      catch(error){if(!conflict(error)||attempt===4)throw error;}
+      let updating=false;
+      try{
+        const saved=await repositories.transaction(async transaction=>{
+          const latest=(await records.get(id,{transaction}))!;
+          const current=read(latest),previous=current.objects[key];
+          if(previous){if(hash(previous)!==hash(object))throw new Error('Processed output immutable versions conflict.');return latest;}
+          updating=true;
+          return records.update(id,latest.revision,{value:{...latest.value,objects:{...current.objects,[key]:object}}},{transaction});
+        });
+        row=saved;journal=read(saved);return;
+      }catch(error){if(!updating||!conflict(error)||attempt===4)throw error;}
     }
   };
   if(journal&&input.owned)for(const output of journal.plan.outputs)if(!journal.objects[output.id]){
@@ -117,8 +125,8 @@ export async function persistProcessedOutputs(input:{
     else{
       journal={plan,fingerprint,objects:{}};
       if(records){
-        try{row=await records.create({id,instanceId:asset.instanceId,homeCellId:asset.homeCellId,dataHomeRegion:asset.dataHomeRegion,dataHomeAssignedAt:asset.dataHomeAssignedAt,routingRevision:asset.routingRevision,namespace,scopeId:asset.creatorId,key:usageKey,value:journal as unknown as Record<string,unknown>});}
-        catch(error){row=await records.get(id);if(!row)throw error;}
+        try{row=await repositories.transaction(transaction=>records.create({id,instanceId:asset.instanceId,homeCellId:asset.homeCellId,dataHomeRegion:asset.dataHomeRegion,dataHomeAssignedAt:asset.dataHomeAssignedAt,routingRevision:asset.routingRevision,namespace,scopeId:asset.creatorId,key:usageKey,value:journal as unknown as Record<string,unknown>},{transaction}));}
+        catch(error){row=await readRecord();if(!row)throw error;}
         journal=read(row!);if(journal.fingerprint!==fingerprint)throw new Error('Concurrent processed output sets conflict.');
       }
     }

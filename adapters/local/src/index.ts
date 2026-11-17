@@ -391,14 +391,16 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
   }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const path = this.objectPath(input); rmSync(path, { force: true }); rmSync(`${path}.json`, { force: true }); }
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation> {
-    const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
-    const uploadId = input.idempotencyKey ? digest(JSON.stringify([match[1],input.object.key,input.idempotencyKey])) : randomUUID();
-    if(this.local.database.prepare('SELECT id FROM ubeeq_upload_seals WHERE id=?').get(uploadId))throw new Error('Upload is permanently sealed.');
-    if(this.local.database.prepare("SELECT id FROM ubeeq_upload_completions WHERE id=?").get(uploadId)) throw new Error("Upload operation already has a completion intent.");
-    this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
-    const saved = this.local.database.prepare("SELECT object_payload, expires_at FROM ubeeq_uploads WHERE id=?").get(uploadId) as {object_payload:string;expires_at:string};
-    if(!this.sameUploadObject(parse<StoredObject>(saved.object_payload),input.object) || saved.expires_at !== input.expiresAt) throw new Error("Upload initiation idempotency conflict.");
-    return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
+    return this.local.transaction(async () => {
+      const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
+      const uploadId = input.idempotencyKey ? digest(JSON.stringify([match[1],input.object.key,input.idempotencyKey])) : randomUUID();
+      if(this.local.database.prepare('SELECT id FROM ubeeq_upload_seals WHERE id=?').get(uploadId))throw new Error('Upload is permanently sealed.');
+      if(this.local.database.prepare("SELECT id FROM ubeeq_upload_completions WHERE id=?").get(uploadId)) throw new Error("Upload operation already has a completion intent.");
+      this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
+      const saved = this.local.database.prepare("SELECT object_payload, expires_at FROM ubeeq_uploads WHERE id=?").get(uploadId) as {object_payload:string;expires_at:string};
+      if(!this.sameUploadObject(parse<StoredObject>(saved.object_payload),input.object) || saved.expires_at !== input.expiresAt) throw new Error("Upload initiation idempotency conflict.");
+      return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
+    });
   }
   async accept(input:UploadAcceptance):Promise<void>{
     // Byte callers share the same custody/receipt path; new content is never
