@@ -1,17 +1,19 @@
+import {protectCreatorContentAuthority} from '@ubeeq/persistence';
 /**
  * Provider-neutral machine adapters. PostgreSQL is the canonical durable store
  * for a scalable machine cell; no application service imports this package.
  */
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import {AsyncLocalStorage} from 'node:async_hooks';
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
 import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type RepositorySnapshot, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
-import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
+import type { AuthenticatedSession, AuthorizationSubject, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
 
 const timestamp = (): string => new Date().toISOString();
@@ -28,11 +30,13 @@ export interface PostgresAdapterConfiguration {
 
 type Queryable = Pick<Pool, "query"> | Pick<PoolClient, "query">;
 type MachineTransaction = PersistenceTransaction & { client: PoolClient };
+type MachineTransactionState={id:string;client:PoolClient;active:boolean;failed:boolean;guards:Map<string,number|null>;writes:Set<string>};
 
 /** Applies explicit SQL migrations and exposes atomic repository transactions. */
 export class PostgresDatabase {
   readonly pool: Pool;
-  private readonly transactions = new Map<string, PoolClient>();
+  private readonly transactions = new Map<string, MachineTransactionState>();
+  private readonly context=new AsyncLocalStorage<MachineTransactionState>();
 
   constructor(readonly configuration: PostgresAdapterConfiguration, pool?: Pool) {
     if (!configuration.connectionString.trim() || !configuration.cellId.trim()) throw new Error("PostgreSQL adapters require connectionString and cellId.");
@@ -41,7 +45,7 @@ export class PostgresDatabase {
 
   async migrate(): Promise<void> {
     await this.pool.query("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL)");
-    for (const id of ["001-core", "002-identity"]) {
+    for (const id of ["001-core", "002-identity", "003-repository-snapshots", "004-account-authorization", "005-record-absence-guards"]) {
       const applied = await this.pool.query<{ id: string }>("SELECT id FROM ubeeq_schema_migrations WHERE id = $1", [id]);
       if (applied.rowCount) continue;
       const client = await this.pool.connect();
@@ -59,23 +63,51 @@ export class PostgresDatabase {
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
+    const inherited=this.context.getStore();
+    if(inherited){
+      if(!inherited.active)throw Error('PostgreSQL transaction context has ended.');
+      try{return await operation({id:inherited.id,client:inherited.client} as MachineTransaction);}catch(error){inherited.failed=true;throw error;}
+    }
     const client = await this.pool.connect();
     const transaction: MachineTransaction = { id: `postgres-${randomUUID()}`, client };
-    this.transactions.set(transaction.id, client);
+    const state:MachineTransactionState={...transaction,active:true,failed:false,guards:new Map(),writes:new Set()};this.transactions.set(transaction.id,state);
     try {
       await client.query("BEGIN");
-      const result = await operation(transaction);
+      const result = await this.context.run(state,()=>operation(transaction));
+      if(state.failed)throw Error('PostgreSQL transaction aborted after a failed operation.');
+      state.active=false;
       await client.query("COMMIT");
       return result;
     } catch (error) { await client.query("ROLLBACK"); throw error; }
-    finally { this.transactions.delete(transaction.id); client.release(); }
+    finally { state.active=false;this.transactions.delete(transaction.id); client.release(); }
+  }
+
+  failTransaction():void{const state=this.context.getStore();if(state?.active)state.failed=true;}
+  guardRecord(repository:string,id:string,expected:number|null,transaction:PersistenceTransaction):boolean{
+    this.queryable(transaction);
+    const state=this.context.getStore()!,key=JSON.stringify([repository,id]);
+    if(state.writes.has(key)){state.failed=true;throw new Error('A transaction must guard or write each item once.');}
+    if(state.guards.has(key)){
+      if(state.guards.get(key)!==expected){state.failed=true;throw new OptimisticConcurrencyError(id,expected??0);}
+      return false;
+    }
+    state.guards.set(key,expected);return true;
+  }
+  recordWrite(repository:string,id:string):void{
+    const state=this.context.getStore();if(!state)return;
+    if(!state.active)throw new Error('PostgreSQL transaction context has ended.');
+    const key=JSON.stringify([repository,id]);
+    if(state.guards.has(key)){state.failed=true;throw new Error('A transaction cannot write a guarded item.');}
+    state.writes.add(key);
   }
 
   queryable(transaction?: PersistenceTransaction): Queryable {
-    if (!transaction) return this.pool;
-    const client = this.transactions.get(transaction.id) ?? (transaction as Partial<MachineTransaction>).client;
-    if (!client) throw new Error("PostgreSQL repository received an unknown transaction.");
-    return client;
+    const context=this.context.getStore();
+    if(context&&!context.active)throw Error('PostgreSQL transaction context has ended.');
+    if(!transaction)return context?.client??this.pool;
+    const state=this.transactions.get(transaction.id);
+    if(!state?.active||state!==context){this.failTransaction();throw Error('PostgreSQL repository received an unknown transaction.');}
+    return state.client;
   }
 
   async close(): Promise<void> { await this.pool.end(); }
@@ -93,6 +125,7 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
       const existing = await db.query<{ record_id: string }>("SELECT record_id FROM ubeeq_idempotency WHERE repository = $1 AND idempotency_key = $2", [this.repository, options.idempotencyKey]);
       if (existing.rowCount) return (await this.get(existing.rows[0].record_id, options))!;
     }
+    this.database.recordWrite(this.repository,record.id);
     const value = { ...record, revision: 1, createdAt: timestamp(), updatedAt: timestamp() } as T;
     try {
       await db.query("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES ($1, $2, $3, $4::jsonb, $5, $6)", [this.repository, value.id, value.revision, JSON.stringify(value), value.createdAt, value.updatedAt]);
@@ -115,12 +148,44 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
     const result = await this.database.queryable(options?.transaction).query<{ payload: T }>("SELECT payload FROM ubeeq_records WHERE repository = $1 AND id = $2", [this.repository, id]);
     return result.rows[0]?.payload;
   }
+  async checkRevision(id:string,expectedRevision:number,options:{transaction:PersistenceTransaction}):Promise<void>{
+    if(!this.database.guardRecord(this.repository,id,expectedRevision,options.transaction))return;
+    const result=await this.database.queryable(options.transaction).query<{revision:number}>('SELECT revision FROM ubeeq_records WHERE repository = $1 AND id = $2 FOR SHARE',[this.repository,id]);
+    if(result.rows[0]?.revision!==expectedRevision){this.database.failTransaction();throw new OptimisticConcurrencyError(id,expectedRevision);}
+  }
+  async checkAbsent(id:string,options:{transaction:PersistenceTransaction}):Promise<void>{
+    if(!this.database.guardRecord(this.repository,id,null,options.transaction))return;
+    const db=this.database.queryable(options.transaction);
+    try{
+      // The BEFORE trigger takes the matching exclusive transaction lock for
+      // every actual writer, including direct SQL inserts into an absent key.
+      await db.query('SELECT pg_advisory_xact_lock_shared(hashtextextended(jsonb_build_array($1::text,$2::text)::text,0))',[this.repository,id]);
+      const existing=await db.query('SELECT id FROM ubeeq_records WHERE repository = $1 AND id = $2',[this.repository,id]);
+      // The table read retains its relation lock, so its writer trigger cannot
+      // be removed concurrently after this protocol check. Old schemas fail closed.
+      const protocol=await db.query("SELECT 1 FROM pg_trigger WHERE tgrelid = 'ubeeq_records'::regclass AND tgname = 'ubeeq_record_key_lock' AND tgenabled IN ('O','A') AND NOT tgisinternal");
+      if(!protocol.rowCount)throw new Error('PostgreSQL absence guards require the installed record writer-lock migration.');
+      if(existing.rowCount)throw new OptimisticConcurrencyError(id,0);
+    }catch(error){this.database.failTransaction();throw error;}
+  }
+  async snapshot():Promise<RepositorySnapshot<T>>{
+    // One MVCC statement captures the complete legacy inventory and its marker.
+    const result=await this.database.pool.query<{version:string;items:T[]}>("SELECT coalesce((SELECT version FROM ubeeq_repository_versions WHERE repository = $1),0)::text AS version, coalesce((SELECT jsonb_agg(payload ORDER BY id) FROM ubeeq_records WHERE repository = $1),'[]'::jsonb) AS items",[this.repository]);
+    const expected=result.rows[0].version;
+    return {items:result.rows[0].items,bind:async transaction=>{
+      const db=this.database.queryable(transaction);
+      await db.query('INSERT INTO ubeeq_repository_versions (repository, version) VALUES ($1,0) ON CONFLICT DO NOTHING',[this.repository]);
+      const current=await db.query<{version:string}>('SELECT version::text AS version FROM ubeeq_repository_versions WHERE repository = $1 FOR SHARE',[this.repository]);
+      if(current.rows[0]?.version!==expected){this.database.failTransaction();throw new OptimisticConcurrencyError('repository:'+this.repository,0);}
+    }};
+  }
   async list(request: PageRequest, options?: { transaction?: PersistenceTransaction }): Promise<Page<T>> {
     const result = await this.database.queryable(options?.transaction).query<{ id: string; payload: T }>("SELECT id, payload FROM ubeeq_records WHERE repository = $1 AND id > $2 ORDER BY id LIMIT $3", [this.repository, afterCursor(request.cursor), limit(request.limit) + 1]);
     const items = result.rows.slice(0, limit(request.limit)).map((row) => row.payload);
     return { items, nextCursor: result.rows.length > limit(request.limit) ? cursor(items.at(-1)!.id) : undefined };
   }
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>, options?: Options): Promise<T> {
+    this.query(options);this.database.recordWrite(this.repository,id);
     const current = await this.get(id, options);
     if (!current || current.revision !== expectedRevision) throw new OptimisticConcurrencyError(id, expectedRevision);
     const value = { ...current, ...change, revision: current.revision + 1, updatedAt: timestamp() } as T;
@@ -129,6 +194,7 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
     return value;
   }
   async remove(id: string, expectedRevision: number, options?: { transaction?: PersistenceTransaction }): Promise<void> {
+    this.database.queryable(options?.transaction);this.database.recordWrite(this.repository,id);
     const result = await this.database.queryable(options?.transaction).query("DELETE FROM ubeeq_records WHERE repository = $1 AND id = $2 AND revision = $3", [this.repository, id, expectedRevision]);
     if (result.rowCount !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
   }
@@ -137,9 +203,9 @@ export class PostgresRevisionedRepository<T extends RevisionedRecord> implements
 const repository = <T extends RevisionedRecord>(database: PostgresDatabase, name: string) => new PostgresRevisionedRepository<T>(database, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(database: PostgresDatabase, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(database, name), database.configuration.cellId);
 
-export const createPostgresRepositories = (database: PostgresDatabase): UbeeqRepositories => ({
+export const createPostgresRepositories = (database: PostgresDatabase): UbeeqRepositories => protectCreatorContentAuthority({
   transaction: (operation) => database.transaction(operation),
-  creators: cellRepository(database, "creators"), works: cellRepository(database, "works"), assets: cellRepository(database, "assets"), collections: cellRepository(database, "collections"), workMemberships: cellRepository(database, "workMemberships"), publicationIntents: cellRepository(database, "publicationIntents"), publications: cellRepository(database, "publications"), reconciliationSnapshots: cellRepository(database, "reconciliationSnapshots"), moderationEvidence: cellRepository(database, "moderationEvidence"), moderationHolds: cellRepository(database, "moderationHolds"), reviewCases: cellRepository(database, "reviewCases"), auditEvents: cellRepository(database, "auditEvents"), usageEvents: cellRepository(database, "usageEvents"), creditLots: cellRepository(database, "creditLots"), creditReservations: cellRepository(database, "creditReservations"), balances: cellRepository(database, "balances"), integrationAccounts: cellRepository(database, "integrationAccounts"), syncCursors: cellRepository(database, "syncCursors"), integrationJobs: cellRepository(database, "integrationJobs"), exportManifests: cellRepository(database, "exportManifests"), importCheckpoints: cellRepository(database, "importCheckpoints"), federationActors: repository(database, "federationActors"), remotePublicationReferences: repository(database, "remotePublicationReferences"),
+  hostRecords: cellRepository(database, "hostRecords"), creators: cellRepository(database, "creators"), works: cellRepository(database, "works"), assets: cellRepository(database, "assets"), collections: cellRepository(database, "collections"), workMemberships: cellRepository(database, "workMemberships"), publicationIntents: cellRepository(database, "publicationIntents"), publications: cellRepository(database, "publications"), reconciliationSnapshots: cellRepository(database, "reconciliationSnapshots"), moderationEvidence: cellRepository(database, "moderationEvidence"), moderationHolds: cellRepository(database, "moderationHolds"), reviewCases: cellRepository(database, "reviewCases"), auditEvents: cellRepository(database, "auditEvents"), usageEvents: cellRepository(database, "usageEvents"), creditLots: cellRepository(database, "creditLots"), creditReservations: cellRepository(database, "creditReservations"), balances: cellRepository(database, "balances"), integrationAccounts: cellRepository(database, "integrationAccounts"), syncCursors: cellRepository(database, "syncCursors"), integrationJobs: cellRepository(database, "integrationJobs"), exportManifests: cellRepository(database, "exportManifests"), importCheckpoints: cellRepository(database, "importCheckpoints"), instanceOperators: repository(database, "instanceOperators"), federationActors: repository(database, "federationActors"), remotePublicationReferences: repository(database, "remotePublicationReferences"),
 });
 
 type JobRow = QueryResultRow & { id: string; cell_id: string; type: string; payload: unknown; idempotency_key: string; state: DurableJob["state"]; attempt: number; max_attempts: number; available_at: Date | string; lease_expires_at?: Date | string; created_at: Date | string; updated_at: Date | string; correlation_id?: string; last_error?: DurableJob["lastError"] };
@@ -196,31 +262,50 @@ export class PostgresPasswordIdentity implements PasswordIdentityAdapter {
   async register(input: { email: string; password: string }): Promise<IdentityAccount> {
     if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
     const id = randomUUID(), createdAt = timestamp(), salt = randomBytes(16).toString("hex"), passwordHash = scryptSync(input.password, salt, 64).toString("hex");
-    await this.database.pool.query("INSERT INTO ubeeq_accounts (id, email, password_hash, salt, status, created_at, updated_at) VALUES ($1, $2, $3, $4, 'active', $5, $5)", [id, input.email.toLowerCase(), passwordHash, salt, createdAt]);
+    await this.database.queryable().query("INSERT INTO ubeeq_accounts (id, email, password_hash, salt, status, created_at, updated_at) VALUES ($1, $2, $3, $4, 'active', $5, $5)", [id, input.email.toLowerCase(), passwordHash, salt, createdAt]);
     return { id, subjectId: id, status: "active", createdAt, updatedAt: createdAt };
   }
   async authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
-    const result = await this.database.pool.query<{ id: string; password_hash: string; salt: string; status: IdentityAccount["status"] }>("SELECT id, password_hash, salt, status FROM ubeeq_accounts WHERE email = $1", [input.email.toLowerCase()]);
+    const result = await this.database.queryable().query<{ id: string; password_hash: string; salt: string; status: IdentityAccount["status"] }>("SELECT id, password_hash, salt, status FROM ubeeq_accounts WHERE email = $1", [input.email.toLowerCase()]);
     const account = result.rows[0];
     if (!account || account.status !== "active") throw new Error("Invalid local credentials.");
     const supplied = scryptSync(input.password, account.salt, 64), expected = Buffer.from(account.password_hash, "hex");
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Invalid local credentials.");
+    const subject = await this.getAuthorizationSubject(account.id);
+    if (!subject) throw new Error("Invalid local credentials.");
     const token = randomBytes(32).toString("base64url"), id = randomUUID(), issuedAt = timestamp(), expiresAt = new Date(Date.now() + this.sessionTtlSeconds * 1_000).toISOString();
-    await this.database.pool.query("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)", [id, account.id, digest(token), expiresAt, issuedAt]);
-    return { token, session: { id, subject: { id: account.id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt, expiresAt, authenticationMethod: "password" } };
+    await this.database.queryable().query("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4, $5)", [id, account.id, digest(token), expiresAt, issuedAt]);
+    return { token, session: { id, subject, issuedAt, expiresAt, authenticationMethod: "password" } };
   }
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
-    const result = await this.database.pool.query<{ id: string; account_id: string; expires_at: Date | string }>("SELECT id, account_id, expires_at FROM ubeeq_sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()", [digest(input.credential)]);
+    const result = await this.database.queryable().query<{ id: string; account_id: string; expires_at: Date | string }>("SELECT id, account_id, expires_at FROM ubeeq_sessions WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()", [digest(input.credential)]);
     const session = result.rows[0];
     if (!session) return undefined;
-    return { id: session.id, subject: { id: session.account_id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: "", expiresAt: date(session.expires_at), authenticationMethod: "password" };
+    const subject = await this.getAuthorizationSubject(session.account_id);
+    if (!subject) return undefined;
+    return { id: session.id, subject, issuedAt: "", expiresAt: date(session.expires_at), authenticationMethod: "password" };
   }
   async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
-    const result = await this.database.pool.query<{ id: string; status: IdentityAccount["status"]; created_at: Date | string; updated_at: Date | string }>("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = $1", [subjectId]);
+    const result = await this.database.queryable().query<{ id: string; status: IdentityAccount["status"]; created_at: Date | string; updated_at: Date | string }>("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = $1", [subjectId]);
     const account = result.rows[0]; return account ? { id: account.id, subjectId: account.id, status: account.status, createdAt: date(account.created_at), updatedAt: date(account.updated_at) } : undefined;
   }
+  async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    // queryable() joins the current repository transaction. FOR SHARE retains
+    // the account's scope/status/roles until that same transaction commits.
+    const result = await this.database.queryable().query<{ id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string }>('SELECT id, email, status, account_scope, roles_json, scopes_json FROM ubeeq_accounts WHERE id = $1 FOR SHARE', [subjectId]);
+    const account = result.rows[0];
+    if (!account || account.status !== 'active') return undefined;
+    if (account.id !== subjectId || !['creator_operator', 'customer_account'].includes(account.account_scope)) throw new Error('PostgreSQL authorization evidence is unavailable.');
+    const values = (encoded: string): string[] => {
+      let parsed: unknown;
+      try { parsed = JSON.parse(encoded); } catch { throw new Error('PostgreSQL authorization evidence is unavailable.'); }
+      if (!Array.isArray(parsed) || parsed.some(value => typeof value !== 'string' || !value)) throw new Error('PostgreSQL authorization evidence is unavailable.');
+      return parsed;
+    };
+    return { id: account.id, email: account.email, accountScope: account.account_scope as AuthorizationSubject['accountScope'], roles: values(account.roles_json), scopes: values(account.scopes_json) };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
-  async revokeSession(input: { sessionId: string }): Promise<void> { await this.database.pool.query("UPDATE ubeeq_sessions SET revoked_at = NOW() WHERE id = $1", [input.sessionId]); }
+  async revokeSession(input: { sessionId: string }): Promise<void> { await this.database.queryable().query("UPDATE ubeeq_sessions SET revoked_at = NOW() WHERE id = $1", [input.sessionId]); }
 }
 
 export interface S3CompatibleConfiguration {
@@ -263,6 +348,16 @@ export class S3CompatibleStorage implements ObjectStorage, UploadContentAdapter,
     const response = await this.client.send(new GetObjectCommand({ Bucket: this.configuration.bucket, Key: input.key, VersionId: input.versionId }));
     const body = new Uint8Array(await response.Body!.transformToByteArray());
     return { object: { bucket: this.configuration.bucket, key: input.key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body };
+  }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(!input.versionId||input.versionId==='null'||input.bucket!==this.configuration.bucket)throw Error('An exact version in the configured object bucket is required.');
+    const key=input.key;this.local(key);
+    const response=await this.client.send(new GetObjectCommand({Bucket:this.configuration.bucket,Key:key,VersionId:input.versionId}));
+    const body=response.Body;
+    const close=async()=>{if(body&&typeof (body as {destroy?:unknown}).destroy==='function')(body as unknown as {destroy():void}).destroy();};
+    if(!body||typeof (body as unknown as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]!=='function'||response.VersionId!==input.versionId||!Number.isSafeInteger(response.ContentLength)||response.ContentLength!<0){await close();throw Error('Original storage did not return the exact immutable stream.');}
+    const object:StoredObject={bucket:this.configuration.bucket,key,versionId:response.VersionId,contentType:response.ContentType??'application/octet-stream',byteLength:response.ContentLength!,checksum:response.Metadata?.checksum,scope:(response.Metadata?.scope as StoredObject['scope'])??'private',...(response.LastModified?{writtenAt:response.LastModified.toISOString()}:{})};
+    return {object,body:body as unknown as AsyncIterable<Uint8Array>,close};
   }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { this.local(input.key); await this.client.send(new DeleteObjectCommand({ Bucket: this.configuration.bucket, Key: input.key, VersionId: input.versionId })); }
   async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {

@@ -14,11 +14,11 @@ test("every SQLite repository port satisfies the shared persistence contract", a
   const directory = mkdtempSync(join(tmpdir(), "ubeeq-local-contract-"));
   try {
     const { repositories } = createLocalAdapterSet({ databasePath: join(directory, "state.sqlite"), dataDirectory: directory, publicBaseUrl: "http://127.0.0.1", cellId: "cell-a" });
-    const names = Object.keys(repositories).filter((name) => name !== "transaction");
+    const names = Object.keys(repositories).filter((name) => !["transaction","readScope"].includes(name));
     for (const name of names) {
       const repository = repositories[name];
       await verifyRevisionedRepositoryContract({ repository, createRecord: (id) => ({ id, instanceId: "local", homeCellId: "cell-a", dataHomeRegion: "test", dataHomeAssignedAt: "2026-01-01T00:00:00.000Z", routingRevision: 1, contractValue: name }), change: () => ({ contractValue: `updated-${name}` }) });
-      if (name !== "federationActors" && name !== "remotePublicationReferences") await verifyCellScopedRepositoryContract({ repository, unscopedRepository: repository.repository, cellId: "cell-a" });
+      if (!["federationActors", "remotePublicationReferences", "instanceOperators"].includes(name)) await verifyCellScopedRepositoryContract({ repository, unscopedRepository: repository.repository, cellId: "cell-a" });
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

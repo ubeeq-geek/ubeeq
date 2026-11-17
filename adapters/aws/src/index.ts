@@ -1,3 +1,21 @@
+import {OwnedAwsClientLifetime} from './owned-client-lifetime.js';
+import {openOwnedS3Ranges} from './original-ranges.js';
+export {DynamoCapacityError} from './item-capacity.js';
+export {createFreshGlobalSnapshotRealm,openGlobalSnapshotRealm,openOwnedGlobalSnapshotRealm,type GlobalSnapshotRealm,type GlobalSnapshotSession,type FreshGlobalSnapshotGenesis,requireFreshGlobalSnapshotGenesis,requireGlobalSnapshotRealm} from './global-snapshot-realm.js';
+import {boundGlobalSnapshotClient,requireGlobalSnapshotRealm,type GlobalSnapshotRealm} from './global-snapshot-realm.js';
+import {dynamoItemFits} from './item-capacity.js';
+import {removeOwnedS3Version} from './owned-version-removal.js';
+import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
+import {cognitoUserBySubject} from './cognito-subject.js';
+export {applyCustomerIssuedScope,createCustomerIssuedScopeHandler} from './customer-issued-scope.js';
+import {CognitoCustomerIdentities} from './customer-identities.js';
+import {protectCreatorContentAuthority} from '@ubeeq/persistence';
+export * from './retained-content-atomic.js';
+import { CognitoJwtVerifier } from 'aws-jwt-verify';
+export * from './retained-creator-content.js';
+export type { AwsCommandClient } from './client-port.js';
+import type { AwsCommandClient } from './client-port.js';
+import {supportsRepositorySnapshots} from './repository-snapshots.js';
 /** Optional AWS adapter composition. AWS SDK imports are intentionally isolated to this package. */
 import { DeleteCommand, GetCommand, PutCommand, QueryCommand, UpdateCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 import { DescribeTableCommand, DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -7,14 +25,14 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { CreateSecretCommand, GetSecretValueCommand, UpdateSecretCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import { GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
+import { AdminGetUserCommand, AdminListGroupsForUserCommand, GetUserCommand, GlobalSignOutCommand, InitiateAuthCommand, CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { getSignedUrl as getCloudFrontSignedUrl } from "@aws-sdk/cloudfront-signer";
 import { createHash, randomUUID } from "node:crypto";
-import { CellScopedRepository, OptimisticConcurrencyError, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
+import { CellScopedRepository, OptimisticConcurrencyError, repositoryItems, type CellOwnedRecord, type Page, type PageRequest, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
 import type { PublicationCommandRepositories } from '@ubeeq/persistence';
 import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
-import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
-import type { AuthenticatedSession, IdentityAccount, IdentityAdapter } from "@ubeeq/auth";
+import { requireCellScopedObject, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAdapter, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
+import { PasswordAuthenticationError, type AuthenticatedSession, type AuthorizationSubject, type IdentityAccount, type IdentityAdapter } from "@ubeeq/auth";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { DurableJob, JobLease, JobQueue, JobState } from "@ubeeq/jobs";
 import { requireRecoverableJob } from "@ubeeq/jobs";
@@ -28,9 +46,13 @@ export const createAwsReferenceHealthHandler = (input: { region?: string; record
   const dynamo = new DynamoDBClient({ region: input.region }), s3 = new S3Client({ region: input.region }), sqs = new SQSClient({ region: input.region }); const jsonResponse = (statusCode: number, body: unknown): AwsFunctionUrlResult => ({ statusCode, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }, body: JSON.stringify(body) });
   return async (event: AwsFunctionUrlEvent): Promise<AwsFunctionUrlResult> => { const path = event.rawPath ?? "/"; if (path === "/health") return jsonResponse(200, { ok: true, service: "ubeeq-reference-api", runtime: "aws-lambda" }); if (path !== "/ready") return jsonResponse(404, { error: { code: "not_found", message: "Route was not found" } }); try { await Promise.all([dynamo.send(new DescribeTableCommand({ TableName: input.recordsTable() })), s3.send(new HeadBucketCommand({ Bucket: input.sourceBucket() })), sqs.send(new GetQueueAttributesCommand({ QueueUrl: input.jobsQueueUrl(), AttributeNames: ["QueueArn"] }))]); return jsonResponse(200, { ok: true, status: "ok", dependencies: ["dynamodb", "s3", "sqs"] }); } catch (error) { return jsonResponse(503, { ok: false, status: "degraded", error: error instanceof Error ? error.message : "Dependency check failed" }); } };
 };
-export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; }
-type Dynamo = Pick<DynamoDBDocumentClient, "send"> & { assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
-  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void };
+export interface AwsRepositoryConfiguration { tableName: string; cellId: string; repositoryIndexName?: string; globalSnapshotRealm?:GlobalSnapshotRealm; }
+type Dynamo = AwsCommandClient & { enlistReadGuard?<T>(transaction:{id:string},operation:()=>Promise<T>):Promise<T>; assertTransaction?: (transaction: { id: string }) => void; failTransaction?: () => void;
+  checkRevision?: (table: string, key: Record<string, string>, expectedRevision: number) => void|Promise<void>;
+  checkAbsent?: (table: string, key: Record<string, string>) => void|Promise<void>;
+  snapshotRepository?<T>(table:string,repository:string):Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
+  snapshotPage?<T>(table:string,repository:string,request:PageRequest):Page<T>|undefined;
+  mutateRepository?<T>(table:string,repository:string,operation:()=>Promise<T>):Promise<T> };
 const now = () => new Date().toISOString();
 const pk = (repository: string, id: string) => `${repository}#${id}`;
 /** AWS's standard document client rejects undefined attributes; absence is the portable representation. */
@@ -41,7 +63,22 @@ const withoutUndefined = <T>(value: T): T => {
 };
 
 export class DynamoRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
-  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {}
+  failTransaction():void {this.dynamo.failTransaction?.();}
+  readonly snapshot?:()=>Promise<import('@ubeeq/persistence').RepositorySnapshot<T>>;
+  constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly repository: string) {
+    if(supportsRepositorySnapshots(repository)&&!dynamo.mutateRepository){
+      if(configuration.globalSnapshotRealm)requireGlobalSnapshotRealm(configuration.globalSnapshotRealm,dynamo,configuration.tableName);
+      this.dynamo=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}).client;
+    }
+    const actual=this.dynamo;
+    if(actual.snapshotRepository&&supportsRepositorySnapshots(repository))this.snapshot=()=>actual.snapshotRepository!<T>(configuration.tableName,repository);
+  }
+  /** Fixed target-provider protocol; full repository envelope is measured. */
+  physicalRecordFits(record:T):boolean {return dynamoItemFits({pk:pk(this.repository,record.id),sk:'record',repository:this.repository,id:record.id,revision:record.revision,value:withoutUndefined(record)});}
+  originalJsonFits(value:Readonly<Record<string,unknown>>,managedByteLimit:number):boolean {if(!Number.isSafeInteger(managedByteLimit)||managedByteLimit<1)throw Error('An original managed row contract is required.');return Buffer.byteLength(JSON.stringify(value),'utf8')<=managedByteLimit;}
+  private mutate<R>(operation:()=>Promise<R>):Promise<R>{
+    return this.dynamo.mutateRepository&&supportsRepositorySnapshots(this.repository)?this.dynamo.mutateRepository(this.configuration.tableName,this.repository,operation):operation();
+  }
   private guard(previous: T | undefined, next: T) {
     try {
       if (this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
@@ -56,54 +93,68 @@ export class DynamoRevisionedRepository<T extends RevisionedRecord> implements R
   async checkRevision(id: string, expectedRevision: number, options: { transaction: { id: string } }): Promise<void> {
     this.assertTransaction(options);
     if (!this.dynamo.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
-    this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
+    await this.dynamo.checkRevision(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' }, expectedRevision);
+  }
+  async checkAbsent(id: string, options: { transaction: { id: string } }): Promise<void> {
+    this.assertTransaction(options);
+    if (!this.dynamo.checkAbsent) throw new Error('Repository does not support commit-time absence guards.');
+    await this.dynamo.checkAbsent(this.configuration.tableName, { pk: pk(this.repository, id), sk: 'record' });
   }
   async create(record: Omit<T, 'revision' | 'createdAt' | 'updatedAt'>, options?: { idempotencyKey?: string; transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
     const timestamp = now(), value = { ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T;
     this.guard(undefined, value);
+    if(!this.physicalRecordFits(value)){this.dynamo.failTransaction?.();throw new Error('The full physical repository record exceeds the Dynamo item budget.');}
     try {
-      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+      await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, value.id), sk: 'record', repository: this.repository, id: value.id, revision: value.revision, value: withoutUndefined(value) },
-        ConditionExpression: 'attribute_not_exists(pk)' }));
+        ConditionExpression: 'attribute_not_exists(pk)' })));
       return value;
     } catch (error) {
-      const existing = options?.idempotencyKey && (error as { name?: string }).name === 'ConditionalCheckFailedException' ? await this.get(value.id) : undefined;
+      const failure=error as {name?:string;CancellationReasons?:Array<{Code?:string}>};
+      const conditional=failure.name==='ConditionalCheckFailedException'||failure.name==='TransactionCanceledException'&&failure.CancellationReasons?.some(reason=>reason.Code==='ConditionalCheckFailed');
+      const existing = options?.idempotencyKey && conditional ? await this.get(value.id) : undefined;
       if (existing) return existing;
       throw error;
     }
   }
   async get(id: string, options?: { transaction?: { id: string } }): Promise<T | undefined> { this.assertTransaction(options); const response = await this.dynamo.send(new GetCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConsistentRead: true })); return response.Item?.value as T | undefined; }
   /** Records are queried through the explicit repository/id index, never a filtered scan. */
-  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: (response.Items ?? []).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
+  async list(request: PageRequest, options?: { transaction?: { id: string } }): Promise<Page<T>> { this.assertTransaction(options); const snapshot=this.dynamo.snapshotPage?.<T>(this.configuration.tableName,this.repository,request);if(snapshot)return snapshot;const response = await this.dynamo.send(new QueryCommand({ TableName: this.configuration.tableName, IndexName: this.configuration.repositoryIndexName ?? "repository-id-index", KeyConditionExpression: "#repository = :repository", ExpressionAttributeNames: { "#repository": "repository" }, ExpressionAttributeValues: { ":repository": this.repository }, Limit: request.limit, ExclusiveStartKey: request.cursor ? JSON.parse(Buffer.from(request.cursor, "base64url").toString("utf8")) : undefined })); return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => item.value as T), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined }; }
   async update(id: string, expectedRevision: number, change: Partial<Omit<T, 'id' | 'revision' | 'createdAt' | 'updatedAt'>>, options?: { transaction?: { id: string } }): Promise<T> {
     this.assertTransaction(options);
     const current = await this.get(id);
     if (!current || current.revision !== expectedRevision) { this.dynamo.failTransaction?.(); throw new OptimisticConcurrencyError(id, expectedRevision); }
     const value = { ...current, ...change, revision: expectedRevision + 1, updatedAt: now() } as T;
     this.guard(current, value);
+    if(!this.physicalRecordFits(value)){this.dynamo.failTransaction?.();throw new Error('The full physical repository record exceeds the Dynamo item budget.');}
     try {
-      await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
+      await this.mutate(()=>this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk(this.repository, id), sk: 'record', repository: this.repository, id, revision: value.revision, value: withoutUndefined(value) },
-        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } }));
+        ConditionExpression: 'attribute_exists(pk) AND #revision = :revision', ExpressionAttributeNames: { '#revision': 'revision' }, ExpressionAttributeValues: { ':revision': expectedRevision } })));
       return value;
     } catch (error) {
       if ((error as { name?: string }).name === 'ConditionalCheckFailedException') throw new OptimisticConcurrencyError(id, expectedRevision);
       throw error;
     }
   }
-  async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } })); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
+  async remove(id: string, expectedRevision: number, options?: { transaction?: { id: string } }): Promise<void> { this.assertTransaction(options); try { await this.mutate(()=>this.dynamo.send(new DeleteCommand({ TableName: this.configuration.tableName, Key: { pk: pk(this.repository, id), sk: "record" }, ConditionExpression: "#revision = :revision", ExpressionAttributeNames: { "#revision": "revision" }, ExpressionAttributeValues: { ":revision": expectedRevision } }))); } catch (error) { if ((error as { name?: string }).name === "ConditionalCheckFailedException") throw new OptimisticConcurrencyError(id, expectedRevision); throw error; } }
 }
 
 const repository = <T extends RevisionedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string) => new DynamoRevisionedRepository<T>(dynamo, config, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(dynamo: Dynamo, config: AwsRepositoryConfiguration, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(dynamo, config, name), config.cellId);
+const repositoryRealms=new WeakMap<object,GlobalSnapshotRealm>();
+export function requireRepositoryGlobalSnapshotRealm(repositories:UbeeqRepositories,realm:GlobalSnapshotRealm):void{if(repositoryRealms.get(repositories)!==realm)throw new Error('The actual repositories bound to the identical global snapshot realm are required.');}
 export const createDynamoPublicationCommandRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): PublicationCommandRepositories & UbeeqRepositories => {
-  const { client: dynamo, transaction } = createTransactionalDynamo(base);
-  return { ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
+  if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
+  const { client: dynamo, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
+  const result:PublicationCommandRepositories & UbeeqRepositories=protectCreatorContentAuthority({ ...dynamoRepositories(dynamo, transaction, config), publications: cellRepository(dynamo, config, 'publications'),
     claims: cellRepository(dynamo, config, 'publicationClaims'), operations: cellRepository(dynamo, config, 'publicationOperations'),
-    outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') };
+    outbox: cellRepository(dynamo, config, 'publicationOutbox'), auditEvents: cellRepository(dynamo, config, 'auditEvents') });
+  if(config.globalSnapshotRealm)repositoryRealms.set(result,config.globalSnapshotRealm);return result;
 };
-const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => ({ transaction,
+const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['transaction'], config: AwsRepositoryConfiguration): UbeeqRepositories => protectCreatorContentAuthority({ transaction,
+  hostRecords: cellRepository(dynamo, config, 'hostRecords'),
   creators: cellRepository(dynamo, config, 'creators'), works: cellRepository(dynamo, config, 'works'), assets: cellRepository(dynamo, config, 'assets'),
   collections: cellRepository(dynamo, config, 'collections'), workMemberships: cellRepository(dynamo, config, 'workMemberships'),
   publicationIntents: cellRepository(dynamo, config, 'publicationIntents'), publications: cellRepository(dynamo, config, 'publications'),
@@ -113,12 +164,13 @@ const dynamoRepositories = (dynamo: Dynamo, transaction: UbeeqRepositories['tran
   creditLots: cellRepository(dynamo, config, 'creditLots'), creditReservations: cellRepository(dynamo, config, 'creditReservations'), balances: cellRepository(dynamo, config, 'balances'),
   integrationAccounts: cellRepository(dynamo, config, 'integrationAccounts'), syncCursors: cellRepository(dynamo, config, 'syncCursors'),
   integrationJobs: cellRepository(dynamo, config, 'integrationJobs'), exportManifests: cellRepository(dynamo, config, 'exportManifests'),
-  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), federationActors: repository(dynamo, config, 'federationActors'),
+  importCheckpoints: cellRepository(dynamo, config, 'importCheckpoints'), instanceOperators: repository(dynamo, config, 'instanceOperators'), federationActors: repository(dynamo, config, 'federationActors'),
   remotePublicationReferences: repository(dynamo, config, 'remotePublicationReferences')
 });
 export const createDynamoRepositories = (base: Dynamo, config: AwsRepositoryConfiguration): UbeeqRepositories => {
-  const { client, transaction } = createTransactionalDynamo(base);
-  return dynamoRepositories(client, transaction, config);
+  if(config.globalSnapshotRealm)requireGlobalSnapshotRealm(config.globalSnapshotRealm,base,config.tableName);
+  const { client, transaction } = createTransactionalDynamo(base,{globalSnapshotRealm:config.globalSnapshotRealm});
+  const result=dynamoRepositories(client, transaction, config);if(config.globalSnapshotRealm)repositoryRealms.set(result,config.globalSnapshotRealm);return result;
 };
 
 /**
@@ -152,7 +204,7 @@ export class DynamoRoutingDirectory implements RoutingDirectory {
   }
   async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly CellRoute[]; nextCursor?: string }> {
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "route" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    return { items: (response.Items ?? []).map((item) => validateCellRoute(item.route as CellRoute)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+    return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateCellRoute(item.route as CellRoute)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
 
@@ -178,7 +230,7 @@ export class DynamoMigrationCheckpoints implements MigrationCheckpointStore {
     // The partition remains intentionally small metadata. Querying the dedicated
     // control-plane table avoids scans across any regional creator records.
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "migration" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    const items = (response.Items ?? []).map((item) => validateMigrationCheckpoint(item.checkpoint as MigrationCheckpoint)).filter((checkpoint) => !input.creatorId || checkpoint.creatorId === input.creatorId);
+    const items = ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateMigrationCheckpoint(item.checkpoint as MigrationCheckpoint)).filter((checkpoint) => !input.creatorId || checkpoint.creatorId === input.creatorId);
     return { items, nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
@@ -206,7 +258,7 @@ export class DynamoMigrationCellRegistry implements MigrationCellRegistry {
   }
   async list(input: { limit: number; cursor?: string }): Promise<{ items: readonly MigrationCellRegistration[]; nextCursor?: string }> {
     const response = await this.control.dynamo.send(new QueryCommand({ TableName: this.control.tableName, KeyConditionExpression: "pk = :pk", ExpressionAttributeValues: { ":pk": "cell" }, Limit: Math.max(1, Math.min(100, input.limit)), ExclusiveStartKey: input.cursor ? JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")) : undefined }));
-    return { items: (response.Items ?? []).map((item) => validateMigrationCellRegistration(item.cell as MigrationCellRegistration)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
+    return { items: ((response.Items ?? []) as Record<string, unknown>[]).map((item) => validateMigrationCellRegistration(item.cell as MigrationCellRegistration)), nextCursor: response.LastEvaluatedKey ? Buffer.from(JSON.stringify(response.LastEvaluatedKey)).toString("base64url") : undefined };
   }
 }
 
@@ -220,7 +272,7 @@ export const createAwsRoutingControlPlane = (configuration: { tableName: string;
 
 /** Private synchronous invocation client for a cell registered by an operator. */
 export class LambdaMigrationCellEndpoint implements MigrationCellEndpoint {
-  constructor(private readonly lambda: Pick<LambdaClient, "send">, private readonly functionName: string) {}
+  constructor(private readonly lambda: AwsCommandClient, private readonly functionName: string) {}
   async execute(command: MigrationCellCommand): Promise<MigrationCellCommandResult> {
     const response = await this.lambda.send(new InvokeCommand({ FunctionName: this.functionName, InvocationType: "RequestResponse", Payload: Buffer.from(JSON.stringify(command)) }));
     const payload = response.Payload ? JSON.parse(Buffer.from(response.Payload).toString("utf8")) as { error?: { message?: string }; result?: MigrationCellCommandResult } : {};
@@ -250,7 +302,7 @@ export const createAwsMigrationCommandQueue = (configuration: { queueUrl: string
  * record table or participates in normal creator request handling.
  */
 export class AwsMigrationControlWorker {
-  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: Pick<LambdaClient, "send">; lambdaForRegion?: (region: string) => Pick<LambdaClient, "send">; s3ForRegion?: (region: string) => Pick<S3Client, "send">; clock?: () => string }) {}
+  constructor(private readonly input: { routingDirectory: RoutingDirectory; checkpoints: MigrationCheckpointStore; cells: MigrationCellRegistry; lambda?: AwsCommandClient; lambdaForRegion?: (region: string) => AwsCommandClient; s3ForRegion?: (region: string) => AwsCommandClient; clock?: () => string }) {}
   async execute(command: AwsMigrationCommand): Promise<MigrationCheckpoint> {
     if (!command.migrationId.trim() || !["resume", "rollback", "retire"].includes(command.operation)) throw new Error("Migration command is invalid.");
     const checkpoint = await this.input.checkpoints.get(command.migrationId);
@@ -272,7 +324,9 @@ export class AwsMigrationControlWorker {
 }
 
 export class S3ObjectStorage implements ObjectStorage {
-  constructor(private readonly s3: Pick<S3Client, "send">, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){return openOwnedS3Ranges(this.s3,{bucket:this.bucket,cellId:this.cellId,keyPrefix:this.keyPrefix},input);}
+  removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedS3Version(this.s3,{bucket:this.bucket,cellId:this.cellId,keyPrefix:this.keyPrefix},input);}
+  constructor(private readonly s3: AwsCommandClient, private readonly bucket: string, private readonly cellId?: string, private readonly keyPrefix?: string) {}
   private objectKey(key: string): string { return this.keyPrefix && !key.startsWith(`${this.keyPrefix}/`) ? `${this.keyPrefix}/${key}` : key; }
   private requireLocalKey(key: string): void { if (this.cellId) requireCellScopedObject(key, this.cellId); }
   async put(input: { object: StoredObject; body: Uint8Array }): Promise<void> {
@@ -285,6 +339,16 @@ export class S3ObjectStorage implements ObjectStorage {
     if (response.VersionId) input.object.versionId = response.VersionId;
   }
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> { const key = this.objectKey(input.key); this.requireLocalKey(key); const response = await this.s3.send(new GetObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); const body = new Uint8Array(await response.Body!.transformToByteArray()); return { object: { bucket: this.bucket, key, versionId: response.VersionId, contentType: response.ContentType ?? "application/octet-stream", byteLength: body.byteLength, checksum: response.Metadata?.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? "private" }, body }; }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(!input.versionId||input.versionId==='null'||input.bucket!==this.bucket)throw Error('An exact version in the configured object bucket is required.');
+    const key=this.objectKey(input.key);this.requireLocalKey(key);if(key!==input.key)throw Error('An exact physical key is required.');
+    const response=await this.s3.send(new GetObjectCommand({Bucket:this.bucket,Key:key,VersionId:input.versionId}));
+    const body=response.Body;
+    const close=async()=>{if(body&&typeof (body as {destroy?:unknown}).destroy==='function')(body as unknown as {destroy():void}).destroy();};
+    if(!body||typeof (body as unknown as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]!=='function'||response.VersionId!==input.versionId||!Number.isSafeInteger(response.ContentLength)||response.ContentLength!<0){await close();throw Error('Original storage did not return the exact immutable stream.');}
+    const object:StoredObject={bucket:this.bucket,key,versionId:response.VersionId,contentType:response.ContentType??'application/octet-stream',byteLength:response.ContentLength!,checksum:response.Metadata?.checksum,scope:(response.Metadata?.scope as StoredObject['scope'])??'private',...(response.LastModified?{writtenAt:response.LastModified.toISOString()}:{})};
+    return {object,body:body as unknown as AsyncIterable<Uint8Array>,close};
+  }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const key = this.objectKey(input.key); this.requireLocalKey(key); await this.s3.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: key, VersionId: input.versionId })); }
 }
 
@@ -295,7 +359,7 @@ export class S3ObjectStorage implements ObjectStorage {
  * Normal Ubeeq uploads never instantiate or call this adapter.
  */
 export class S3MigrationObjectTransfer implements MigrationObjectTransfer {
-  constructor(private readonly source: Pick<S3Client, "send">, private readonly destination: Pick<S3Client, "send">) {}
+  constructor(private readonly source: AwsCommandClient, private readonly destination: AwsCommandClient) {}
   private validate(checkpoint: MigrationCheckpoint, object: MigrationObjectInventoryEntry): void {
     if (!object.source.key.startsWith(`cells/${checkpoint.source.homeCellId}/`) || !object.destination.key.startsWith(`cells/${checkpoint.destination.cellId}/`)) throw new Error("Migration object inventory crosses an undeclared cell boundary.");
   }
@@ -327,32 +391,67 @@ const objectForDirectUpload = (uploadId: string): StoredObject => {
   catch { throw new Error("AWS direct upload identifier is invalid."); }
 };
 
-/** S3 direct uploads bind the SHA-256 checksum to the presigned write and verify the immutable version at completion. */
+/** S3 direct uploads bind the exact body and permit one current object at the issued key. */
 export class S3DirectUploadAdapter implements UploadAdapter {
   constructor(private readonly s3: S3Client, private readonly bucket: string, private readonly cellId?: string) {}
-  async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
+  async initiate(input: Parameters<UploadAdapter['initiate']>[0]): Promise<UploadInitiation> {
     if (input.multipart) throw new Error("Multipart uploads require a dedicated multipart adapter.");
-    if (Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
+    if (!Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt) <= Date.now()) throw new Error("AWS direct upload expiry must be in the future.");
     if (this.cellId) requireCellScopedObject(input.object.key, this.cellId);
     const requestedChecksum = input.object.checksum;
-    if (!requestedChecksum) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!requestedChecksum || !/^[a-f0-9]{64}$/i.test(requestedChecksum) && !/^[A-Za-z0-9+/]{43}=$/.test(requestedChecksum)) throw new Error("AWS direct uploads require a SHA-256 checksum before initiation.");
+    if (!Number.isSafeInteger(input.object.byteLength) || input.object.byteLength < 0 || !input.object.contentType.trim()) throw new Error('AWS direct uploads require an exact byte length and content type.');
     const object = { ...input.object, checksum: requestedChecksum, bucket: this.bucket, scope: input.object.scope };
     const expiresIn = Math.max(1, Math.min(900, Math.floor((Date.parse(input.expiresAt) - Date.now()) / 1_000)));
     const checksum = checksumBase64(object.checksum);
-    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentType: object.contentType, ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
+    const headers = { 'content-type': object.contentType, 'if-none-match': '*', 'x-amz-checksum-sha256': checksum, 'x-amz-meta-checksum': object.checksum!, 'x-amz-meta-scope': object.scope, 'x-amz-meta-bytelength': String(object.byteLength) };
+    const url = await getSignedUrl(this.s3, new PutObjectCommand({ Bucket: this.bucket, Key: object.key, ContentLength: object.byteLength, ContentType: object.contentType, IfNoneMatch: '*', ChecksumSHA256: checksum, Metadata: { checksum: object.checksum, scope: object.scope, byteLength: String(object.byteLength) } }), {
       expiresIn,
       // The browser must send these headers with the object. Keeping them in the
       // canonical request prevents clients from changing integrity or access metadata.
       unhoistableHeaders: new Set(["x-amz-checksum-sha256", "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength"]),
+      signableHeaders: new Set(['content-length', 'content-type', 'if-none-match']),
     });
-    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
+    return { uploadId: directUploadId(object), object, parts: [{ partNumber: 1, url, headers, expiresAt: input.expiresAt }], completeUrl: undefined, expiresAt: input.expiresAt };
   }
   async complete(input: UploadCompletion): Promise<StoredObject> {
     const requested = objectForDirectUpload(input.uploadId);
     requireCreatorScopedObject(requested.key, input); if (this.cellId) requireCellScopedObject(requested.key, this.cellId);
-    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key }));
-    if (!response.VersionId || response.ContentLength !== input.byteLength || response.Metadata?.checksum !== input.checksum || (response.ChecksumSHA256 && response.ChecksumSHA256 !== checksumBase64(input.checksum))) throw new Error("AWS upload completion did not match the signed object checksum, size, or version.");
-    return { ...requested, versionId: response.VersionId, contentType: response.ContentType ?? requested.contentType, byteLength: response.ContentLength, checksum: input.checksum, scope: (response.Metadata?.scope as StoredObject["scope"]) ?? requested.scope };
+    if (requested.bucket !== this.bucket || requested.byteLength !== input.byteLength || requested.checksum !== input.checksum) throw new Error('AWS upload completion differs from the issued request.');
+    const response = await this.s3.send(new HeadObjectCommand({ Bucket: this.bucket, Key: requested.key, ChecksumMode: 'ENABLED' }));
+    if (!response.VersionId || response.ContentLength !== requested.byteLength || response.ContentType !== requested.contentType || response.Metadata?.checksum !== requested.checksum || response.Metadata?.scope !== requested.scope || response.Metadata?.bytelength !== String(requested.byteLength) || response.ChecksumSHA256 !== checksumBase64(input.checksum)) throw new Error("AWS upload completion did not match the signed object checksum, size, type, scope, or version.");
+    const {writtenAt:_untrusted,...object}=requested;
+    return { ...object, versionId: response.VersionId, ...(response.LastModified ? {writtenAt:response.LastModified.toISOString()} : {}) };
+  }
+  async recoverCompletion(input: UploadCompletion): Promise<StoredObject | undefined> {
+    try { return await this.complete(input); }
+    catch (error) { if ((error as { name?: string }).name === 'NotFound' || (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) return undefined; throw error; }
+  }
+  async seal(input: UploadSealInput): Promise<UploadSealResult> {
+    const requested=objectForDirectUpload(input.uploadId);
+    requireCreatorScopedObject(requested.key,input);if(this.cellId)requireCellScopedObject(requested.key,this.cellId);
+    if(requested.bucket!==this.bucket || !requested.checksum || !Number.isSafeInteger(requested.byteLength) || requested.byteLength<0)throw new Error('Upload sealing requires the exact issued object.');
+    const sealHash=createHash('sha256').update(JSON.stringify([requested.bucket,requested.key,requested.byteLength,requested.checksum,requested.contentType,requested.scope])).digest('hex');
+    const emptyChecksum=createHash('sha256').update(new Uint8Array()).digest('hex');
+    let lastError:unknown;
+    for(let attempt=0;attempt<3;attempt++){
+      let head;
+      try{head=await this.s3.send(new HeadObjectCommand({Bucket:this.bucket,Key:requested.key,ChecksumMode:'ENABLED'}));}
+      catch(error){if((error as {name?:string}).name!=='NotFound' && (error as {$metadata?:{httpStatusCode?:number}}).$metadata?.httpStatusCode!==404)throw error;}
+      if(head){
+        if(head.Metadata?.['ubeeq-upload-seal']){
+          if(head.Metadata['ubeeq-upload-seal']!==sealHash || head.ContentLength!==0 || head.ContentType!=='application/octet-stream' || head.Metadata.scope!=='private' || head.ChecksumSHA256!==checksumBase64(emptyChecksum) || !head.VersionId || !head.LastModified)throw new Error('Physical upload seal requires reconciliation.');
+          const closedAt=head.LastModified.toISOString(),proofId=createHash('sha256').update(JSON.stringify([this.bucket,requested.key,head.VersionId,sealHash])).digest('hex');
+          return {state:'sealed',proofId,closedAt,retainedFence:{bucket:this.bucket,key:requested.key,versionId:head.VersionId,contentType:'application/octet-stream',byteLength:0,checksum:emptyChecksum,scope:'private',writtenAt:closedAt}};
+        }
+        return {state:'completed',object:await this.complete({uploadId:input.uploadId,cellId:input.cellId,creatorId:input.creatorId,checksum:requested.checksum,byteLength:requested.byteLength})};
+      }
+      // Keep this current version: deleting it (or adding a delete marker) would
+      // reopen a still-valid conditional PUT, including one already in flight.
+      try{await this.s3.send(new PutObjectCommand({Bucket:this.bucket,Key:requested.key,IfNoneMatch:'*',Body:new Uint8Array(),ContentLength:0,ContentType:'application/octet-stream',ChecksumSHA256:checksumBase64(emptyChecksum),Metadata:{'ubeeq-upload-seal':sealHash,scope:'private',checksum:emptyChecksum,bytelength:'0'}}));}
+      catch(error){lastError=error;if((error as {$metadata?:{httpStatusCode?:number}}).$metadata?.httpStatusCode===403)throw error;}
+    }
+    throw lastError ?? new Error('Physical upload seal could not be verified.');
   }
 }
 export const issueS3Download = async (s3: S3Client, bucket: string, object: Pick<StoredObject, "key" | "versionId">, expiresInSeconds = 300) => getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: object.key, VersionId: object.versionId }), { expiresIn: expiresInSeconds });
@@ -370,7 +469,10 @@ export class S3PresignedDelivery implements DeliveryAdapter {
  * truth. Workers lease atomically from DynamoDB, so duplicate SQS delivery and lost
  * notifications are harmless: a periodic recovery worker can always re-offer queued work.
  */
-interface AwsJobRecord extends DurableJob, RevisionedRecord {}
+interface AwsJobRecord extends DurableJob, RevisionedRecord {
+  /** Separate request trace from the existing correlationId lease fence. Null means no retained trace. */
+  requestCorrelationId?: string | null;
+}
 export class AwsJobQueue implements JobQueue {
   private readonly jobs: DynamoRevisionedRepository<AwsJobRecord>;
   constructor(private readonly dynamo: Dynamo, private readonly configuration: AwsRepositoryConfiguration, private readonly sqs: Pick<SQSClient, "send">, private readonly queueUrl: string, private readonly eventBridge?: { client: Pick<EventBridgeClient, "send">; eventBusName: string }) {
@@ -378,17 +480,16 @@ export class AwsJobQueue implements JobQueue {
   }
   async enqueue<TPayload>(input: Omit<DurableJob<TPayload>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<TPayload>> {
     const id = `job-${createHash("sha256").update(`${input.cellId}:${input.idempotencyKey}`).digest("hex").slice(0, 32)}`;
-    const existing = await this.jobs.get(id) as DurableJob<TPayload> | undefined;
-    if (existing) return existing;
-    const created = await this.jobs.create({ id, ...input, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey }) as DurableJob<TPayload>;
+    const existing = await this.jobs.get(id);
+    if (existing) return this.publicJob(existing) as DurableJob<TPayload>;
+    const created = await this.jobs.create({ id, ...input, requestCorrelationId: input.correlationId ?? null, state: "queued", attempt: 0, availableAt: input.availableAt ?? now() } as Omit<AwsJobRecord, "revision" | "createdAt" | "updatedAt">, { idempotencyKey: input.idempotencyKey });
     await this.notify(created.id, created.type, created.cellId);
-    return created;
+    return this.publicJob(created) as DurableJob<TPayload>;
   }
   async lease<TPayload>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<TPayload> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const candidates = await this.jobs.list({ limit: 100 });
-    const timestamp = Date.now();
-    for (const candidate of candidates.items) {
+    for await (const candidate of repositoryItems(request => this.jobs.list(request))) {
+      const timestamp = Date.now();
       if (candidate.cellId !== input.cellId || (input.types?.length && !input.types.includes(candidate.type))) continue;
       const expired = candidate.state === 'leased' && Boolean(candidate.leaseExpiresAt) && Date.parse(candidate.leaseExpiresAt!) <= timestamp;
       const available = ['queued', 'retry_scheduled'].includes(candidate.state) && Date.parse(candidate.availableAt) <= timestamp;
@@ -400,14 +501,18 @@ export class AwsJobQueue implements JobQueue {
           continue;
         }
         const leased = await this.claimOrExpire(candidate, timestamp, expired, { state: 'leased', attempt: candidate.attempt + 1, leaseExpiresAt: new Date(timestamp + input.leaseDurationSeconds * 1_000).toISOString(), correlationId: `${input.workerId}:${leaseToken}` });
-        return { job: leased as DurableJob<TPayload>, leaseToken };
+        return { job: this.publicJob(leased) as DurableJob<TPayload>, leaseToken };
       } catch (error) { if (!(error instanceof OptimisticConcurrencyError)) throw error; }
     }
     return undefined;
   }
   private async claimOrExpire(job: AwsJobRecord, timestamp: number, expired: boolean, change: Partial<AwsJobRecord>): Promise<AwsJobRecord> {
     const currentTime = new Date(timestamp).toISOString();
-    const value = { ...job, ...change, revision: job.revision + 1, updatedAt: currentTime };
+    // Keep the raw ownership marker for both old and new workers. Historical jobs
+    // already leased by an older writer have lost their original trace; never
+    // mistake the old worker/token for a request ID.
+    const requestCorrelationId = job.requestCorrelationId === undefined ? (job.attempt === 0 ? job.correlationId ?? null : null) : job.requestCorrelationId;
+    const value = { ...job, ...change, requestCorrelationId, revision: job.revision + 1, updatedAt: currentTime };
     try {
       await this.dynamo.send(new PutCommand({ TableName: this.configuration.tableName,
         Item: { pk: pk('durableJobs', job.id), sk: 'record', repository: 'durableJobs', id: job.id, revision: value.revision, value: withoutUndefined(value) },
@@ -425,9 +530,29 @@ export class AwsJobQueue implements JobQueue {
   async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { const job = await this.requiredLease(input.id, input.leaseToken); await this.updateLeased(job, job.attempt >= job.maxAttempts ? { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined } : { state: "retry_scheduled", lastError: input.error, availableAt: input.retryAt, leaseExpiresAt: undefined }); if (job.attempt < job.maxAttempts) await this.notify(job.id, job.type, job.cellId); }
   async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.transition(input.id, input.leaseToken, { state: "dead_lettered", lastError: input.error, leaseExpiresAt: undefined }); }
   async cancel(input: { id: string; reason?: string }): Promise<void> { const job = await this.required(input.id); await this.jobs.update(job.id, job.revision, { state: "cancelled", lastError: input.reason ? { code: "cancelled", message: input.reason } : undefined, leaseExpiresAt: undefined }); }
-  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return recovered; }
-  async get(id: string): Promise<DurableJob | undefined> { return this.jobs.get(id); }
-  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> { const page = await this.jobs.list({ limit: Math.max(input.limit * 4, input.limit) }); return page.items.filter((job) => job.cellId === input.cellId && (!input.states || input.states.includes(job.state))).slice(0, input.limit); }
+  async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> { const job = await this.required(input.id); requireRecoverableJob(job.state); const recovered = await this.jobs.update(job.id, job.revision, { state: "queued", availableAt: input.availableAt ?? now(), leaseExpiresAt: undefined }); await this.notify(recovered.id, recovered.type, recovered.cellId); return this.publicJob(recovered); }
+  enlistLease(input:{id:string;cellId:string;leaseToken:string;attempt:number;leaseExpiresAt:string},transaction:{id:string}):Promise<void>{
+    if(!this.dynamo.enlistReadGuard){this.dynamo.failTransaction?.();return Promise.reject(new Error('The actual same-coordinator accepting job-lease capability is unavailable.'));}
+    return this.dynamo.enlistReadGuard(transaction,async()=>{const job=await this.jobs.get(input.id,{transaction});if(!job||!input.leaseToken||job.cellId!==input.cellId||job.state!=='leased'||job.correlationId?.split(':').at(-1)!==input.leaseToken||job.attempt!==input.attempt||job.leaseExpiresAt!==input.leaseExpiresAt||!Number.isFinite(Date.parse(input.leaseExpiresAt))||Date.parse(input.leaseExpiresAt)<=Date.now())throw new Error('The exact current job lease is required in the accepting transaction.');await this.jobs.checkRevision(job.id,job.revision,{transaction});});
+  }
+  async get(id: string): Promise<DurableJob | undefined> { const job = await this.jobs.get(id); return job && this.publicJob(job); }
+  async list(input: { cellId: string; states?: readonly JobState[]; limit: number }): Promise<readonly DurableJob[]> {
+    if (!input.cellId.trim() || !Number.isSafeInteger(input.limit) || input.limit < 1) throw new Error('A cell and positive integer job limit are required.');
+    const found: DurableJob[] = [];
+    for await (const job of repositoryItems(request => this.jobs.list(request))) {
+      if (job.cellId !== input.cellId || input.states?.length && !input.states.includes(job.state)) continue;
+      found.push(this.publicJob(job));
+      if (found.length >= input.limit) break;
+    }
+    return found;
+  }
+  private publicJob(record: AwsJobRecord): DurableJob {
+    const { requestCorrelationId, ...job } = record;
+    const trace = requestCorrelationId === undefined && record.attempt === 0 ? record.correlationId : requestCorrelationId;
+    if (typeof trace === 'string') job.correlationId = trace;
+    else delete job.correlationId;
+    return job;
+  }
   private async required(id: string): Promise<AwsJobRecord> { const job = await this.jobs.get(id); if (!job) throw new Error(`Job ${id} was not found.`); return job; }
   private async requiredLease(id: string, leaseToken: string): Promise<AwsJobRecord> { const job = await this.required(id); if (job.state !== "leased" || !leaseToken || job.correlationId?.split(":").at(-1) !== leaseToken || !job.leaseExpiresAt || !(Date.parse(job.leaseExpiresAt) > Date.now())) throw new Error(`Job ${id} does not hold this lease.`); return job; }
   private async transition(id: string, leaseToken: string, change: Partial<AwsJobRecord>): Promise<void> { const job = await this.requiredLease(id, leaseToken); await this.updateLeased(job, change); }
@@ -461,14 +586,123 @@ export class SecretsManagerCredentialVault implements CredentialVault {
   async revoke(input: { cellId: string; reference: string }): Promise<void> { const id = this.id(input); if (id) await this.secrets.send(new UpdateSecretCommand({ SecretId: id, SecretString: "revoked" })); }
 }
 
+export interface VerifiedCognitoAccessClaims {
+  sub: string; username?: string; iat: number; exp: number; scope?: string; 'cognito:groups'?: string[]; 'custom:account_scope'?:string;
+}
+export interface CognitoIdentityRealm {readonly provider:'cognito';readonly userPoolId:string;readonly clientId:string;readonly subjectIdMode:'legacy_username'|'canonical_sub'}
+const actualCognitoRealms=new WeakMap<object,{realm:CognitoIdentityRealm;client:AwsCommandClient}>();
+/** Namespace provenance from the ACTUAL concrete identity constructor. This
+ * never asserts a new/empty pool or complete historical safety migration. */
+export function requireCognitoIdentityRealm(identity:IdentityAdapter):Readonly<CognitoIdentityRealm>{const actual=identity&&actualCognitoRealms.get(identity);if(!actual)throw Error('The actual configured Cognito identity adapter is required.');return actual.realm;}
+/** Actual provider metadata from the same closed-over credential authority. */
+export async function describeCognitoIdentityRealm(identity:IdentityAdapter){const actual=identity&&actualCognitoRealms.get(identity);if(!actual)throw Error('The actual configured Cognito identity adapter is required.');const {DescribeUserPoolCommand,DescribeUserPoolClientCommand}=await import('@aws-sdk/client-cognito-identity-provider');const [pool,client]=await Promise.all([actual.client.send(new DescribeUserPoolCommand({UserPoolId:actual.realm.userPoolId})),actual.client.send(new DescribeUserPoolClientCommand({UserPoolId:actual.realm.userPoolId,ClientId:actual.realm.clientId}))]);const details=pool.UserPool,application=client.UserPoolClient;if(!details||!application||details.Id!==actual.realm.userPoolId||typeof details.Arn!=='string'||!(details.CreationDate instanceof Date)||!Number.isFinite(details.CreationDate.getTime())||application.UserPoolId!==actual.realm.userPoolId||application.ClientId!==actual.realm.clientId||!(application.CreationDate instanceof Date)||!Number.isFinite(application.CreationDate.getTime()))throw Error('The actual Cognito principal namespace is unavailable or inconsistent.');return Object.freeze({...actual.realm,userPoolArn:details.Arn,userPoolCreatedAt:details.CreationDate.toISOString(),clientCreatedAt:application.CreationDate.toISOString()});}
+
 export class CognitoIdentity implements IdentityAdapter {
-  constructor(private readonly cognito: Pick<CognitoIdentityProviderClient, "send">, private readonly userPoolId: string, private readonly clientId: string) {}
+  readonly customerAccounts:CognitoCustomerIdentities;
+  private verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> };
+  constructor(private readonly cognito: AwsCommandClient, private readonly userPoolId: string, private readonly clientId: string,
+    private readonly options: {subjectIdMode?:'legacy_username'|'canonical_sub';verifier?: { verify(token: string): Promise<VerifiedCognitoAccessClaims> } } = {}) { if(options.subjectIdMode!==undefined&&!['legacy_username','canonical_sub'].includes(options.subjectIdMode))throw Error('Choose an explicit supported Cognito subject ID mode.');actualCognitoRealms.set(this,{realm:Object.freeze({provider:'cognito',userPoolId,clientId,subjectIdMode:options.subjectIdMode??'legacy_username'}),client:cognito});this.verifier = options.verifier;this.customerAccounts=new CognitoCustomerIdentities(cognito,userPoolId,clientId,this,options.subjectIdMode??'legacy_username'); }
   /** Cognito GlobalSignOut requires the original access token; callers must keep this session id internal and never serialize it into audit/export data. */
-  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> { try { const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential })); const id = user.Username; if (!id) return undefined; return { id: input.credential, subject: { id, roles: [], scopes: user.UserAttributes?.filter((item) => item.Name === "scope").flatMap((item) => item.Value?.split(" ") ?? []) }, issuedAt: "", expiresAt: "", authenticationMethod: "oidc" }; } catch { return undefined; } }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return { id: subjectId, subjectId, status: "active", createdAt: "", updatedAt: "" }; }
+  async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
+    try {
+      // Verify the signature, issuer, client_id, access-token use and time claims before GetUser.
+      this.verifier ??= CognitoJwtVerifier.create({ userPoolId: this.userPoolId, clientId: this.clientId, tokenUse: 'access' });
+      const payload = await this.verifier.verify(input.credential);
+      if (!payload.sub || !Number.isFinite(payload.exp) || payload.exp * 1000 <= Date.now()) return undefined;
+      const user = await this.cognito.send(new GetUserCommand({ AccessToken: input.credential }));
+      const id = user.Username;
+      const attributes = (user.UserAttributes ?? []) as Array<{ Name?: string; Value?: string }>;
+      if (typeof id !== 'string' || !id || (payload.username && id !== payload.username) || attributes.find(item => item.Name === 'sub')?.Value !== payload.sub) return undefined;
+      const accountScopes=attributes.filter(item=>item.Name==='custom:account_scope');
+      if(accountScopes.length>1||accountScopes.length&&!['creator_operator','customer_account'].includes(accountScopes[0].Value??''))return undefined;
+      const customer = accountScopes[0]?.Value === 'customer_account',issuedScope=payload['custom:account_scope'];
+      if(accountScopes.length===1&&issuedScope!==accountScopes[0].Value||issuedScope!==undefined&&(!['creator_operator','customer_account'].includes(issuedScope)||issuedScope!==(customer?'customer_account':'creator_operator')))return undefined;
+      return { id: input.credential, subject: { id:customer||this.options.subjectIdMode==='canonical_sub'?payload.sub:id, email: attributes.find(item => item.Name === 'email')?.Value, emailVerified: attributes.find(item => item.Name === 'email_verified')?.Value === 'true', roles: Array.isArray(payload['cognito:groups']) ? payload['cognito:groups'].filter(role => typeof role === 'string') : [], accountScope: customer ? 'customer_account' : 'creator_operator', scopes: payload.scope?.split(' ') ?? [] },
+        issuedAt: new Date(payload.iat * 1000).toISOString(), expiresAt: new Date(payload.exp * 1000).toISOString(), authenticationMethod: 'oidc' };
+    } catch { return undefined; }
+  }
+  private async currentUser(subjectId: string): Promise<{ account: IdentityAccount; attributes: Array<{ Name?: string; Value?: string }>;providerUsername:string } | undefined> {
+    if (typeof subjectId !== 'string' || !subjectId || subjectId.length > 128 || /[\s\u0000-\u001f\u007f]/u.test(subjectId)) return undefined;
+    let user;
+    try { user=this.options.subjectIdMode==='canonical_sub'?await cognitoUserBySubject(this.cognito,this.userPoolId,subjectId):await this.cognito.send(new AdminGetUserCommand({UserPoolId:this.userPoolId,Username:subjectId})); }
+    catch (error) {
+      if ((error as { name?: string })?.name === 'UserNotFoundException') return undefined;else
+      // Never substitute an active account when the provider is unavailable or the host lacks permission.
+      throw new Error('Cognito account status is unavailable.');
+    }
+    if(!user)return undefined;
+    if (typeof user !== 'object') throw new Error('Cognito account evidence is unavailable.');
+    const status = user.UserStatus;
+    if (typeof user.Username!=='string'||!user.Username||!Array.isArray(user.UserAttributes)||user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='sub').length!==1||typeof user.Enabled !== 'boolean' || !['UNCONFIRMED', 'CONFIRMED', 'ARCHIVED', 'COMPROMISED', 'RESET_REQUIRED', 'FORCE_CHANGE_PASSWORD', 'EXTERNAL_PROVIDER'].includes(status)) throw new Error('Cognito account evidence is unavailable.');
+    const timestamp = (value: unknown) => {
+      if (value === undefined) return '';
+      if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error('Cognito account timestamp is invalid.');
+      return value.toISOString();
+    };
+    const canonicalSub=user.UserAttributes.find((attribute:{Name?:string})=>attribute.Name==='sub')?.Value;if(typeof canonicalSub!=='string'||!canonicalSub)throw new Error('Cognito account evidence is unavailable.');
+    const isCustomer=user.UserAttributes.some((attribute:{Name?:string;Value?:string})=>attribute.Name==='custom:account_scope'&&attribute.Value==='customer_account');
+    if(!isCustomer&&this.options.subjectIdMode!=='canonical_sub'&&user.Username!==subjectId)throw new Error('Cognito account evidence is unavailable.');
+    const currentId=isCustomer||this.options.subjectIdMode==='canonical_sub'?canonicalSub:user.Username;if(currentId!==subjectId)return undefined;
+    const customerScopes=user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='custom:account_scope'),emailVerifications=user.UserAttributes.filter((attribute:{Name?:string})=>attribute.Name==='email_verified');
+    const verifiedCustomerSetup=status==='FORCE_CHANGE_PASSWORD'&&customerScopes.length===1&&customerScopes[0].Value==='customer_account'&&emailVerifications.length===1&&emailVerifications[0].Value==='true';
+    return { account: { id: subjectId, subjectId, status: status === 'ARCHIVED' ? 'closed' : !user.Enabled || status === 'COMPROMISED' ? 'suspended' : ['CONFIRMED', 'EXTERNAL_PROVIDER'].includes(status)||verifiedCustomerSetup ? 'active' : 'pending_verification', createdAt: timestamp(user.UserCreateDate), updatedAt: timestamp(user.UserLastModifiedDate) }, attributes: user.UserAttributes,providerUsername:user.Username };
+  }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> {
+    return (await this.currentUser(subjectId))?.account;
+  }
+  async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    const current = await this.currentUser(subjectId);
+    if (!current || current.account.status !== 'active') return undefined;
+    const unavailable = () => new Error('Cognito authorization evidence is unavailable.');
+    if (!Array.isArray(current.attributes) || current.attributes.some(attribute => !attribute || typeof attribute.Name !== 'string' || typeof attribute.Value !== 'string')) throw unavailable();
+    const attribute = (name: string): string | undefined => {
+      const matches = current.attributes.filter(value => value.Name === name);
+      if (matches.length > 1) throw unavailable();
+      return matches[0]?.Value;
+    };
+    const scope = attribute('custom:account_scope');
+    if (scope !== undefined && scope !== 'creator_operator' && scope !== 'customer_account') throw unavailable();
+    const roles = new Set<string>(), cursors = new Set<string>();
+    let nextToken: string | undefined;
+    do {
+      let page;
+      try { page = await this.cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: this.userPoolId, Username: current.providerUsername, Limit: 60, ...(nextToken ? { NextToken: nextToken } : {}) })); }
+      catch { throw unavailable(); }
+      if (!page || typeof page !== 'object' || page.Groups !== undefined && !Array.isArray(page.Groups)) throw unavailable();
+      for (const group of page.Groups ?? []) {
+        if (!group || typeof group.GroupName !== 'string' || !group.GroupName) throw unavailable();
+        roles.add(group.GroupName);
+      }
+      if (page.NextToken !== undefined && (typeof page.NextToken !== 'string' || !page.NextToken || cursors.has(page.NextToken))) throw unavailable();
+      nextToken = page.NextToken;
+      if (nextToken) cursors.add(nextToken);
+    } while (nextToken);
+    return { id: subjectId, email: attribute('email'), emailVerified: attribute('email_verified') === 'true', accountScope: scope === 'customer_account' ? 'customer_account' : 'creator_operator', roles: [...roles] };
+  }
   async listDelegations(): Promise<readonly []> { return []; }
   async revokeSession(input: { sessionId: string }): Promise<void> { await this.cognito.send(new GlobalSignOutCommand({ AccessToken: input.sessionId })); }
-  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> { const result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); if (!result.AuthenticationResult?.AccessToken) throw new Error("Cognito authentication did not return an access token."); return { token: result.AuthenticationResult.AccessToken }; }
+  async authenticate(input: { username: string; password: string }): Promise<{ token: string }> {
+    let result;
+    try { result = await this.cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: this.clientId, AuthParameters: { USERNAME: input.username, PASSWORD: input.password } })); }
+    catch (error) {
+      const name = (error as { name?: string })?.name;
+      throw new PasswordAuthenticationError(['NotAuthorizedException','UserNotFoundException'].includes(name ?? '') ? 'invalid_credentials' : ['UserNotConfirmedException','PasswordResetRequiredException'].includes(name ?? '') ? 'authentication_challenge_required' : 'identity_provider_unavailable');
+    }
+    if (result?.ChallengeName) throw new PasswordAuthenticationError('authentication_challenge_required');
+    const token = result?.AuthenticationResult?.AccessToken;
+    if (typeof token !== 'string' || !token || token.trim() !== token) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    return { token };
+  }
+  async authenticateSession(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
+    const { token } = await this.authenticate({ username: input.email, password: input.password });
+    const session = await this.verifySession({ credential: token });
+    if (!session) throw new PasswordAuthenticationError('identity_provider_unavailable');
+    let account;
+    try { account = await this.getAccount(session.subject.id); }
+    catch { throw new PasswordAuthenticationError('identity_provider_unavailable'); }
+    if (!account || account.status !== 'active') throw new PasswordAuthenticationError('invalid_credentials');
+    return { token, session };
+  }
 }
 
 export const issueCloudFrontDelivery = (input: { url: string; privateKey: string; keyPairId: string; expiresAt: string }): string => getCloudFrontSignedUrl({ url: input.url, privateKey: input.privateKey, keyPairId: input.keyPairId, dateLessThan: input.expiresAt });
@@ -482,18 +716,40 @@ export class CloudFrontDelivery implements DeliveryAdapter {
 }
 
 /** Explicit AWS composition; core/application code receives only provider-neutral ports. */
-export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; credentialSecretPrefix: string; eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
+export interface AwsAdapterConfiguration extends AwsRepositoryConfiguration { region?: string; objectBucket: string; queueUrl: string; userPoolId: string; userPoolClientId: string; passwordAuthenticationEnabled?: boolean; subjectIdMode?:'legacy_username'|'canonical_sub'; credentialSecretPrefix: string;
+  /** Reuse the actual configured Cognito adapter, including a live explicit
+   * principal-genesis lifetime. Namespace equality is checked before use. */
+  cognitoIdentity?: CognitoIdentity;
+  eventBusName?: string; cloudFront?: { origin: string; privateKey: string; keyPairId: string }; }
 export const createAwsAdapterSet = (configuration: AwsAdapterConfiguration) => {
-  const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: configuration.region }));
-  const s3 = new S3Client({ region: configuration.region }); const sqs = new SQSClient({ region: configuration.region }); const events = new EventBridgeClient({ region: configuration.region });
+  const lifetime=new OwnedAwsClientLifetime();
+  try{
+  const identity = configuration.cognitoIdentity ?? (()=>{const client=lifetime.own(new CognitoIdentityProviderClient({region:configuration.region}));client.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});return new CognitoIdentity(client,configuration.userPoolId,configuration.userPoolClientId,{subjectIdMode:configuration.subjectIdMode});})();
+  const principal = requireCognitoIdentityRealm(identity);
+  if(principal.userPoolId!==configuration.userPoolId||principal.clientId!==configuration.userPoolClientId||principal.subjectIdMode!==(configuration.subjectIdMode??'legacy_username'))throw new Error('The actual Cognito identity must match the configured principal namespace and subject mode.');
+  const dynamo = configuration.globalSnapshotRealm?boundGlobalSnapshotClient(configuration.globalSnapshotRealm,configuration.tableName):(()=>{const raw=lifetime.own(new DynamoDBClient({region:configuration.region})),client=DynamoDBDocumentClient.from(raw);client.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});return client;})();
+  const s3=lifetime.own(new S3Client({region:configuration.region})),sqs=lifetime.own(new SQSClient({region:configuration.region})),events=lifetime.own(new EventBridgeClient({region:configuration.region})),secrets=lifetime.own(new SecretsManagerClient({region:configuration.region}));
+  s3.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  sqs.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  events.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  secrets.middlewareStack.add(next=>args=>lifetime.send(()=>next(args)),{name:'ubeeqOwnedClientLifetime',step:'initialize',priority:'high'});
+  // Jobs and canonical repositories must share the ACTUAL transaction context;
+  // a second coordinator over the same client cannot enlist dispatch leases.
+  const coordinator=createTransactionalDynamo(dynamo,{globalSnapshotRealm:configuration.globalSnapshotRealm}),repositories=dynamoRepositories(coordinator.client,coordinator.transaction,configuration);
+  if(configuration.globalSnapshotRealm)repositoryRealms.set(repositories,configuration.globalSnapshotRealm);
   const storage = new S3ObjectStorage(s3, configuration.objectBucket, configuration.cellId);
   return {
-    repositories: createDynamoRepositories(dynamo, configuration), storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
+    repositories, storage, uploads: new S3DirectUploadAdapter(s3, configuration.objectBucket, configuration.cellId),
     delivery: configuration.cloudFront ? new CloudFrontDelivery({ ...configuration.cloudFront, cellId: configuration.cellId }) : new S3PresignedDelivery(s3, configuration.objectBucket, configuration.cellId),
-    jobs: new AwsJobQueue(dynamo, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
-    identity: new CognitoIdentity(new CognitoIdentityProviderClient({ region: configuration.region }), configuration.userPoolId, configuration.userPoolClientId),
-    credentials: new SecretsManagerCredentialVault(new SecretsManagerClient({ region: configuration.region }), configuration.credentialSecretPrefix)
+    jobs: new AwsJobQueue(coordinator.client, configuration, sqs, configuration.queueUrl, configuration.eventBusName ? { client: events, eventBusName: configuration.eventBusName } : undefined),
+    identity,
+    ...(configuration.passwordAuthenticationEnabled ? { passwordAuthentication: { authenticate: (input: { email: string; password: string }) => identity.authenticateSession(input) } } : {}),
+    credentials: new SecretsManagerCredentialVault(secrets, configuration.credentialSecretPrefix),
+    /** Only clients constructed above belong to this set. The actual supplied
+     * Cognito identity/global snapshot session remain caller-owned and usable. */
+    close:()=>lifetime.close()
   };
+  }catch(error){void lifetime.close().catch(()=>{});throw error;}
 };
 export { DynamoSmugMugRepository } from './smugmug-repository.js';
 export { createS3PublicDerivativeStore, type PublicDerivativeStore } from './public-derivative-storage.js';
@@ -502,3 +758,9 @@ export { createDynamoPublicDerivativeRepository, publicDerivativePublicationKey,
 export * from './website-hosting.js';
 
 export {DynamoCommerceStore} from './commerce.js';
+
+export {DynamoWebsiteStore,type DynamoWebsiteConfiguration} from './websites.js';
+export {DynamoWebsiteHostingStore} from './website-hosting-store.js';
+export {DynamoCollectionMetadataStore,assertCollectionMetadataTransactionBudget,type DynamoCollectionMetadataConfiguration,type CollectionMetadataTransactionItems} from './collection-metadata-store.js';
+
+export {createFreshCognitoPrincipalRealm,requireFreshCognitoPrincipalGenesis,type FreshCognitoPrincipalGenesis,type FreshCognitoPrincipalConfiguration} from './cognito-principal-realm.js';

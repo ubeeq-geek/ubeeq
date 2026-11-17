@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { createCreatorExport, validateCreatorExport } from "@ubeeq/portability";
+import { createCreatorExport, validateCreatorExport, creatorAssetObjectInventory } from "@ubeeq/portability";
 import type { UbeeqRepositories } from "@ubeeq/persistence";
 import type { ObjectStorage, StoredObject } from "@ubeeq/storage";
 import type { MigrationCellCommand, MigrationCellCommandResult, MigrationCellEndpoint } from "@ubeeq/deployment-platform";
 
-type StoredLocation = { bucket?: string; key?: string; versionId?: string; byteLength?: number };
-type StoredAsset = { id: string; creatorId: string; checksum: string; objectVersion: string; storage?: StoredLocation; originalStorage?: StoredLocation; [key: string]: unknown };
+type StoredLocation = { bucket?: string; key?: string; versionId?: string; byteLength?: number; checksum?:string;contentType?:string;scope?:string };
+type StoredAsset = { id: string; creatorId: string; checksum: string; objectVersion: string; storage?: StoredLocation; originalStorage?: StoredLocation;processedRenditions?: {id:string;storage:StoredLocation}[]; [key: string]: unknown };
 const all = async <T>(repository: { list(input: { limit: number; cursor?: string }): Promise<{ items: readonly T[]; nextCursor?: string }> }): Promise<readonly T[]> => { const values: T[] = []; let cursor: string | undefined; do { const page = await repository.list({ limit: 100, cursor }); values.push(...page.items); cursor = page.nextCursor; } while (cursor); return values; };
 
 /**
@@ -49,10 +49,21 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
         if (!object) throw new Error(`Migration object inventory is missing asset ${value.id}.`);
         const asset = value as any;
         if (asset.originalStorage && !original) throw new Error(`Migration object inventory is missing the original for asset ${value.id}.`);
+        const resolve=async(location:StoredLocation)=>{
+          const entry=command.checkpoint.objectInventory?.find(candidate=>candidate.source.bucket===location.bucket&&candidate.source.key===location.key&&candidate.source.versionId===location.versionId);
+          if(!entry)throw new Error(`Migration output inventory is missing an immutable reference for asset ${value.id}.`);
+          const found=await input.storage.get(entry.destination);
+          if(found.object.bucket!==entry.destination.bucket||found.object.key!==entry.destination.key||found.object.checksum!==entry.checksum
+            ||found.object.byteLength!==entry.byteLength||found.body.byteLength!==entry.byteLength||createHash('sha256').update(found.body).digest('hex')!==entry.checksum
+            ||found.object.contentType!==location.contentType||found.object.scope!==location.scope||!found.object.versionId)throw new Error('Migration output physical receipt conflicts.');
+          return found.object;
+        };
+        const encoded=Array.isArray(asset.processedRenditions)&&asset.processedRenditions.length>0;
         await put(input.repositories.assets, {
           ...asset,
-          storage: asset.storage ? { ...asset.storage, bucket: object.destination.bucket, key: object.destination.key, versionId: undefined } : asset.storage,
-          originalStorage: asset.originalStorage ? { ...asset.originalStorage, bucket: original!.destination.bucket, key: original!.destination.key, versionId: undefined } : asset.originalStorage,
+          storage: encoded?await resolve(asset.storage):asset.storage ? { ...asset.storage, bucket: object.destination.bucket, key: object.destination.key, versionId: undefined } : asset.storage,
+          originalStorage: encoded&&asset.originalStorage?await resolve(asset.originalStorage):asset.originalStorage ? { ...asset.originalStorage, bucket: original!.destination.bucket, key: original!.destination.key, versionId: undefined } : asset.originalStorage,
+          ...(encoded?{processedRenditions:await Promise.all(asset.processedRenditions.map(async(rendition:any)=>({...rendition,storage:await resolve(rendition.storage)})))}:{}),
         }, "asset");
       }
       for (const value of manifest.publications) await put(input.repositories.publications, value, "publication");
@@ -83,7 +94,7 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
       const subjectIds = new Set([creatorId, ...workIds, ...assetIds, ...collectionIds]);
       // Object removal is intentionally migration-only. The normal cell path
       // never calls this operation or receives a foreign object location.
-      for (const asset of assets) for (const location of [asset.storage, asset.originalStorage]) {
+      for (const asset of assets) for (const location of [asset.storage, asset.originalStorage,...(asset.processedRenditions??[]).map(value=>value.storage)]) {
         if (location?.bucket && location.key) await input.storage.remove({ bucket: location.bucket, key: location.key, versionId: location.versionId }).catch(() => undefined);
       }
       await removeOwned(input.repositories.workMemberships, (value) => workIds.has(value.workId) || collectionIds.has(value.collectionId));
@@ -122,7 +133,7 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
     const collections = (await all(input.repositories.collections)).filter((value: any) => value.creatorId === creator.id);
     const workIds = new Set(works.map((value: any) => value.id)), subjectIds = new Set([creator.id, ...works.map((value: any) => value.id), ...assets.map((value) => value.id)]);
     const pick = async (repository: any, predicate: (value: any) => boolean) => (await all(repository)).filter(predicate);
-    const manifest = createCreatorExport(({ exportedAt: new Date().toISOString(), creator, works, assets: assets as any, collections, publications: await pick(input.repositories.publications, (value) => workIds.has(value.workId)), publicationIntents: await pick(input.repositories.publicationIntents, (value) => workIds.has(value.workId)), processing: assets.map((asset: any) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion, dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, state: asset.status })), moderationEvidence: await pick(input.repositories.moderationEvidence, (value) => subjectIds.has(value.subjectId)), moderationHolds: await pick(input.repositories.moderationHolds, (value) => subjectIds.has(value.subjectId)), reviewCases: await pick(input.repositories.reviewCases, (value) => subjectIds.has(value.subjectId)), auditEvents: await pick(input.repositories.auditEvents, (value) => subjectIds.has(value.subjectId)), usageEvents: await pick(input.repositories.usageEvents, (value) => value.accountId === creator.id), integrationAccounts: (await pick(input.repositories.integrationAccounts, (value) => value.creatorId === creator.id)).map(({ credentialReference: _secret, ...value }: any) => ({ ...value, credentialExcluded: true })), exportCheckpoints: await pick(input.repositories.exportManifests, (value) => value.creatorId === creator.id), importCheckpoints: await pick(input.repositories.importCheckpoints, (value) => value.creatorId === creator.id), objectInventory: assets.map((asset) => ({ assetId: asset.id, key: asset.storage?.key, versionId: asset.storage?.versionId ?? asset.objectVersion, checksum: asset.checksum, byteLength: asset.storage?.byteLength, transferState: "manifest_only" as const })) }) as any);
+    const manifest = createCreatorExport(({ exportedAt: new Date().toISOString(), creator, works, assets: assets as any, collections, publications: await pick(input.repositories.publications, (value) => workIds.has(value.workId)), publicationIntents: await pick(input.repositories.publicationIntents, (value) => workIds.has(value.workId)), processing: assets.map((asset: any) => ({ id: `asset-processing:${asset.id}`, assetId: asset.id, homeCellId: creator.homeCellId, dataHomeRegion: creator.dataHomeRegion, dataHomeAssignedAt: creator.dataHomeAssignedAt, routingRevision: creator.routingRevision, state: asset.status })), moderationEvidence: await pick(input.repositories.moderationEvidence, (value) => subjectIds.has(value.subjectId)), moderationHolds: await pick(input.repositories.moderationHolds, (value) => subjectIds.has(value.subjectId)), reviewCases: await pick(input.repositories.reviewCases, (value) => subjectIds.has(value.subjectId)), auditEvents: await pick(input.repositories.auditEvents, (value) => subjectIds.has(value.subjectId)), usageEvents: await pick(input.repositories.usageEvents, (value) => value.accountId === creator.id), integrationAccounts: (await pick(input.repositories.integrationAccounts, (value) => value.creatorId === creator.id)).map(({ credentialReference: _secret, ...value }: any) => ({ ...value, credentialExcluded: true })), exportCheckpoints: await pick(input.repositories.exportManifests, (value) => value.creatorId === creator.id), importCheckpoints: await pick(input.repositories.importCheckpoints, (value) => value.creatorId === creator.id), objectInventory: assets.map(asset=>creatorAssetObjectInventory(asset as any)) }) as any);
     validateCreatorExport(manifest);
     const body = Buffer.from(JSON.stringify(manifest)), checksum = createHash("sha256").update(body).digest("hex"), manifestKey = `cells/${input.cellId}/migrations/${command.checkpoint.id}/creator-export.json`;
     const manifestObject: StoredObject = { bucket: input.cellId, key: manifestKey, contentType: "application/json", byteLength: body.byteLength, checksum, scope: "private" };
@@ -137,15 +148,22 @@ export const createMigrationCellEndpoint = (input: { cellId: string; region: str
         id,
         source: { bucket: location.bucket ?? input.cellId, key: location.key, versionId: location.versionId },
         destination: { bucket: command.destinationBucket!, key: location.key.replace(`cells/${input.cellId}/`, `cells/${command.checkpoint.destination.cellId}/`) },
-        checksum: asset.checksum,
+        checksum: location.checksum ?? asset.checksum,
         byteLength: location.byteLength ?? 0,
       };
     };
     const assetObjects = assets.flatMap((asset) => {
       if (!asset.storage) throw new Error(`Migration asset ${asset.id} has no active storage location.`);
       const active = inventoryEntry(asset.id, asset.storage, asset);
-      if (!asset.originalStorage || asset.originalStorage.key === asset.storage.key) return [active];
-      return [active, inventoryEntry(`${asset.id}:original`, asset.originalStorage, asset)];
+      const entries=[active];
+      if(asset.originalStorage&&asset.originalStorage.key!==asset.storage.key)entries.push(inventoryEntry(`${asset.id}:original`,asset.originalStorage,asset));
+      for(const rendition of asset.processedRenditions??[]){
+        const location=rendition.storage;
+        if(!location.versionId||!location.checksum)throw new Error('Migration encoded output requires an immutable physical reference.');
+        if(!entries.some(entry=>entry.source.bucket===location.bucket&&entry.source.key===location.key&&entry.source.versionId===location.versionId))
+          entries.push(inventoryEntry(`${asset.id}:rendition:${createHash('sha256').update(rendition.id).digest('hex')}`,location,asset));
+      }
+      return entries;
     });
     const objects = [{ id: "migration-manifest", source: { bucket: storedManifest.object.bucket, key: manifestKey, versionId: storedManifest.object.versionId }, destination: { bucket: command.destinationBucket!, key: `cells/${command.checkpoint.destination.cellId}/migrations/${command.checkpoint.id}/creator-export.json` }, checksum, byteLength: body.byteLength }, ...assetObjects];
     return { manifestChecksum: manifest.checksum, objectInventory: objects };

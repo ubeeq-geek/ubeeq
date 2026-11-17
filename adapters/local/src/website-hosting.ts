@@ -37,11 +37,13 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
   private async safeParent(root:string,file:string){safeFile(file);const destination=join(root,file);if(relative(root,destination).startsWith('..'))throw new WebsiteError('unsafe_hosting_path','File escapes its release root.');let cursor=root;for(const part of file.split('/').slice(0,-1)){cursor=join(cursor,part);const st=await exists(cursor);if(st?.isSymbolicLink()||st&&!st.isDirectory())throw new WebsiteError('symlink_output','Output cannot traverse symlinks.');await mkdir(cursor,{recursive:true,mode:0o750});}if((await exists(destination))?.isSymbolicLink())throw new WebsiteError('symlink_output','Output cannot replace a symlink.');return destination;}
   async prepare(context:HostingDeploymentContext){const artifact=context.artifact;if(!artifact)throw new WebsiteError('artifact_unavailable','A pinned artifact is required.');const site=await this.site(context.target),releaseId=artifact.digest,releaseRoot=join(site,'releases',releaseId),stage=join(site,'.staging-'+randomUUID());
     const releases=join(site,'releases'),assets=join(site,'assets');for(const dir of [releases,assets]){const st=await exists(dir);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Release/asset storage cannot be a symlink.');await mkdir(dir,{recursive:true,mode:0o750});}
-    if(await exists(releaseRoot)){for(const [file,bytes] of artifact.files){const destination=await this.safeParent(releaseRoot,file);if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('release_drift','An immutable release has changed.');}return {releaseId};}
-    await mkdir(stage,{mode:0o750});try{for(const [file,bytes] of artifact.files){const destination=await this.safeParent(stage,file);
-        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}else{try{await writeSynced(asset,bytes);}catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST'||hash(await readFile(asset))!==hash(bytes))throw error;}}await link(asset,destination);}
+    // Reusing retained bytes still requires current writer authorization.
+    if(await exists(releaseRoot)){for(const [file,bytes] of artifact.files){await context.beforeUpload?.();const destination=await this.safeParent(releaseRoot,file);if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('release_drift','An immutable release has changed.');}return {releaseId};}
+    await mkdir(stage,{mode:0o750});try{for(const [file,bytes] of artifact.files){await context.beforeUpload?.();const destination=await this.safeParent(stage,file);
+        if(/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(file)){const asset=join(assets,file.slice(7)),st=await exists(asset);if(st?.isSymbolicLink())throw new WebsiteError('symlink_output','Asset cannot be a symlink.');if(st){if(hash(await readFile(asset))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');await link(asset,destination);}else await writeSynced(destination,bytes);}
         else await writeSynced(destination,bytes);}
-      await syncTree(stage);await syncDirectory(assets);await rename(stage,releaseRoot);await syncDirectory(releases);return {releaseId};
+      // The last file and directory syncs may have outlived the prior guard.
+      await syncTree(stage);await syncDirectory(assets);await context.beforeUpload?.();await rename(stage,releaseRoot);await syncDirectory(releases);return {releaseId};
     }catch(error){await rm(stage,{recursive:true,force:true});throw error;}
   }
   private async pointer(context:HostingDeploymentContext,disabled:boolean){const site=await this.site(context.target),file=join(site,'current.json'),old=await exists(file);if(old?.isSymbolicLink())throw new WebsiteError('symlink_output','Current pointer cannot be a symlink.');if(old){const previous=JSON.parse(await readFile(file,'utf8'));if(previous.generation>context.generation)throw new WebsiteError('superseded','A newer native generation is active.');}
@@ -49,7 +51,20 @@ export class NativeWebsiteHostingAdapter implements WebsiteHostingAdapter {
     const releaseId=disabled?'disabled-'+context.generation:context.checkpoint.releaseId;
     if(!disabled&&(!releaseId||releaseId!==context.artifact?.digest))throw new WebsiteError('artifact_unavailable','Staged release does not match the exact artifact.');
     const temp=join(site,'.current-'+randomUUID());await writeSynced(temp,JSON.stringify({version:'1',generation:context.generation,state:disabled?'disabled':'active',releaseId,marker:context.artifact?.marker??null}));
-    try{await context.beforeActivation();await rename(temp,file);await syncDirectory(site);}finally{await rm(temp,{force:true});}
+    try{
+      // New content-addressed bytes remain private until publication authority
+      // is checked. Previously published assets retain their stable URLs.
+      if(!disabled)for(const [name,bytes] of context.artifact!.files){
+        if(!/^assets\/[a-f0-9]{64}\.[a-z0-9]+$/.test(name))continue;
+        const source=await this.safeParent(join(site,'releases',releaseId!),name),destination=await this.safeParent(site,name);
+        if(hash(await readFile(source))!==hash(bytes))throw new WebsiteError('release_drift','Staged asset changed before activation.');
+        const retained=await exists(destination);
+        if(retained){if(hash(await readFile(destination))!==hash(bytes))throw new WebsiteError('asset_drift','Retained public asset changed.');}
+        else{await context.beforeActivation();await link(source,destination);}
+      }
+      if(!disabled)await syncDirectory(join(site,'assets'));
+      await context.beforeActivation();await rename(temp,file);await syncDirectory(site);
+    }finally{await rm(temp,{force:true});}
     return {state:disabled?'disabled' as const:'activated' as const,releaseId,publicUrl:context.target.publicUrl};
   }
   private async policyGate(target:WebsiteHostingTarget,state:'active'|'suspended',beforeServing?:()=>Promise<void>){

@@ -1,4 +1,5 @@
 {
+  "license": "MIT",
   "name": "@ubeeq/auth",
   "version": "0.1.0",
   "private": false,
@@ -9,5 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/extension-sdk": "^0.1.0"
   }
 }

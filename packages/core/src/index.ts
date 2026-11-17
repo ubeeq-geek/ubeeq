@@ -367,3 +367,9 @@ export * from "./announcement-plans.js";
 
 export * from './announcement-layout.js';
 export * from './content-workflows.js';
+
+export * as collectionMetadata from './collection-metadata.js';
+
+export * as collectionMetadataService from './collection-metadata-service.js';
+
+export * as collectionMetadataCommands from './collection-metadata-commands.js';

@@ -1,4 +1,5 @@
 {
+  "license": "MIT",
   "name": "@ubeeq/adapter-machine",
   "version": "0.1.0",
   "private": false,
@@ -13,7 +14,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json && rm -rf dist/migrations && cp -R migrations dist/migrations",
-    "test:contract": "npm run build && node --test test/contracts.test.mjs",
+    "test:contract": "npm run build && node --test test/*.test.mjs",
     "test": "npm run test:contract"
   },
   "dependencies": {

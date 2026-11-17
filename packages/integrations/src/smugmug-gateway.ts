@@ -3,7 +3,15 @@ import { readBoundedBytes } from '@ubeeq/storage';
 import { readBoundedResponseText } from './bounded-response-text.js';
 import type { SmugMugCapabilities, SmugMugGateway, SmugMugInventoryPage, SmugMugRemoteCollection, SmugMugRemoteImage } from './smugmug-contracts.js';
 
+export interface SmugMugImageMetadata {
+  remoteId:string;remoteUri:string;title?:string;caption?:string;keywords:string[];
+  /** Full actual provider readback, never an image checksum or byte receipt. */
+  rawMetadata:Record<string,unknown>;
+}
+
 export interface SmugMugOAuthCredential { token: string; tokenSecret: string; }
+export interface SmugMugAuthorizedAccount {credentialRef:string;accountId:string;accountName:string;capabilities:SmugMugCapabilities;}
+
 
 /** Credential storage is deliberately separate from migration records so tokens can be
  * encrypted, rotated, and destroyed without deleting imported catalogue data. */
@@ -80,7 +88,15 @@ export class SmugMugHttpGateway implements SmugMugGateway {
     const tokenSecret = scalar(body.get('oauth_token_secret'));
     if (!token || !tokenSecret) throw new Error('SmugMug returned an invalid access token.');
     const nextReference = await this.options.vault.replace(credentialRef, { token, tokenSecret });
-    const authUser = await this.apiGet('/api/v2!authuser', { token, tokenSecret });
+    return this.authorizedAccount(nextReference,{token,tokenSecret});
+  }
+
+  /** Read the actual currently authenticated account with its saved credential.
+   * This performs no request/access-token exchange or credential mutation. */
+  async account(credentialRef:string):Promise<SmugMugAuthorizedAccount>{return this.authorizedAccount(credentialRef,await this.requiredCredential(credentialRef));}
+
+  private async authorizedAccount(credentialRef:string,credential:SmugMugOAuthCredential):Promise<SmugMugAuthorizedAccount>{
+    const authUser = await this.apiGet('/api/v2!authuser', credential);
     const response = record(record(authUser).Response);
     const user = record(response.User);
     const accountId = scalar(user.UserID) || scalar(user.Uri);
@@ -94,11 +110,21 @@ export class SmugMugHttpGateway implements SmugMugGateway {
       passwordProtectedGalleries: false
     };
     return {
-      credentialRef: nextReference,
+      credentialRef,
       accountId,
       accountName: scalar(user.NickName) || scalar(user.Name) || 'SmugMug creator',
       capabilities
     };
+  }
+
+  /** Genuine read-only metadata baseline for an already owned remote image.
+   * No upload, source download, credential rotation or inferred image hash. */
+  async readImageMetadata(credentialRef:string,remoteUri:string):Promise<SmugMugImageMetadata>{
+    if(!remoteUri.startsWith('/api/v2/'))throw new Error('SmugMug image URI is invalid.');
+    const path=this.apiPath(remoteUri),credential=await this.requiredCredential(credentialRef),payload=await this.apiGet(path,credential),image=record(record(payload.Response).Image||payload.Image),remoteId=scalar(image.ImageKey)||scalar(image.Uri),actualUri=scalar(image.Uri);
+    if(!remoteId||!actualUri||this.apiPath(actualUri)!==path)throw new Error('SmugMug returned another image metadata identity.');
+    const keywords=Array.isArray(image.Keywords)?image.Keywords.filter((value):value is string=>typeof value==='string'):scalar(image.Keywords)?.split(/[;,]/).map(value=>value.trim()).filter(Boolean)||[];
+    return{remoteId,remoteUri:actualUri,title:scalar(image.Title),caption:scalar(image.Caption),keywords,rawMetadata:payload};
   }
 
   async inventory(credentialRef: string, cursor?: string): Promise<SmugMugInventoryPage> {

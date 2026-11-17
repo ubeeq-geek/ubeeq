@@ -1,0 +1,65 @@
+[
+  {
+    "name": "stable_object",
+    "value": {
+      "z": [
+        3,
+        {
+          "b": 2,
+          "a": 1
+        }
+      ],
+      "a": "Title"
+    },
+    "hash": "a14a3660a1c9484bbac90fbca4f584d9d6cf549a1b801369db110b76bff70f8e"
+  },
+  {
+    "name": "null",
+    "value": null,
+    "hash": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+    "name": "unicode_description",
+    "field": "description",
+    "value": "Café\r\nLine 2",
+    "hash": "5b64256ede562ce16139797d0cd21b9b7815ad2cbec44acd99e2c9348c36ac8a"
+  },
+  {
+    "name": "null_description",
+    "field": "description",
+    "value": null,
+    "hash": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+  },
+  {
+    "name": "empty_description",
+    "field": "description",
+    "value": "",
+    "hash": "12ae32cb1ec02d01eda3581b127c1fee3b0dc53572ed6baf239721a03d82e126"
+  },
+  {
+    "name": "saved_cover",
+    "field": "cover",
+    "value": {
+      "kind": "native",
+      "image": {
+        "format": "collection_2x",
+        "fit": "cover",
+        "sourceKey": "original/covers/source.png",
+        "renditionKeys": {
+          "desktop": "covers/desktop.webp",
+          "tablet": "covers/tablet.webp",
+          "mobile": "covers/mobile.webp"
+        },
+        "focalPoint": {
+          "x": 0.25,
+          "y": 0.75
+        },
+        "zoom": 1.2,
+        "sourceWorkId": "work",
+        "altText": "Saved cover",
+        "updatedAt": "2026-10-30T00:00:00.000Z"
+      }
+    },
+    "hash": "9ecde77439e36bb2c72666d6b3668a3f4df25846633729b4652e3ccf95e2a08b"
+  }
+]

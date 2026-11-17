@@ -41,6 +41,26 @@ class MemoryDynamo {
   values = new Map();
   async send(command) {
     const input = command.input;
+    if (command.constructor.name === 'TransactWriteCommand') {
+      const staged=new MemoryDynamo();staged.values=structuredClone(this.values);
+      const reasons=input.TransactItems.map(()=>({Code:'None'}));
+      for(let index=0;index<input.TransactItems.length;index++){
+        const entry=input.TransactItems[index];
+        try{
+          if(entry.ConditionCheck){
+            const check=entry.ConditionCheck,current=this.values.get(`${check.Key.pk}|${check.Key.sk}`);
+            const condition=check.ConditionExpression;
+            const accepted=condition==='attribute_not_exists(pk)'?!current:condition==='#version = :version'?current?.version===check.ExpressionAttributeValues[':version']:condition==='attribute_exists(pk) AND #revision = :revision'?current?.revision===check.ExpressionAttributeValues[':revision']:undefined;
+            assert.notEqual(accepted,undefined,'The contract fixture must understand the actual condition');
+            if(!accepted)throw Object.assign(Error('conditional conflict'),{name:'ConditionalCheckFailedException'});
+          }else await staged.send({constructor:{name:entry.Put?'PutCommand':'DeleteCommand'},input:entry.Put??entry.Delete});
+        }catch(error){
+          if(error.name!=='ConditionalCheckFailedException')throw error;
+          reasons[index]={Code:'ConditionalCheckFailed'};throw Object.assign(Error('atomic conditional conflict'),{name:'TransactionCanceledException',CancellationReasons:reasons});
+        }
+      }
+      this.values=staged.values;return {};
+    }
     if (command.constructor.name === "GetCommand") return { Item: this.values.get(`${input.Key.pk}|${input.Key.sk}`) };
     if (command.constructor.name === "QueryCommand") {
       const partition = input.ExpressionAttributeValues[":pk"];
@@ -54,6 +74,7 @@ class MemoryDynamo {
       const key = `${input.Item.pk}|${input.Item.sk}`;
       const current = this.values.get(key);
       if (input.ConditionExpression === "attribute_not_exists(pk)" && current) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
+      if (input.ConditionExpression === '#version = :version' && current?.version !== input.ExpressionAttributeValues[':version']) throw Object.assign(Error('snapshot conflict'),{name:'ConditionalCheckFailedException'});
       if (input.ConditionExpression?.includes("#revision") && (!current || current.revision !== input.ExpressionAttributeValues[":revision"])) { const error = new Error("ConditionalCheckFailedException"); error.name = "ConditionalCheckFailedException"; throw error; }
       if (input.ConditionExpression?.includes('#expiry') && (!current || current.value.state !== input.ExpressionAttributeValues[':leased'] || current.value.correlationId !== input.ExpressionAttributeValues[':owner'] || !(current.value.leaseExpiresAt > input.ExpressionAttributeValues[':now']))) throw Object.assign(new Error('lease conflict'), { name: 'ConditionalCheckFailedException' });
       if (input.ConditionExpression?.includes('#due') && (!current || current.value.cellId !== input.ExpressionAttributeValues[':cell'] || current.value.state !== input.ExpressionAttributeValues[':state'] || !(current.value[input.ExpressionAttributeNames['#due']] <= input.ExpressionAttributeValues[':now']))) throw Object.assign(new Error('claim conflict'), { name: 'ConditionalCheckFailedException' });
@@ -200,7 +221,8 @@ test('AWS reclaim conditions retain a lease renewed after candidate discovery', 
   renewing = true;
   assert.equal(await queue.lease(input), undefined);
   assert.equal((await queue.get(job.id)).attempt, 1);
-  assert.equal((await queue.get(job.id)).correlationId, `worker:${original.leaseToken}`);
+  assert.equal(memory.values.get(`durableJobs#${job.id}|record`).value.correlationId, `worker:${original.leaseToken}`);
+  assert.equal((await queue.get(job.id)).correlationId, undefined);
 });
 
 test('expired, missing and malformed AWS lease expiries cannot acknowledge work', async () => {
@@ -376,7 +398,7 @@ test("operator migration queue accepts only checkpoint commands", async () => {
 test("S3 direct upload binds a checksum and returns the immutable object version", async () => {
   const checksum = "a".repeat(64); const upload = new S3DirectUploadAdapter({ config: {}, middlewareStack: { add: () => {}, addRelativeTo: () => {}, clone: () => ({}) } }, "objects");
   // Replace the network boundary only for the completion assertion; initiation is covered by its signed-command shape below.
-  upload.s3 = { send: async (command) => command.constructor.name === "HeadObjectCommand" ? { VersionId: "v1", ContentLength: 4, ContentType: "image/png", ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"), Metadata: { checksum, scope: "private" } } : {} };
+  upload.s3 = { send: async (command) => command.constructor.name === "HeadObjectCommand" ? { VersionId: "v1", ContentLength: 4, ContentType: "image/png", ChecksumSHA256: Buffer.from(checksum, "hex").toString("base64"), Metadata: { checksum, scope: "private", bytelength: "4" } } : {} };
   const uploadId = Buffer.from(JSON.stringify({ bucket: "objects", key: "cells/cell-a/creators/creator-a/uploads/a", contentType: "image/png", byteLength: 4, checksum, scope: "private" })).toString("base64url");
   const completed = await upload.complete({ uploadId, cellId: "cell-a", creatorId: "creator-a", checksum, byteLength: 4 });
   assert.equal(completed.versionId, "v1"); assert.equal(completed.checksum, checksum);
@@ -385,9 +407,115 @@ test("S3 direct upload binds a checksum and returns the immutable object version
 
 test("Cognito identity verifies opaque sessions and maps access scopes", async () => {
   let revoked = false;
-  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); return { Username: "subject-1", UserAttributes: [{ Name: "scope", Value: "works:write exports:read" }] }; } }, "pool", "client");
+  const identity = new CognitoIdentity({ send: async (command) => { if (command.constructor.name === "GlobalSignOutCommand") { revoked = true; return {}; } if (revoked) throw new Error("revoked"); if (command.constructor.name === "AdminGetUserCommand") return { Username: "subject-1", Enabled: true, UserStatus: "CONFIRMED", UserAttributes: [{ Name: "sub", Value: "subject-sub" }] }; return { Username: "subject-1", UserAttributes: [{ Name: "sub", Value: "subject-sub" }] }; } }, "pool", "client", { verifier: { verify: async () => ({ sub: "subject-sub", username: "subject-1", iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000)+3600, scope: "works:write exports:read" }) } });
   const session = await identity.verifySession({ credential: "opaque-access-token" });
   assert.equal(session?.subject.id, "subject-1");
   assert.deepEqual(session?.subject.scopes, ["works:write", "exports:read"]);
   await verifyIdentityAdapterContract(identity, { credential: "opaque-access-token", subjectId: "subject-1" });
+});
+
+test('Cognito identity rejects unverified or expired tokens before invoking GetUser', async () => {
+  let calls = 0;
+  const client = { send: async () => { calls++; return {}; } };
+  const unverified = new CognitoIdentity(client, 'us-east-1_test', 'client');
+  assert.equal(await unverified.verifySession({ credential: 'not-a-signed-jwt' }), undefined);
+  const expired = new CognitoIdentity(client, 'pool', 'client', { verifier: { verify: async () => ({ sub: 'subject', iat: 0, exp: 1 }) } });
+  assert.equal(await expired.verifySession({ credential: 'expired' }), undefined);
+  assert.equal(calls, 0);
+});
+
+function pagedJobFixture() {
+  const memory=new MemoryDynamo(),queries=[],stamp=new Date().toISOString();
+  const add=(id,patch={})=>{
+    const value={id,cellId:'cell',type:'work',payload:{id},idempotencyKey:id,state:'completed',attempt:1,maxAttempts:3,availableAt:stamp,createdAt:stamp,updatedAt:stamp,revision:1,...patch};
+    memory.values.set(`durableJobs#${id}|record`,{pk:`durableJobs#${id}`,sk:'record',repository:'durableJobs',id,revision:1,value});return value;
+  };
+  for(let i=0;i<250;i++)add('history-'+String(i).padStart(3,'0'));
+  const queue=new AwsJobQueue({send:async command=>{if(command.constructor.name==='QueryCommand')queries.push(command.input);return memory.send(command);}},{tableName:'records',cellId:'cell'},{send:async()=>({})},'https://queue.test/jobs');
+  return {memory,queue,queries,add,stamp};
+}
+test('AWS worker finds eligible jobs after terminal history and skips foreign, wrong-type and future work across pages',async()=>{
+  const f=pagedJobFixture();
+  f.add('foreign',{cellId:'other',state:'queued',attempt:0});f.add('wrong-type',{type:'other',state:'queued',attempt:0});
+  f.add('future',{state:'queued',attempt:0,availableAt:'2099-01-01T00:00:00.000Z'});
+  f.add('exhausted',{state:'leased',attempt:3,leaseExpiresAt:'2000-01-01T00:00:00.000Z',correlationId:'old:token'});
+  f.add('target',{state:'queued',attempt:0});
+  const lease=await f.queue.lease({cellId:'cell',types:['work'],workerId:'worker',leaseDurationSeconds:60});
+  assert.ok(lease);assert.equal(lease.job.id,'target');assert.equal(lease.job.attempt,1);
+  assert.equal((await f.queue.get('exhausted')).state,'dead_lettered');assert.equal((await f.queue.get('foreign')).state,'queued');
+  assert.equal((await f.queue.get('wrong-type')).state,'queued');assert.equal((await f.queue.get('future')).attempt,0);
+  assert.equal(f.queries.length,3);assert.ok(f.queries[1].ExclusiveStartKey);assert.ok(f.queries[2].ExclusiveStartKey);
+});
+test('AWS filtered listing continues through unrelated pages and empty state filters retain normal all-state semantics',async()=>{
+  const f=pagedJobFixture();f.add('foreign',{cellId:'other',state:'queued',attempt:0});f.add('target',{state:'queued',attempt:0});
+  assert.deepEqual((await f.queue.list({cellId:'cell',states:['queued'],limit:1})).map(j=>j.id),['target']);
+  assert.deepEqual(await f.queue.list({cellId:'cell',states:[],limit:2}),await f.queue.list({cellId:'cell',limit:2}));
+  assert.equal((await f.queue.list({cellId:'cell',states:[],limit:2})).length,2);
+});
+test('AWS lease time is measured after later-page reads so a slow scan cannot return an already expired lease',async t=>{
+  const f=pagedJobFixture(),base=Date.now();let clock=base;
+  f.add('target',{state:'queued',attempt:0,availableAt:new Date(base+30_000).toISOString()});
+  const send=f.memory.send.bind(f.memory);f.memory.send=async command=>{if(command.constructor.name==='QueryCommand'&&command.input.ExclusiveStartKey)clock+=120_000;return send(command);};
+  t.mock.method(Date,'now',()=>clock);
+  const lease=await f.queue.lease({cellId:'cell',types:['work'],workerId:'worker',leaseDurationSeconds:60});
+  assert.ok(lease);assert.equal(lease.job.id,'target');assert.equal(Date.parse(lease.job.leaseExpiresAt),clock+60_000);
+});
+
+test('AWS request correlation survives leasing, retries and completion without exposing ownership tokens',async()=>{
+  const memory=new MemoryDynamo(),queue=new AwsJobQueue(memory,{tableName:'records',cellId:'cell'},{send:async()=>({})},'https://queue.test/jobs');
+  const job=await queue.enqueue({cellId:'cell',type:'work',payload:{},idempotencyKey:'trace',correlationId:'original-request',maxAttempts:3});
+  const first=await queue.lease({cellId:'cell',workerId:'worker',leaseDurationSeconds:60});
+  assert.equal(first.job.correlationId,'original-request');assert.equal((await queue.get(job.id)).correlationId,'original-request');
+  assert.equal(memory.values.get(`durableJobs#${job.id}|record`).value.correlationId,`worker:${first.leaseToken}`,'legacy ownership representation must still fence old workers');
+  await queue.retry({id:job.id,leaseToken:first.leaseToken,error:{code:'temporary',message:'retry'},retryAt:new Date(0).toISOString()});
+  const second=await queue.lease({cellId:'cell',workerId:'replacement',leaseDurationSeconds:60});
+  await assert.rejects(queue.complete({id:job.id,leaseToken:first.leaseToken}),/does not hold/);
+  assert.equal(second.job.correlationId,'original-request');await queue.complete({id:job.id,leaseToken:second.leaseToken});
+  assert.equal((await queue.list({cellId:'cell',states:['completed'],limit:1}))[0].correlationId,'original-request');
+});
+test('AWS active legacy leases remain acknowledgeable and a legacy owner change fences the prior token',async()=>{
+  const memory=new MemoryDynamo(),queue=new AwsJobQueue(memory,{tableName:'records',cellId:'cell'},{send:async()=>({})},'https://queue.test/jobs');
+  const job=await queue.enqueue({cellId:'cell',type:'work',payload:{},idempotencyKey:'legacy-ack',correlationId:'retained-request',maxAttempts:3});
+  const first=await queue.lease({cellId:'cell',workerId:'new-worker',leaseDurationSeconds:60});
+  const row=memory.values.get(`durableJobs#${job.id}|record`);row.revision++;row.value.revision++;
+  row.value.correlationId='legacy-worker:legacy-token';row.value.attempt++; // Existing legacy writer changes its ownership marker; optional trace metadata survives its record spread.
+  await assert.rejects(queue.complete({id:job.id,leaseToken:first.leaseToken}),/does not hold/);
+  await queue.complete({id:job.id,leaseToken:'legacy-token'});
+  assert.equal((await queue.get(job.id)).state,'completed');assert.equal((await queue.get(job.id)).correlationId,'retained-request');
+  const legacy=await queue.enqueue({cellId:'cell',type:'work',payload:{},idempotencyKey:'legacy-row',maxAttempts:3});
+  const legacyRow=memory.values.get(`durableJobs#${legacy.id}|record`);delete legacyRow.value.requestCorrelationId;
+  legacyRow.value.state='leased';legacyRow.value.attempt=1;legacyRow.value.correlationId='old:old-token';legacyRow.value.leaseExpiresAt=new Date(Date.now()+60000).toISOString();
+  await queue.complete({id:legacy.id,leaseToken:'old-token'});assert.equal((await queue.get(legacy.id)).state,'completed');
+  assert.equal((await queue.get(legacy.id)).correlationId,undefined,'a lost historical request trace must not become a worker ownership token');
+});
+
+test('AWS untraced jobs never expose internal lease ownership through queue results',async()=>{
+  const memory=new MemoryDynamo(),queue=new AwsJobQueue(memory,{tableName:'records',cellId:'cell'},{send:async()=>({})},'https://queue.test/jobs');
+  const job=await queue.enqueue({cellId:'cell',type:'work',payload:{},idempotencyKey:'no-trace',maxAttempts:3});
+  const lease=await queue.lease({cellId:'cell',workerId:'worker',leaseDurationSeconds:60});
+  for(const result of [job,lease.job,await queue.get(job.id),(await queue.list({cellId:'cell',limit:1}))[0],await queue.enqueue({cellId:'cell',type:'work',payload:{},idempotencyKey:'no-trace',maxAttempts:3})]){
+    assert.equal(result.correlationId,undefined);assert.equal(Object.hasOwn(result,'requestCorrelationId'),false);
+  }
+  await queue.deadLetter({id:job.id,leaseToken:lease.leaseToken,error:{code:'test',message:'test'}});
+  assert.equal((await queue.recover({id:job.id})).correlationId,undefined);
+});
+
+test('AWS first lease retains an unclaimed legacy request trace without changing legacy fencing',async()=>{
+  const memory=new MemoryDynamo(),queue=new AwsJobQueue(memory,{tableName:'records',cellId:'cell'},{send:async()=>({})},'https://queue.test/jobs');
+  const job=await queue.enqueue({cellId:'cell',type:'work',payload:{},correlationId:'legacy-request',idempotencyKey:'legacy-queued',maxAttempts:3});
+  delete memory.values.get(`durableJobs#${job.id}|record`).value.requestCorrelationId;
+  const lease=await queue.lease({cellId:'cell',workerId:'worker',leaseDurationSeconds:60});
+  assert.equal(lease.job.correlationId,'legacy-request');assert.equal((await queue.get(job.id)).correlationId,'legacy-request');
+  await queue.complete({id:job.id,leaseToken:lease.leaseToken});
+});
+
+
+test('queue conformance isolates each run from retained jobs in the legacy contract cell', async () => {
+ const queue=new AwsJobQueue(new MemoryDynamo(),{tableName:'records'},{send:async()=>({})},'https://queue.test/jobs');
+ const old=await queue.enqueue({cellId:'contract-cell',type:'contract',idempotencyKey:'retained-old-live-run',payload:{retained:true},maxAttempts:3});
+ await assert.rejects(verifyJobQueueContract(queue,'another-shared-run'),/queued work is not leasable/);
+ const retained=await queue.get(old.id);
+ await verifyJobQueueContract(queue,'isolated-run',{cellId:'isolated-live-cell',foreignCellId:'isolated-foreign-cell'});
+ assert.deepEqual(await queue.get(old.id),retained,'Conformance must not consume or delete another run’s work.');
+ await assert.rejects(verifyJobQueueContract(queue,'invalid-cells',{cellId:'same',foreignCellId:'same'}),/distinct cells/);
 });

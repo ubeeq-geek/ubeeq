@@ -1,0 +1,14 @@
+{
+  "license": "MIT",
+  "name": "ubeeq-customer-scope-claims-deployment",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ubeeq/adapter-aws": "^0.1.0",
+    "@aws-sdk/client-lambda": "3.1120.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

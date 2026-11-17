@@ -1,3 +1,4 @@
+import type { AwsCommandClient } from './client-port.js';
 import { CopyObjectCommand, DeleteObjectCommand, type S3Client } from '@aws-sdk/client-s3';
 
 export interface PublicDerivativeStore {
@@ -9,7 +10,7 @@ export interface PublicDerivativeStore {
  * Callers must authorize both locations, validate the derivative and own its key.
  * Hash metadata is supplied by the caller; copying does not verify content bytes.
  */
-export const createS3PublicDerivativeStore = (client: Pick<S3Client, 'send'>): PublicDerivativeStore => ({
+export const createS3PublicDerivativeStore = (client: AwsCommandClient): PublicDerivativeStore => ({
   copy: async input => {
     await client.send(new CopyObjectCommand({
       Bucket: input.destinationBucket,

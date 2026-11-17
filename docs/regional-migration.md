@@ -83,3 +83,20 @@ errors. Migration transfer is metered separately from ordinary public delivery.
   deployment-supplied authorization requirement.
 
 The reference API remains a single-cell application. A managed multi-cell deployment supplies the directory and migration worker outside the reference application's data plane. Until such an operator adapter is installed, a regional outage remains unavailable for writes and cannot trigger failover.
+
+## Upload-journal cutover
+
+Stop new upload admission in the previous writer and drain its active upload
+sessions and processing queue before switching to the journal-backed API.
+Provider upload identifiers issued by an older API are not proof of a new
+application session; do not adopt arbitrary decoded provider identifiers. Keep
+the previous endpoint available for its admitted sessions through their defined
+completion/drain window. Existing asset IDs and retained object versions remain
+unchanged.
+
+The local provider completion table is additive. Preserve upload-journal records,
+provider completion receipts, object versions, queue acknowledgements and pending
+settlement evidence in backups and rollback inventories. A physical object can
+exist before its asset transaction commits; recover its exact receipt rather
+than issuing another version or treating it as absent. Do not release reserved
+capacity until the object and any remaining write capability are reconciled.

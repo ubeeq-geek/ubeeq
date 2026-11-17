@@ -1,0 +1,142 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp,rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash,randomUUID } from 'node:crypto';
+import { DynamoDBClient,CreateTableCommand,DeleteTableCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient,GetCommand,ScanCommand } from '@aws-sdk/lib-dynamodb';
+import { createDynamoRepositories,AwsJobQueue,DynamoRevisionedRepository } from '../dist/index.js';
+import { createLocalAdapterSet } from '@ubeeq/adapter-local';
+import {OwnedObjectWrites} from '../../../packages/runtime/dist/owned-object-writes.js';
+import { UploadLifecycle } from '../../../packages/runtime/dist/upload-lifecycle.js';
+import { createIntakeWork } from '../../../packages/runtime/dist/work-intake.js';
+import {UsageSettlementOutbox} from '../../../packages/runtime/dist/usage-settlement-outbox.js';
+import {StorageClosureOutbox} from '../../../packages/runtime/dist/storage-closure-outbox.js';
+const endpoint=process.env.TEST_DYNAMODB_ENDPOINT;
+if(!endpoint || !/^http:\/\/(127\.0\.0\.1|localhost):\d+\/?$/.test(endpoint))throw Error('An explicit loopback DynamoDB test endpoint is required.');
+test('actual DynamoDB upload/asset transaction and independent queue acknowledgement recover without duplication',async()=>{
+ const client=new DynamoDBClient({endpoint,region:'ca-central-1',maxAttempts:1,credentials:{accessKeyId:'DUMMYLOCALTEST',secretAccessKey:'DUMMYLOCALTEST'}}),document=DynamoDBDocumentClient.from(client);
+ const table='upload-test-'+randomUUID(),directory=await mkdtemp(join(tmpdir(),'upload-dynamodb-'));
+ let created=false,local;
+ try{
+  await client.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:'pk',AttributeType:'S'},{AttributeName:'sk',AttributeType:'S'},{AttributeName:'repository',AttributeType:'S'},{AttributeName:'id',AttributeType:'S'}],GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
+  const configuration={tableName:table,cellId:'cell'},repositories=createDynamoRepositories(document,configuration);
+  const creator=await repositories.creators.create({id:'intake-creator',instanceId:'instance',handle:'intake',displayName:'Intake Creator',homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1});
+  const draftResults=await Promise.all([createIntakeWork(repositories,creator,'operator','One draft','same-draft'),createIntakeWork(repositories,creator,'operator','One draft','same-draft')]);
+  assert.equal(draftResults[0].id,draftResults[1].id);
+  await assert.rejects(createIntakeWork(repositories,creator,'operator','Changed title','same-draft'),error=>error.status===409);
+  let notifications=0,loseQueueReply=true;
+  const jobs=new AwsJobQueue(document,configuration,{async send(){notifications++;return {}; }},'http://localhost/unused-notification-fixture');
+  const enqueue=jobs.enqueue.bind(jobs);
+  jobs.enqueue=async input=>{
+   const persisted=(await document.send(new GetCommand({TableName:table,Key:{pk:'assets#'+input.payload.assetId,sk:'record'},ConsistentRead:true}))).Item;
+   assert.ok(persisted,'asset transaction must already be committed before queue dispatch');
+   const result=await enqueue(input);if(loseQueueReply){loseQueueReply=false;throw Error('Lost queue acknowledgement after durable enqueue');}return result;
+  };
+  local=createLocalAdapterSet({databasePath:join(directory,'provider.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
+  const settled=new Map(),closed=new Map();let loseClosureReply=true;
+  const quota={async checkAndReserveQuota(){return {allowed:true};},async recordUsageSettlement(input){
+    if(settled.has(input.idempotencyKey))assert.deepEqual(settled.get(input.idempotencyKey),input);
+    settled.set(input.idempotencyKey,input);
+  },async closeStorageReservation(input){
+    const rows=(await document.send(new ScanCommand({TableName:table}))).Items;
+    const committed=rows.find(row=>row.value?.namespace==='runtime-upload' && row.value.value?.accounting?.key===input.idempotencyKey);
+    assert.equal(committed?.value.value.phase,'sealed','the closure journal must commit before quota release');
+    assert.equal(committed.value.value.seal.proofId,input.proofId);
+    const intent=rows.find(row=>row.value?.namespace==='runtime-storage-closure' && row.value.key===input.idempotencyKey);
+    assert.ok(intent,'the closure outbox must have its own durable record');
+    if(closed.has(input.idempotencyKey))assert.deepEqual(closed.get(input.idempotencyKey),input);
+    closed.set(input.idempotencyKey,input);
+    if(loseClosureReply){loseClosureReply=false;throw Error('Lost closure acknowledgement');}
+  }};
+  const journal=()=>{const repo=createDynamoRepositories(document,configuration);return new UploadLifecycle(repo,local.storage,jobs,'instance','cell','http://localhost',{quota,usageOutbox:new UsageSettlementOutbox(repo,quota,'instance','cell'),closureOutbox:new StorageClosureOutbox(repo,quota,'instance','cell')});};
+  const work=await repositories.works.create({id:'work',creatorId:'creator',instanceId:'instance',title:'Synthetic Work',status:'draft',homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1});
+  const body=Buffer.from('Synthetic original body'),checksum=createHash('sha256').update(body).digest('hex');
+  const upload=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'same-file');
+  await journal().accept(upload.uploadId,'creator',body);
+  const first=await journal().complete(upload.uploadId,work,'operator',{checksum,byteLength:body.length});
+  assert.equal(first.queuePending,true);assert.equal(first.job,null);
+  await journal().repair();
+  const repeated=await Promise.all([journal().complete(upload.uploadId,work,'operator',{checksum,byteLength:body.length}),journal().complete(upload.uploadId,work,'operator',{checksum,byteLength:body.length})]);
+  assert.equal(repeated.every(r=>r.asset.id===first.asset.id && !r.queuePending),true);assert.equal(repeated[0].job.id,repeated[1].job.id);assert.equal(notifications,1);
+  const items=(await document.send(new ScanCommand({TableName:table}))).Items;
+  for(const repository of ['assets','moderationEvidence','auditEvents','durableJobs'])assert.equal(items.filter(i=>i.repository===repository).length,1,repository+' must commit once');
+  // Concurrent first completions also contend on the same journal/asset write set.
+  const secondUpload=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'concurrent-file');await journal().accept(secondUpload.uploadId,'creator',body);
+  const concurrent=await Promise.all([journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length}),journal().complete(secondUpload.uploadId,work,'operator',{checksum,byteLength:body.length})]);
+  assert.equal(concurrent[0].asset.id,concurrent[1].asset.id);assert.equal(concurrent[0].job.id,concurrent[1].job.id);
+  assert.equal(settled.size,2);assert.equal([...settled.values()].every(input=>input.storageBytesDelta===body.length && input.observedAt),true);
+  const unused=await journal().initiate(work,'operator',{mimeType:'text/plain',byteLength:body.length,checksum},'unused-file');
+  const row=(await repositories.hostRecords.list({limit:100})).items.find(row=>row.namespace==='runtime-upload' && row.value.uploadId===unused.uploadId);
+  await repositories.hostRecords.update(row.id,row.revision,{value:{...row.value,expiresAt:'2000-01-01T00:00:00.000Z'}});
+  await journal().repair();await journal().repair();
+  const sealed=await repositories.hostRecords.get(row.id);assert.equal(sealed.value.phase,'sealed');assert.equal(closed.size,1);
+  const intent=await repositories.hostRecords.get(sealed.value.closureIntentId);assert.equal(intent.namespace,'runtime-storage-closure');assert.equal(intent.value.state,'closed');
+  await assert.rejects(journal().accept(unused.uploadId,'creator',body),error=>error.code==='upload_closed');
+  console.log('Verified actual DynamoDB atomic Work/asset/evidence/audit/upload/usage receipts, unordered maps, concurrent completion, lost queue acknowledgement, and physical closure/outbox commit before replayable quota release.');
+ }finally{
+  if(local)local.database.close();await rm(directory,{recursive:true,force:true});if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();
+ }
+});
+
+test('actual DynamoDB job pagination finds later work and retains request traces through fenced retries',async()=>{
+ const client=new DynamoDBClient({endpoint,region:'ca-central-1',maxAttempts:1,credentials:{accessKeyId:'DUMMYLOCALTEST',secretAccessKey:'DUMMYLOCALTEST'}}),document=DynamoDBDocumentClient.from(client);
+ const table='queue-test-'+randomUUID();let created=false;
+ try{
+  await client.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:'pk',AttributeType:'S'},{AttributeName:'sk',AttributeType:'S'},{AttributeName:'repository',AttributeType:'S'},{AttributeName:'id',AttributeType:'S'}],GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
+  const configuration={tableName:table,cellId:'queue-cell'},records=new DynamoRevisionedRepository(document,configuration,'durableJobs');
+  for(let i=0;i<250;i++)await records.create({id:'a-history-'+String(i).padStart(3,'0'),cellId:'queue-cell',type:'work',payload:{},idempotencyKey:'history-'+i,state:'completed',attempt:1,maxAttempts:3,availableAt:new Date(0).toISOString()});
+  const queue=new AwsJobQueue(document,configuration,{async send(){return {}; }},'http://localhost/unused-notification-fixture');
+  const job=await queue.enqueue({cellId:'queue-cell',type:'work',payload:{},idempotencyKey:'trace-after-history',correlationId:'originating-request',maxAttempts:3});
+  assert.deepEqual((await queue.list({cellId:'queue-cell',states:['queued'],limit:1})).map(j=>j.id),[job.id]);
+  assert.equal((await queue.list({cellId:'queue-cell',states:[],limit:251})).length,251);
+  const first=await queue.lease({cellId:'queue-cell',types:['work'],workerId:'first',leaseDurationSeconds:60});
+  assert.ok(first);assert.equal(first.job.id,job.id);assert.equal(first.job.correlationId,'originating-request');
+  await queue.retry({id:job.id,leaseToken:first.leaseToken,error:{code:'test',message:'synthetic retry'},retryAt:new Date(0).toISOString()});
+  const second=await queue.lease({cellId:'queue-cell',types:['work'],workerId:'second',leaseDurationSeconds:60});
+  assert.ok(second);assert.notEqual(second.leaseToken,first.leaseToken);assert.equal(second.job.correlationId,'originating-request');
+  await assert.rejects(queue.complete({id:job.id,leaseToken:first.leaseToken}),/does not hold/);
+  const raw=await records.get(job.id);assert.equal(raw.correlationId,'second:'+second.leaseToken);
+  // Simulate an older writer retaining its existing lease protocol during a rolling upgrade.
+  await records.update(job.id,raw.revision,{correlationId:'legacy:legacy-token'});
+  await assert.rejects(queue.complete({id:job.id,leaseToken:second.leaseToken}),/does not hold/);
+  await queue.complete({id:job.id,leaseToken:'legacy-token'});
+  assert.equal((await queue.get(job.id)).state,'completed');assert.equal((await queue.get(job.id)).correlationId,'originating-request');
+  console.log('Verified actual DynamoDB later-page leasing/listing, request correlation, retry fencing and legacy lease acknowledgement.');
+ }finally{
+  if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();
+ }
+});
+
+test('actual DynamoDB owned output receipts and usage survive rollback, unordered maps and late grants',async()=>{
+ const client=new DynamoDBClient({endpoint,region:'ca-central-1',maxAttempts:1,credentials:{accessKeyId:'DUMMYLOCALTEST',secretAccessKey:'DUMMYLOCALTEST'}}),document=DynamoDBDocumentClient.from(client);
+ const table='owned-output-'+randomUUID(),directory=await mkdtemp(join(tmpdir(),'owned-output-dynamo-'));let created=false,local;
+ try{
+  await client.send(new CreateTableCommand({TableName:table,BillingMode:'PAY_PER_REQUEST',KeySchema:[{AttributeName:'pk',KeyType:'HASH'},{AttributeName:'sk',KeyType:'RANGE'}],AttributeDefinitions:[{AttributeName:'pk',AttributeType:'S'},{AttributeName:'sk',AttributeType:'S'},{AttributeName:'repository',AttributeType:'S'},{AttributeName:'id',AttributeType:'S'}],GlobalSecondaryIndexes:[{IndexName:'repository-id-index',KeySchema:[{AttributeName:'repository',KeyType:'HASH'},{AttributeName:'id',KeyType:'RANGE'}],Projection:{ProjectionType:'ALL'}}]}));created=true;
+  const config={tableName:table,cellId:'cell'},repositories=createDynamoRepositories(document,config),settled=new Map(),closed=new Map();let lostSettlement=true,lostClosure=true;
+  const quota={async checkAndReserveQuota(input){return {allowed:!closed.has(input.idempotencyKey),reasonCode:'RESERVATION_CLOSED'};},async recordUsageSettlement(input){
+   const rows=(await document.send(new ScanCommand({TableName:table}))).Items,journal=rows.find(row=>row.value?.namespace==='runtime-owned-object' && 'physical-object:'+row.value.id===input.idempotencyKey);
+   assert.equal(journal.value.value.phase,'completed');const intent=rows.find(row=>row.value?.id===journal.value.value.usageIntentId);assert.equal(intent.value.namespace,'runtime-usage-settlement');assert.notEqual(intent.value.id,journal.value.id);
+   if(settled.has(input.idempotencyKey))assert.deepEqual(settled.get(input.idempotencyKey),input);settled.set(input.idempotencyKey,input);if(lostSettlement){lostSettlement=false;throw Error('Lost committed usage reply');}
+  },async closeStorageReservation(input){
+   const rows=(await document.send(new ScanCommand({TableName:table}))).Items,journal=rows.find(row=>row.value?.namespace==='runtime-owned-object' && 'physical-object:'+row.value.id===input.idempotencyKey);
+   assert.equal(journal.value.value.phase,'sealed');assert.equal(journal.value.value.seal.proofId,input.proofId);assert.ok(rows.find(row=>row.value?.id===journal.value.value.closureIntentId));
+   if(closed.has(input.idempotencyKey))assert.deepEqual(closed.get(input.idempotencyKey),input);closed.set(input.idempotencyKey,input);if(lostClosure){lostClosure=false;throw Error('Lost committed closure reply');}
+  }};
+  local=createLocalAdapterSet({databasePath:join(directory,'provider.sqlite'),dataDirectory:directory,cellId:'cell',publicBaseUrl:'http://localhost'});
+  const writer=repo=>new OwnedObjectWrites(repo,local.storage,quota,'instance','cell');
+  const input={creatorId:'creator',operation:'asset.rendition',idempotencyKey:'source-v1',home:{homeCellId:'cell',dataHomeRegion:'ca-central-1',dataHomeAssignedAt:new Date().toISOString(),routingRevision:1},bucket:'cell',kind:'renditions',scope:'public',contentType:'text/plain',body:Buffer.from('Synthetic derived output'),metadata:{source:{id:'asset',version:'original'}}};
+  const update=repositories.hostRecords.update.bind(repositories.hostRecords);let fail=true;
+  repositories.hostRecords.update=async(id,revision,patch,options)=>{if(fail&&patch.value?.phase==='completed'){fail=false;throw Error('Receipt commit unavailable');}return update(id,revision,patch,options);};
+  await assert.rejects(()=>writer(repositories).write(input),/Receipt commit unavailable/);assert.equal(settled.size,0);
+  const fresh=()=>writer(createDynamoRepositories(document,config));const recovered=await fresh().recover(input);assert.ok(recovered.object.versionId);await fresh().repair();assert.deepEqual(await fresh().write(input),recovered);assert.equal(settled.size,1);
+  const unused={...input,idempotencyKey:'unused'},accept=local.storage.accept.bind(local.storage);local.storage.accept=async()=>{throw Error('No body sent');};await assert.rejects(()=>fresh().write(unused),/No body sent/);local.storage.accept=accept;
+  assert.equal(await fresh().recover(unused),undefined);await fresh().repair();assert.equal(closed.size,1);const replacement=await fresh().write(unused);assert.ok(replacement.object.versionId);assert.equal(settled.size,2);
+  let enter,release;const entered=new Promise(resolve=>{enter=resolve;}),gate=new Promise(resolve=>{release=resolve;}),reserve=quota.checkAndReserveQuota.bind(quota);
+  quota.checkAndReserveQuota=async input=>{enter();await gate;return reserve(input);};
+  const late={...input,idempotencyKey:'late-reserve'},pending=fresh().write(late);await entered;assert.equal(await fresh().recover(late),undefined);release();await assert.rejects(()=>pending,/RESERVATION_CLOSED/);assert.equal(closed.size,2);
+  const rows=(await document.send(new ScanCommand({TableName:table}))).Items;assert.equal(rows.filter(row=>row.repository==='assets').length,0);assert.equal(rows.filter(row=>row.value?.namespace==='runtime-owned-object'&&row.value.value.phase==='completed').length,2);
+  console.log('Verified actual DynamoDB physical output/outbox atomicity before callbacks, rollback and lost-reply recovery, empty-generation fencing and late-grant denial.');
+ }finally{if(local)local.database.close();await rm(directory,{recursive:true,force:true});if(created)await client.send(new DeleteTableCommand({TableName:table}));client.destroy();}
+});

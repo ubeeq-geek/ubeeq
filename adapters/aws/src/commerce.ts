@@ -1,3 +1,4 @@
+import type { AwsCommandClient } from './client-port.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {createCipheriv,createDecipheriv,createHash,randomBytes,randomUUID} from 'node:crypto';
 import {GetCommand,PutCommand,DeleteCommand,QueryCommand,UpdateCommand,TransactWriteCommand,type DynamoDBDocumentClient} from '@aws-sdk/lib-dynamodb';
@@ -16,7 +17,7 @@ export class DynamoCommerceStore implements PayPalConnectionStore {
  private readonly context=new AsyncLocalStorage<{key:string;token:string;valid:boolean}>();
  private readonly encryptionKey:Buffer;
  private readonly pk:string;private readonly p:string;private readonly s:string;
- constructor(readonly deploymentId:string,private readonly client:Pick<DynamoDBDocumentClient,'send'>,private readonly tableName:string,key:string,keys:{partition?:string;sort?:string}={}){
+ constructor(readonly deploymentId:string,private readonly client:AwsCommandClient,private readonly tableName:string,key:string,keys:{partition?:string;sort?:string}={}){
   if(!deploymentId||!tableName||key.length<32)throw new CommerceError('commerce_storage_configuration_required');
   this.encryptionKey=createHash('sha256').update('commerce-state:'+key).digest();this.pk='COMMERCE#'+deploymentId;this.p=keys.partition??'pk';this.s=keys.sort??'sk';
  }

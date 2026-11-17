@@ -118,6 +118,35 @@ const harness=async(options={})=>{
   for(const doc of snapshot.documents)await service.saveDocument(actor,doc,0);await service.save(actor,snapshot.website,0);
   return {service,store,snapshot,actor,events,queued,setActive:v=>active=v,setAllowed:v=>allowed=v,setEligible:v=>eligible=v};
 };
+test('identity authority receives the exact website for save, publication, build and candidate access',async t=>{
+  const snapshot=fixture(),store=new SqliteWebsiteStore(':memory:');t.after(()=>store.close());
+  const actor={actorId:'actual-unit-actor',workspaceId:snapshot.website.workspaceId};
+  snapshot.website.contributingCreatorIds=['contributor'];
+  let allowed=true;const identities=[];
+  const service=new WebsiteService({
+    store,membership:async()=>({workspaceId:actor.workspaceId,userId:actor.actorId,role:'owner',status:'active'}),
+    creatorIdentityAllowed:async(current,id,websiteId)=>{assert.deepEqual(current,actor);identities.push({id,websiteId});return allowed&&websiteId===snapshot.website.id;},
+    capabilities:async()=>({apiVersion:'1',export:true,...limits,deploymentAdapters:[]}),
+    resolveSnapshot:async(_actor,website)=>({...structuredClone(snapshot),website}),
+    evaluateRelease:async()=>({decision:'allow',revision:'unit-policy',reasons:[]}),
+    dependenciesEligible:async()=>true,enqueue:async()=>{},audit:async()=>{},
+  });
+  for(const doc of snapshot.documents)await service.saveDocument(actor,doc,0);
+  await service.save(actor,snapshot.website,0);
+  await service.capturePublication(actor,snapshot.website.id,1);
+  const build=await service.requestBuild(actor,snapshot.website.id,1,'exact-site');
+  assert.equal((await service.execute(actor.workspaceId,build.id)).state,'ready');
+  await service.preview(actor,build.id,'index.html');
+  await service.previewArchive(actor,build.id);
+  await service.export(actor,build.id);
+  assert.ok(identities.some(row=>row.id==='contributor'));
+  assert.ok(identities.every(row=>row.websiteId===snapshot.website.id));
+  await assert.rejects(service.authorizePublication(actor,'ungranted-site',snapshot.website.creatorIdentityId,[]),{code:'foreign_reference'});
+  allowed=false;
+  await assert.rejects(service.preview(actor,build.id,'index.html'),{code:'foreign_reference'});
+  await assert.rejects(service.capturePublication(actor,snapshot.website.id,1),{code:'foreign_reference'});
+});
+
 test('durable build/export lifecycle reauthorizes queued work and immutable candidate downloads',async t=>{
   const h=await harness();t.after(()=>h.store.close());
   const {service,actor,store,snapshot}=h;

@@ -5,7 +5,7 @@
 import { CognitoIdentityProviderClient } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DeleteCommand, DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { S3Client } from "@aws-sdk/client-s3";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { verifyIdentityAdapterContract } from "@ubeeq/auth";
@@ -23,8 +23,15 @@ if (missing.length) {
   const region = process.env.UBEEQ_AWS_REGION;
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
   const repositoryConfiguration = { tableName: process.env.UBEEQ_AWS_RECORDS_TABLE };
-  const key = `aws-live-contract-${Date.now()}`;
-  const jobId = `job-${createHash("sha256").update(key).digest("hex").slice(0, 32)}`;
+  const key = `aws-live-contract-${randomUUID()}`;
+  const queueCellId = key;
+  const foreignQueueCellId = `${key}-foreign`;
+  const jobIds = [
+    [queueCellId, key],
+    [foreignQueueCellId, key],
+    [queueCellId, `${key}:cancelled`],
+    [queueCellId, `${key}:budget`],
+  ].map(([cellId, idempotencyKey]) => `job-${createHash("sha256").update(`${cellId}:${idempotencyKey}`).digest("hex").slice(0, 32)}`);
   const directCellId = key;
   const directCreatorId = `creator-${Date.now()}`;
   const directBody = new TextEncoder().encode("ubeeq-direct-upload-contract");
@@ -37,11 +44,11 @@ if (missing.length) {
     await verifyObjectStorageContract(new S3ObjectStorage(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET, undefined, `cells/${key}`));
     const direct = new S3DirectUploadAdapter(new S3Client({ region }), process.env.UBEEQ_AWS_OBJECT_BUCKET);
     const initiated = await direct.initiate({ object: directObject, checksumAlgorithm: "sha256", expiresAt: new Date(Date.now() + 60_000).toISOString() });
-    const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: { "content-type": directObject.contentType, "x-amz-checksum-sha256": Buffer.from(directChecksum, "hex").toString("base64"), "x-amz-meta-checksum": directChecksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(directBody.byteLength) }, body: directBody });
+    const put = await fetch(initiated.parts[0].url, { method: "PUT", headers: initiated.parts[0].headers, body: directBody });
     if (!put.ok) throw new Error(`Direct S3 upload failed with ${put.status}: ${await put.text()}`);
     directCompleted = await direct.complete({ uploadId: initiated.uploadId, cellId: directCellId, creatorId: directCreatorId, checksum: directChecksum, byteLength: directBody.byteLength });
     if (!directCompleted.versionId) throw new Error("Direct S3 upload did not return an immutable version.");
-    await verifyJobQueueContract(new AwsJobQueue(dynamo, repositoryConfiguration, new SQSClient({ region }), process.env.UBEEQ_AWS_JOBS_QUEUE_URL), key);
+    await verifyJobQueueContract(new AwsJobQueue(dynamo, repositoryConfiguration, new SQSClient({ region }), process.env.UBEEQ_AWS_JOBS_QUEUE_URL), key, { cellId: queueCellId, foreignCellId: foreignQueueCellId });
     const identity = new CognitoIdentity(new CognitoIdentityProviderClient({ region }), process.env.UBEEQ_AWS_USER_POOL_ID, process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID);
     const authenticated = await identity.authenticate({ username: process.env.UBEEQ_AWS_TEST_USERNAME, password: process.env.UBEEQ_AWS_TEST_PASSWORD });
     const session = await identity.verifySession({ credential: authenticated.token });
@@ -50,6 +57,6 @@ if (missing.length) {
     console.log("AWS repository, storage, job, and identity conformance passed.");
   } finally {
     await directStorage.remove(directCompleted ?? directObject).catch(() => undefined);
-    await dynamo.send(new DeleteCommand({ TableName: repositoryConfiguration.tableName, Key: { pk: `durableJobs#${jobId}`, sk: "record" } })).catch(() => undefined);
+    for (const jobId of jobIds) await dynamo.send(new DeleteCommand({ TableName: repositoryConfiguration.tableName, Key: { pk: `durableJobs#${jobId}`, sk: "record" } })).catch(() => undefined);
   }
 }

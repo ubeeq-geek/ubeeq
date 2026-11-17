@@ -1,0 +1,195 @@
+{
+  "license": "MIT",
+  "name": "@ubeeq/runtime",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./commerce": {
+      "types": "./dist/commerce.d.ts",
+      "default": "./dist/commerce.js"
+    },
+    "./commerce-page": {
+      "types": "./dist/commerce-page.d.ts",
+      "default": "./dist/commerce-page.js"
+    },
+    "./website-hosting": {
+      "types": "./dist/website-hosting.d.ts",
+      "default": "./dist/website-hosting.js"
+    },
+    "./websites": {
+      "types": "./dist/websites.d.ts",
+      "default": "./dist/websites.js"
+    },
+    "./website-sources": {
+      "types": "./dist/website-sources.d.ts",
+      "default": "./dist/website-sources.js"
+    },
+    "./website-hosting-connections": {
+      "types": "./dist/website-hosting-connections.d.ts",
+      "default": "./dist/website-hosting-connections.js"
+    },
+    "./owned-object-writes": {
+      "types": "./dist/owned-object-writes.d.ts",
+      "default": "./dist/owned-object-writes.js"
+    },
+    "./processed-outputs": {
+      "types": "./dist/processed-outputs.d.ts",
+      "default": "./dist/processed-outputs.js"
+    },
+    "./owned-website-blobs": {
+      "types": "./dist/owned-website-blobs.d.ts",
+      "default": "./dist/owned-website-blobs.js"
+    },
+    "./creator-collections": {
+      "types": "./dist/creator-collections.d.ts",
+      "default": "./dist/creator-collections.js"
+    },
+    "./content-preparations": {
+      "types": "./dist/content-preparations.d.ts",
+      "default": "./dist/content-preparations.js"
+    },
+    "./preparation-records": {
+      "types": "./dist/preparation-records.d.ts",
+      "default": "./dist/preparation-records.js"
+    },
+    "./content-preparation-http": {
+      "types": "./dist/content-preparation-http.d.ts",
+      "default": "./dist/content-preparation-http.js"
+    },
+    "./content-preparation-node": {
+      "types": "./dist/content-preparation-node.d.ts",
+      "default": "./dist/content-preparation-node.js"
+    },
+    "./content-representations": {
+      "types": "./dist/content-representations.d.ts",
+      "default": "./dist/content-representations.js"
+    },
+    "./content-releases": {
+      "types": "./dist/content-releases.d.ts",
+      "default": "./dist/content-releases.js"
+    },
+    "./retained-preparation-host": {
+      "types": "./dist/retained-preparation-host.d.ts",
+      "default": "./dist/retained-preparation-host.js"
+    },
+    "./content-worker": {
+      "types": "./dist/content-worker.d.ts",
+      "default": "./dist/content-worker.js"
+    },
+    "./retained-repository-store": {
+      "types": "./dist/retained-repository-store.d.ts",
+      "default": "./dist/retained-repository-store.js"
+    },
+    "./retained-source-files": {
+      "types": "./dist/retained-source-files.d.ts",
+      "default": "./dist/retained-source-files.js"
+    },
+    "./source-file-uploads": {
+      "types": "./dist/source-file-uploads.d.ts",
+      "default": "./dist/source-file-uploads.js"
+    },
+    "./retained-source-http": {
+      "types": "./dist/retained-source-http.d.ts",
+      "default": "./dist/retained-source-http.js"
+    },
+    "./creator-intake": {
+      "types": "./dist/creator-intake.d.ts",
+      "default": "./dist/creator-intake.js"
+    },
+    "./usage-settlement-outbox": {
+      "types": "./dist/usage-settlement-outbox.d.ts",
+      "default": "./dist/usage-settlement-outbox.js"
+    },
+    "./retained-value-codec": {
+      "types": "./dist/retained-value-codec.d.ts",
+      "default": "./dist/retained-value-codec.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@ubeeq/adapter-local": "^0.1.0",
+    "@ubeeq/auth": "^0.1.0",
+    "@ubeeq/api": "^0.1.0",
+    "@ubeeq/extension-sdk": "^0.1.0",
+    "@ubeeq/deployment-platform": "^0.1.0",
+    "@ubeeq/moderation": "^0.1.0",
+    "@ubeeq/federation": "^0.1.0",
+    "@ubeeq/portability": "^0.1.0",
+    "@ubeeq/processing": "^0.1.0",
+    "@ubeeq/persistence": "^0.1.0",
+    "@ubeeq/core": "^0.1.0",
+    "@ubeeq/commerce-runtime": "^0.1.0",
+    "@ubeeq/integrations": "^0.1.0",
+    "@ubeeq/jobs": "^0.1.0",
+    "@ubeeq/media-sharp": "^0.1.0",
+    "@ubeeq/storage": "^0.1.0",
+    "sharp": "^0.35.5"
+  },
+  "typesVersions": {
+    "*": {
+      "processed-outputs": [
+        "dist/processed-outputs.d.ts"
+      ],
+      "content-preparations": [
+        "dist/content-preparations.d.ts"
+      ],
+      "preparation-records": [
+        "dist/preparation-records.d.ts"
+      ],
+      "content-preparation-http": [
+        "dist/content-preparation-http.d.ts"
+      ],
+      "content-preparation-node": [
+        "dist/content-preparation-node.d.ts"
+      ],
+      "content-representations": [
+        "dist/content-representations.d.ts"
+      ],
+      "content-releases": [
+        "dist/content-releases.d.ts"
+      ],
+      "retained-preparation-host": [
+        "dist/retained-preparation-host.d.ts"
+      ],
+      "content-worker": [
+        "dist/content-worker.d.ts"
+      ],
+      "retained-repository-store": [
+        "dist/retained-repository-store.d.ts"
+      ],
+      "retained-source-files": [
+        "dist/retained-source-files.d.ts"
+      ],
+      "source-file-uploads": [
+        "dist/source-file-uploads.d.ts"
+      ],
+      "retained-source-http": [
+        "dist/retained-source-http.d.ts"
+      ],
+      "creator-intake": [
+        "dist/creator-intake.d.ts"
+      ],
+      "usage-settlement-outbox": [
+        "dist/usage-settlement-outbox.d.ts"
+      ],
+      "retained-value-codec": [
+        "dist/retained-value-codec.d.ts"
+      ]
+    }
+  }
+}

@@ -52,6 +52,10 @@ export interface CommerceRuntimeDependencies {
   deploymentId: string; cellId: string; publicBaseUrl: string; dataDirectory: string; vault: CredentialVault; storage: ObjectStorage;
   subject(request: IncomingMessage): Promise<string>;
   customerSubject?(request:IncomingMessage):Promise<string>;
+  /** When configured, this actual current account authority exclusively resolves
+   * Commerce credentials. Its denial must never fall back to old session-only
+   * verification that omits current identity/profile/scope checks. */
+  customerCredential?(credential:string):Promise<string|undefined>;
   creator(subjectId: string, ownerId?:string): Promise<{ id: string; homeCellId: string }>;
   publicOfferCollection?(offer:Pick<Offer,'id'|'ownerId'|'collectionRoots'|'benefits'|'description'|'published'>):Promise<{title:string;type?:string;description?:string;coverUrl?:string;coverAlt?:string}|undefined>;
   publicCreator?(ownerId:string):Promise<{displayName:string;handle?:string;bio?:string}|undefined>;
@@ -93,6 +97,12 @@ const environment = (value: unknown): Environment => { if (value !== 'sandbox' &
 const required = (value: unknown): string => { if (typeof value !== 'string' || !value || value.length > 10000) throw new CommerceError('invalid_request'); return value; };
 const send = (response: ServerResponse, value: unknown, status = 200) => { response.statusCode = status; response.setHeader('content-type', 'application/json; charset=utf-8'); response.end(JSON.stringify(value)); };
 
+/** The actual shared route ownership predicate, reused by product transports
+ * before any parser. It does not authenticate or advertise provider readiness. */
+export function isCommerceRuntimePath(path:string):boolean{
+ if(path.startsWith('/api/')&&!/^\/api\/(?:webhooks\/paypal\/|private-assets\/|previews\/|storefront$|auth\/email(?:\/|$)|me(?:$|\/(?:purchases$|purchase-claims\/|subscriptions\/|access$|gallery$|email(?:\/|$)|discord\/))|downloads\/|checkouts(?:$|\/)|connections\/paypal$|commerce\/|offers(?:$|\/)|discord\/)/.test(path))return false;
+ return path==='/commerce'||path.startsWith('/commerce/')||path.startsWith('/buy/')||path.startsWith('/api/');
+}
 export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps: CommerceRuntimeDependencies) {
   if (!Number.isSafeInteger(config.financialRetentionDays) || config.financialRetentionDays <= 0) throw new CommerceError('financial_retention_policy_required');
   const baseUrl = config.publicBaseUrl ?? deps.publicBaseUrl;
@@ -184,8 +194,7 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
   };
   const handle = async (request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean> => {
     const path = url.pathname, method = request.method ?? 'GET';
-    if(path.startsWith('/api/')&&!/^\/api\/(?:webhooks\/paypal\/|private-assets\/|previews\/|storefront$|auth\/email(?:\/|$)|me(?:$|\/(?:purchases$|purchase-claims\/|subscriptions\/|access$|gallery$|email(?:\/|$)|discord\/))|downloads\/|checkouts(?:$|\/)|connections\/paypal$|commerce\/|offers(?:$|\/)|discord\/)/.test(path))return false;
-    if (!(path === '/commerce' || path.startsWith('/commerce/') || path.startsWith('/buy/') || path.startsWith('/api/'))) return false;
+    if(!isCommerceRuntimePath(path))return false;
     const correlationId=randomUUID();response.setHeader('x-request-id',correlationId);
     response.setHeader('cache-control', 'private, no-store'); response.setHeader('x-content-type-options', 'nosniff'); response.setHeader('referrer-policy', 'no-referrer');
     const origin = request.headers.origin;
@@ -223,8 +232,13 @@ export function createCommerceRuntime(config: CommerceRuntimeConfiguration, deps
       if (path === '/api/auth/email/context' && method === 'POST') { const b = await parseBody(request); send(response, await service.emailLoginContext(required(b.id),required(b.token))); return true; }
       if (path === '/api/auth/email/redeem' && method === 'POST') { const b = await parseBody(request); send(response, await service.redeemEmailLogin(required(b.id), required(b.token))); return true; }
       let subjectId: string;
-      try { subjectId = await (deps.customerSubject??deps.subject)(request); }
-      catch (error) { const resolved = await service.customerSubject(request.headers.authorization?.replace(/^Bearer\s+/i,'') ?? ''); if (!resolved) throw error; subjectId = resolved; }
+      const credential=request.headers.authorization?.replace(/^Bearer\s+/i,'')??'';
+      if(deps.customerCredential&&/^[^.\s]+\.[^.\s]+$/.test(credential)){
+        const resolved=await deps.customerCredential(credential);if(!resolved)throw new CommerceError('authentication_required',401);subjectId=resolved;
+      }else{
+        try { subjectId = await (deps.customerSubject??deps.subject)(request); }
+        catch (error) { if(deps.customerCredential)throw error;const resolved=await service.customerSubject(credential);if(!resolved)throw error;subjectId=resolved; }
+      }
       // A customer magic-link session carries no creator management authority, even for the same email/subject.
       const actor = async (): Promise<CreatorActor> => { const managementSubject = await deps.subject(request); return { subjectId: managementSubject, ownerId: (await deps.creator(managementSubject,url.searchParams.get('owner')??undefined)).id }; };
       if (path === '/api/me' && method === 'GET') { send(response, await service.customerProfile(subjectId)); return true; }
