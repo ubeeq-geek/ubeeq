@@ -564,8 +564,14 @@ test('an unmarked decoder error with the same scope-message text never starts re
 test('a genuine Owned factual-policy snapshot collision preserves the retired body error without physical reprepare',{timeout:15_000},async t=>{
  const {OptimisticConcurrencyError}=await import('@ubeeq/persistence');
  const r=await retiredObservationRace(t),policy=r.f.quota.checkCurrentPolicy.bind(r.f.quota);
- let armed=false,collisions=0,policyError;
+ const oldPolicyEntered=retiredDeferred(),releaseOldPolicy=retiredDeferred();
+ let armed=false,collisions=0,policyError,holdOldPolicy=false;
  t.mock.method(r.f.quota,'checkCurrentPolicy',async input=>{
+  if(holdOldPolicy&&r.error&&input.operation==='upload.original'){
+   holdOldPolicy=false;
+   assert.equal(r.f.store.transaction(),undefined,'Pause the old observation before its fresh policy decision and outside an accepting Raw.');
+   oldPolicyEntered.resolve();await releaseOldPolicy.promise;
+  }
   const actual=await policy(input);
   if(r.error&&input.operation==='asset.rendition'&&!armed){
    armed=true;assert.equal(actual.allowed,true,'Keep the actual financial policy allowed; only its read guard races.');
@@ -596,11 +602,17 @@ test('a genuine Owned factual-policy snapshot collision preserves the retired bo
   assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);
   const actor=await retiredRepositoryRead(r.f.local.repositories,transaction=>r.f.local.repositories.hostRecords.get(actorRecord.id,{transaction}));
   assert.equal(actor.value.active,true);assert.equal(actor.value.actualOwnedPolicyReadRace,1);
-  r.releaseNext();const old=await r.oldCall,next=await r.nextCall;await assertRetiredWinner(r,old,next);
+  // Both adapters remain genuine and independent. Only metadata admission is
+  // scheduled here: a synchronous second SQLite BEGIN cannot wait on the same
+  // event loop that must finish the old observer's accepting transaction.
+  holdOldPolicy=true;
+  await retiredBefore(oldPolicyEntered,r.oldCall,'The old observer did not reach its actual outside-SQL policy boundary.');
+  assert.equal(r.settled,false);r.releaseNext();const next=await r.nextCall;
+  releaseOldPolicy.resolve();const old=await r.oldCall;await assertRetiredWinner(r,old,next);
   assert.equal(collisions,1);assert.equal(r.prepares.old,1);assert.equal(r.prepares.next,1);
   r.restoreOldAccept();const replay=await r.f.complete();assert.deepEqual(replay.object,old.value.object);
   assert.equal((await r.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
   assert.equal([...r.f.quota.settlements.values()].filter(row=>row.operation==='upload.original').length,1);
   t.diagnostic(JSON.stringify({actualPolicyGuardError:policyError.name,actualOldBodyError:r.error.message,guardCollisions:collisions,oldPreparations:r.prepares.old,independentPreparations:r.prepares.next,completionAudits:1,originalCharges:1}));
- }finally{await r.cleanup();}
+ }finally{releaseOldPolicy.resolve();await r.cleanup();}
 });
