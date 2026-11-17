@@ -1,3 +1,4 @@
+import {publishReferenceWhenReady} from './reference-publication-retry.mjs';
 import {readReferenceOperator,releaseCreatedReferenceOperator} from './owned-reference-operator.mjs';
 /** Opt-in AWS example flow: Cognito bearer auth -> API Gateway -> direct S3 -> SQS worker -> publication -> delivery. */
 import { createHash, randomUUID } from "node:crypto";
@@ -19,8 +20,8 @@ if (missing.length) {
   const s3 = new S3Client({ region });
   const created = new Set(); let object, operatorFixture;
   const instanceId=process.env.UBEEQ_AWS_INSTANCE_ID ?? "aws-reference";
-  const call = async (path, { method = "GET", token, body } = {}) => {
-    const response = await fetch(`${apiUrl}${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  const call = async (path, { method = "GET", token, body, headers = {} } = {}) => {
+    const response = await fetch(`${apiUrl}${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = response.status === 204 ? undefined : await response.json();
     return { response, value };
   };
@@ -53,14 +54,8 @@ if (missing.length) {
     const completed = await call(`/v1/uploads/${upload.value.upload.uploadId}/complete`, { method: "POST", token, body: { workId: work.value.work.id, checksum, byteLength: bytes.byteLength } });
     if (completed.response.status !== 202) throw new Error(`Upload completion failed: ${JSON.stringify(completed.value)}`);
     created.add(completed.value.asset.id); created.add(completed.value.job.id); object = completed.value.asset.storage;
-    let published;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const result = await call(`/v1/works/${work.value.work.id}/publications`, { method: "POST", token, body: { destination: "reference" } });
-      if (result.response.status === 201) { published = result.value; created.add(published.intent.id); created.add(published.publication.id); break; }
-      if (result.value?.error?.code !== "processing_incomplete") throw new Error(`Publication failed: ${JSON.stringify(result.value)}`);
-      await new Promise((resolve) => setTimeout(resolve, 2_000));
-    }
-    if (!published) throw new Error("SQS worker did not process the uploaded asset before the deadline.");
+    const published=await publishReferenceWhenReady((path,options)=>call(path,{...options,token}),{workId:work.value.work.id,idempotencyKey:marker+'-publication'});
+    created.add(published.intent.id);created.add(published.publication.id);
     const publicWork = await call(`/v1/public/works/${work.value.work.id}`);
     if (publicWork.response.status !== 200 || !publicWork.value.assets?.[0]?.delivery?.url) throw new Error(`Public work or delivery grant failed: ${JSON.stringify(publicWork.value)}`);
     const delivery = await fetch(publicWork.value.assets[0].delivery.url);
