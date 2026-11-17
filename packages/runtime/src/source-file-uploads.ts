@@ -1,5 +1,5 @@
 import {createHash} from 'node:crypto';
-import {withRepositoryRead,repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
+import {OptimisticConcurrencyError,UniqueConstraintError,withRepositoryRead,repositoryItems,type CellOwnedRecord,type HostRecord,type PersistenceTransaction,type RetainedCreatorContentModels,type UbeeqRepositories} from '@ubeeq/persistence';
 import {cellScopedObjectKey,requireCreatorScopedObject,writeBoundedUploadStream,ownedVersionFingerprint,validateOwnedVersionAbsence,type OwnedVersionRemovalAdapter,type OwnedVersionRemovalRequest,type OwnedVersionAbsenceProof,type StoredObject,type UploadAdapter,type UploadContentStreamAdapter,type UploadContentAdapter,type UploadInitiation,type UploadSealResult} from '@ubeeq/storage';
 import type {UsageQuotaPort} from '@ubeeq/extension-sdk';
 import {RepositoryRetainedSourceFiles,SourceFileConflict,type RetainedSourceFile,type SourceFileAudit} from './retained-source-files.js';
@@ -13,6 +13,22 @@ const instant=(value:unknown):value is string=>typeof value==='string'&&Number.i
 const same=(a:unknown,b:unknown)=>ownedEvidenceHash(a)===ownedEvidenceHash(b);
 const conflict=(error:unknown)=>error instanceof SourceFileConflict||error instanceof SourceFileUploadError&&error.code==='upload_source_conflict'||error instanceof Error&&['OptimisticConcurrencyError','UniqueConstraintError','ConditionalCheckFailedException','TransactionCanceledException'].includes(error.name);
 const denied=(error:unknown)=>error instanceof RetainedRepositoryError&&error.code==='access_denied';
+/** Whole-command retry is narrower than the inner finalization reconciliation:
+ * real repository collisions, or an explicitly condition-only Dynamo cancel. */
+const completionRepositoryConflict=(error:unknown):boolean=>{
+  if(error instanceof OptimisticConcurrencyError||error instanceof UniqueConstraintError)return true;
+  if(!(error instanceof Error)||error.name!=='TransactionCanceledException')return false;
+  const reasons:unknown=Object.getOwnPropertyDescriptor(error,'CancellationReasons')?.value;
+  if(!Array.isArray(reasons)||!reasons.length||reasons.length>100)return false;
+  let conditional=false;
+  for(let index=0;index<reasons.length;index++){
+    const reason:unknown=reasons[index];if(!reason||typeof reason!=='object'||Array.isArray(reason))return false;
+    const code:unknown=Object.getOwnPropertyDescriptor(reason,'Code')?.value;
+    if(code==='ConditionalCheckFailed')conditional=true;else if(code!=='None')return false;
+  }
+  return conditional;
+};
+
 /** Server-owned placement for NEW originals. Legacy keys are never rewritten. */
 export function sourceFileOriginalCreatorPrefix(input:{instanceId:string;cellId:string;creatorId:string}):string{
   if(typeof input.instanceId!=='string'||!input.instanceId.trim()||input.instanceId.length>200)throw Error('A fixed original instance identity is required.');
@@ -355,7 +371,45 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
       return {file:structuredClone(file),state:'completed',object:structuredClone(physical),usagePending:intent.value.state!=='settled'};
     });
   }
-  async complete(input:{actorId:string;fileId:string}):Promise<SourceFileUploadResult<F>>{
+  private async currentCompletionRetryPolicy():Promise<void>{
+    const policy=this.options.quota.checkCurrentPolicy;
+    if(!policy)throw new SourceFileUploadError('upload_accounting_unavailable',503,'Current original policy is required before retrying completion.');
+    const decision=await policy.call(this.options.quota,{creatorId:this.files.scope.creatorId,operation:'upload.original'});
+    if(decision.allowed!==true)throw new SourceFileUploadError(decision.reasonCode??'upload_admission_denied',403,'This original completion is currently unavailable.');
+  }
+  private async currentCompletionRetryResult(input:{actorId:string;fileId:string},result:SourceFileUploadResult<F>):Promise<SourceFileUploadResult<F>>{
+    await this.currentCompletionRetryPolicy();
+    // Policy IO can overlap actor/session revocation. The last accepting proof
+    // must therefore be the genuine current Source scope, not a cached result.
+    return this.files.asActor(input.actorId,async()=>{
+      await this.files.captureSourceAccess(input.actorId);
+      const transaction=this.files.transaction();if(!transaction)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual current Source metadata read is required.');
+      const row=await this.read(input.fileId,transaction),value=this.value(row),file=await this.file(input.fileId);
+      if(value.actorId!==input.actorId)throw new SourceFileUploadError('upload_identity_conflict',403,'The original upload must be completed by its initiating actor.');
+      this.matchFile(value,file);
+      if(!same(file,result.file)||value.phase!==result.state||!result.object||!same(value.completedObject,result.object)||result.state==='completed'&&file.uploadState!=='ready')throw new SourceFileUploadError('upload_source_conflict',409,'The original changed before its completion retry response.');
+      return{...result,file:structuredClone(file)};
+    });
+  }
+  async complete(input:{actorId:string;fileId:string},recovery?:Readonly<{requireCurrentPolicy?:true}>):Promise<SourceFileUploadResult<F>>{
+    // The real initiating actor and original cannot be retargeted by a caller
+    // mutating its command while a genuine accepting guard is being retried.
+    const command=Object.freeze({actorId:input.actorId,fileId:input.fileId});
+    // Only stricter caller-side recovery eligibility; never a body field,
+    // persisted permission, or a way to disable this command's own retries.
+    const requireCurrentPolicy=recovery?.requireCurrentPolicy===true;
+    for(let attempt=0;attempt<5;attempt++){
+      try{
+        const recovering=requireCurrentPolicy||attempt>0,result=await this.completeOnce(command,recovering);
+        // A completed phase is factual, not a current policy grant. A result
+        // guard conflict must not turn a later policy denial into success.
+        if(recovering)return await this.currentCompletionRetryResult(command,result);
+        return result;
+      }catch(error){if(!completionRepositoryConflict(error)||attempt===4)throw error;}
+    }
+    throw new SourceFileUploadError('upload_recovery_pending',409,'Original completion requires reconciliation.');
+  }
+  private async completeOnce(input:{actorId:string;fileId:string},retrying:boolean):Promise<SourceFileUploadResult<F>>{
     this.outsideTransaction();
     const row=await this.files.asActor(input.actorId,async()=>{
       await this.files.captureSourceAccess(input.actorId);const row=await this.read(input.fileId,this.files.transaction()!),value=this.value(row);
@@ -364,6 +418,7 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
       if(file.uploadState==='cancelled'||value.phase==='sealed'||value.phase==='closing')throw new SourceFileUploadError('upload_not_pending',409,'This original upload is cancelled or closed.');
       if(!value.provider)throw new SourceFileUploadError('upload_not_issued',409,'The original upload capability has not been issued.');return row;
     });
+    if(retrying)await this.currentCompletionRetryPolicy();
     const value=this.value(row),completion=this.completion(value);
     let object=value.completedObject??await this.options.uploads.recoverCompletion!(completion);
     if(!object){try{object=await this.options.uploads.complete(completion);}catch(error){object=await this.options.uploads.recoverCompletion!(completion);if(!object)throw error;}}

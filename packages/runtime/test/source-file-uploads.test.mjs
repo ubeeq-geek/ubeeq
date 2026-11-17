@@ -363,3 +363,138 @@ test('the original Source finisher uses its genuinely completed same-request Own
  assert.deepEqual((await f.local.storage.get(result.object)).body,bytes);assert.deepEqual(order,['replacement-output-completed','original-owned-successor-returned','original-source-committed']);
  f.restart();assert.deepEqual((await f.complete()).object,result.object);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
 });
+
+// Whole-command retry coverage uses real complete HostRecord snapshots and a
+// genuinely independent Local writer. No named concurrency error is thrown by
+// these race fixtures: the adapter's actual snapshot.bind guard must reject.
+async function completionCommandRace(t, f, {limit=1, transition, afterSourceCommit=false}={}) {
+  const independent=createLocalAdapterSet({databasePath:join(f.directory,'sources.sqlite'),dataDirectory:f.directory,cellId:scope.cellId,publicBaseUrl:'http://127.0.0.1'});
+  let independentOpen=true;const closeIndependent=()=>{if(independentOpen){independentOpen=false;independent.database.close();}},closeOriginal=f.local.database.close.bind(f.local.database);
+  // The original fixture removes its owned directory in its after hook. Close
+  // this extra genuine connection before that owner (and before cold restart).
+  f.local.database.close=()=>{closeIndependent();return closeOriginal();};t.after(closeIndependent);
+  const snapshot=f.local.repositories.hostRecords.snapshot.bind(f.local.repositories.hostRecords);
+  const audit=f.local.repositories.auditEvents.create.bind(f.local.repositories.auditEvents);
+  let armed=!afterSourceCommit,collisions=0;
+  if(afterSourceCommit)t.mock.method(f.local.repositories.auditEvents,'create',async(...args)=>{
+    const result=await audit(...args);
+    if(args[0].action==='source_file.upload.completed')armed=true;
+    return result;
+  });
+  t.mock.method(f.local.repositories.hostRecords,'snapshot',async()=>{
+    const captured=await snapshot();
+    if(armed&&collisions<limit){
+      const number=++collisions;
+      const actor=await independent.repositories.hostRecords.get(actorRecord.id);
+      // Keep the real active authority unchanged while advancing its actual
+      // revision/global marker, unless this control explicitly revokes it.
+      await independent.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,commandRaceObservation:number}});
+      await transition?.({independent,number});
+    }
+    return captured;
+  });
+  return {independent,get collisions(){return collisions;},disarm(){armed=false;}};
+}
+async function assertOneOriginalCompletion(f, result) {
+  assert.equal(result.state,'completed');assert.equal(result.file.uploadState,'ready');assert.equal(result.file.fileId,'original');assert.equal(result.file.checksumSha256,checksum);
+  assert.deepEqual(result.file.opaque,f.file.opaque);assert.deepEqual(result.file.metadata,f.file.metadata);
+  assert.deepEqual((await f.local.storage.get(result.object)).body,bytes);
+  assert.equal(f.local.database.database.prepare("SELECT COUNT(*) AS n FROM ubeeq_upload_completions WHERE state='completed'").get().n,1);
+  assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+  assert.equal(f.quota.reserveCalls,1);assert.equal(f.quota.reservations.size,1);assert.equal(f.quota.settlements.size,1);assert.equal(f.quota.closures.size,0);
+  const [settled]=f.quota.settlements.values();assert.equal(settled.operation,'upload.original');assert.equal(settled.storageBytesDelta,bytes.length);assert.equal(settled.observedAt,result.object.writtenAt);
+  assert.deepEqual(await f.uploads.readPhysicalReceipt('original'),result.object);
+}
+
+test('the whole original completion reopens a genuinely stale initial Local snapshot without repeating physical bytes, audit or charge',async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f),complete=f.local.storage.complete.bind(f.local.storage);let physicalCompletions=0;
+  t.mock.method(f.local.storage,'complete',async input=>{physicalCompletions++;return complete(input);});
+  const result=await f.complete();assert.equal(race.collisions,1);race.disarm();assert.equal(physicalCompletions,1);await assertOneOriginalCompletion(f,result);
+  const before=await f.journal(),audits=await f.audits();f.restart();assert.deepEqual((await f.complete()).object,result.object);assert.deepEqual(await f.journal(),before);assert.deepEqual(await f.audits(),audits);assert.equal(f.quota.settlements.size,1);
+});
+
+test('a genuine result-read snapshot conflict after Source acceptance returns that same fact exactly once',async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f,{afterSourceCommit:true}),complete=f.local.storage.complete.bind(f.local.storage);let physicalCompletions=0;
+  t.mock.method(f.local.storage,'complete',async input=>{physicalCompletions++;return complete(input);});
+  const result=await f.complete();assert.equal(race.collisions,1);race.disarm();assert.equal(physicalCompletions,1);await assertOneOriginalCompletion(f,result);assert.equal(result.file.revision,2);
+});
+
+for(const mode of ['denied','absent'])test(`a real post-commit result conflict cannot turn current retry policy ${mode} into a completed response`,async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const policy=f.quota.checkCurrentPolicy;
+  const race=await completionCommandRace(t,f,{afterSourceCommit:true,transition:async()=>{if(mode==='denied')f.quota.setAdmitted(false);else f.quota.checkCurrentPolicy=undefined;}});
+  await assert.rejects(f.complete(),mode==='denied'?{code:'SUSPENDED',status:403}:{code:'upload_accounting_unavailable',status:503});
+  assert.equal(race.collisions,1);race.disarm();const file=await f.store.getSourceFileById('original'),row=await f.journal();
+  assert.equal(file.uploadState,'ready','The already accepted Source is historical fact, not a new authorization.');assert.equal(file.revision,2);assert.equal(row.value.phase,'completed');
+  assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,1);
+  // Factual usage drains through the genuine existing outbox, independently of
+  // the denied response; no reserve or zero-settlement workaround is introduced.
+  await new UsageSettlementOutbox(f.local.repositories,f.quota,scope.instanceId,scope.cellId).drain();
+  assert.equal(f.quota.settlements.size,1);assert.equal(f.quota.reserveCalls,1);assert.equal(f.quota.closures.size,0);
+  f.quota.checkCurrentPolicy=policy;f.quota.setAdmitted(true);const result=await f.complete();await assertOneOriginalCompletion(f,result);
+});
+
+test('an actual Source actor revocation between a genuine conflict and retry cannot lend its prior authority',async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f,{transition:async({independent})=>{
+    const actor=await independent.repositories.hostRecords.get(actorRecord.id);await independent.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,active:false}});
+  }});
+  await assert.rejects(f.complete(),{code:'access_denied',status:403});assert.equal(race.collisions,1);race.disarm();
+  assert.equal((await f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await f.journal()).value.phase,'issued');assert.equal(f.quota.settlements.size,0);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);
+  assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_completions').get().n,0);
+});
+
+test('a real concurrent Source metadata change stays a metadata denial instead of becoming another outer retry',async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f,{transition:async({independent})=>{
+    const {store}=sourceStore(independent.repositories),file=await store.getSourceFileById('original'),access=await store.captureSourceAccess('actor');
+    await store.commitSourceFile({expected:file,file:{...file,mimeType:'application/pdf',revision:file.revision+1},audit:sourceAudit('actual-command-concurrent-source-change','actor',{action:'source_file.updated'}),access});
+  }});
+  await assert.rejects(f.complete(),{code:'upload_source_conflict',status:409});assert.equal(race.collisions,1);race.disarm();
+  const file=await f.store.getSourceFileById('original');assert.equal(file.uploadState,'pending');assert.equal(file.mimeType,'application/pdf');assert.deepEqual(file.opaque,f.file.opaque);
+  assert.equal(f.quota.settlements.size,0);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);assert.equal((await f.journal()).value.phase,'issued');
+});
+
+test('five actual snapshot guard collisions exhaust the whole-command budget without creating a physical completion',async t=>{
+  const {OptimisticConcurrencyError}=await import('@ubeeq/persistence');const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f,{limit:20});
+  await assert.rejects(f.complete(),error=>error instanceof OptimisticConcurrencyError);assert.equal(race.collisions,5);race.disarm();
+  assert.equal((await f.store.getSourceFileById('original')).uploadState,'pending');assert.equal((await f.journal()).value.phase,'issued');assert.equal(f.quota.reserveCalls,1);assert.equal(f.quota.settlements.size,0);
+  assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_completions').get().n,0);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);
+});
+
+test('the complete request snapshots its actual actor and file once, so later caller-object mutation cannot retarget a retry',async t=>{
+  const f=await fixture(t);const other=sourceFile('actual-other-original',{storageKey:sourceFileOriginalObjectKey({...scope,fileId:'actual-other-original'}),sizeBytes:bytes.length});
+  await f.store.commitSourceFile({expected:null,file:other,audit:sourceAudit('actual-other-intake','actor',{detail:{fileId:other.fileId,creatorId:scope.creatorId}}),access:await f.store.captureSourceAccess('actor')});
+  await f.initiate();await f.accept();const input={actorId:'actor',fileId:'original'},race=await completionCommandRace(t,f,{transition:async()=>{input.actorId='other-actor';input.fileId=other.fileId;}});
+  const result=await f.uploads.complete(input);assert.equal(race.collisions,1);race.disarm();assert.equal(input.fileId,other.fileId);assert.equal(input.actorId,'other-actor');await assertOneOriginalCompletion(f,result);
+  assert.deepEqual(await f.store.getSourceFileById(other.fileId),other);assert.equal(await f.uploads.owns(other.fileId),false);
+});
+
+for(const kind of ['plain-message','spoofed-name','nonconditional-cancellation','missing-cancellation-reasons'])test(`whole-command retry rejects ${kind} errors after exactly one genuine initial Source read`,async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const asActor=f.store.asActor.bind(f.store);let reads=0,depth=0;
+  const failure=Error(kind==='plain-message'?'Record conflict changed revision; retry this unknown operation.':'An explicit non-repository failure');
+  if(kind==='spoofed-name')failure.name='OptimisticConcurrencyError';
+  if(kind==='nonconditional-cancellation'){failure.name='TransactionCanceledException';failure.CancellationReasons=[{Code:'None'},{Code:'ProvisionedThroughputExceeded'}];}
+  if(kind==='missing-cancellation-reasons')failure.name='TransactionCanceledException';
+  t.mock.method(f.store,'asActor',async(...args)=>{if(depth)return asActor(...args);reads++;depth++;try{await asActor(...args);}finally{depth--;}throw failure;});
+  await assert.rejects(f.complete(),error=>error===failure);assert.equal(reads,1);assert.equal(f.quota.settlements.size,0);
+  assert.equal(f.local.database.database.prepare('SELECT COUNT(*) AS n FROM ubeeq_upload_completions').get().n,0);assert.equal((await f.audits()).filter(row=>row.action==='source_file.upload.completed').length,0);
+});
+
+test('revocation during the retry final allowed policy await cannot return its earlier Source result or alter accepted physical/audit/usage facts',async t=>{
+  const f=await fixture(t);await f.initiate();await f.accept();const race=await completionCommandRace(t,f),policy=f.quota.checkCurrentPolicy.bind(f.quota),complete=f.local.storage.complete.bind(f.local.storage);let revoked=false,physicalCompletions=0;
+  t.mock.method(f.local.storage,'complete',async input=>{physicalCompletions++;return complete(input);});
+  t.mock.method(f.quota,'checkCurrentPolicy',async input=>{
+    const actual=await policy(input);
+    if(!revoked&&f.quota.settlements.size===1){
+      assert.equal(actual.allowed,true,'The policy result remains genuinely allowed; Source actor revocation is a separate condition.');
+      assert.equal(input.operation,'upload.original');revoked=true;
+      const actor=await race.independent.repositories.hostRecords.get(actorRecord.id);
+      await race.independent.repositories.hostRecords.update(actor.id,actor.revision,{value:{...actor.value,active:false}});
+    }
+    return actual;
+  });
+  await assert.rejects(f.complete(),{code:'access_denied',status:403});assert.equal(revoked,true);assert.equal(race.collisions,1);race.disarm();assert.equal(physicalCompletions,1);
+  const file=await f.store.getSourceFileById('original'),row=await f.journal(),audits=await f.audits();
+  assert.equal(file.uploadState,'ready');assert.equal(file.revision,2);assert.equal(file.checksumSha256,checksum);assert.deepEqual(file.opaque,f.file.opaque);assert.deepEqual(file.metadata,f.file.metadata);assert.equal(row.value.phase,'completed');
+  assert.equal(audits.filter(value=>value.action==='source_file.upload.completed').length,1);assert.equal(f.quota.reserveCalls,1);assert.equal(f.quota.reservations.size,1);assert.equal(f.quota.settlements.size,1);assert.equal(f.quota.closures.size,0);
+  assert.deepEqual((await f.local.storage.get(row.value.completedObject)).body,bytes);assert.equal(f.local.database.database.prepare("SELECT COUNT(*) AS n FROM ubeeq_upload_completions WHERE state='completed'").get().n,1);
+  f.restart();await assert.rejects(f.complete(),{code:'access_denied',status:403});assert.deepEqual(await f.journal(),row);assert.deepEqual(await f.audits(),audits);assert.deepEqual(await f.uploads.readPhysicalReceipt('original'),row.value.completedObject);assert.equal(f.quota.settlements.size,1);
+});

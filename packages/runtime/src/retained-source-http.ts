@@ -3,7 +3,7 @@ import type {IncomingMessage,ServerResponse} from 'node:http';
 import {Readable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import type {AuthenticatedSession} from '@ubeeq/auth';
-import type {RetainedCreatorContentModels} from '@ubeeq/persistence';
+import {OptimisticConcurrencyError,UniqueConstraintError,type RetainedCreatorContentModels} from '@ubeeq/persistence';
 import type {DeliveryAdapter,StreamingObjectStorage,StoredObject} from '@ubeeq/storage';
 import {prepareSourceFileIntake,SourceFileIntakeError} from './retained-preparation-host.js';
 import type {RetainedIntakeFile} from './retained-preparation-host-types.js';
@@ -117,10 +117,27 @@ export function createRetainedSourceFileNodeHandler<M extends RetainedCreatorCon
    }
    let fileId:string;try{fileId=decodeURIComponent(match![1]);}catch{fail('invalid_input',400,'Choose a valid original identity.');}
    if(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(fileId!))fail('invalid_input',400,'Choose a valid original identity.');
-   const action=match![2],context=await bindings.resolve(request,{fileId:fileId!}),file=await context.files.getSourceFileById(fileId!);
+   const action=match![2];
+   let completionMetadata:{context:RetainedSourceHttpContext<M,F>;file:F}|undefined,completionMetadataConflict=false;
+   if(action==='complete'){
+    // Authentication/body parsing happen once above. Only these current
+    // metadata/authority reads repeat; no legacy/provider/transfer effect does.
+    for(let attempt=0;attempt<5;attempt++){
+     try{
+      const context=await bindings.resolve(request,{fileId:fileId!}),file=await context.files.getSourceFileById(fileId!);
+      if(!file)throw new SourceFileUploadError('file_not_found',404,'Original file was not found.');
+      await access(request,context,'complete',file);
+      completionMetadata={context,file};break;
+     }catch(error){
+      if(!(error instanceof OptimisticConcurrencyError||error instanceof UniqueConstraintError)||attempt===4)throw error;
+      completionMetadataConflict=true;
+     }
+    }
+   }
+   const context=completionMetadata?.context??await bindings.resolve(request,{fileId:fileId!}),file=completionMetadata?.file??await context.files.getSourceFileById(fileId!);
    if(!file)fail('file_not_found',404,'Original file was not found.');
    const operation:RetainedSourceOperation=action==='download'?'download':action==='complete'?'complete':action==='cancel'?'cancel':'upload';
-   await access(request,context,operation,file!);
+   if(!completionMetadata)await access(request,context,operation,file!);
    if(file!.storageKey!==sourceFileOriginalObjectKey({...context.files.scope,fileId:fileId!})){
     if(bindings.legacy&&await bindings.legacy(request,response,{context,operation,file:file!}))return true;
     fail('original_legacy_driver_required',503,'This retained original requires its existing storage driver. Its location has been preserved.');
@@ -137,7 +154,7 @@ export function createRetainedSourceFileNodeHandler<M extends RetainedCreatorCon
     await context.uploads.acceptStream({actorId:session.subject.id,fileId:fileId!,body:incoming});response.statusCode=204;response.end();return true;
    }
    if(action==='complete'){
-    const result=await context.uploads.complete({actorId:session.subject.id,fileId:fileId!});
+    const result=await context.uploads.complete({actorId:session.subject.id,fileId:fileId!},completionMetadataConflict?{requireCurrentPolicy:true}:undefined);
     if(result.state!=='completed')fail('original_recovery_pending',409,'Original bytes are retained and await authorized finalization.');
     json(response,200,result.file);return true;
    }
