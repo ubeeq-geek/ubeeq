@@ -36,8 +36,12 @@ if (missing.length) {
     const checksum = createHash("sha256").update(bytes).digest("hex");
     const upload = await call("/v1/uploads", { method: "POST", token, body: { workId: work.value.work.id, mimeType: "image/png", byteLength: bytes.byteLength, checksum } });
     if (upload.response.status !== 201 || !upload.value.upload.parts?.[0]?.url) throw new Error(`Upload initiation did not issue a direct S3 URL: ${JSON.stringify(upload.value)}`);
-    const put = await fetch(upload.value.upload.parts[0].url, { method: "PUT", headers: { "content-type": "image/png", "x-amz-checksum-sha256": Buffer.from(checksum, "hex").toString("base64"), "x-amz-meta-checksum": checksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(bytes.byteLength) }, body: bytes });
-    if (!put.ok) throw new Error(`Direct S3 upload failed: ${put.status} ${await put.text()}`);
+    const put = await fetch(upload.value.upload.parts[0].url, { method: "PUT", headers: upload.value.upload.parts[0].headers, body: bytes });
+    if (!put.ok) {
+      // Provider XML may contain signed requests and temporary access tokens.
+      const code = /<Code>([A-Za-z0-9]+)<\/Code>/.exec(await put.text())?.[1] ?? "UnknownProviderError";
+      throw new Error(`Direct S3 upload failed: ${put.status} ${code}`);
+    }
     const completed = await call(`/v1/uploads/${upload.value.upload.uploadId}/complete`, { method: "POST", token, body: { workId: work.value.work.id, checksum, byteLength: bytes.byteLength } });
     if (completed.response.status !== 202) throw new Error(`Upload completion failed: ${JSON.stringify(completed.value)}`);
     created.add(completed.value.asset.id); created.add(completed.value.job.id); object = completed.value.asset.storage;
