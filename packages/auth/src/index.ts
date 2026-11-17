@@ -1,4 +1,5 @@
 export * from './customer-identity.js';
+export * from './email-verification.js';
 /** An authenticated principal expressed without identity-provider assumptions. */
 export * from "./request-identity.js";
 export * from "./single-operator-tenancy.js";
@@ -39,6 +40,7 @@ export interface CreatorDelegation {
 
 /** Provider-neutral boundary for local, OIDC, and future cloud identity adapters. */
 export interface IdentityAdapter {
+  readonly emailVerification?:import('./email-verification.js').AccountEmailVerificationPort;
   /** Actual persisted customer lifecycle; absent means unavailable, never Local fallback. */
   readonly customerAccounts?:import('./customer-identity.js').CustomerIdentityProvider;
   verifySession(input: { credential: string; audience?: string }): Promise<AuthenticatedSession | undefined>;

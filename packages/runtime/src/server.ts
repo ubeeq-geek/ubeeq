@@ -27,7 +27,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomUUID } from "node:crypto";
 import { PublicationService, PublicationRequestError } from '@ubeeq/api';
 import { createLocalAdapterSet, SqliteWebsiteStore, type LocalAdapterConfiguration } from "@ubeeq/adapter-local";
-import { SingleOperatorTenancyAdapter, AuthorizationDeniedError, PasswordAuthenticationError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter, type PasswordAuthenticationPort } from "@ubeeq/auth";
+import { AccountEmailVerificationError, SingleOperatorTenancyAdapter, AuthorizationDeniedError, PasswordAuthenticationError, requireAuthorization, type AuthorizationRequirement, type IdentityAdapter, type PasswordIdentityAdapter, type PasswordAuthenticationPort } from "@ubeeq/auth";
 import { SingleOperatorLimitError, FeatureDisabledInSingleOperatorModeError, type TenancyAndAccessPort, type HostExtensionRuntimePorts, createDefaultOpenCorePorts } from "@ubeeq/extension-sdk";
 import { CellRoutingError, composeReferenceApplication, requireHomeCell, type DependencyDiagnostic } from "@ubeeq/api";
 import type { JobQueue } from "@ubeeq/jobs";
@@ -53,9 +53,9 @@ const allRecords = async <T>(repository: { list(request: PageRequest): Promise<P
 };
 const requireString = (value: unknown, field: string): string => { if (typeof value !== "string" || !value.trim()) throw new HttpError(400, "invalid_request", `${field} is required`); return value.trim(); };
 const pageRequest = (url: URL) => ({ cursor: url.searchParams.get("cursor") || undefined, limit: Math.max(1, Math.min(100, Number(url.searchParams.get("limit") ?? 50) || 50)) });
-const parseBody = async (request: IncomingMessage): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
+const parseBody = async (request: IncomingMessage, maximumBytes = 10 * 1024 * 1024): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
   const chunks: Buffer[] = []; let size = 0;
-  request.on("data", (chunk: Buffer) => { size += chunk.length; if (size > 10 * 1024 * 1024) reject(new HttpError(413, "payload_too_large", "Request body exceeds 10 MiB")); else chunks.push(chunk); });
+  request.on("data", (chunk: Buffer) => { size += chunk.length; if (size > maximumBytes) reject(new HttpError(413, "payload_too_large", maximumBytes === 10 * 1024 * 1024 ? "Request body exceeds 10 MiB" : "Request body exceeds its byte allowance")); else chunks.push(chunk); });
   request.on("end", () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); } catch { reject(new HttpError(400, "invalid_json", "Request body must be JSON")); } });
   request.on("error", reject);
 });
@@ -1006,6 +1006,18 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === 'GET' && url.pathname === '/v1/host-capabilities') {
         await session(request);
         return json(response, 200, { slots: hostPorts.studioUiSlots, transforms: { graphicWatermark: hostPorts.watermarkAndTransform.supportsGraphicWatermark, imageAdjustments: hostPorts.watermarkAndTransform.supportsImageAdjustments }, requestId }, requestId);
+      }
+      if ((url.pathname==='/v1/auth/email-verification'&&(method==='GET'||method==='POST'))||(url.pathname==='/v1/auth/email-verification/complete'&&method==='POST')) {
+        response.setHeader('cache-control','no-store');const verification=adapters.identity.emailVerification;
+        if(!verification)throw new HttpError(404,'email_verification_unavailable','Account email verification is unavailable.');
+        await session(request);const credential=request.headers.authorization!.replace(/^Bearer\s+/i,'');
+        try {
+          if(method==='GET')return json(response,200,await verification.status({credential}),requestId);
+          const body=await parseBody(request,4096);
+          if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).some(key=>!(url.pathname.endsWith('/complete')?['challengeId','code']:[]).includes(key)))throw new HttpError(400,'invalid_request','Use the original email challenge.');
+          if(url.pathname.endsWith('/complete'))return json(response,200,await verification.complete({credential,challengeId:requireString(body.challengeId,'challengeId'),code:requireString(body.code,'code')}),requestId);
+          const result=await verification.begin({credential});return json(response,'emailVerified'in result?200:202,result,requestId);
+        } catch(error){if(error instanceof AccountEmailVerificationError)throw new HttpError(error.status,error.code,error.message);throw error;}
       }
       if (method === "POST" && url.pathname === "/v1/auth/sign-up") { if (!adapters.localIdentity) throw new HttpError(404, "local_auth_unavailable", "This instance uses an external identity provider"); const body = await parseBody(request); const email = requireString(body.email, "email");
         const admission = await configuration.registrationAdmission?.({ email, invitationCode: typeof body.invitationCode === 'string' ? body.invitationCode : undefined, organizationName: typeof body.organizationName === 'string' ? body.organizationName : undefined });

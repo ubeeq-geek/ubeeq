@@ -1,3 +1,5 @@
+import {LocalAccountEmailVerification} from './account-email-verification.js';
+import type {AccountEmailVerificationPort,LocalAccountEmailVerificationConfiguration} from '@ubeeq/auth';
 import {openOwnedLocalRanges} from './original-ranges.js';
 import {removeOwnedLocalVersion} from './owned-version-removal.js';
 import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
@@ -39,7 +41,7 @@ const digest = (value: Uint8Array | string): string => createHash("sha256").upda
 type SqliteDatabase = { close(): void; exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
 type LocalTransactionState = { id: string; active: boolean; rollbackOnly: boolean; guards: Map<string, number | null>; writes: Set<string> };
 
-export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
+export interface LocalAdapterConfiguration { emailVerification?:LocalAccountEmailVerificationConfiguration; databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
@@ -88,7 +90,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "022-upload-stream-custody", "023-customer-password-effects"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "022-upload-stream-custody", "023-customer-password-effects", "024-account-email-verification"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -424,7 +426,8 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
 
 export class LocalIdentityAdapter implements PasswordIdentityAdapter {
   readonly customerAccounts:LocalCustomerIdentities;
-  constructor(private readonly local: LocalSqliteDatabase) {this.customerAccounts=new LocalCustomerIdentities(local);}
+  readonly emailVerification?:AccountEmailVerificationPort;
+  constructor(private readonly local: LocalSqliteDatabase) {this.customerAccounts=new LocalCustomerIdentities(local);if(local.configuration.emailVerification)this.emailVerification=new LocalAccountEmailVerification(local,this,local.configuration.emailVerification);}
   async register(input: { email: string; password: string }): Promise<IdentityAccount> {
     if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
     const id = randomUUID(), timestamp = now(), salt = randomBytes(16).toString("hex"), passwordHash = scryptSync(input.password, salt, 64).toString("hex");
