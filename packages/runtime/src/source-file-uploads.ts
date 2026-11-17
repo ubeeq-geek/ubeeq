@@ -328,6 +328,33 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     }}
     throw Error('Original source completion requires reconciliation.');
   }
+  /** A stale decoder/rendition attempt is not permission to reuse its closed
+   * output capability. Only the independently accepted SAME original may be
+   * returned here, through fresh current Source and policy read authority. */
+  private async completedSourceWinner(original:HostRecord,object:StoredObject,actorId:string):Promise<SourceFileUploadResult<F>|undefined>{
+    const initial=this.value(original);this.proveObject(initial,object);if(initial.actorId!==actorId)return undefined;
+    const journal=await this.read(initial.fileId),current=this.value(journal),identity=(value:Session)=>{const {phase,completedObject,usageIntentId,...immutable}=value;return immutable;};
+    if(current.phase!=='completed'||current.closureIntentId||current.seal||current.removal||!current.completedObject||!same(current.completedObject,object)||!same(identity(initial),identity(current))||!same(this.home(original),this.home(journal))||original.createdAt!==journal.createdAt)return undefined;
+    // Immutable provider bytes are verified OUTSIDE the Source metadata Raw.
+    const physical=await this.options.uploads.recoverCompletion!(this.completion(current));if(!physical||!same(physical,object))return undefined;
+    const input={creatorId:current.creatorId,operation:'upload.original',idempotencyKey:this.usageKey(journal),storageBytesDelta:object.byteLength,observedAt:object.writtenAt!};
+    const id=createHash('sha256').update(JSON.stringify([this.instanceId,'runtime-usage-settlement',input.creatorId,input.idempotencyKey])).digest('hex');if(current.usageIntentId!==id)return undefined;
+    const intent=await this.readRecord(id),fingerprint=JSON.stringify([input.creatorId,input.operation,input.idempotencyKey,0,input.storageBytesDelta,0,input.observedAt]);
+    if(!intent||intent.id!==id||intent.namespace!=='runtime-usage-settlement'||intent.instanceId!==this.instanceId||intent.scopeId!==current.creatorId||intent.key!==input.idempotencyKey||!same(this.home(intent),this.home(journal))||!Number.isSafeInteger(intent.revision)||intent.revision<1||!['pending','settled'].includes(String(intent.value.state))||intent.value.fingerprint!==fingerprint||!same(intent.value.input,input))return undefined;
+    if(intent.value.state==='pending'){const admission=await this.options.quota.checkCurrentAdmission?.({creatorId:current.creatorId,operation:input.operation,idempotencyKey:input.idempotencyKey});if(!admission?.allowed)return undefined;}
+    const policy=this.options.quota.checkCurrentPolicy;if(!policy||!(await policy.call(this.options.quota,{creatorId:current.creatorId,operation:input.operation})).allowed)return undefined;
+    return this.files.asActor<SourceFileUploadResult<F>|undefined>(actorId,async()=>{
+      await this.files.captureSourceAccess(actorId);const transaction=this.files.transaction();if(!transaction)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual current Source metadata read is required.');
+      const actual=await this.read(current.fileId,transaction),actualIntent=await this.records.get(intent.id,{transaction});if(!same(actual,journal)||!actualIntent||!same(actualIntent,intent))throw new SourceFileUploadError('upload_source_conflict',409,'The accepted original changed before its factual response.');
+      const file=await this.file(current.fileId);this.matchFile(current,file);if(file.uploadState!=='ready'||file.checksumSha256!==object.checksum||!Number.isSafeInteger(file.revision)||!file.revision)return undefined;
+      const audit=await this.files.getSourceFileAudit('source-completed-'+ownedEvidenceHash([journal.id,object.versionId])),detail=audit?.detail;
+      if(!audit||audit.action!=='source_file.upload.completed'||audit.actorUserId!==actorId||!detail||typeof detail!=='object'||Array.isArray(detail)||!('fileId'in detail)||detail.fileId!==current.fileId||!('creatorId'in detail)||detail.creatorId!==current.creatorId||!('objectVersion'in detail)||detail.objectVersion!==object.versionId||!('uploadState'in detail)||detail.uploadState!=='ready'||!('revision'in detail)||typeof detail.revision!=='number'||!Number.isSafeInteger(detail.revision)||detail.revision<1||detail.revision>file.revision)return undefined;
+      const check=this.records.checkRevision;if(!check)throw new SourceFileUploadError('upload_accounting_unavailable',503,'The actual original receipt read guards are required.');await check.call(this.records,journal.id,journal.revision,{transaction});await check.call(this.records,intent.id,intent.revision,{transaction});
+      // This is an existing fact, not result()/deliver(): no Source/audit/journal
+      // write, settlement IO, charge, output retry or old-generation reuse.
+      return {file:structuredClone(file),state:'completed',object:structuredClone(physical),usagePending:intent.value.state!=='settled'};
+    });
+  }
   async complete(input:{actorId:string;fileId:string}):Promise<SourceFileUploadResult<F>>{
     this.outsideTransaction();
     const row=await this.files.asActor(input.actorId,async()=>{
@@ -340,7 +367,8 @@ export class SourceFileUploads<M extends RetainedCreatorContentModels=RetainedCr
     const value=this.value(row),completion=this.completion(value);
     let object=value.completedObject??await this.options.uploads.recoverCompletion!(completion);
     if(!object){try{object=await this.options.uploads.complete(completion);}catch(error){object=await this.options.uploads.recoverCompletion!(completion);if(!object)throw error;}}
-    const saved=await this.finish(row,object,true);return this.result(saved);
+    let saved:HostRecord;try{saved=await this.finish(row,object,true);}catch(error){const winner=await this.completedSourceWinner(row,object,input.actorId);if(winner)return winner;throw error;}
+    return this.result(saved);
   }
   private async close(initial:HostRecord):Promise<HostRecord>{
     let row=await this.mutate(this.value(initial).fileId,value=>['completed','retained','sealed','closing'].includes(value.phase)?value:{...value,phase:'closing',closingAt:this.now().toISOString()}),value=this.value(row);
