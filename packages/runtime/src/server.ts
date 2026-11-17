@@ -260,7 +260,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     cellId,
     sessionTtlSeconds: configuration.sessionTtlSeconds,
     credentialEncryptionKey: configuration.credentialEncryptionKey,
-    emailVerification: configuration.emailVerification,
+    ...(configuration.emailVerification===undefined?{}:{emailVerification:configuration.emailVerification}),
   };
   const localAdapters = configuration.adapters ? undefined : (configuration.createLocalAdapters ?? createLocalAdapterSet)(localConfiguration);
   const adapters: ReferenceAdapterSet = configuration.adapters ?? {
