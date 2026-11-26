@@ -12,6 +12,12 @@
     "AppClientIds": {
       "Type": "CommaDelimitedList"
     },
+    "ClaimsImplementation": {
+      "Type": "String",
+      "Default": "node",
+      "AllowedValues": ["node", "rust"],
+      "Description": "Select the implementation matching the versioned claims ZIP."
+    },
     "CodeBucket": {
       "Type": "String"
     },
@@ -27,6 +33,9 @@
     }
   },
   "Conditions": {
+    "UseRustClaims": {
+      "Fn::Equals": [{"Ref": "ClaimsImplementation"}, "rust"]
+    },
     "HasDelegate": {
       "Fn::Not": [
         {
@@ -137,8 +146,8 @@
     "ClaimsFunction": {
       "Type": "AWS::Lambda::Function",
       "Properties": {
-        "Runtime": "nodejs22.x",
-        "Handler": "customer-issued-scope-handler.handler",
+        "Runtime": {"Fn::If": ["UseRustClaims", "provided.al2023", "nodejs22.x"]},
+        "Handler": {"Fn::If": ["UseRustClaims", "bootstrap", "customer-issued-scope-handler.handler"]},
         "Role": {
           "Fn::GetAtt": [
             "ClaimsRole",
