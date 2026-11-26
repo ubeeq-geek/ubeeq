@@ -81,3 +81,4 @@ export const recordUsageMeasurement = async (repository: UsageMeterRepository, m
   validateUsageMeasurement(measurement);
   return repository.record(measurement);
 };
+export * from './slideshow.js';

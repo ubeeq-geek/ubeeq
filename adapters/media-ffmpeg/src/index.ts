@@ -75,3 +75,4 @@ export class FfmpegVideoToolAdapter implements VideoToolAdapter {
       { maxBuffer: 1024 * 1024, timeout: this.timeout, killSignal: 'SIGKILL' });
   }
 }
+export { FfmpegSlideshowRenderer, type FfmpegSlideshowOptions } from './slideshow.js';

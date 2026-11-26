@@ -53,7 +53,8 @@
     "test:managed-source-http": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/retained-source-http.dynamodb.mjs",
     "test:managed-job-acceptance": "node adapters/aws/scripts/wait-for-dynamodb-local.mjs && node --test adapters/aws/test/accepting-job-lease.dynamodb.mjs",
     "release:prepare": "npm run pack:verify && node scripts/prepare-public-release.mjs",
-    "test:release-inventory": "node --test scripts/test/public-package-inventory.test.mjs"
+    "test:release-inventory": "node --test scripts/test/public-package-inventory.test.mjs",
+    "test:slideshow-browser": "node scripts/smoke-slideshow-browser.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

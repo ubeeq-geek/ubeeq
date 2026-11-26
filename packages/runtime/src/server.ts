@@ -1,3 +1,6 @@
+import { ReferenceCollectionSlideshows } from './slideshows.js';
+import { SlideshowError } from '@ubeeq/core';
+import type { SlideshowRenderer } from '@ubeeq/processing';
 import {ReferenceRuntimeLifetime} from './runtime-lifetime.js';
 import {createRetainedSourceFileNodeHandler} from './retained-source-http.js';
 import {createContentPreparationNodeHandler,type ContentPreparationRuntimeBindings} from './content-preparation-node.js';
@@ -142,6 +145,7 @@ export interface ReferenceContentPreparationContext {
  website:Readonly<ReferenceWebsiteRuntime>;commerce:ReturnType<typeof createReferenceCommerce>|undefined;
 }
 export interface ReferenceApiConfiguration extends Partial<LocalAdapterConfiguration> {
+  slideshowRenderer?: SlideshowRenderer;
   /** Retained host supplies its real store, services and feature drivers. Core
    * resolves the verified creator session before reading request input. */
   contentPreparation?: (context:ReferenceContentPreparationContext)=>ContentPreparationRuntimeBindings;
@@ -505,6 +509,18 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     if(collection.creatorId!==creatorId)throw new HttpError(404,'collection_not_found','Collection not found.');
     return{...collectionView(collection,(await context.store.listCollectionWorks(collection.tenantId,id)).map(m=>m.workId)),permissions:{canEdit:context.canEdit&&collection.managementReady&&collection.status!=='deleted'}};
   };
+  const slideshows = configuration.slideshowRenderer && ownedObjectWrites
+    ? new ReferenceCollectionSlideshows({
+      repositories, storage: adapters.storage, jobs: adapters.jobs, cellId,
+      owned: ownedObjectWrites, renderer: configuration.slideshowRenderer,
+      writable: requireCreatorWritable,
+      admit: ids => requireClearAdmission('Slideshow', ids),
+      orderedWorks: async (creator, id) => {
+        const store = new RepositoryCreatorCollectionStore(repositories, {instanceId: creator.instanceId, cellId, region}, async () => { throw new Error("Slideshow membership reads cannot mutate collections."); });
+        return (await store.listCollectionWorks(creator.instanceId, id)).map(member => member.workId);
+      },
+    })
+    : undefined;
   const existingImportIds = async () => ({ publication: (await allRecords(repositories.publications)).map(({ id }) => id), publicationIntent: (await allRecords(repositories.publicationIntents)).map(({ id }) => id), moderationEvidence: (await allRecords(repositories.moderationEvidence)).map(({ id }) => id), moderationHold: (await allRecords(repositories.moderationHolds)).map(({ id }) => id), reviewCase: (await allRecords(repositories.reviewCases)).map(({ id }) => id), auditEvent: (await allRecords(repositories.auditEvents)).map(({ id }) => id), usageEvent: (await allRecords(repositories.usageEvents)).map(({ id }) => id), integrationAccount: (await allRecords(repositories.integrationAccounts)).map(({ id }) => id) });
   const currentPublicWork = async (workId: string) => {
     const denied = () => new HttpError(404, 'work_not_found', 'Published work was not found');
@@ -771,7 +787,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
     }
 
     const lease = await adapters.jobs.lease<{ assetId: string }>({ cellId, types: ["asset.process"], leaseDurationSeconds: processingLeaseSeconds, workerId });
-    if (!lease) return commerce?.runNextJob(workerId);
+    if (!lease) return (await slideshows?.runNextJob(workerId)) ?? commerce?.runNextJob(workerId);
     let reservedUsageKey: string | undefined;
     try {
       if (lease.job.cellId !== cellId) throw new Error(`Foreign-cell job ${lease.job.cellId} rejected by ${cellId}`);
@@ -1129,7 +1145,38 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         }
         const context=await collectionContext(identity.subject.id,creator);
         const collections=(await context.service.list({tenantId:creator.instanceId,creatorId:creator.id})).map(c=>({...collectionView(c,c.workIds),permissions:{canEdit:context.canEdit&&c.managementReady&&c.status!=='deleted'}}));
-        return json(response, 200, { collections,capabilities:{canCreate:context.canEdit&&await context.store.isManagementReady(creator.id)}, requestId }, requestId);
+        return json(response, 200, { collections,capabilities:{canCreate:context.canEdit&&await context.store.isManagementReady(creator.id)}, ...(slideshows ? await slideshows.catalogue(creator) : {slideshowEnabled: false, music: []}), requestId }, requestId);
+      }
+      const slideshowRoute = /^\/v1\/collections\/([^/]+)\/slideshows(?:\/([^/]+)(\/content)?)?$/.exec(url.pathname);
+      if (slideshowRoute && (method === 'GET' || method === 'POST')) {
+        const [, collectionId, renditionId, content] = slideshowRoute.map(value => value && decodeURIComponent(value));
+        const body = method === 'POST' ? await parseBody(request) : undefined;
+        const identity = await session(request);
+        const record = await repositories.collections.get(collectionId);
+        if (!record) throw new HttpError(404, 'collection_not_found', 'Collection was not found.');
+        if (!(await tenancy.listAccessibleCreatorIds(identity.subject.id)).includes(record.creatorId)) throw new HttpError(404, 'collection_not_found', 'Collection was not found.');
+        const creator = await creatorFor(identity.subject.id, record.creatorId);
+        requireCompactContent(creator);
+        if (creator.subjectId !== identity.subject.id) throw new HttpError(403, 'slideshow_access_denied', 'Current Creator owner authority is required.');
+        if (creator.instanceId !== record.instanceId) throw new HttpError(404, 'collection_not_found', 'Collection was not found.');
+        const context = await collectionContext(identity.subject.id, creator, method === 'POST');
+        await collectionResult(context, creator.id, collectionId);
+        if (!slideshows) throw new HttpError(503, 'slideshow_unavailable', 'Slideshow rendering is unavailable.');
+        response.setHeader('cache-control', 'private, no-store');
+        if (method === 'POST') {
+          if (renditionId) throw new HttpError(405, 'method_not_allowed', 'Slideshow method is not supported.');
+          return json(response, 202, { ...await slideshows.request(creator, collectionId, body!), requestId }, requestId);
+        }
+        if (!renditionId) return json(response, 200, { ...await slideshows.list(creator, collectionId), requestId }, requestId);
+        if (!content) return json(response, 200, { rendition: await slideshows.status(creator, collectionId, renditionId), requestId }, requestId);
+        const video = await slideshows.download(creator, collectionId, renditionId);
+        const finalIdentity = await session(request);
+        const currentCreator = await creatorFor(finalIdentity.subject.id, creator.id);
+        await collectionContext(finalIdentity.subject.id, currentCreator, false);
+        if (currentCreator.revision !== creator.revision || currentCreator.subjectId !== finalIdentity.subject.id) throw new HttpError(409, 'slideshow_conflict', 'Creator custody changed during download.');
+        response.writeHead(200, {'content-type': 'video/mp4', 'content-length': video.byteLength, 'content-disposition': 'attachment; filename="collection-slideshow.mp4"', 'x-content-type-options': 'nosniff'});
+        response.end(video);
+        return;
       }
       const privateCollectionMatch=url.pathname.match(/^\/v1\/collections\/([^/]+)(\/works)?$/);
       if(privateCollectionMatch&&['GET','PATCH','DELETE','PUT'].includes(method)){
@@ -1375,7 +1422,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       if (method === "GET" && url.pathname === "/v1/exports/me") {
         const identity = await session(request); const creator = await creatorFor(identity.subject.id); requireCompactContent(creator); requireHomeCell({ cellId }, creator); await requireCreatorWritable(creator);
         const works = (await allRecords(repositories.works)).filter((record) => record.creatorId === creator.id); const workIds = new Set(works.map(({ id }) => id));
-        const assets = (await allRecords(repositories.assets)).filter((record) => record.creatorId === creator.id); const collections = (await allRecords(repositories.collections)).filter((record) => record.creatorId === creator.id);
+        const assets = (await allRecords(repositories.assets)).filter((record) => record.creatorId === creator.id && !('slideshow' in record)); const collections = (await allRecords(repositories.collections)).filter((record) => record.creatorId === creator.id);
         const publications = (await allRecords(repositories.publications)).filter((record) => workIds.has(record.workId)); const publicationIntents = (await allRecords(repositories.publicationIntents)).filter((record) => workIds.has(record.workId));
         const subjectIds = new Set([creator.id, ...works.map(({ id }) => id), ...assets.map(({ id }) => id)]); const moderationEvidence = (await allRecords(repositories.moderationEvidence)).filter((record) => subjectIds.has(record.subjectId)); const moderationHolds = (await allRecords(repositories.moderationHolds)).filter((record) => subjectIds.has(record.subjectId)); const reviewCases = (await allRecords(repositories.reviewCases)).filter((record) => subjectIds.has(record.subjectId)); const auditEvents = (await allRecords(repositories.auditEvents)).filter((record) => Boolean(record.subjectId && subjectIds.has(record.subjectId))); const usageEvents = (await allRecords(repositories.usageEvents)).filter((record) => record.accountId === creator.id);
         const integrationAccounts = (await allRecords(repositories.integrationAccounts)).filter((record) => record.creatorId === creator.id).map(({ credentialReference: _credentialReference, ...record }) => ({ ...record, credentialExcluded: true as const })); const exportCheckpoints = (await allRecords(repositories.exportManifests)).filter((record) => record.creatorId === creator.id); const importCheckpoints = (await allRecords(repositories.importCheckpoints)).filter((record) => record.creatorId === creator.id);
@@ -1406,7 +1453,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
         try {
           const completed = await repositories.transaction(async (transaction) => {
             for (const work of manifest.works) await repositories.works.create({ ...work, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: work.status === "published" ? "ready" : work.status }, { transaction, idempotencyKey: `import:${importId}:work:${work.id}` });
-            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, processedRenditions: _processedRenditions, deliveryMimeType: _deliveryMimeType, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processedRenditions?:unknown;deliveryMimeType?:unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
+            for (const asset of manifest.assets) { const { storage: _storage, originalStorage: _originalStorage, processedRenditions: _processedRenditions, slideshow: _slideshow, slideshowPending: _slideshowPending, slideshowJobId: _slideshowJobId, renderMetadata: _renderMetadata, deliveryMimeType: _deliveryMimeType, ...portableAsset } = asset as AssetRecord & { storage?: unknown; originalStorage?: unknown; processedRenditions?:unknown;slideshow?:unknown;slideshowPending?:unknown;slideshowJobId?:unknown;renderMetadata?:unknown;deliveryMimeType?:unknown }; await repositories.assets.create({ ...portableAsset, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id, status: "pending" }, { transaction, idempotencyKey: `import:${importId}:asset:${asset.id}` }); }
             for (const collection of manifest.collections) await repositories.collections.create({ ...collection, instanceId: creator.instanceId, ...dataHomeOf(creator), creatorId: creator.id }, { transaction, idempotencyKey: `import:${importId}:collection:${collection.id}` });
             await invalidateCollectionDirectoryForImport(repositories,creator,manifest.collections.map(c=>c.id),transaction);
             const publicationRestoreMaps = { publications: Object.fromEntries(manifest.publications.map(p => [p.id, p.id])),
@@ -1440,6 +1487,7 @@ export const createReferenceApi = (configuration: ReferenceApiConfiguration): { 
       throw new HttpError(404, "not_found", "Route was not found");
     } catch (error) {
       if(error instanceof OptimisticConcurrencyError)return json(response,409,{error:{code:'revision_conflict',message:'This resource changed. Reload before saving.',requestId}},requestId);
+      if (error instanceof SlideshowError) return json(response, error.code.endsWith('not_found') ? 404 : error.code === 'invalid_slideshow' ? 400 : 409, {error: {code: error.code, message: error.message}, requestId}, requestId);
       if(error instanceof CreatorCollectionError)return json(response,error.code==='access_denied'?403:error.code==='not_found'?404:['slug_conflict','revision_conflict'].includes(error.code)?409:400,{error:{code:error.code,message:error.message,requestId}},requestId);
       if(error instanceof CollectionManagementError)return json(response,error.code==='invalid_collection'?400:error.code==='collection_too_large'?413:409,{error:{code:error.code,message:error.message,requestId}},requestId);
       if (error instanceof TenancyAdmissionError) return json(response, 403, { error: { code: error.reasonCode, message: error.message, requestId } }, requestId);

@@ -1,5 +1,12 @@
 # Optional FFmpeg video tools
 
+`FfmpegSlideshowRenderer` is an opt-in collection renderer for ordered images,
+adjustable cuts/crossfades, three aspect-ratio presets and an optional trimmed,
+looping music playlist. It returns a validated H.264/AAC MP4 without publishing
+it. See [collection slideshow videos](../../docs/collection-slideshow-videos.md)
+in the source repository for settings, budgets, host responsibilities and reference
+API/UI composition.
+
 `FfmpegPosterProcessor` composes these tools with a supplied validation profile to
 produce one private JPEG poster at time zero. It preserves source-version lineage,
 bounds output bytes, and removes its temporary attempt files on success or failure.

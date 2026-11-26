@@ -21,6 +21,11 @@ test("serves a neutral workspace and proxies only to the configured reference AP
   });
   const workspace = await fetch(`http://127.0.0.1:${address.port}/workspace`);
   assert.match(await workspace.text(), /Ubeeq reference workspace/);
+  const collections = await fetch(`http://127.0.0.1:${address.port}/collections`);
+  assert.match(await collections.text(), /collection-editor.js/);
+  const collectionEditor = await fetch(`http://127.0.0.1:${address.port}/collection-editor.js`);
+  assert.equal(collectionEditor.status, 200);
+  assert.match(collectionEditor.headers.get('content-type'), /javascript/);
   const websites = await fetch(`http://127.0.0.1:${address.port}/websites`);
   assert.match(await websites.text(), /website-editor.js/);
   assert.match(websites.headers.get('content-security-policy'), /script-src[^;]*'self'/, 'the external editor bundle must be allowed by the page policy');

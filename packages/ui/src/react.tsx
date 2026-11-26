@@ -498,3 +498,4 @@ export function BlockEditor({
 }
 export { PublicationImageControls, selectPublicationImageModel } from './publication-image-controls.js';
 export type { PublicationImageReadModel, PublicationImageControlsProps } from './publication-image-controls.js';
+export { CollectionSlideshowPanel, type CollectionSlideshowPanelProps } from './collection-slideshow-panel.js';
