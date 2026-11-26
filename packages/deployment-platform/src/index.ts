@@ -1,6 +1,8 @@
+import type { DeploymentArtifactSchemaVersion } from './artifact-files.js';
+
 export interface DeploymentArtifact { path: string; fileCount: number; sha256: string; }
 export interface DeploymentArtifactManifest {
-  schemaVersion: 1 | 2;
+  schemaVersion: DeploymentArtifactSchemaVersion;
   product: string;
   revision: string;
   artifacts: Readonly<Record<string, DeploymentArtifact>>;
@@ -10,6 +12,7 @@ export interface DeploymentArtifactManifest {
   migrationReady?: boolean;
 }
 export interface DeploymentArtifactExpectation {
+  schemaVersion?: DeploymentArtifactManifest['schemaVersion'];
   product: string;
   revision: string;
   artifacts: readonly string[];
@@ -319,8 +322,8 @@ export const rollbackCellRoute = (route: CellRoute, checkpoint: MigrationCheckpo
 
 export const validateDeploymentArtifactManifest = (manifest: DeploymentArtifactManifest, expected: DeploymentArtifactExpectation): DeploymentArtifactManifest => {
   const commit = /^[a-f0-9]{40}$/;
-  if (!manifest || ![1, 2].includes(manifest.schemaVersion) || manifest.product !== expected.product || manifest.revision !== expected.revision || !commit.test(manifest.revision)) throw new Error("Deployment artifact manifest identity does not match the planned release");
-  if (manifest.schemaVersion === 2) {
+  if (!manifest || ![1, 2, 3].includes(manifest.schemaVersion) || (expected.schemaVersion !== undefined && manifest.schemaVersion !== expected.schemaVersion) || manifest.product !== expected.product || manifest.revision !== expected.revision || (manifest.schemaVersion !== 1 && !commit.test(manifest.revision))) throw new Error("Deployment artifact manifest identity does not match the planned release");
+  if (manifest.schemaVersion !== 1) {
     if (!manifest.appCode || !commit.test(manifest.coreCommit ?? '') || !commit.test(manifest.commercialCommit ?? '') || typeof manifest.migrationReady !== 'boolean') throw new Error("Deployment artifact source provenance is incomplete");
   }
   for (const key of ['appCode', 'coreCommit', 'commercialCommit'] as const) {

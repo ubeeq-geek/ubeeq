@@ -13,9 +13,24 @@ test('v2 binds source provenance, components and readiness while retaining v1',(
  assert.throws(()=>validateDeploymentArtifactManifest(manifest,{...expected,requireMigrationReady:true}));
  for(const path of ['../escape','/absolute','x/../../escape','x\\escape','x/./y','x//y']) assert.throws(()=>validateDeploymentArtifactManifest({...manifest,artifacts:{api:{...manifest.artifacts.api,path}}},expected));
  assert.throws(()=>validateDeploymentArtifactManifest({...manifest,artifacts:{...manifest.artifacts,web:manifest.artifacts.api}},expected));
- const v1={schemaVersion:1,product:expected.product,revision:expected.revision,artifacts:manifest.artifacts};
- assert.equal(validateDeploymentArtifactManifest(v1,{product:expected.product,revision:expected.revision,artifacts:['api']}),v1);
+ const v1={schemaVersion:1,product:expected.product,revision:'release-2026.11',artifacts:manifest.artifacts};
+ assert.equal(validateDeploymentArtifactManifest(v1,{product:expected.product,revision:v1.revision,artifacts:['api']}),v1);
  assert.throws(()=>validateDeploymentArtifactManifest(v1,expected));
+ const v3={...manifest,schemaVersion:3};
+ assert.equal(validateDeploymentArtifactManifest(v3,{...expected,schemaVersion:3}),v3);
+ assert.throws(()=>validateDeploymentArtifactManifest(manifest,{...expected,schemaVersion:3}),/identity/);
+ assert.throws(()=>validateDeploymentArtifactManifest({...v3,revision:v1.revision},{...expected,revision:v1.revision}),/identity/);
+});
+
+test('schema 3 has a stable digest for empty and binary files',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'artifact-contract-v3-'));
+ try{
+  await writeFile(join(root,'a'),Buffer.from([0,255]));
+  await writeFile(join(root,'b'),Buffer.alloc(0));
+  const framed=Buffer.from('000000000000000161000000000000000200ff0000000000000001620000000000000000','hex');
+  const sha256=createHash('sha256').update('ubeeq-deployment-artifact-v3\0').update(framed).digest('hex');
+  assert.deepEqual(await hashDeploymentArtifactDirectory(root,3),{fileCount:2,sha256});
+ }finally{await rm(root,{recursive:true,force:true});}
 });
 test('digest versions have stable byte vectors and reject links and changed files',async()=>{
  const root=await mkdtemp(join(tmpdir(),'artifact-contract-'));
