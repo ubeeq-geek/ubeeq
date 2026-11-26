@@ -10,6 +10,7 @@ use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde::Serialize;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use ubeeq_migration_control_api::store::document;
 use url::Url;
 
 const ROOT: &str = "/v1/operations/regional/";
@@ -197,25 +198,6 @@ fn cursor(collection: Collection, input: &str) -> Result<HashMap<String, Attribu
         ("pk".into(), AttributeValue::S(pk.into())),
         ("sk".into(), AttributeValue::S(sk.into())),
     ]))
-}
-
-fn document(value: AttributeValue) -> Result<Value, Error> {
-    Ok(match value {
-        AttributeValue::S(value) => Value::String(value),
-        AttributeValue::N(value) => Value::Number(value.parse()?),
-        AttributeValue::Bool(value) => Value::Bool(value),
-        AttributeValue::Null(true) => Value::Null,
-        AttributeValue::L(values) => {
-            Value::Array(values.into_iter().map(document).collect::<Result<_, _>>()?)
-        }
-        AttributeValue::M(values) => Value::Object(
-            values
-                .into_iter()
-                .map(|(k, v)| Ok((k, document(v)?)))
-                .collect::<Result<_, Error>>()?,
-        ),
-        _ => return Err("Unsupported control-plane attribute.".into()),
-    })
 }
 
 enum Route<'a> {
