@@ -185,6 +185,7 @@ export interface Collection extends CellOwned {
 }
 
 export interface CollectionWork {
+  representationId?: string;
   collectionId: EntityId;
   workId: EntityId;
   position: number;
@@ -202,6 +203,9 @@ export interface PublicationReconciliationField {
 }
 
 export interface Publication extends CellOwned {
+  imageSelection?: import('./publication-image.js').PublicationImageSelection;
+  unresolvedImageContext?: { sourceCollectionId: string };
+  configurationRevision?: number;
   copy?: import("./publication-copy.js").PublicationCopyIdentity;
   activeOperationId?: EntityId;
   /** CAS revision for copy-aware operations; legacy records have no revision. */
@@ -341,14 +345,32 @@ export * from './creator-source-files.js';
 export * from './shared-viewing.js';
 
 export * from "./publication-copy.js";
+export * from './publication-image.js';
+export * from './publication-delivery.js';
 
 export * from "./historical-announcements.js";
 
 export * from "./websites.js";
+export * from './website-preview-limits.js';
 export * from "./website-design.js";
 export * from './website-hosting.js';
 export * from './collection-destinations.js';
 export * from './collection-publications.js';
 
 export * from "./website-redirect-history.js";
+export * from "./announcement-orchestration.js";
+export * from "./collection-release-readiness.js";
+export * from "./collection-releases.js";
+export * from "./collection-announcement-preferences.js";
+export * from "./announcement-plan-scheduler.js";
+export * from "./announcement-plans.js";
+
+export * from './announcement-layout.js';
+export * from './content-workflows.js';
+
+export * as collectionMetadata from './collection-metadata.js';
+
+export * as collectionMetadataService from './collection-metadata-service.js';
+
+export * as collectionMetadataCommands from './collection-metadata-commands.js';
 export * from './slideshow.js';

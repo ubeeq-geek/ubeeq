@@ -24,3 +24,5 @@ The stack also outputs an AWS-IAM Function URL for operator diagnostics and life
 It also creates a migration operations dashboard and alarms for visible command backlog, dead-letter depth, and control-worker errors. Completed commands emit a non-secret transfer-byte metric for operational trend monitoring; it is not a billing ledger. Configure alarm actions in private operator infrastructure.
 
 See [`../../../docs/aws-multi-cell-operator-runbook.md`](../../../docs/aws-multi-cell-operator-runbook.md) for registration, region selection, backup/recovery disclosure, migration/rollback, and production-readiness procedures.
+
+The package native suite synthesizes the real stack and checks retained recovery state, IAM-only control access, queue/worker timing, operational alarms and exact configured migration-resource grants. Provider behavior is separately exercised by the opt-in two-cell development workflow. That workflow uses issued upload headers, stable publication retries, owned fixture teardown and serialized access to its fixed development cells.

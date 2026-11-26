@@ -6,10 +6,11 @@ import { join } from 'node:path';
 import { createReferenceApi } from '../dist/server.js';
 import { createHash } from 'node:crypto';
 import sharp from 'sharp';
+import {DatabaseSync} from 'node:sqlite';
 
 test('personal website API persists pages, queues builds, isolates previews and downloads an authorized ZIP',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'ubeeq-websites-'));
-  const api=createReferenceApi({databasePath:join(dir,'state.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',operatorAuthorization:{anyRoles:['creator']}});
+  const api=createReferenceApi({databasePath:join(dir,'state.sqlite'),dataDirectory:dir,publicBaseUrl:'http://127.0.0.1:0',operatorAuthorization:{anyRoles:['creator']},tenancyMode:'multi_tenant_saas'});
   await new Promise(resolve=>api.server.listen(0,'127.0.0.1',resolve));const origin='http://127.0.0.1:'+api.server.address().port;
   t.after(async()=>{await api.close();rmSync(dir,{recursive:true,force:true});});
   let token;
@@ -18,6 +19,7 @@ test('personal website API persists pages, queues builds, isolates previews and 
   await call('/v1/auth/sign-up','POST',{email:'website@example.test',password:'long-safe-password'});
   token=(await call('/v1/auth/sign-in','POST',{email:'website@example.test',password:'long-safe-password'})).body.token;
   const creator=(await call('/v1/creators','POST',{handle:'website-owner',displayName:'Website owner'})).body.creator;
+  const capabilities=(await call('/v1/websites/capabilities')).body.capabilities;assert.ok(capabilities.maxAssets>=1000);assert.ok(capabilities.maxPages>1000);
   const workspaceId=creator.id,doc={id:'document',workspaceId,revision:1,blocks:[{id:'heading',type:'heading',text:'Hello readers'},{id:'paragraph',type:'paragraph',text:'Welcome to a portable website.'}]};
   assert.equal((await call('/v1/websites/documents/document','PUT',{document:doc,expectedRevision:0})).status,200);
   const site={id:'website',workspaceId,creatorIdentityId:creator.id,revision:1,title:'Artist website',locale:'en',homePageId:'home',theme:{id:'neutral',version:'1',settings:{}},galleryDefault:{destination:{mode:'local'}},mediaMode:'bundled',basePath:'/',pages:[{id:'home',workspaceId,websiteId:'website',documentId:'document',revision:1,kind:'home',title:'Home',slug:'',order:0,state:'ready',navigation:true}],galleryPublicationIds:[],redirects:[]};
@@ -32,6 +34,14 @@ test('personal website API persists pages, queues builds, isolates previews and 
   const headers={authorization:'Bearer '+token};
   const preview=await fetch(origin+'/v1/websites/builds/'+id+'/preview?inline=1',{headers});assert.equal(preview.status,200);assert.match(preview.headers.get('content-security-policy'),/^sandbox;/);assert.match(preview.headers.get('cache-control'),/no-store/);assert.match(await preview.text(),/<style>/);
   const download=await fetch(origin+'/v1/websites/builds/'+id+'/export',{headers});assert.equal(download.status,200);assert.equal(download.headers.get('content-type'),'application/zip');const bytes=Buffer.from(await download.arrayBuffer());assert.equal(bytes.readUInt32LE(0),0x04034b50);
+  const physical=new DatabaseSync(join(dir,'websites.sqlite'));
+  assert.equal(physical.prepare('SELECT sum(length(bytes)) AS n FROM website_blobs').get().n,0,'normal builds keep owned file bytes out of SQL');
+  assert.equal(physical.prepare('SELECT sum(length(zip)) AS n FROM website_archives').get().n,0,'authorized ZIP bytes use the owned backend');physical.close();
+  const receipts=new DatabaseSync(join(dir,'state.sqlite'));
+  const owned=receipts.prepare("SELECT payload FROM ubeeq_records WHERE repository='hostRecords'").all().map(row=>JSON.parse(row.payload));receipts.close();
+  const archive=owned.find(row=>row.namespace==='runtime-website-blob'&&row.scopeId===creator.id&&row.key===createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(archive.value.byteLength,bytes.length);assert.ok(archive.value.chunkCount>0);assert.ok(Buffer.byteLength(JSON.stringify(archive.value))<1024,'blob manifests stay small independently of website capacity');
+  for(const output of owned.filter(row=>row.namespace==='runtime-owned-object'&&row.value.operation==='website.blob'&&row.value.phase==='completed')){const usage=owned.find(row=>row.id===output.value.usageIntentId);assert.equal(usage.value.input.storageBytesDelta,output.value.completedObject.byteLength);assert.equal(usage.value.state,'settled');}
   assert.equal((await fetch(origin+'/v1/websites/builds/'+id+'/preview')).status,401);
   assert.equal((await call('/v1/websites/builds/'+id+'/preview?file=../state.sqlite')).status,400);
   const savedToken=token;
@@ -45,12 +55,25 @@ test('personal website API persists pages, queues builds, isolates previews and 
   const upload=(await call('/v1/uploads','POST',{workId:work.id,mimeType:'image/jpeg',byteLength:source.length,checksum})).body.upload;
   await call('/v1/uploads/'+upload.uploadId+'/content','PUT',{base64:source.toString('base64')});
   await call('/v1/uploads/'+upload.uploadId+'/complete','POST',{workId:work.id,checksum,byteLength:source.length});await api.runNextJob('image-worker');
+  const cache=new DatabaseSync(join(dir,'websites.sqlite'));
+  assert.equal(cache.prepare('SELECT count(*) AS count FROM website_renditions').get().count,0,'new accounted cache bytes are not duplicated in SQLite');cache.close();
+  const records=new DatabaseSync(join(dir,'state.sqlite'));
+  const renditions=records.prepare("SELECT payload FROM ubeeq_records WHERE repository='hostRecords'").all().map(row=>JSON.parse(row.payload)).filter(row=>row.namespace==='runtime-owned-object'&&row.value.operation==='website.rendition'&&row.value.phase==='completed');records.close();
+  assert.equal(renditions.length,1,'processing prewarms one owned website rendition');
   const pub=(await call('/v1/works/'+work.id+'/publications','POST',{destination:'local'})).body.publication;
   assert.equal((await call('/v1/websites/catalogue')).body.publications[0].id,pub.id);
   const gallerySite={...site,revision:2,galleryPublicationIds:[pub.id]};
   assert.equal((await call('/v1/websites/website','PUT',{website:gallerySite,expectedRevision:1})).status,200);
   const galleryBuild=(await call('/v1/websites/website/builds','POST',{expectedRevision:2,idempotencyKey:'gallery'})).body.build;await api.runNextJob('gallery-worker');
   const galleryReport=(await call('/v1/websites/builds/'+galleryBuild.id)).body.build;assert.equal(galleryReport.state,'ready',JSON.stringify(galleryReport));
+  const manifest=(await call('/v1/websites/builds/'+galleryBuild.id+'/preview-manifest')).body;
+  const publicImage=Object.keys(manifest.files).find(path=>path.endsWith('.jpg'));
+  const batch=await call('/v1/websites/builds/'+galleryBuild.id+'/preview-files','POST',{paths:[publicImage]});assert.equal(batch.status,200);assert.ok(batch.body.files[0].base64);
+  const cachedBatch=await call('/v1/websites/builds/'+galleryBuild.id+'/preview-files','POST',{paths:[publicImage],knownChecksums:{[publicImage]:manifest.files[publicImage].checksum}});assert.equal(cachedBatch.body.files[0].base64,undefined);
+  // A different process can change the catalogue without an in-process invalidation event.
+  const writer=new DatabaseSync(join(dir,'state.sqlite'));
+  writer.prepare("UPDATE ubeeq_records SET revision=revision+1,payload=json_set(payload,'$.title','Changed title','$.revision',revision+1) WHERE repository='works' AND id=?").run(work.id);writer.close();
+  assert.equal((await call('/v1/websites/website/builds?previewRevision=2')).body.builds[0].stale,true);
   const galleryZip=Buffer.from(await(await fetch(origin+'/v1/websites/builds/'+galleryBuild.id+'/export',{headers})).arrayBuffer());
   assert.ok(galleryZip.includes(Buffer.from('galleries/autumn-landscape/index.html')));assert.ok(!galleryZip.includes(Buffer.from('PRIVATE CAMERA OWNER')));
   const metadataFree=await fetch(origin+'/v1/websites/builds/'+galleryBuild.id+'/preview?file=assets/'+galleryReport.dependencies.find(d=>d.kind==='asset').revision.split(':')[1]+'.jpg',{headers});

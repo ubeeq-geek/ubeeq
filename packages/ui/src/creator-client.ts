@@ -1,5 +1,6 @@
 /** Same-origin creator API client. Credentials are kept in memory, never persisted. */
-import type { WorkKind, CreatorAssetRegenerationRequest } from '@ubeeq/core';
+import type { WorkKind, CreatorAssetRegenerationRequest, PublicationImageSelection } from '@ubeeq/core';
+import type { PublicationImageReadModel } from './publication-image-controls.js';
 export type CreatorImageCoordinateSpace = 'raw' | 'oriented';
 export interface CreatorCoverImageControls {
   focalPoint?: { x: number; y: number };
@@ -34,6 +35,18 @@ export class CreatorClient {
   async register(email: string, password: string) { await this.call('/v1/auth/sign-up', 'POST', { email, password }); }
   async signOut() { try { await this.call('/v1/auth/sign-out', 'POST'); } finally { this.token = undefined; } }
   creators() { return this.call('/v1/creators/me'); }
+  private publicationImagePath(workId: string, publicationId: string) {
+    if (!workId?.trim() || !publicationId?.trim()) throw new Error('Select an explicit Work and Publication.');
+    return `/studio/works/${encodeURIComponent(workId)}/publications/${encodeURIComponent(publicationId)}/image-selection`;
+  }
+  publicationImageSelection(workId: string, publicationId: string): Promise<PublicationImageReadModel<Record<string, unknown>>> {
+    return this.call(this.publicationImagePath(workId, publicationId));
+  }
+  savePublicationImageSelection(workId: string, publicationId: string, input: {
+    selection: PublicationImageSelection; expectedConfigurationRevision: number; requestId: string;
+  }): Promise<PublicationImageReadModel<Record<string, unknown>>> {
+    return this.call(this.publicationImagePath(workId, publicationId), 'PUT', input, { idempotencyKey: input.requestId });
+  }
   async brandingCropSource(creatorId: string, kind: 'profile' | 'cover'): Promise<CreatorCropSourcePreview> {
     if (kind !== 'profile' && kind !== 'cover') throw new Error('Invalid branding image kind.');
     const value = await this.call(`/studio/creators/${encodeURIComponent(creatorId)}/branding/${kind}-image/crop-source`);

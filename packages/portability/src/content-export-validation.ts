@@ -1,3 +1,4 @@
+import {validateContentPreparationArchive} from './content-preparations.js';
 import { stableJson } from './index.js';
 import { contentAssetReferences } from '@ubeeq/core';
 type RecordValue = Record<string, any>;
@@ -133,6 +134,7 @@ export const parseCreatorContentExport = (json: string, limits: { maxBytes?: num
       accountStack.push(child);
     }
   }
+  if(manifest.contentPreparations!==undefined)validateContentPreparationArchive(manifest.contentPreparations,{tenantId,creatorId},{workIds,collectionIds});
   return { manifest, creatorId, tenantId, relatedIds: { publications: [...publicationIds], publicationIntents: [...intentIds], integrationAccounts: [...accountIds] }, counts: { works: workIds.size, assets: assetIds.size, retainedAssets: retained.length, collections: collectionIds.size,
     ...(manifest.sourceFiles === undefined ? {} : { sourceFiles: sourceFileIds.size }) } };
 };

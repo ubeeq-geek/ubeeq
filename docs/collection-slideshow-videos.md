@@ -59,7 +59,8 @@ The reference composition stores a separate private Asset rendition without a
 Work attachment. Its snapshot binds collection revision, ordered image and music
 asset versions/checksums, Work revisions and normalized settings. Neither browser
 playback nor a render changes the collection’s original assets or publications.
-Source bytes and output bytes never enter job JSON.
+Source bytes and output bytes never enter job JSON. The runtime uses its owned-object
+write journal for output custody and reuses a completed write after a retry.
 
 Durable `collection.slideshow` jobs retry transient failures. The pending Asset
 also acts as an outbox, allowing workers to repair a crash before enqueue. Request
@@ -67,8 +68,8 @@ IDs are idempotent for an exact snapshot; changing sources or settings requires 
 new request ID. Failed/stale renders can be regenerated using their prior settings.
 Source changes before or during rendering prevent completion. Later changes mark
 the rendition stale and disable downloading until a new render is generated.
-Metadata-only manifest imports retain lineage but remove dispatch flags and job
-references. They never restart slideshow rendering or grant access to old output.
+Portable metadata exports omit private slideshow renditions. Imports cannot
+restart slideshow rendering or grant access to old output.
 
 Generation and download require the collection owner, current cell/data home,
 active ready source assets, and clear admission for the Creator, collection,

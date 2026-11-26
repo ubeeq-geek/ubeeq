@@ -1,5 +1,11 @@
+export * from './creator-content-authority.js';
+export * from './retained-content-atomic.js';
 /** Provider-neutral durable persistence contracts. Provider implementations belong in adapter packages. */
+import type { PublicationImageConfiguration, PublicationImageDeliveryEvidence } from '@ubeeq/core';
 export * from "./creator-content.js";
+export * from './content-preparation.js';
+export * from './retained-creator-content.js';
+export * from './creator-work-inventory.js';
 export * from './websites.js';
 export * from './website-hosting.js';
 export * from './creator-content-restore.js';
@@ -64,11 +70,36 @@ export interface TransactionRunner {
   transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T>;
 }
 
+/** Complete canonical inventory, captured outside a write transaction. bind()
+ * conditionally guards every mutation (including insertions and removals) until
+ * commit, and enables repository list reads from that guarded inventory plus the
+ * transaction's own writes. It must never be backed by an eventual index or by
+ * an assumed empty legacy history. All writers must use the adapter's protocol. */
+export interface RepositorySnapshot<T> {
+  readonly items: readonly T[];
+  bind(transaction: PersistenceTransaction): Promise<void>;
+}
+
 /**
  * All durable repositories retain idempotency keys for at least the adapter's documented retention period.
  * Updates must reject stale revisions with OptimisticConcurrencyError.
  */
 export interface RevisionedRepository<T extends RevisionedRecord> {
+  snapshot?(): Promise<RepositorySnapshot<T>>;
+  /** Mark this adapter's active transaction rollback-only after a repository
+   * wrapper rejects its own accepting guard. This grants no write authority. */
+  failTransaction?():void;
+  /** Mathematical physical-row sizing from the actual adapter, including its
+   * full durable envelope. No caller-configurable logical/content budget. */
+  physicalRecordFits?(record:T):boolean;
+  /** Preserve an original managed JSON-row contract without importing its
+   * managed-only limit into Local's complete JSON storage. Provider-owned math. */
+  originalJsonFits?(value:Readonly<Record<string,unknown>>,managedByteLimit:number):boolean;
+  /** Commit-time read guard. Required by publication commands; never emulate with an unguarded read. */
+  checkRevision?(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void>;
+  /** Guard physical record absence until this transaction commits. A plain
+   * missing get() is not evidence. Conflicts use expectedRevision zero. */
+  checkAbsent?(id: string, options: { transaction: PersistenceTransaction }): Promise<void>;
   create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { transaction?: PersistenceTransaction; idempotencyKey?: string }): Promise<T>;
   get(id: string, options?: { transaction?: PersistenceTransaction }): Promise<T | undefined>;
   list(request: PageRequest, options?: { transaction?: PersistenceTransaction }): Promise<Page<T>>;
@@ -80,9 +111,22 @@ const DATA_HOME_FIELDS = ["homeCellId", "dataHomeRegion", "dataHomeAssignedAt", 
 
 /** Provider-neutral fail-closed boundary for canonical creator-owned repositories. */
 export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> implements RevisionedRepository<T> {
+  readonly snapshot?: () => Promise<RepositorySnapshot<T>>;
+  readonly physicalRecordFits?: (record:T)=>boolean;
+  readonly originalJsonFits?: (value:Readonly<Record<string,unknown>>,managedByteLimit:number)=>boolean;
+  readonly checkAbsent?: (id: string, options: { transaction: PersistenceTransaction }) => Promise<void>;
   constructor(readonly repository: RevisionedRepository<T>, readonly cellId: string) {
     if (!cellId.trim()) throw new Error("A cell-scoped repository requires a cellId.");
+    if (repository.snapshot) this.snapshot = async () => {
+      const snapshot = await repository.snapshot!();
+      return {items:snapshot.items.filter(record=>record.homeCellId===this.cellId),bind:transaction=>snapshot.bind(transaction)};
+    };
+    if(repository.originalJsonFits)this.originalJsonFits=repository.originalJsonFits.bind(repository);
+    if(repository.physicalRecordFits)this.physicalRecordFits=record=>record.homeCellId===cellId&&repository.physicalRecordFits!(record);
+    // A hidden foreign-cell row must never become evidence of physical absence.
+    if (repository.checkAbsent) this.checkAbsent = repository.checkAbsent.bind(repository);
   }
+  failTransaction():void {this.repository.failTransaction?.();}
   private local(record: T | undefined): T | undefined {
     return record?.homeCellId === this.cellId ? record : undefined;
   }
@@ -93,11 +137,23 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   async get(id: string, options?: Parameters<RevisionedRepository<T>["get"]>[1]): Promise<T | undefined> {
     return this.local(await this.repository.get(id, options));
   }
+  async checkRevision(id: string, expectedRevision: number, options: { transaction: PersistenceTransaction }): Promise<void> {
+    try {
+      if (!this.repository.checkRevision) throw new Error('Repository does not support commit-time revision guards.');
+      // Enlist before the first await. A detached wrapper must not perform an
+      // untracked point read while its companion transaction accepts a write.
+      await this.repository.checkRevision(id, expectedRevision, options);
+      const record = await this.get(id, options);
+      if (!record) throw new CellOwnershipError(this.cellId);
+    } catch(error) {this.failTransaction();throw error;}
+  }
   async list(request: PageRequest, options?: Parameters<RevisionedRepository<T>["list"]>[1]): Promise<Page<T>> {
     const limit = Math.max(1, request.limit); const items: T[] = []; let cursor = request.cursor;
     do {
-      const page = await this.repository.list({ cursor, limit: 1 }, options);
-      const record = page.items[0]; if (record?.homeCellId === this.cellId) items.push(record);
+      const count=Math.min(100,limit-items.length);
+      const page = await this.repository.list({ cursor, limit:count }, options);
+      if(page.items.length>count)throw Error('Repository exceeded its requested page size.');
+      for(const record of page.items)if(record.homeCellId===this.cellId)items.push(record);
       cursor = page.nextCursor;
       if (!cursor || items.length >= limit) return { items, nextCursor: cursor };
     } while (cursor);
@@ -116,13 +172,20 @@ export class CellScopedRepository<T extends RevisionedRecord & CellOwnedRecord> 
   }
 }
 
-export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
+export interface CreatorRecord extends RevisionedRecord, CellOwnedRecord { contentAuthority?: 'retained-v1'; instanceId: string; handle: string; handleHistory?: readonly string[]; displayName: string; subjectId?: string; bio?: string; links?: readonly { label: string; url: string }[]; }
+/** `published` is a retained legacy value. New publication commands leave the
+ * Work `ready`; current Publication records determine destination visibility. */
 export interface WorkRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; status: "draft" | "ready" | "published" | "archived" | "deleted"; }
 export interface AssetRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; workId?: string; mimeType: string; checksum: string; objectVersion: string; status: "pending" | "processing" | "ready" | "failed" | "deleted"; }
 export interface CollectionRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; creatorId: string; title: string; visibility: "private" | "unlisted" | "public"; }
 export interface WorkMembershipRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; collectionId: string; workId: string; position: number; }
 export interface PublicationIntentRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; workId: string; destination: string; idempotencyKey: string; }
-export interface PublicationRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; workId: string; destination: string; status: "draft" | "queued" | "live" | "removed" | "failed"; remoteId?: string; }
+export interface PublicationRecord extends RevisionedRecord, CellOwnedRecord, PublicationImageConfiguration {
+  instanceId: string; workId: string; destination: string; status: "draft" | "scheduled" | "queued" | "live" | "removed" | "failed"; remoteId?: string;
+  lastConfirmedImage?: PublicationImageDeliveryEvidence;
+  /** Disconnected provenance; never an active remote binding or delivery pointer. */
+  restoredPublicationHistory?: { sourcePublicationId: string; remoteId?: string; image?: PublicationImageDeliveryEvidence; copy?: import('@ubeeq/core').PublicationCopyIdentity };
+}
 export interface ReconciliationSnapshotRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; publicationId: string; cursor?: string; snapshot: Readonly<Record<string, unknown>>; }
 export interface ModerationEvidenceRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; subjectType: string; subjectId: string; source: string; payload: Readonly<Record<string, unknown>>; }
 export interface ModerationHoldRecord extends RevisionedRecord, CellOwnedRecord { instanceId: string; subjectType: string; subjectId: string; state: "active" | "released"; reason?: string; }
@@ -140,7 +203,22 @@ export interface ImportCheckpointRecord extends RevisionedRecord, CellOwnedRecor
 export interface FederationActorRecord extends RevisionedRecord { instanceId: string; actorUri: string; host: string; publicKey?: string; }
 export interface RemotePublicationReferenceRecord extends RevisionedRecord { instanceId: string; actorId: string; publicationUri: string; immutableId: string; state: "accepted" | "withdrawn" | "rejected"; }
 
+/** Host-owned records share the adapter transaction and cell boundary without adding host policy to core. */
+export interface HostRecord extends RevisionedRecord, CellOwnedRecord {
+  instanceId: string;
+  namespace: string;
+  scopeId: string;
+  key: string;
+  value: Readonly<Record<string, unknown>>;
+}
+export interface InstanceOperatorRecord extends RevisionedRecord { instanceId: string; actorId: string; }
 export interface UbeeqRepositories extends TransactionRunner {
+  /** Serialize an outside read when a provider shares one owned connection.
+   * The callback must only read records; it must not perform external I/O or
+   * accept domain writes. This is not an inventory or commit-time guard. */
+  readScope?<T>(operation:(transaction?:PersistenceTransaction)=>Promise<T>):Promise<T>;
+  hostRecords?: RevisionedRepository<HostRecord>;
+  instanceOperators?: RevisionedRepository<InstanceOperatorRecord>;
   creators: RevisionedRepository<CreatorRecord>;
   works: RevisionedRepository<WorkRecord>;
   assets: RevisionedRepository<AssetRecord>;
@@ -164,6 +242,12 @@ export interface UbeeqRepositories extends TransactionRunner {
   importCheckpoints: RevisionedRepository<ImportCheckpointRecord>;
   federationActors: RevisionedRepository<FederationActorRecord>;
   remotePublicationReferences: RevisionedRepository<RemotePublicationReferenceRecord>;
+}
+
+/** Preserve each adapter's outside-read semantics. In particular, a paginated
+ * DynamoDB query must not be inserted into a write transaction. */
+export function withRepositoryRead<T>(repositories:UbeeqRepositories,operation:(transaction?:PersistenceTransaction)=>Promise<T>):Promise<T>{
+  return repositories.readScope?repositories.readScope(operation):operation();
 }
 
 /** Executable shared fixture for every adapter's revisioned repository implementation. */
@@ -212,3 +296,7 @@ export const verifyCellScopedRepositoryContract = async (harness: { repository: 
   }
 };
 export * from './publication-copies.js';
+export * from './collection-announcements.js';
+export * from './publication-commands.js';
+export * from './publication-inventory.js';
+export * from './publication-record-guards.js';

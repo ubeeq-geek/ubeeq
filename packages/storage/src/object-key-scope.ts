@@ -7,3 +7,8 @@ export const isObjectKeyWithinPrefix = (key: string, prefix: string): boolean =>
   const root = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
   return canonical(key) && canonical(root) && key.startsWith(`${root}/`);
 };
+
+export const requireCreatorScopedObject = (key: string, input: { cellId: string; creatorId: string }): void => {
+  const prefix = `cells/${input.cellId}/creators/${input.creatorId}/`;
+  if (!isObjectKeyWithinPrefix(key,prefix)) throw new Error(`Object key is not scoped to creator ${input.creatorId} in cell ${input.cellId}`);
+};

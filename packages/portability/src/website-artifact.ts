@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { parse, type DefaultTreeAdapterMap } from 'parse5';
-import { WebsiteError, websitePath, type Website, type WebsiteDependency, type WebsiteDocument, type WebsiteGallery, type WebsitePublicationMapping } from '@ubeeq/core';
+import { WebsiteError, websitePath, type Website, type WebsiteDependency, type WebsiteDocument, type WebsiteGallery, type WebsiteNamedGallery, type WebsitePublicationMapping } from '@ubeeq/core';
 import { renderStaticWebsite, STATIC_BLOCK_SUPPORT, websiteGalleryViewerScript, resolveMediaEmbed, type StaticWebsiteMedia } from '@ubeeq/ui';
 import { parseContentBlocks, resolveWebsiteGallery, websiteRoutes, websiteExternalUrl } from '@ubeeq/core';
 
@@ -14,6 +14,8 @@ export interface WebsitePublicAsset {
 export interface WebsiteSnapshot {
   /** Approved cover rendition per named gallery; independent of its Work images. */
   namedGalleryCovers?:Readonly<Record<string,string>>;
+  /** Resolved public gallery links for this build, outside the saved website settings. */
+  namedGalleryLinks?: Readonly<Record<string, Pick<WebsiteNamedGallery, 'purchaseLinks' | 'externalLinks'>>>;
   copyrightYear?:number;
   creatorIdentities?:readonly {id:string;title:string}[];
   mailingList?: {signupUrl:string;submitUrl:string;consentText:string;offers:readonly {id:string;title:string}[]};
@@ -43,10 +45,11 @@ export const normalizeWebsiteDocument = (document: WebsiteDocument): WebsiteDocu
   return {...document, blocks};
 };
 
+const crcTable=Uint32Array.from({length:256},(_,index)=>{let value=index;for(let bit=0;bit<8;bit++)value=(value>>>1)^((value&1)?0xedb88320:0);return value;});
 /** Portable STORE ZIP with fixed DOS epoch, UTF-8 names and no platform metadata. */
 export const createWebsiteZip = (files: ReadonlyMap<string, Uint8Array>): Uint8Array => {
   const local: Buffer[] = [], central: Buffer[] = []; let offset = 0;
-  const crc = (bytes: Uint8Array) => { let value=0xffffffff; for (const byte of bytes) { value ^= byte; for(let i=0;i<8;i++) value=(value>>>1)^((value&1)?0xedb88320:0); } return (value^0xffffffff)>>>0; };
+  const crc = (bytes: Uint8Array) => { let value=0xffffffff; for (const byte of bytes) value=(value>>>8)^crcTable[(value^byte)&255]; return (value^0xffffffff)>>>0; };
   if (files.size > 65535) throw new WebsiteError('quota_exceeded','ZIP entry limit exceeded.');
   for (const [name, bytes] of [...files].sort(([a],[b]) => a < b ? -1 : a > b ? 1 : 0)) {
     if (!/^[\p{L}\p{N}%_./-]+$/u.test(name) || name.startsWith('/') || name.split('/').some(p => !p || p === '.' || p === '..')) throw new WebsiteError('invalid_output_path','Unsafe artifact filename.');
@@ -55,7 +58,7 @@ export const createWebsiteZip = (files: ReadonlyMap<string, Uint8Array>): Uint8A
     head.writeUInt32LE(checksum,14); head.writeUInt32LE(bytes.length,18); head.writeUInt32LE(bytes.length,22); head.writeUInt16LE(filename.length,26);
     directory.writeUInt32LE(0x02014b50); directory.writeUInt16LE(20,4); directory.writeUInt16LE(20,6); directory.writeUInt16LE(0x800,8); directory.writeUInt16LE(33,14);
     directory.writeUInt32LE(checksum,16); directory.writeUInt32LE(bytes.length,20); directory.writeUInt32LE(bytes.length,24); directory.writeUInt16LE(filename.length,28); directory.writeUInt32LE(offset,42);
-    local.push(head,filename,Buffer.from(bytes)); central.push(directory,filename); offset+=head.length+filename.length+bytes.length;
+    local.push(head,filename,Buffer.from(bytes.buffer,bytes.byteOffset,bytes.byteLength)); central.push(directory,filename); offset+=head.length+filename.length+bytes.length;
     if (offset > 0xffffffff) throw new WebsiteError('quota_exceeded','ZIP size limit exceeded.');
   }
   const end=Buffer.alloc(22), directory=Buffer.concat(central);
@@ -128,14 +131,18 @@ export const validateWebsiteSnapshotBudget = (raw: WebsiteSnapshot, limits: {max
   if(raw.creatorIdentities&&(raw.creatorIdentities.length>51||new Set(raw.creatorIdentities.map(creator=>creator.id)).size!==raw.creatorIdentities.length||raw.creatorIdentities.some(creator=>![raw.website.creatorIdentityId,...raw.website.contributingCreatorIds??[]].includes(creator.id)||typeof creator.title!=='string'||!creator.title.trim()||creator.title.length>500)))throw new WebsiteError('invalid_contributors','Resolve only the connected public creator identities.');
   if (raw.website.pages.length > limits.maxPages || raw.assets.length > limits.maxAssets || raw.galleries.length > 1000) throw new WebsiteError('quota_exceeded','Website page, gallery or media quota exceeded.');
   // Bound the source projection before cloning it or allocating rendered output.
-  let sourceBytes=Buffer.byteLength(JSON.stringify(raw.website));
+  let sourceBytes=Buffer.byteLength(JSON.stringify(raw.website)) + Buffer.byteLength(JSON.stringify(raw.namedGalleryLinks ?? {}));
   for(const value of [...raw.documents,...raw.galleries]) { sourceBytes+=Buffer.byteLength(JSON.stringify(value)); if(sourceBytes>limits.maxBytes) throw new WebsiteError('quota_exceeded','Website source projection exceeds the build byte budget.'); }
   for(const asset of raw.assets) { sourceBytes+=asset.bytes?.byteLength??0; if(sourceBytes>limits.maxBytes) throw new WebsiteError('quota_exceeded','Website source media exceeds the build byte budget.'); }
 };
 
 export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:number;maxAssets:number;maxBytes:number}) => {
   validateWebsiteSnapshotBudget(raw,limits);
-  const snapshot=structuredClone(raw), site=snapshot.website;
+  // Rendering is synchronous and never mutates media. Clone metadata without
+  // allocating another complete copy of the already-pinned binary payloads.
+  const snapshot:WebsiteSnapshot=structuredClone({...raw,assets:raw.assets.map(({bytes,...asset})=>asset)});
+  snapshot.assets=snapshot.assets.map((asset,index)=>({...asset,bytes:raw.assets[index].bytes}));
+  const site=snapshot.website;
   const routes=websiteRoutes(site), base=websitePath(site.basePath).replace(/\/$/,''), media=new Map<string,StaticWebsiteMedia>(), files=new Map<string,Uint8Array>();
   const documents=new Map(snapshot.documents.map(doc => [doc.id,normalizeWebsiteDocument(doc)]));
   if (documents.size !== snapshot.documents.length || snapshot.documents.some(d => d.workspaceId !== site.workspaceId)) throw new WebsiteError('foreign_reference','Documents must be unique and workspace-scoped.');
@@ -147,6 +154,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     if(g.canonicalUrl) websiteExternalUrl(g.canonicalUrl);
     return {...g,...resolveWebsiteGallery(site,g,snapshot.mappings)};
   });
+  const assetsById=new Map(snapshot.assets.map(asset=>[asset.id,asset]));
   const needed=new Set<string>();
   for(const [galleryId,assetId] of Object.entries(snapshot.namedGalleryCovers??{})){
     if(!site.namedGalleries?.some(g=>g.id===galleryId)||typeof assetId!=='string'||!snapshot.assets.some(a=>a.id===assetId&&a.mimeType.startsWith('image/')))throw new WebsiteError('invalid_media','Gallery covers must reference an approved image for an existing gallery.');
@@ -159,7 +167,7 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
   if (new Set(snapshot.assets.map(a=>a.id)).size !== snapshot.assets.length) throw new WebsiteError('invalid_media','Duplicate rendition identity.');
   let mediaBytes=0;
   for (const id of needed) {
-    const asset=snapshot.assets.find(a=>a.id===id);
+    const asset=assetsById.get(id);
     if (!asset || asset.workspaceId !== site.workspaceId || asset.approvedPublic !== true || asset.metadataStripped !== true || !extension[asset.mimeType] || !/^[a-f0-9]{64}$/.test(asset.checksum) || !Number.isSafeInteger(asset.revision) || asset.revision < 1) throw new WebsiteError('media_not_public','Required media is not an approved, metadata-clean public rendition.');
     for(const n of [asset.width,asset.height]) if(n !== undefined && (!Number.isSafeInteger(n) || n<1)) throw new WebsiteError('invalid_media','Media dimensions must be positive integers.');
     let src:string;
@@ -172,7 +180,19 @@ export const buildWebsiteArtifact = (raw: WebsiteSnapshot, limits: {maxPages:num
     }
     media.set(id,{src,mimeType:asset.mimeType,alt:asset.alt,width:asset.width,height:asset.height});
   }
-  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:site,routes,documents,galleries,media,namedGalleryCovers:snapshot.namedGalleryCovers,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
+  const galleryLinks = snapshot.namedGalleryLinks;
+  if (galleryLinks && Object.keys(galleryLinks).some(id => !site.namedGalleries?.some(gallery => gallery.id === id))) {
+    throw new WebsiteError('foreign_reference', 'Resolved gallery links must reference an existing website gallery.');
+  }
+  const renderSite = galleryLinks ? {
+    ...site,
+    namedGalleries: site.namedGalleries?.map(gallery => {
+      const links = Object.hasOwn(galleryLinks, gallery.id) ? galleryLinks[gallery.id] : undefined;
+      return links ? { ...gallery, purchaseLinks: links.purchaseLinks, externalLinks: links.externalLinks } : gallery;
+    })
+  } : site;
+  if (galleryLinks) websiteRoutes(renderSite);
+  const rendered=renderStaticWebsite({limits:{maxPages:limits.maxPages,maxBytes:limits.maxBytes-mediaBytes},apiVersion:'1',copyrightYear:snapshot.copyrightYear,website:renderSite,routes,documents,galleries,media,namedGalleryCovers:snapshot.namedGalleryCovers,creatorIdentities:snapshot.creatorIdentities,mailingList:snapshot.mailingList});
   for (const [path,content] of rendered.files) { if(files.has(path)) throw new WebsiteError('route_collision','Generated file collision.'); files.set(path,new TextEncoder().encode(content)); }
   const bytes=[...files.values()].reduce((sum,b)=>sum+b.length,0), pages=[...files.keys()].filter(k=>k.endsWith('.html')).length;
   if(bytes>limits.maxBytes || pages>limits.maxPages) throw new WebsiteError('quota_exceeded','Generated website exceeds output limits.');

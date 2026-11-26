@@ -16,7 +16,7 @@ function Collections() {
     const response = await fetch('/api/v1/' + path, { method, headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), cache: 'no-store', redirect: 'error' });
     const result = await response.json(); if (!response.ok) throw new Error(result.error?.message ?? 'Collection operation failed.'); return result;
   };
-  useEffect(() => { let active = true; if (token) void api('collections').then((result: Catalogue) => { if (active) { setCatalogue(result); setId(result.collections[0]?.id ?? ''); setOrder(result.collections[0]?.workIds ?? []); } }).catch(error => { if (active) setMessage(error.message); }); return () => { active = false; }; }, [token]);
+  useEffect(() => { let active = true; if (token) void Promise.all([api('collections'), api('works')]).then(([collections, works]) => ({...collections, works: works.works} as Catalogue)).then((result: Catalogue) => { if (active) { setCatalogue(result); setId(result.collections[0]?.id ?? ''); setOrder(result.collections[0]?.workIds ?? []); } }).catch(error => { if (active) setMessage(error.message); }); return () => { active = false; }; }, [token]);
   const create = async () => {
     setBusy(true);
     try { const result = await api('collections', 'POST', { title }); const next = { ...result.collection, workIds: [] }; setCatalogue(current => current && { ...current, collections: [...current.collections, next] }); setId(next.id); setOrder([]); setMessage('Collection created. Add image Works in order.'); }
@@ -25,7 +25,7 @@ function Collections() {
   const save = async () => {
     if (!collection) return;
     setBusy(true);
-    try { const result = await api(`collections/${encodeURIComponent(id)}/works`, 'PUT', { workIds: order, expectedRevision: collection.revision }); setCatalogue(current => current && { ...current, collections: current.collections.map(c => c.id === id ? { ...result.collection, workIds: result.workIds } : c) }); setMessage('Collection order saved.'); }
+    try { const result = await api(`collections/${encodeURIComponent(id)}/works`, 'PUT', { workIds: order, revision: collection.revision, expectedWorkIds: collection.workIds }); setCatalogue(current => current && { ...current, collections: current.collections.map(c => c.id === id ? result.collection : c) }); setMessage('Collection order saved.'); }
     catch (error) { setMessage(error instanceof Error ? error.message : 'Could not save collection.'); } finally { setBusy(false); }
   };
   const move = (index: number, direction: number) => { const next = [...order]; [next[index], next[index + direction]] = [next[index + direction], next[index]]; setOrder(next); };

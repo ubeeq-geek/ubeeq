@@ -1,9 +1,18 @@
+import {LocalAccountEmailVerification} from './account-email-verification.js';
+import type {AccountEmailVerificationPort,LocalAccountEmailVerificationConfiguration} from '@ubeeq/auth';
+import {openOwnedLocalRanges} from './original-ranges.js';
+import {removeOwnedLocalVersion} from './owned-version-removal.js';
+import type {OwnedVersionRemovalRequest} from '@ubeeq/storage';
+import {LocalCustomerIdentities} from './customer-identities.js';
+import {LocalUploadStreamCustody} from './upload-stream-custody.js';
+import {assertCreatorContentAuthorityChange,compactCreatorContentRepositories,CreatorContentAuthorityError,registerCreatorContentFinalizationRepository} from '@ubeeq/persistence';
+export * from './retained-content-atomic.js';
 export { SqliteDirectMessagingStore } from './direct-messaging.js';
 export { SqliteCommerceStore } from './commerce.js';
 export { SqliteWebsiteStore } from './websites.js';
 export * from './website-hosting.js';
 import { createCipheriv, createDecipheriv, createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign as signMessage, scryptSync, timingSafeEqual, verify as verifyMessage } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync, statSync, realpathSync, openSync, closeSync, fstatSync, constants, createReadStream } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -14,28 +23,34 @@ export { readCreatorLibrarySnapshot, type CreatorLibrarySnapshot } from './libra
 export { LocalFavoriteStore } from './favorites.js';
 export { LocalCreatorFollowStore } from './creator-follows.js';
 export { LocalCommentStore } from './comments.js';
-import type { AuthenticatedSession, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
+import type { AuthenticatedSession, AuthorizationSubject, IdentityAccount, PasswordIdentityAdapter } from "@ubeeq/auth";
 import type { DurableJob, JobLease, JobQueue, Scheduler } from "@ubeeq/jobs";
 import { JobRecoveryError } from "@ubeeq/jobs";
 import type { CredentialVault } from "@ubeeq/integrations";
 import type { FederationReplayStore, FederationSignatureVerifier, FederationSigner } from "@ubeeq/federation";
 import { RoutingDirectoryConflictError, validateCellRoute, validateMigrationCheckpoint, type CellRoute, type MigrationCheckpoint, type MigrationCheckpointStore, type RoutingDirectory } from "@ubeeq/deployment-platform";
-import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type UbeeqRepositories } from "@ubeeq/persistence";
-import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadCompletion, type UploadInitiation } from "@ubeeq/storage";
+import { CellScopedRepository, OptimisticConcurrencyError, UniqueConstraintError, type CellOwnedRecord, type Page, type PageRequest, type PersistenceTransaction, type RevisionedRecord, type RevisionedRepository, type RepositorySnapshot, type UbeeqRepositories } from "@ubeeq/persistence";
+import type { PublicationCommandRepositories } from '@ubeeq/persistence';
+import { assertManagedPublicationWrite, assertPublicationDeliveryWrite } from '@ubeeq/persistence';
+import { isObjectKeyWithinPrefix, requireCreatorScopedObject, type DeliveryAdapter, type ObjectStorage, type StoredObject, type UploadAcceptance, type UploadContentAdapter, type UploadContentStreamAdapter, type UploadStreamAcceptance, type UploadCompletion, type UploadInitiation, type UploadSealInput, type UploadSealResult } from "@ubeeq/storage";
 
 const now = (): string => new Date().toISOString();
 const json = <T>(value: T): string => JSON.stringify(value);
 const parse = <T>(value: string): T => JSON.parse(value) as T;
 const digest = (value: Uint8Array | string): string => createHash("sha256").update(value).digest("hex");
-type SqliteDatabase = { exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
+type SqliteDatabase = { close(): void; exec(sql: string): void; prepare(sql: string): { get(...parameters: unknown[]): unknown; all(...parameters: unknown[]): unknown; run(...parameters: unknown[]): { changes: number } }; };
+type LocalTransactionState = { id: string; active: boolean; rollbackOnly: boolean; guards: Map<string, number | null>; writes: Set<string> };
 
-export interface LocalAdapterConfiguration { databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
+export interface LocalAdapterConfiguration { emailVerification?:LocalAccountEmailVerificationConfiguration; databasePath: string; dataDirectory: string; publicBaseUrl: string; cellId: string; sessionTtlSeconds?: number; credentialEncryptionKey?: string; deliverySigningKey?: string; deliverySigningKeys?: Readonly<Record<string, string>>; activeDeliveryKeyId?: string; }
 
 export class LocalSqliteDatabase {
   readonly database: SqliteDatabase;
-  private readonly transactionContext = new AsyncLocalStorage<{ id: string; active: boolean; rollbackOnly: boolean }>();
-  private owner?: { id: string; active: boolean; rollbackOnly: boolean };
+  private readonly transactionContext = new AsyncLocalStorage<LocalTransactionState>();
+  private owner?: LocalTransactionState;
+  private synchronousTransaction=false;
   private transactionTail: Promise<void> = Promise.resolve();
+
+  close(): void { this.database.close(); }
 
   constructor(readonly configuration: LocalAdapterConfiguration) {
     mkdirSync(resolve(configuration.dataDirectory), { recursive: true });
@@ -75,7 +90,7 @@ export class LocalSqliteDatabase {
     this.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)");
     if (!configuration.cellId.trim()) throw new Error("Local adapters require a cellId.");
     this.transactionSync(()=>{
-    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency"]) {
+    for (const id of ["001-initial", "002-credential-vault", "003-federation-replays", "004-federation-keys", "005-regional-cell", "006-cell-boundaries", "007-routing-directory", "008-creator-library", "009-creator-handles", "010-creator-handle-history", "011-favorites", "012-creator-follows", "013-comments", "014-comment-visible-pages", "015-creator-asset-lookup", "016-work-publications", "017-source-file-catalogue", "018-job-cell-idempotency", "019-repository-snapshots", "020-account-authorization", "021-customer-identities", "022-upload-stream-custody", "023-customer-password-effects", "024-account-email-verification"]) {
       const applied = this.database.prepare("SELECT id FROM ubeeq_schema_migrations WHERE id = ?").get(id) as { id?: string } | undefined;
       if (!applied?.id) { this.database.exec(readFileSync(join(__dirname, "migrations", `${id}.sql`), "utf8")); this.database.prepare("INSERT INTO ubeeq_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, now()); }
     }
@@ -83,6 +98,41 @@ export class LocalSqliteDatabase {
   }
 
   /** Atomic synchronous work must not yield while holding SQLite's write lock. */
+  assertTransaction(transaction: PersistenceTransaction): void {
+    const context = this.transactionContext.getStore();
+    if (!context?.active || context !== this.owner || context.id !== transaction.id) throw new Error('Transaction handle is not active on this repository context.');
+  }
+  currentTransactionId():string|undefined {
+    const context=this.transactionContext.getStore();
+    return context?.active&&context===this.owner?context.id:undefined;
+  }
+  failTransaction(): void {
+    const context = this.transactionContext.getStore();
+    if (context?.active) context.rollbackOnly = true;
+  }
+  guardRecord(repository: string, id: string, expected: number | null, transaction: PersistenceTransaction): boolean {
+    try{this.assertTransaction(transaction);}catch(error){this.failTransaction();throw error;}
+    const context=this.transactionContext.getStore()!,key=JSON.stringify([repository,id]);
+    if(context.writes.has(key)){context.rollbackOnly=true;throw new Error('A transaction must guard or write each item once.');}
+    if(context.guards.has(key)){
+      if(context.guards.get(key)!==expected){context.rollbackOnly=true;throw new OptimisticConcurrencyError(id,expected??0);}
+      return false;
+    }
+    context.guards.set(key,expected);return true;
+  }
+  recordWrite(repository: string, id: string): void {
+    const context=this.transactionContext.getStore();
+    if(!context)return;
+    this.assertTransaction(context);
+    const key=JSON.stringify([repository,id]);
+    if(context.guards.has(key)){context.rollbackOnly=true;throw new Error('A transaction cannot write a guarded item.');}
+    context.writes.add(key);
+  }
+  /** Physical provider effects cannot borrow a domain/Raw transaction whose
+   * rollback could erase their permanent custody/removal fence. */
+  assertOutsideProviderTransaction():void {
+    if(this.transactionContext.getStore()||this.owner||this.synchronousTransaction)throw new Error('Physical provider effects must run outside an active Local transaction.');
+  }
   transactionSync<T>(operation: () => T): T {
     const inherited = this.transactionContext.getStore();
     if (inherited) {
@@ -90,13 +140,14 @@ export class LocalSqliteDatabase {
       try { return operation(); }
       catch (error) { inherited.rollbackOnly = true; throw error; }
     }
-    if (this.owner) throw new Error('SQLite connection is owned by another transaction.');
-    this.database.exec('BEGIN IMMEDIATE');
+    if (this.owner||this.synchronousTransaction) throw new Error('SQLite connection is owned by another transaction.');
+    this.database.exec('BEGIN IMMEDIATE');this.synchronousTransaction=true;
     try {
       const result = operation();
       this.database.exec('COMMIT');
       return result;
     } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+    finally{this.synchronousTransaction=false;}
   }
 
   async transaction<T>(operation: (transaction: PersistenceTransaction) => Promise<T>): Promise<T> {
@@ -110,11 +161,24 @@ export class LocalSqliteDatabase {
     const previous = this.transactionTail;
     this.transactionTail = new Promise<void>(resolve => { release = resolve; });
     await previous;
-    const context = { id: `sqlite-${randomUUID()}`, active: true, rollbackOnly: false };
+    const context:LocalTransactionState = { id: `sqlite-${randomUUID()}`, active: true, rollbackOnly: false, guards:new Map(), writes:new Set() };
     this.owner = context;
     try {
       return await this.transactionContext.run(context, async () => {
-        this.database.exec('BEGIN IMMEDIATE');
+        // SQLite's synchronous busy handler cannot let another connection in
+        // this process finish its awaited callback. Acquire asynchronously,
+        // keeping the same five-second bound and original native busy error.
+        const deadline = Date.now() + 5000;
+        for (;;) {
+          this.database.exec('PRAGMA busy_timeout = 0');
+          let busy: unknown;
+          try { this.database.exec('BEGIN IMMEDIATE'); }
+          catch (error) { busy = error; }
+          finally { this.database.exec('PRAGMA busy_timeout = 5000'); }
+          if (!busy) break;
+          if ((busy as {errcode?:number}).errcode !== 5 || Date.now() >= deadline) throw busy;
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
         try {
           const result = await operation({ id: context.id });
           if (context.rollbackOnly) throw new Error('SQLite transaction is rollback-only after a nested failure.');
@@ -127,7 +191,27 @@ export class LocalSqliteDatabase {
 }
 
 class SqliteRevisionedRepository<T extends RevisionedRecord> implements RevisionedRepository<T> {
+  /** Local stores complete JSON in one SQLite TEXT row. It has no Dynamo item
+   * cap; do not add 300KiB/chunks to valid Native-sized 1MiB logical records.
+   * SQLite itself owns its physical engine limits and atomic rollback. */
+  failTransaction():void {this.local.failTransaction();}
+  physicalRecordFits(record:T):boolean {return typeof JSON.stringify(record)==='string';}
+  originalJsonFits(value:Readonly<Record<string,unknown>>,_managedByteLimit:number):boolean {return typeof JSON.stringify(value)==='string';}
   constructor(private readonly local: LocalSqliteDatabase, private readonly repository: string) {}
+  private guard(previous:T|undefined,next:T|undefined){
+    try {
+      if(this.repository==='creators')assertCreatorContentAuthorityChange(previous as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,next as unknown as import('@ubeeq/persistence').CreatorRecord|undefined,{coordinator:this.local,transactionId:this.local.currentTransactionId()});
+      if((compactCreatorContentRepositories as readonly string[]).includes(this.repository)){
+        const read=(repository:string,id:string)=>{const row=this.local.database.prepare('SELECT payload FROM ubeeq_records WHERE repository = ? AND id = ?').get(repository,id) as {payload:string}|undefined;return row?JSON.parse(row.payload):undefined;};
+        for(const value of [previous,next] as Array<Record<string,any>|undefined>){
+          if(!value)continue;const creatorId=value.creatorId??(value.workId?read('works',value.workId)?.creatorId:undefined)??(value.collectionId?read('collections',value.collectionId)?.creatorId:undefined);
+          if(creatorId&&read('creators',creatorId)?.contentAuthority==='retained-v1')throw new CreatorContentAuthorityError();
+        }
+      }
+      if (next && this.repository === 'publications') assertManagedPublicationWrite(previous as unknown as import('@ubeeq/persistence').ManagedPublicationRecord, next as unknown as import('@ubeeq/persistence').ManagedPublicationRecord);
+      if (next && this.repository === 'publicationOperations') assertPublicationDeliveryWrite(previous as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord, next as unknown as import('@ubeeq/persistence').PublicationDeliveryRecord);
+    } catch (error) { this.local.failTransaction(); throw error; }
+  }
 
   private write(operation: () => { changes: number }): { changes: number } {
     try { return operation(); }
@@ -151,16 +235,19 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     return { ...value, handleHistory: [...new Set([...(old?.handleHistory || []), ...(old?.handle ? [old.handle] : []), ...(next.handleHistory || []), next.handle])] };
   }
 
-  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string }): Promise<T> {
+  async create(record: Omit<T, "revision" | "createdAt" | "updatedAt">, options?: { idempotencyKey?: string; transaction?:PersistenceTransaction }): Promise<T> {
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
     return this.local.transactionSync(() => {
       if (options?.idempotencyKey) {
         const existing = this.local.database.prepare("SELECT record_id FROM ubeeq_idempotency WHERE repository = ? AND idempotency_key = ?").get(this.repository, options.idempotencyKey) as { record_id?: string } | undefined;
         if (existing?.record_id) return this.read(existing.record_id)!;
       }
+      this.local.recordWrite(this.repository,record.id);
       const existing = this.read(record.id);
       if (existing) throw new Error(`Record ${record.id} already exists.`);
       const timestamp = now();
       const value = this.retainHandleHistory({ ...record, revision: 1, createdAt: timestamp, updatedAt: timestamp } as T);
+      this.guard(undefined, value);
       this.write(() => this.local.database.prepare("INSERT INTO ubeeq_records (repository, id, revision, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run(this.repository, value.id, value.revision, json(value), timestamp, timestamp));
       if (options?.idempotencyKey) this.local.database.prepare("INSERT INTO ubeeq_idempotency (repository, idempotency_key, record_id, created_at) VALUES (?, ?, ?, ?)").run(this.repository, options.idempotencyKey, value.id, timestamp);
       return value;
@@ -169,6 +256,17 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
 
   async get(id: string): Promise<T | undefined> {
     return this.read(id);
+  }
+  async checkRevision(id: string, expectedRevision: number, _options: { transaction: PersistenceTransaction }): Promise<void> {
+    if(!this.local.guardRecord(this.repository,id,expectedRevision,_options.transaction))return;
+    // The transaction owns BEGIN IMMEDIATE; this read stays guarded until commit.
+    const current = this.read(id);
+    if (!current || current.revision !== expectedRevision) { this.local.failTransaction(); throw new OptimisticConcurrencyError(id, expectedRevision); }
+  }
+  async checkAbsent(id: string, options: { transaction: PersistenceTransaction }): Promise<void> {
+    if(!this.local.guardRecord(this.repository,id,null,options.transaction))return;
+    // BEGIN IMMEDIATE excludes every other SQLite writer until this commit.
+    if(this.read(id)){this.local.failTransaction();throw new OptimisticConcurrencyError(id,0);}
   }
 
   private read(id: string): T | undefined {
@@ -185,36 +283,83 @@ class SqliteRevisionedRepository<T extends RevisionedRecord> implements Revision
     return { items, nextCursor: hasMore ? Buffer.from(items.at(-1)!.id).toString("base64url") : undefined };
   }
 
-  async update(id: string, expectedRevision: number, change: Partial<Omit<T, "id" | "revision" | "createdAt" | "updatedAt">>): Promise<T> {
-    const current = await this.get(id);
-    if (!current || current.revision !== expectedRevision) throw new OptimisticConcurrencyError(id, expectedRevision);
-    const value = this.retainHandleHistory({ ...current, ...change, revision: current.revision + 1, updatedAt: now() } as T, current);
-    const result = this.write(() => this.local.database.prepare("UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?").run(value.revision, json(value), value.updatedAt, this.repository, id, expectedRevision));
-    if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
-    return value;
+  async snapshot(): Promise<RepositorySnapshot<T>> {
+    return this.local.transaction(async () => {
+      const version = () => {
+        const value = (this.local.database.prepare('SELECT version FROM ubeeq_repository_versions WHERE repository = ?').get(this.repository) as {version:number}|undefined)?.version ?? 0;
+        if (!Number.isSafeInteger(value) || value < 0) throw new Error('Repository change marker requires reconciliation.');
+        return value;
+      };
+      const expected = version();
+      // One canonical table read includes legacy rows; zero is a mutation marker,
+      // never a claim that the inventory or publication history is empty.
+      const rows = this.local.database.prepare('SELECT payload FROM ubeeq_records WHERE repository = ? ORDER BY id').all(this.repository) as Array<{payload:string}>;
+      return {items:rows.map(row=>parse<T>(row.payload)),bind:async transaction=>{
+        this.local.assertTransaction(transaction);
+        if (version() !== expected) { this.local.failTransaction(); throw new OptimisticConcurrencyError('repository:'+this.repository, expected); }
+      }};
+    });
   }
 
-  async remove(id: string, expectedRevision: number): Promise<void> {
-    const result = this.local.database.prepare("DELETE FROM ubeeq_records WHERE repository = ? AND id = ? AND revision = ?").run(this.repository, id, expectedRevision);
-    if (result.changes !== 1) throw new OptimisticConcurrencyError(id, expectedRevision);
+  async update(id:string,expectedRevision:number,change:Partial<Omit<T,'id'|'revision'|'createdAt'|'updatedAt'>>,options?:{transaction?:PersistenceTransaction}):Promise<T>{
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
+    return this.local.transactionSync(()=>{
+      this.local.recordWrite(this.repository,id);
+      const current=this.read(id);
+      if(!current||current.revision!==expectedRevision){this.local.failTransaction();throw new OptimisticConcurrencyError(id,expectedRevision);}
+      const value=this.retainHandleHistory({...current,...change,revision:current.revision+1,updatedAt:now()} as T,current);
+      this.guard(current,value);
+      const result=this.write(()=>this.local.database.prepare('UPDATE ubeeq_records SET revision = ?, payload = ?, updated_at = ? WHERE repository = ? AND id = ? AND revision = ?').run(value.revision,json(value),value.updatedAt,this.repository,id,expectedRevision));
+      if(result.changes!==1)throw new OptimisticConcurrencyError(id,expectedRevision);
+      return value;
+    });
+  }
+  async remove(id:string,expectedRevision:number,options?:{transaction?:PersistenceTransaction}):Promise<void>{
+    if(options?.transaction)this.local.assertTransaction(options.transaction);
+    this.local.transactionSync(()=>{
+      this.local.recordWrite(this.repository,id);
+      this.guard(this.read(id),undefined);
+      const result=this.local.database.prepare('DELETE FROM ubeeq_records WHERE repository = ? AND id = ? AND revision = ?').run(this.repository,id,expectedRevision);
+      if(result.changes!==1)throw new OptimisticConcurrencyError(id,expectedRevision);
+    });
   }
 }
 
 const repository = <T extends RevisionedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new SqliteRevisionedRepository<T>(local, name);
 const cellRepository = <T extends RevisionedRecord & CellOwnedRecord>(local: LocalSqliteDatabase, name: string): RevisionedRepository<T> => new CellScopedRepository(repository<T>(local, name), local.configuration.cellId);
 
+/** Shares the authoritative publications/works buckets and SQLite transaction with the ordinary repositories. */
+export const createLocalPublicationCommandRepositories = (local: LocalSqliteDatabase): PublicationCommandRepositories & UbeeqRepositories => ({
+  ...createLocalRepositories(local), publications: cellRepository(local, 'publications'),
+  claims: cellRepository(local, 'publicationClaims'), operations: cellRepository(local, 'publicationOperations'),
+  outbox: cellRepository(local, 'publicationOutbox'), auditEvents: cellRepository(local, 'auditEvents')
+});
+
 /** Durable local composition. It is intentionally a generic JSON-record adapter, not an in-memory default. */
 export const createLocalRepositories = (local: LocalSqliteDatabase): UbeeqRepositories => ({
   transaction: local.transaction.bind(local),
-  creators: cellRepository(local, "creators"), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
+  readScope:operation=>local.transaction(transaction=>operation(transaction)),
+  hostRecords: cellRepository(local, "hostRecords"),
+  creators: registerCreatorContentFinalizationRepository(cellRepository(local, "creators"),local), works: cellRepository(local, "works"), assets: cellRepository(local, "assets"), collections: cellRepository(local, "collections"), workMemberships: cellRepository(local, "workMemberships"),
   publicationIntents: cellRepository(local, "publicationIntents"), publications: cellRepository(local, "publications"), reconciliationSnapshots: cellRepository(local, "reconciliationSnapshots"),
   moderationEvidence: cellRepository(local, "moderationEvidence"), moderationHolds: cellRepository(local, "moderationHolds"), reviewCases: cellRepository(local, "reviewCases"), auditEvents: cellRepository(local, "auditEvents"),
   usageEvents: cellRepository(local, "usageEvents"), creditLots: cellRepository(local, "creditLots"), creditReservations: cellRepository(local, "creditReservations"), balances: cellRepository(local, "balances"),
-  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
+  integrationAccounts: cellRepository(local, "integrationAccounts"), syncCursors: cellRepository(local, "syncCursors"), integrationJobs: cellRepository(local, "integrationJobs"), exportManifests: cellRepository(local, "exportManifests"), importCheckpoints: cellRepository(local, "importCheckpoints"), instanceOperators: repository(local, "instanceOperators"), federationActors: repository(local, "federationActors"), remotePublicationReferences: repository(local, "remotePublicationReferences")
 });
 
-export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, DeliveryAdapter {
-  constructor(private readonly local: LocalSqliteDatabase) {}
+export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapter, UploadContentStreamAdapter, DeliveryAdapter {
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){return openOwnedLocalRanges(this.local,input);}
+  removeOwnedVersion(input:OwnedVersionRemovalRequest){return removeOwnedLocalVersion(this.local,input);}
+  private readonly uploadCustody:LocalUploadStreamCustody;
+  constructor(private readonly local: LocalSqliteDatabase) {
+    this.local.database.exec("CREATE TABLE IF NOT EXISTS ubeeq_upload_completions (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, object_payload TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','completed')))");
+    this.local.database.exec('CREATE TABLE IF NOT EXISTS ubeeq_upload_seals (id TEXT PRIMARY KEY, cell_id TEXT NOT NULL, creator_id TEXT NOT NULL, proof_id TEXT NOT NULL, closed_at TEXT NOT NULL)');
+    this.uploadCustody=new LocalUploadStreamCustody(local);
+  }
+  private sameUploadObject(a:StoredObject,b:StoredObject):boolean {
+    const facts=(o:StoredObject)=>[o.bucket,o.key,o.versionId??null,o.contentType,o.byteLength,o.checksum??null,o.scope];
+    return json(facts(a))===json(facts(b));
+  }
   private objectPath(object: Pick<StoredObject, "bucket" | "key" | "versionId">): string {
     const root = resolve(this.local.configuration.dataDirectory, "objects", object.bucket);
     const path = resolve(root, object.key, object.versionId ?? "current");
@@ -243,23 +388,45 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
   async get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }> {
     const path = this.objectPath(input); return { object: parse<StoredObject>(readFileSync(`${path}.json`, "utf8")), body: readFileSync(path) };
   }
+  async openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}){
+    if(!input.bucket||Buffer.byteLength(input.bucket)>255||/[\\/\r\n\u0000]/.test(input.bucket)||['.','..'].includes(input.bucket)||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(input.versionId??''))throw Error('An exact local object bucket/version is required.');
+    const match=input.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//);if(!match||match[1]!==this.local.configuration.cellId)throw Error('Original stream is outside its cell.');
+    requireCreatorScopedObject(input.key,{cellId:match[1],creatorId:match[2]});
+    const root=realpathSync(resolve(this.local.configuration.dataDirectory,'objects',input.bucket)),path=resolve(root,input.key,input.versionId);
+    if(!path.startsWith(root+'/')||realpathSync(path)!==path||realpathSync(path+'.json')!==path+'.json')throw Error('Original stream location escapes its owned root.');
+    let fd:number|undefined;
+    try{
+      if(statSync(path+'.json').size>64*1024)throw Error('Original stream metadata exceeds its safe size.');
+      const object=parse<StoredObject>(readFileSync(path+'.json','utf8'));
+      fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);const observed=fstatSync(fd);
+      if(!observed.isFile()||object.bucket!==input.bucket||object.key!==input.key||object.versionId!==input.versionId||object.byteLength!==observed.size||!Number.isSafeInteger(object.byteLength)||!object.contentType||!['private','restricted','public'].includes(object.scope))throw Error('Original stream metadata conflicts.');
+      const body=createReadStream(path,{fd,autoClose:true,highWaterMark:64*1024});fd=undefined;
+      return {object,body,async close(){body.destroy();}};
+    }finally{if(fd!==undefined)closeSync(fd);}
+  }
   async remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void> { const path = this.objectPath(input); rmSync(path, { force: true }); rmSync(`${path}.json`, { force: true }); }
-  async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation> {
-    const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
-    const uploadId = randomUUID(); this.local.database.prepare("INSERT INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
-    return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
+  async initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation> {
+    return this.local.transaction(async () => {
+      const match = input.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match) throw new Error("Upload object is not creator-scoped.");
+      const uploadId = input.idempotencyKey ? digest(JSON.stringify([match[1],input.object.key,input.idempotencyKey])) : randomUUID();
+      if(this.local.database.prepare('SELECT id FROM ubeeq_upload_seals WHERE id=?').get(uploadId))throw new Error('Upload is permanently sealed.');
+      if(this.local.database.prepare("SELECT id FROM ubeeq_upload_completions WHERE id=?").get(uploadId)) throw new Error("Upload operation already has a completion intent.");
+      this.local.database.prepare("INSERT OR IGNORE INTO ubeeq_uploads (id, object_payload, cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(uploadId, json(input.object), match[1], match[2], input.expiresAt, input.object.checksum ?? null, input.object.byteLength, "upload_content", now());
+      const saved = this.local.database.prepare("SELECT object_payload, expires_at FROM ubeeq_uploads WHERE id=?").get(uploadId) as {object_payload:string;expires_at:string};
+      if(!this.sameUploadObject(parse<StoredObject>(saved.object_payload),input.object) || saved.expires_at !== input.expiresAt) throw new Error("Upload initiation idempotency conflict.");
+      return { uploadId, object: input.object, completeUrl: `${this.local.configuration.publicBaseUrl.replace(/\/$/, "")}/v1/uploads/${uploadId}/complete`, expiresAt: input.expiresAt };
+    });
   }
-  async accept(input: UploadAcceptance): Promise<void> { const row = this.local.database.prepare("SELECT cell_id, creator_id, expires_at, expected_checksum, expected_byte_length, operation FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { cell_id: string; creator_id: string; expires_at: string; expected_checksum?: string; expected_byte_length: number; operation: string } | undefined; if (!row || row.cell_id !== input.cellId || row.creator_id !== input.creatorId || row.operation !== input.operation) throw new Error("Upload scope does not match the authenticated creator and cell."); if (Date.parse(row.expires_at) <= Date.now()) throw new Error("Upload session has expired."); if (input.body.byteLength !== row.expected_byte_length || (row.expected_checksum && digest(input.body) !== row.expected_checksum)) throw new Error("Upload content does not match the declared size or checksum."); this.local.database.prepare("UPDATE ubeeq_uploads SET body = ? WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.body, input.uploadId, input.cellId, input.creatorId); }
-  async abort(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void> { this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id = ? AND cell_id = ? AND creator_id = ?").run(input.uploadId, input.cellId, input.creatorId); }
-  async complete(input: UploadCompletion): Promise<StoredObject> {
-    const row = this.local.database.prepare("SELECT object_payload, body FROM ubeeq_uploads WHERE id = ?").get(input.uploadId) as { object_payload?: string; body?: Uint8Array } | undefined;
-    if (!row?.object_payload || !row.body) throw new Error("Upload content has not been received.");
-    const requested = parse<StoredObject>(row.object_payload);
-    requireCreatorScopedObject(requested.key, input);
-    if (row.body.byteLength !== input.byteLength || digest(row.body) !== input.checksum) throw new Error("Upload checksum or length does not match.");
-    const object = { ...requested, checksum: input.checksum, byteLength: input.byteLength, versionId: randomUUID() };
-    await this.put({ object, body: row.body }); this.local.database.prepare("DELETE FROM ubeeq_uploads WHERE id = ?").run(input.uploadId); return object;
+  async accept(input:UploadAcceptance):Promise<void>{
+    // Byte callers share the same custody/receipt path; new content is never
+    // duplicated into SQLite BLOBs. The exact stream verifier remains mandatory.
+    await this.acceptStream({...input,body:(async function*(){yield input.body;})()});
   }
+  async acceptStream(input:UploadStreamAcceptance):Promise<void>{return this.uploadCustody.acceptStream(input);}
+  async abort(input:{uploadId:string;cellId:string;creatorId:string}):Promise<void>{return this.uploadCustody.abort(input);}
+  async complete(input:UploadCompletion):Promise<StoredObject>{return this.uploadCustody.complete(input);}
+  async recoverCompletion(input:UploadCompletion):Promise<StoredObject|undefined>{return this.uploadCustody.recoverCompletion(input);}
+  async seal(input:UploadSealInput):Promise<UploadSealResult>{return this.uploadCustody.seal(input);}
   async issue(request: { object: Pick<StoredObject, "bucket" | "key" | "versionId" | "scope">; expiresAt: string; disposition?: "inline" | "attachment" }): Promise<{ url: string; expiresAt: string }> {
     const match = request.object.key.match(/^cells\/([^/]+)\/creators\/([^/]+)\//); if (!match || match[1] !== this.local.configuration.cellId) throw new Error("Delivery object is not scoped to this cell.");
     if (request.object.scope === "public" && !request.object.key.includes("/renditions/")) throw new Error("Only rendition objects may receive public cacheable delivery tokens.");
@@ -271,7 +438,9 @@ export class LocalFilesystemStorage implements ObjectStorage, UploadContentAdapt
 }
 
 export class LocalIdentityAdapter implements PasswordIdentityAdapter {
-  constructor(private readonly local: LocalSqliteDatabase) {}
+  readonly customerAccounts:LocalCustomerIdentities;
+  readonly emailVerification?:AccountEmailVerificationPort;
+  constructor(private readonly local: LocalSqliteDatabase) {this.customerAccounts=new LocalCustomerIdentities(local);if(local.configuration.emailVerification)this.emailVerification=new LocalAccountEmailVerification(local,this,local.configuration.emailVerification);}
   async register(input: { email: string; password: string }): Promise<IdentityAccount> {
     if (!/^\S+@\S+\.\S+$/.test(input.email) || input.password.length < 12) throw new Error("Local accounts require a valid email and a password of at least 12 characters.");
     const id = randomUUID(), timestamp = now(), salt = randomBytes(16).toString("hex"), passwordHash = scryptSync(input.password, salt, 64).toString("hex");
@@ -279,22 +448,57 @@ export class LocalIdentityAdapter implements PasswordIdentityAdapter {
     return { id, subjectId: id, status: "active", createdAt: timestamp, updatedAt: timestamp };
   }
   async authenticate(input: { email: string; password: string }): Promise<{ token: string; session: AuthenticatedSession }> {
-    const row = this.local.database.prepare("SELECT id, password_hash, salt, status, created_at, updated_at FROM ubeeq_accounts WHERE email = ?").get(input.email.toLowerCase()) as { id: string; password_hash: string; salt: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined;
-    if (!row || row.status !== "active") throw new Error("Invalid local credentials.");
+    const read=()=>this.local.database.prepare("SELECT id,email,password_hash,salt,status,account_scope,roles_json,scopes_json,email_verified,customer_password_state FROM ubeeq_accounts WHERE email = ?").get(input.email.toLowerCase()) as {id:string;email:string;password_hash:string;salt:string;status:string;account_scope:string;roles_json:string;scopes_json:string;email_verified:number;customer_password_state:string}|undefined;
+    const row=read();
+    if (!row || row.status !== "active" || row.customer_password_state!=="set") throw new Error("Invalid local credentials.");
     const supplied = scryptSync(input.password, row.salt, 64); const expected = Buffer.from(row.password_hash, "hex");
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error("Invalid local credentials.");
-    const token = randomBytes(32).toString("base64url"), id = randomUUID(), timestamp = now(), expiresAt = new Date(Date.now() + (this.local.configuration.sessionTtlSeconds ?? 86_400) * 1000).toISOString();
-    this.local.database.prepare("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)").run(id, row.id, digest(token), expiresAt, timestamp);
-    return { token, session: { id, subject: { id: row.id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: timestamp, expiresAt, authenticationMethod: "password" } };
+    return this.local.transaction(async()=>{
+      const current=read();
+      if(!current||!Object.keys(row).every(key=>row[key as keyof typeof row]===current[key as keyof typeof current]))throw new Error("Invalid local credentials.");
+      const subject=await this.getAuthorizationSubject(row.id);
+      if(!subject||subject.accountScope!==row.account_scope)throw new Error("Invalid local credentials.");
+      const token = randomBytes(32).toString("base64url"), id = randomUUID(), timestamp = now(), expiresAt = new Date(Date.now() + (this.local.configuration.sessionTtlSeconds ?? 86_400) * 1000).toISOString();
+      this.local.database.prepare("INSERT INTO ubeeq_sessions (id, account_id, token_hash, expires_at, created_at, account_scope_at_issue) VALUES (?, ?, ?, ?, ?, ?)").run(id, row.id, digest(token), expiresAt, timestamp, subject.accountScope);
+      return { token, session: { id, subject, issuedAt: timestamp, expiresAt, authenticationMethod: "password" as const } };
+    });
   }
   async verifySession(input: { credential: string }): Promise<AuthenticatedSession | undefined> {
-    const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string } | undefined;
+    return this.local.transaction(async()=>{
+    const row = this.local.database.prepare("SELECT s.id, s.account_id, s.expires_at, s.account_scope_at_issue FROM ubeeq_sessions s WHERE s.token_hash = ? AND s.revoked_at IS NULL").get(digest(input.credential)) as { id: string; account_id: string; expires_at: string; account_scope_at_issue:string } | undefined;
     if (!row || row.expires_at <= now()) return undefined;
-    return { id: row.id, subject: { id: row.account_id, roles: ["creator"], scopes: ["creator.read", "creator.write", "work.publish", "export.create"] }, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
+    const subject = await this.getAuthorizationSubject(row.account_id);
+    if (!subject || subject.accountScope!==row.account_scope_at_issue) return undefined;
+    return { id: row.id, subject, issuedAt: "", expiresAt: row.expires_at, authenticationMethod: "password" };
+    });
   }
-  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }
+  async withVerifiedSession<T>(input:{credential:string;audience?:string},operation:(session:AuthenticatedSession,transaction:import('@ubeeq/auth').CustomerIdentityTransaction)=>Promise<T>):Promise<T|undefined>{
+    return this.local.transaction(async transaction=>{
+      const session=await this.verifySession(input);if(!session)return undefined;
+      return operation(session,transaction);
+    });
+  }
+  async getAccount(subjectId: string): Promise<IdentityAccount | undefined> { return this.local.transaction(async()=>{ const row = this.local.database.prepare("SELECT id, status, created_at, updated_at FROM ubeeq_accounts WHERE id = ?").get(subjectId) as { id: string; status: IdentityAccount["status"]; created_at: string; updated_at: string } | undefined; return row ? { id: row.id, subjectId: row.id, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at } : undefined; }); }
+  async getAuthorizationSubject(subjectId: string): Promise<AuthorizationSubject | undefined> {
+    return this.local.transaction(async()=>{
+    const row = this.local.database.prepare('SELECT id, email, status, account_scope, roles_json, scopes_json, email_verified FROM ubeeq_accounts WHERE id = ?').get(subjectId) as { id: string; email: string; status: string; account_scope: string; roles_json: string; scopes_json: string; email_verified:number } | undefined;
+    if (!row || row.status !== 'active') return undefined;
+    if (row.id !== subjectId || !['creator_operator', 'customer_account'].includes(row.account_scope)) throw new Error('Local authorization evidence is unavailable.');
+    const values = (encoded: string): string[] => {
+      let result: unknown;
+      try { result = JSON.parse(encoded); } catch { throw new Error('Local authorization evidence is unavailable.'); }
+      if (!Array.isArray(result) || result.some(value => typeof value !== 'string' || !value)) throw new Error('Local authorization evidence is unavailable.');
+      return result;
+    };
+    return { id: row.id, email: row.email, ...(row.email_verified===1?{emailVerified:true}:{}), accountScope: row.account_scope as AuthorizationSubject['accountScope'], roles: values(row.roles_json), scopes: values(row.scopes_json) };
+    });
+  }
   async listDelegations(): Promise<readonly []> { return []; }
-  async revokeSession(input: { sessionId: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId); }
+  async revokeSession(input: { sessionId: string }): Promise<void> {
+    // Independent sign-out joins the real writer queue; it never fails merely
+    // because another accepting Local operation currently owns this connection.
+    await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_sessions SET revoked_at = ? WHERE id = ?").run(now(), input.sessionId);});
+  }
 }
 
 /** Development-only encrypted credential custody. Production adapters must use a managed vault/key boundary. */
@@ -336,7 +540,7 @@ export class LocalFederationKey implements FederationSigner, FederationSignature
 export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   constructor(private readonly local: LocalSqliteDatabase) {}
   async enqueue<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): Promise<DurableJob<T>> {
-    return this.enqueueSync(input);
+    return this.local.transaction(async()=>this.enqueueSync(input));
   }
   /** Joins an already-owned synchronous SQLite transaction without yielding. */
   enqueueSync<T>(input: Omit<DurableJob<T>, "id" | "state" | "attempt" | "availableAt" | "createdAt" | "updatedAt"> & { availableAt?: string }): DurableJob<T> {
@@ -353,35 +557,44 @@ export class LocalSqliteJobQueue implements JobQueue, Scheduler {
   }
   async lease<T>(input: { cellId: string; types?: readonly string[]; leaseDurationSeconds: number; workerId: string }): Promise<JobLease<T> | undefined> {
     if (!input.cellId.trim() || !Number.isSafeInteger(input.leaseDurationSeconds) || input.leaseDurationSeconds <= 0) throw new Error("A cell and positive integer lease duration are required.");
-    const timestamp = now();
-    // Recovery is scoped to this worker's cell. Crashed attempts consume the same
-    // retry budget as reported failures, rather than being reclaimed forever.
-    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'dead_lettered', lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ? AND attempt >= max_attempts")
-      .run(json({ code: "lease_attempts_exhausted", message: "Worker leases expired through the configured attempt budget." }), timestamp, input.cellId, timestamp);
-    this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ?")
-      .run(timestamp, timestamp, input.cellId, timestamp);
-    const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
-    const leaseToken = randomUUID(), expiresAt = new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString();
-    const row = this.local.database.prepare(`UPDATE ubeeq_jobs SET state = 'leased', attempt = attempt + 1, lease_token = ?, lease_expires_at = ?, updated_at = ?
-      WHERE id = (SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1)
-      AND state IN ('queued', 'retry_scheduled') RETURNING *`)
-      .get(leaseToken, expiresAt, timestamp, input.cellId, timestamp, ...(input.types ?? [])) as Record<string, unknown> | undefined;
-    return row ? { job: this.row(row) as DurableJob<T>, leaseToken } : undefined;
+    return this.local.transaction(async()=>{
+      const timestamp = now();
+      // Recovery is scoped to this worker's cell. Crashed attempts consume the same
+      // retry budget as reported failures, rather than being reclaimed forever.
+      this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'dead_lettered', lease_token = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ? AND attempt >= max_attempts")
+        .run(json({ code: "lease_attempts_exhausted", message: "Worker leases expired through the configured attempt budget." }), timestamp, input.cellId, timestamp);
+      this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'retry_scheduled', available_at = ?, lease_token = NULL, lease_expires_at = NULL, updated_at = ? WHERE cell_id = ? AND state = 'leased' AND lease_expires_at <= ?")
+        .run(timestamp, timestamp, input.cellId, timestamp);
+      const typeFilter = input.types?.length ? ` AND type IN (${input.types.map(() => "?").join(",")})` : "";
+      const leaseToken = randomUUID(), expiresAt = new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString();
+      const row = this.local.database.prepare(`UPDATE ubeeq_jobs SET state = 'leased', attempt = attempt + 1, lease_token = ?, lease_expires_at = ?, updated_at = ?
+        WHERE id = (SELECT id FROM ubeeq_jobs WHERE cell_id = ? AND state IN ('queued', 'retry_scheduled') AND available_at <= ?${typeFilter} ORDER BY available_at, id LIMIT 1)
+        AND state IN ('queued', 'retry_scheduled') RETURNING *`)
+        .get(leaseToken, expiresAt, timestamp, input.cellId, timestamp, ...(input.types ?? [])) as Record<string, unknown> | undefined;
+      return row ? { job: this.row(row) as DurableJob<T>, leaseToken } : undefined;
+    });
   }
-  async complete(input: { id: string; leaseToken: string }): Promise<void> { this.transition(input.id, input.leaseToken, "completed"); }
-  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt); }
-  async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { this.transition(input.id, input.leaseToken, "dead_lettered", input.error); }
-  async cancel(input: { id: string; reason?: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id); }
+  async complete(input: { id: string; leaseToken: string }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "completed");}); }
+  async retry(input: { id: string; leaseToken: string; error: { code: string; message: string }; retryAt: string }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "retry_scheduled", input.error, input.retryAt);}); }
+  async deadLetter(input: { id: string; leaseToken: string; error: { code: string; message: string } }): Promise<void> { await this.local.transaction(async()=>{this.transition(input.id, input.leaseToken, "dead_lettered", input.error);}); }
+  async cancel(input: { id: string; reason?: string }): Promise<void> { await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', last_error = ?, updated_at = ? WHERE id = ?").run(input.reason ? json({ code: "cancelled", message: input.reason }) : null, now(), input.id);}); }
   async recover(input: { id: string; availableAt?: string }): Promise<DurableJob> {
-    const row = this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'queued', available_at = ?, lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state IN ('retry_scheduled', 'dead_lettered') RETURNING *")
-      .get(input.availableAt ?? now(), now(), input.id) as Record<string, unknown> | undefined;
-    if (!row) throw new JobRecoveryError();
-    return this.row(row);
+    return this.local.transaction(async()=>{
+      const row = this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'queued', available_at = ?, lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE id = ? AND state IN ('retry_scheduled', 'dead_lettered') RETURNING *")
+        .get(input.availableAt ?? now(), now(), input.id) as Record<string, unknown> | undefined;
+      if (!row) throw new JobRecoveryError();
+      return this.row(row);
+    });
   }
-  async get(id: string): Promise<DurableJob | undefined> { const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined; }
-  async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row)); }
+  async enlistLease(input:{id:string;cellId:string;leaseToken:string;attempt:number;leaseExpiresAt:string},transaction:{id:string}):Promise<void>{
+    try{this.local.assertTransaction(transaction);const row=this.local.database.prepare('SELECT * FROM ubeeq_jobs WHERE id = ?').get(input.id) as Record<string,unknown>|undefined;
+      if(!row||!input.leaseToken||row.cell_id!==input.cellId||row.state!=='leased'||row.lease_token!==input.leaseToken||row.attempt!==input.attempt||row.lease_expires_at!==input.leaseExpiresAt||!Number.isFinite(Date.parse(input.leaseExpiresAt))||Date.parse(input.leaseExpiresAt)<=Date.now())throw new Error('The exact current job lease is required in the accepting transaction.');
+    }catch(error){this.local.failTransaction();throw error;}
+  }
+  async get(id: string): Promise<DurableJob | undefined> { return this.local.transaction(async()=>{const row = this.local.database.prepare("SELECT * FROM ubeeq_jobs WHERE id = ?").get(id) as Record<string, unknown> | undefined; return row ? this.row(row) : undefined;}); }
+  async list(input: { cellId: string; states?: readonly DurableJob["state"][]; limit: number }): Promise<readonly DurableJob[]> { return this.local.transaction(async()=>{const limit = Math.max(1, Math.min(100, input.limit)); const stateFilter = input.states?.length ? ` AND state IN (${input.states.map(() => "?").join(",")})` : ""; const rows = this.local.database.prepare(`SELECT * FROM ubeeq_jobs WHERE cell_id = ?${stateFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(input.cellId, ...(input.states ?? []), limit) as Record<string, unknown>[]; return rows.map((row) => this.row(row));}); }
   async schedule(input: { cellId: string; type: string; idempotencyKey: string; payload: unknown; runAt: string }): Promise<void> { await this.enqueue({ ...input, maxAttempts: 3, availableAt: input.runAt }); }
-  async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`); }
+  async cancelSchedule(input: { cellId: string; idempotencyKey: string }): Promise<void> { await this.local.transaction(async()=>{this.local.database.prepare("UPDATE ubeeq_jobs SET state = 'cancelled', updated_at = ? WHERE cell_id = ? AND idempotency_key = ?").run(now(), input.cellId, `${input.cellId}:${input.idempotencyKey}`);}); }
   private row(row: Record<string, unknown>): DurableJob { const cellId = String(row.cell_id); const storedKey = String(row.idempotency_key); return { id: String(row.id), cellId, type: String(row.type), payload: parse(String(row.payload)), idempotencyKey: storedKey.startsWith(`${cellId}:`) ? storedKey.slice(cellId.length + 1) : storedKey, state: row.state as DurableJob["state"], attempt: Number(row.attempt), maxAttempts: Number(row.max_attempts), availableAt: String(row.available_at), leaseExpiresAt: row.lease_expires_at ? String(row.lease_expires_at) : undefined, createdAt: String(row.created_at), updatedAt: String(row.updated_at), correlationId: row.correlation_id ? String(row.correlation_id) : undefined, lastError: row.last_error ? parse(String(row.last_error)) : undefined }; }
   private write(job: DurableJob, leaseToken?: string, storedIdempotencyKey = `${job.cellId}:${job.idempotencyKey}`): void { this.local.database.prepare("INSERT INTO ubeeq_jobs (id,cell_id,type,payload,idempotency_key,state,attempt,max_attempts,available_at,lease_token,lease_expires_at,created_at,updated_at,correlation_id,last_error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state, attempt=excluded.attempt, available_at=excluded.available_at, lease_token=excluded.lease_token, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at, last_error=excluded.last_error").run(job.id, job.cellId, job.type, json(job.payload), storedIdempotencyKey, job.state, job.attempt, job.maxAttempts, job.availableAt, leaseToken ?? null, job.leaseExpiresAt ?? null, job.createdAt, job.updatedAt, job.correlationId ?? null, job.lastError ? json(job.lastError) : null); }
   private transition(id: string, leaseToken: string, state: DurableJob["state"], error?: { code: string; message: string }, availableAt?: string): void {

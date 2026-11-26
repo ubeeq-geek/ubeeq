@@ -11,7 +11,7 @@ const fixture = () => {
     if (command.constructor.name === 'TransactWriteCommand') {
       const next = new Map(rows);
       const reasons = input.TransactItems.map(entry => {
-        const write = entry.Put || entry.Delete, key = write.Item?.pk || write.Key.pk;
+        const write = entry.Put || entry.Delete || entry.ConditionCheck, key = write.Item?.pk || write.Key.pk;
         const revision = write.ExpressionAttributeValues?.[':revision'];
         const failed = (write.ConditionExpression === 'attribute_not_exists(pk)' && rows.has(key)) ||
           (revision !== undefined && rows.get(key)?.revision !== revision);
@@ -19,6 +19,7 @@ const fixture = () => {
       });
       if (reasons.some(reason => reason.Code !== 'None')) throw Object.assign(Error('conflict'), { name: 'TransactionCanceledException', CancellationReasons: reasons });
       for (const entry of input.TransactItems) {
+        if(entry.ConditionCheck)continue;
         const write = entry.Put || entry.Delete, key = write.Item?.pk || write.Key.pk;
         if (write.ConditionExpression === 'attribute_not_exists(pk)' && rows.has(key)) throw Object.assign(Error('conflict'), { name: 'TransactionCanceledException' });
         if (entry.Put) next.set(key, write.Item); else next.delete(key);
@@ -44,6 +45,51 @@ test('repository writes stage until one atomic batch and support reading staged 
   assert.equal(batches.length, 1);
   assert.equal(batches[0].input.TransactItems.length, 2);
   assert.ok(batches[0].input.ClientRequestToken);
+});
+
+test('absence guards condition the accepting commit, coalesce, and map a late insertion to revision-zero conflict',async()=>{
+  const f=fixture(),repository=f.repositories.federationActors;
+  await f.repositories.transaction(async transaction=>{
+    await repository.checkAbsent('role',{transaction});await repository.checkAbsent('role',{transaction});
+    await repository.create({id:'accepted'},{transaction});
+  });
+  const batch=f.commands.find(command=>command.constructor.name==='TransactWriteCommand');
+  assert.equal(batch.input.TransactItems.filter(item=>item.ConditionCheck).length,1);
+  await assert.rejects(f.repositories.transaction(async transaction=>{
+    await repository.checkAbsent('late-role',{transaction});await repository.create({id:'rejected'},{transaction});
+    f.rows.set('federationActors#late-role',{pk:'federationActors#late-role',sk:'record',revision:1,value:{id:'late-role',revision:1}});
+  }),error=>error.name==='OptimisticConcurrencyError'&&error.id==='late-role'&&error.expectedRevision===0);
+  assert.equal(f.rows.has('federationActors#rejected'),false);assert.equal(f.rows.has('federationActors#late-role'),true);
+});
+
+test('absence/revision contradictions and guard/write conflicts poison caught batches in either order',async()=>{
+  for(const order of ['guard-write','write-guard','contradiction']){
+    const f=fixture(),repository=f.repositories.federationActors;
+    await assert.rejects(f.repositories.transaction(async transaction=>{
+      await repository.create({id:'companion'},{transaction});
+      if(order==='write-guard'){
+        await repository.create({id:'role'},{transaction});
+        await assert.rejects(repository.checkAbsent('role',{transaction}),/guard or write/);
+      }else{
+        await repository.checkAbsent('role',{transaction});
+        if(order==='guard-write')await assert.rejects(repository.create({id:'role'},{transaction}),/guarded item/);
+        else await assert.rejects(repository.checkRevision('role',1,{transaction}),{name:'OptimisticConcurrencyError'});
+      }
+    }),/aborted/);
+    assert.equal(f.commands.filter(command=>command.constructor.name==='TransactWriteCommand').length,0);
+    assert.equal(f.rows.size,0);
+  }
+});
+
+test('unique absence guards count towards the physical hundred-item limit while duplicate guards do not',async()=>{
+  const f=fixture(),repository=f.repositories.federationActors;
+  await f.repositories.transaction(async transaction=>{
+    for(let i=0;i<100;i++){await repository.checkAbsent('role-'+i,{transaction});await repository.checkAbsent('role-'+i,{transaction});}
+  });
+  assert.equal(f.commands.at(-1).input.TransactItems.length,100);
+  const batches=f.commands.length;
+  await assert.rejects(f.repositories.transaction(async transaction=>{for(let i=0;i<101;i++)await repository.checkAbsent('overflow-'+i,{transaction});}),/100 distinct/);
+  assert.equal(f.commands.length,batches);
 });
 
 test('callback failure and commit conflict leave every staged write uncommitted', async () => {

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { assertPublicationCopyIdentity, type PublicationCopyIdentity } from '@ubeeq/core';
+import { assertPublicationCopyIdentity, type PublicationCopyIdentity, type PublicationImageConfiguration } from '@ubeeq/core';
 
-export interface CopyPublication {
+export interface CopyPublication extends PublicationImageConfiguration {
   tenantId: string; creatorId: string; workId: string; publicationId: string;
   destination: string; copy?: PublicationCopyIdentity; revision?: number;
   status: string; remoteId?: string; createdAt: string; updatedAt: string;
@@ -75,6 +75,11 @@ export async function createPublicationCopy<P extends CopyPublication>(repositor
 
 /** Identity fields cannot be replaced by generic/legacy upserts. */
 export function assertCopyIdentityUnchanged(previous: CopyPublication | null, next: CopyPublication): void {
+  if (previous && (previous.imageSelection !== undefined || previous.configurationRevision !== undefined)
+    && publicationIdentityHash([previous.imageSelection, previous.configurationRevision, previous.unresolvedImageContext])
+      !== publicationIdentityHash([next.imageSelection, next.configurationRevision, next.unresolvedImageContext])) {
+    throw new PublicationCopyConflict('Publication image configuration requires its own revision-checked command.');
+  }
   if (previous?.copy && (publicationIdentityHash(previous.copy) !== publicationIdentityHash(next.copy)
     || previous.workId !== next.workId || previous.creatorId !== next.creatorId || previous.destination !== next.destination)) {
     throw new PublicationCopyConflict('Publication copy identity is immutable.');
@@ -112,6 +117,7 @@ export interface OperationPublication extends CopyPublication { activeOperationI
 /** Approve one exact source revision. Approval never calls a provider or grants buyer access. */
 export async function approvePublicationOperation<P extends OperationPublication>(repository: PublicationOperationRepository<P>, p: P,
   input: { kind: import('@ubeeq/core').PublicationOperation['kind']; sourceRevision: number; now: string }): Promise<import('@ubeeq/core').PublicationOperation> {
+  if (p.imageSelection !== undefined || p.configurationRevision !== undefined || 'executionPolicy' in p || 'preparationVersion' in p) throw new PublicationCopyConflict('Image-aware Publications require the common reviewed operation service.');
   if (!p.copy || !Number.isSafeInteger(p.revision) || p.revision! < 1 || !Number.isSafeInteger(input.sourceRevision) || input.sourceRevision < 1
     || !['CREATE', 'UPDATE', 'REMOVE', 'DETACH'].includes(input.kind)) throw new PublicationCopyConflict('A copy and exact source/publication revision are required.');
   if (input.kind === 'CREATE' ? Boolean(p.remoteId) : !p.remoteId && input.kind !== 'DETACH') throw new PublicationCopyConflict('Choose an operation matching the copy’s current remote binding.');
@@ -138,6 +144,7 @@ export async function transitionPublicationOperation<P extends OperationPublicat
   const previous = await repository.getPublicationOperation(input.tenantId, input.operationId);
   if (!p?.copy || !previous || previous.publicationId !== p.publicationId || previous.creatorId !== p.creatorId || p.activeOperationId !== previous.operationId
     || previous.version !== input.expectedVersion) throw new PublicationCopyConflict('Operation or publication changed. Refresh before retrying.');
+  if (input.state === 'IN_FLIGHT' && (p.imageSelection !== undefined || p.configurationRevision !== undefined || 'executionPolicy' in p || 'preparationVersion' in p)) throw new PublicationCopyConflict('This legacy operation needs a fresh image-aware review before dispatch.');
   if (!operationTransitions[previous.state]?.includes(input.state)) throw new PublicationCopyConflict('This operation transition requires reconciliation or fresh approval.');
   const createsOrUpdates = previous.kind === 'CREATE' || previous.kind === 'UPDATE';
   if (input.state === 'CONFIRMED' && createsOrUpdates && !input.binding) throw new PublicationCopyConflict('Remote readback is required to confirm delivery.');

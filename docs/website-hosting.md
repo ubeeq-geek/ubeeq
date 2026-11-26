@@ -23,7 +23,7 @@ This branch extends the native website export implementation with an explicit v2
 
 Save edits private drafts. Review captures the saved website, documents, eligible publication catalogue, clean public renditions, source revision vector, release-policy revision, limits, actor and selected target/account/config revisions. Binary bytes are stored privately; approval fingerprints use their checksums. Plans expire after fifteen minutes. A saved destination binding reuses a target selection; its revision/enabled state is checked again at execution.
 
-Publish accepts that exact fingerprint and writes the authoritative intent, per-target generations, attempts and outbox in one SQLite transaction. `recoverOutbox()` inserts into a **durable**, idempotent queue and then acknowledges each outbox row. A crash between those operations safely repeats insertion. A transient event bus is not a suitable queue port. Execution renders only the stored snapshot, including target-specific canonical URLs and base paths. It does not re-fetch drafts. Full-site regeneration updates dependent lists, pagination, links, navigation and metadata together.
+Publish accepts that exact fingerprint and writes the authoritative intent, per-target generations, attempts and outbox in one SQLite transaction. `recoverOutbox()` inserts into a **durable**, idempotent queue and then acknowledges each outbox row. A crash between those operations safely repeats insertion. A transient event bus is not a suitable queue port. Execution renders only the stored snapshot, including target-specific canonical URLs and base paths. It does not re-fetch drafts. Full-site regeneration updates dependent lists, pagination, links, navigation and metadata together. Frozen snapshots and generated artifacts share workspace-scoped immutable media blobs; target URL changes do not duplicate those blob records. Exact final ZIPs remain retained for recovery and rollback. Netlify and Pages index file digests once and upload missing files with at most four in flight; failed batches settle all in-flight work before returning. AWS uses the same upload bound and checks retained media checksums before retransmitting bytes on subsequent releases.
 
 The shared Publish API is also the destination-binding publication event. A consuming product integrating its own content Publish flow must capture/review the approved website source selection and accept this intent as part of that flow. The reference UI publishes the website's explicitly selected, already-public gallery presentations. It does not automatically treat every unrelated Work publication or matching draft as authorization to deploy a website.
 
@@ -32,6 +32,29 @@ Each target has a desired generation, active generation and durable execution ow
 A deployment becomes Published only after provider/pointer association and a bounded public HTTP probe confirm its opaque release marker, home/nested routes, stylesheet/media types and missing-route behavior. Provider credentials never go to public probes. Public staging URLs are not private previews. Netlify draft deploys are explicitly public.
 
 Rollback uses retained exact target-variant bytes and rechecks current membership, publishing identity, eligibility and release policy. Hosting does not require private ZIP export authority. Products supply hosting entitlements through `hostingEnabled` and authorization ports; private export remains independent.
+
+### Private staging and retained asset promotion
+
+On an already active site, newly prepared media must not become accessible through
+its retained-asset namespace. Native preparation writes new media only into the
+private release and may hardlink previously published assets. Activation verifies
+staged bytes and guards each new hardlink before exposing it at the retained URL.
+SFTP pointer preparation similarly writes only protected releases. Activation
+verifies the staged media, writes a protected temporary copy and guards its atomic
+rename into the retained mapping; it never streams a partial temporary object into
+the public assets directory. A denial removes its private temporary copy.
+
+AWS preparation uploads private S3 bytes and registers release-specific page keys.
+Retained asset routing grants are written only during guarded activation. Because
+those grants change the KVS version, activation obtains a fresh ETag and rechecks
+host ownership/mapping and the policy deny gate before conditionally updating the
+host pointer.
+
+The release-pointer switch is atomic; a group of retained-asset promotions is not
+a single atomic transaction. Failure after a guarded serving mutation may leave
+some promoted assets, so existing unknown-outcome fencing/reconciliation remains
+required. This does not implement serving-byte metering, old-release dependency
+revocation, public-byte garbage collection or provider propagation acceptance.
 
 ### Unknown or mixed SFTP recovery
 
@@ -61,7 +84,7 @@ Reviewed against the following provider documentation and official client implem
 
 - [Netlify API guide](https://docs.netlify.com/api-and-cli-guides/api-guides/get-started-with-api/) and [OpenAPI](https://github.com/netlify/open-api/blob/master/swagger.yml): public OAuth application, documented implicit grant, API v1, SHA1 file manifest, `draft: true`, missing-file PUTs, ready polling and **POST** `sites/{site}/deploys/{deploy}/restore`. The callback immediately strips the URL fragment and submits the token over the authenticated same-origin API into the vault. State is one-use and bound to actor, workspace, installation, redirect, account and reconnect identity. There is no default PAT workflow.
 - [Pages Direct Upload](https://developers.cloudflare.com/pages/get-started/direct-upload/), [deployment API](https://developers.cloudflare.com/api/resources/pages/subresources/projects/subresources/deployments/methods/create/) and [Wrangler](https://github.com/cloudflare/workers-sdk/tree/main/packages/wrangler/src/api/pages): restricted Pages token/account, Direct Upload only, upload JWT, missing-asset/upload/upsert APIs, BLAKE3 of base64 bytes plus extension (first 32 hex characters), slash-prefixed manifest, multipart `_redirects`, production branch and release-correlated commit hash. Canonical deployment association and public marker confirm success. Git projects are rejected. Limits: 20,000 files, 25 MiB/file; this implementation additionally caps total output at 512 MiB.
-- [CloudFront KVS](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/kvs-with-functions.html): Describe ETag/conditional UpdateKeys. File-presence indexes and host mappings are separate. Viewer-request rewrites include site and release before cache lookup; hashed media uses a site-scoped retained namespace. Unknown hosts/files return 404, configuration/lookup failures 503, and suspended/disabled sites 410 before cache lookup. Origin 403 is not rewritten into a misleading custom 404. The standard topology has 1,000 files per artifact and one host/base-path mapping per site; KVS capacity and aggregate retained indexes require operator monitoring. This does not claim the distribution-tenant topology or unlimited sites per KVS.
+- [CloudFront KVS](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/kvs-with-functions.html): Describe ETag/conditional UpdateKeys. File-presence indexes and host mappings are separate. Viewer-request rewrites include site and release before cache lookup; hashed media uses a site-scoped retained namespace. Unknown hosts/files return 404, configuration/lookup failures 503, and suspended/disabled sites 410 before cache lookup. Origin 403 is not rewritten into a misleading custom 404. The standard topology has 5,000 files per artifact and one host/base-path mapping per site; KVS capacity and aggregate retained indexes require operator monitoring. This does not claim the distribution-tenant topology or unlimited sites per KVS.
 
 ## Native deployment recipes
 
@@ -69,7 +92,7 @@ Reviewed against the following provider documentation and official client implem
 
 Build the repository. Set `UBEEQ_DATA_DIRECTORY`, `UBEEQ_WEBSITE_HOSTING_ROOT` (a dedicated persistent absolute path) and `UBEEQ_WEBSITE_HOSTING_URL_TEMPLATE` (one `{site}` placeholder, normalized directory path). Run the reference API and one worker, then `node apps/reference-api/dist/website-server.js` on port 4200. Put a TLS reverse proxy in front of the static process and preserve the exact Host. The public URL must be reachable by the publisher's HTTP probes. Keep the editor/API origin separate from creator-controlled public hosting origins.
 
-Mount only release storage into the static runtime, read-only; it opens no editor database or vault. Never expose the release root with an unrestricted directory server. The serving component checks the host, owner and independent serving gate, rejects encoded traversal/internal paths, and then reads the current release or a retained content-addressed asset. Complete files and nested directories are fsynced before release-directory rename; pointer replacement is probed on the actual configured filesystem. A gate writer holds a filesystem lock while rechecking resume authority; the static handler denies serving while that lock exists. A crashed gate lock must be removed only after its writer is proven stopped. One publisher and local rename semantics are required. NFS/shared-volume replicas and cross-device pointer moves are not supported by this profile.
+Mount only release storage into the static runtime, read-only; it opens no editor database or vault. Never expose the release root with an unrestricted directory server. The serving component checks the host, owner and independent serving gate, rejects encoded traversal/internal paths, and then reads the current release or a retained content-addressed asset. Native releases hard-link content-addressed media from the retained asset namespace instead of rewriting it for each release. The media is immutable; never modify a retained file in place. Withdrawal/purge must remove every retained release reference as well as the shared name after gating serving. Complete files and nested directories are fsynced before release-directory rename; pointer replacement is probed on the actual configured filesystem. A gate writer holds a filesystem lock while rechecking resume authority; the static handler denies serving while that lock exists. A crashed gate lock must be removed only after its writer is proven stopped. One publisher and local rename semantics are required. NFS/shared-volume replicas and cross-device pointer moves are not supported by this profile.
 
 ### Compose
 

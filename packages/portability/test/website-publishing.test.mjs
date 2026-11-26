@@ -1,7 +1,7 @@
 import { WebsiteError } from '@ubeeq/core';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,rm,readFile,realpath } from 'node:fs/promises';
+import { mkdtemp,rm,readFile,realpath,stat,readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
@@ -29,6 +29,16 @@ async function fixture(t,{fake,enqueueFails=false,confirmQuiescent}={}){
   const accept=async(key='key',ids=[target.id])=>{const review=await service.review(actor,'site',1,ids);return service.publish(actor,review.planId,review.fingerprint,key);};
   return {dir,store,service,website,target,native,adapter,profile,add,accept,queues,setText:v=>text=v,setAsset:v=>{const bytes=Buffer.from(v);asset={id:'public-image',workspaceId:'workspace',revision:1,checksum:websiteDigest(bytes),mimeType:'image/jpeg',bytes,approvedPublic:true,metadataStripped:true,alt:'Public image',width:1,height:1};},setAllowed:v=>allowed=v,setMember:v=>member=v};
 }
+test('native releases reuse the retained media inode when only page content changes',async t=>{
+ const f=await fixture(t);f.setAsset('immutable approved image');
+ const firstIntent=await f.accept('first'),first=await f.service.execute('workspace',firstIntent.attemptIds[0]);
+ f.setText('Changed page text');const secondIntent=await f.accept('second'),second=await f.service.execute('workspace',secondIntent.attemptIds[0]);
+ assert.equal(first.state,'published');assert.equal(second.state,'published');assert.notEqual(first.artifactDigest,second.artifactDigest);
+ const artifact=await f.store.getArtifact('workspace',first.artifactDigest),path=[...artifact.files.keys()].find(path=>/^assets\/[a-f0-9]{64}/.test(path));
+ const root=join(f.profile.root,'targets',f.target.remoteId),shared=await stat(join(root,path));
+ assert.equal((await stat(join(root,'releases',first.artifactDigest,path))).ino,shared.ino);
+ assert.equal((await stat(join(root,'releases',second.artifactDigest,path))).ino,shared.ino);
+});
 test('Publish freezes approved sources, outbox survives dispatch failure, native HTTP serves nested paths and independent export permission',async t=>{
   const f=await fixture(t,{enqueueFails:true});const review=await f.service.review(actor,'site',1,['target']);f.setText('Unapproved newer draft');
   const intent=await f.service.publish(actor,review.planId,review.fingerprint,'one');assert.equal((await f.store.pendingOutbox(100)).length,1);
@@ -54,6 +64,17 @@ test('two targets fail independently and policy is rechecked before any upload',
   await f.add('bad');const i=await f.accept('multi',['target','bad']);const results=await Promise.all(i.attemptIds.map(id=>f.service.execute('workspace',id)));assert.deepEqual(results.map(r=>r.state).sort(),['failed','published']);
   const blocked=await f.accept('held');f.setAllowed(false);assert.equal((await f.service.execute('workspace',blocked.attemptIds[0])).state,'failed');assert.equal((await f.store.getTarget('workspace','target')).activeGeneration,1);
   await assert.rejects(f.service.rollback(actor,'target',i.attemptIds[0],'held-rollback'));
+});
+test('membership revoked during native staging prevents further uploads and activation',async t=>{
+ let uploads=0,activations=0,f;
+ f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...a)=>n.validateTarget(...a),prepare:c=>n.prepare({...c,beforeUpload:async()=>{if(++uploads===2)f.setMember(false);await c.beforeUpload();}}),activate:c=>{activations++;return n.activate(c);},reconcile:c=>n.reconcile(c),verify:(...a)=>n.verify(...a)})});
+ const intent=await f.accept('revoke-mid-staging'),attempt=await f.service.execute('workspace',intent.attemptIds[0]);
+ assert.equal(attempt.state,'failed');assert.equal(uploads,2);assert.equal(activations,0);
+ assert.equal((await f.store.getTarget('workspace','target')).activeGeneration,0);
+ const root=join(f.profile.root,'targets',f.target.remoteId);
+ assert.deepEqual(await readdir(join(root,'releases')),[]);
+ assert.ok(!(await readdir(root)).some(name=>name.startsWith('.staging-')));
+ assert.equal((await fetch(f.target.publicUrl)).status,404);
 });
 test('lost activation response locks the writer; read-only reconciliation never activates twice',async t=>{
   let calls=0,expose=false;const f=await fixture(t,{fake:n=>({apiVersion:'2',id:n.id,family:n.family,capabilities:n.capabilities,validateTarget:(...a)=>n.validateTarget(...a),prepare:c=>n.prepare(c),activate:async c=>{calls++;await n.activate(c);throw new Error('lost response');},reconcile:c=>expose?n.reconcile(c):Promise.resolve({state:'unknown'}),verify:(...a)=>n.verify(...a)})});

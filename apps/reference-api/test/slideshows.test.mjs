@@ -44,7 +44,7 @@ async function fixture(t, render) {
   }
   const created = await request('/v1/collections', 'POST', { title: 'My images' });
   const collection = created.value.collection;
-  const order = await request(`/v1/collections/${collection.id}/works`, 'PUT', { expectedRevision: collection.revision, workIds: [works[1].id, works[0].id] });
+  const order = await request(`/v1/collections/${collection.id}/works`, 'PUT', { revision: collection.revision, expectedWorkIds: [], workIds: [works[1].id, works[0].id] });
   assert.equal(order.status, 200, JSON.stringify(order.value));
   const path = `/v1/collections/${collection.id}/slideshows`;
   t.after(async () => { await api.close(); adapters.database.database.close(); await rm(directory, { recursive: true, force: true }); });
@@ -143,7 +143,7 @@ test('active holds and source integrity failures block rendering and download', 
   assert.equal((await f.request(`${f.path}/${next.value.rendition.id}/content`)).status, 409);
 });
 
-test('metadata imports retain slideshow lineage without reactivating its outbox or job', async t => {
+test('private slideshow renditions stay out of metadata exports and imports', async t => {
   const f = await fixture(t);
   const requested = await f.request(f.path, 'POST', { requestId: 'portable' });
   const exported = await f.request('/v1/exports/me');
@@ -166,7 +166,7 @@ test('metadata imports retain slideshow lineage without reactivating its outbox 
     const result = await post('imports', { manifest: exported.value, dryRun: false });
     assert.equal(result.checkpoint.state, 'completed');
     const asset = await adapters.repositories.assets.get(requested.value.rendition.id);
-    assert.ok(asset.slideshow); assert.equal(asset.slideshowPending, undefined); assert.equal(asset.slideshowJobId, undefined); assert.equal(asset.storage, undefined);
+    assert.equal(asset, undefined);
     assert.equal(await importer.runNextJob('import-worker'), undefined);
     assert.equal((await adapters.jobs.list({ cellId: 'cell-a', limit: 100 })).length, 0);
   } finally { await importer.close(); adapters.database.database.close(); await rm(directory, { recursive: true, force: true }); }

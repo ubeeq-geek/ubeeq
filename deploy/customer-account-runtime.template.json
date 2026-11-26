@@ -1,0 +1,217 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Actual customer identity API permissions and scoped access-token claim producer. Existing user-pool/client configuration is explicitly retained by its owner.",
+  "Parameters": {
+    "ApiExecutionRoleName": {
+      "Type": "String"
+    },
+    "UserPoolArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:cognito-idp:[a-z0-9-]+:[0-9]{12}:userpool/[A-Za-z0-9_-]+"
+    },
+    "AppClientIds": {
+      "Type": "CommaDelimitedList"
+    },
+    "CodeBucket": {
+      "Type": "String"
+    },
+    "CodeKey": {
+      "Type": "String"
+    },
+    "CodeVersion": {
+      "Type": "String"
+    },
+    "ExistingCompatibleClaimsFunctionVersionArn": {
+      "Type": "String",
+      "Default": ""
+    }
+  },
+  "Conditions": {
+    "HasDelegate": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "ExistingCompatibleClaimsFunctionVersionArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "CustomerAccountApiPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "customer-account-current-authority",
+        "Roles": [
+          {
+            "Ref": "ApiExecutionRoleName"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "cognito-idp:AdminGetUser",
+                "cognito-idp:AdminCreateUser",
+                "cognito-idp:AdminSetUserPassword",
+                "cognito-idp:AdminListGroupsForUser",
+                "cognito-idp:ListUsers",
+                "cognito-idp:DescribeUserPool",
+                "cognito-idp:ListUserPoolClients",
+                "cognito-idp:DescribeUserPoolClient"
+              ],
+              "Resource": {
+                "Ref": "UserPoolArn"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ClaimsRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "claims-logs",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "Fn::If": [
+              "HasDelegate",
+              {
+                "PolicyName": "invoke-existing-claims",
+                "PolicyDocument": {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "lambda:InvokeFunction",
+                      "Resource": {
+                        "Ref": "ExistingCompatibleClaimsFunctionVersionArn"
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "Ref": "AWS::NoValue"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "ClaimsFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Runtime": "nodejs22.x",
+        "Handler": "customer-issued-scope-handler.handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "ClaimsRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "S3Bucket": {
+            "Ref": "CodeBucket"
+          },
+          "S3Key": {
+            "Ref": "CodeKey"
+          },
+          "S3ObjectVersion": {
+            "Ref": "CodeVersion"
+          }
+        },
+        "Timeout": 10,
+        "Environment": {
+          "Variables": {
+            "CUSTOMER_SCOPE_USER_POOL_ID": {
+              "Fn::Select": [
+                1,
+                {
+                  "Fn::Split": [
+                    "/",
+                    {
+                      "Ref": "UserPoolArn"
+                    }
+                  ]
+                }
+              ]
+            },
+            "CUSTOMER_SCOPE_CLIENT_IDS": {
+              "Fn::Join": [
+                ",",
+                {
+                  "Ref": "AppClientIds"
+                }
+              ]
+            },
+            "CUSTOMER_SCOPE_DELEGATE_ARN": {
+              "Ref": "ExistingCompatibleClaimsFunctionVersionArn"
+            }
+          }
+        }
+      }
+    },
+    "CognitoInvokeClaims": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "ClaimsFunction",
+            "Arn"
+          ]
+        },
+        "Principal": "cognito-idp.amazonaws.com",
+        "SourceArn": {
+          "Ref": "UserPoolArn"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ScopeClaimsFunctionArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "ClaimsFunction",
+          "Arn"
+        ]
+      }
+    }
+  }
+}

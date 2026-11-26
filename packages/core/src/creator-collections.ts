@@ -21,10 +21,13 @@ export interface CreatorCollectionMembership {
 
 /** Structurally implemented by the creator-content persistence port. */
 export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
+  /** The adapter reserves current and historical slugs in the write transaction. */
+  readonly supportsAtomicCollectionSlugs?: boolean;
   /** Set only when expected order is compared atomically with membership replacement. */
   readonly supportsExpectedCollectionOrder?: boolean;
   readonly supportsExpectedCollectionStatus?: boolean;
   readonly supportsExpectedCollectionRevision?: boolean;
+  readonly supportsExpectedMembershipRevision?: boolean;
   /** Cover ownership and active state are rechecked atomically during writes. */
   readonly supportsCollectionCoverValidation?: boolean;
   getProcessingAsset?(tenantId: string, assetId: string): Promise<{
@@ -35,7 +38,7 @@ export interface CreatorCollectionPort<C extends CreatorCollectionRecord> {
   createCreatorCollection(collection: C): Promise<void>;
   updateCreatorCollection(collection: C, expectedStatus?: string, expectedRevision?: number): Promise<void>;
   listCollectionWorks(tenantId: string, collectionId: string): Promise<CreatorCollectionMembership[]>;
-  replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[]): Promise<void>;
+  replaceCollectionWorks(tenantId: string, collectionId: string, works: CreatorCollectionMembership[], expectedWorkIds?: readonly string[], expectedRevision?: number): Promise<void>;
   getWork(tenantId: string, workId: string): Promise<{
     tenantId: string; creatorId: string; workId: string; status: string;
   } | null>;
@@ -88,7 +91,7 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
   }
 
   private async requireAvailableSlug(collection: C): Promise<void> {
-    if (collection.status === 'deleted') return;
+    if (collection.status === 'deleted' || this.store.supportsAtomicCollectionSlugs) return;
     const existing = await this.store.listCreatorCollections(collection.tenantId, collection.creatorId);
     const requested = new Set([collection.slug, ...(collection.slugHistory || [])]);
     if (existing.some((other) => other.collectionId !== collection.collectionId && other.tenantId === collection.tenantId &&
@@ -153,7 +156,10 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     await this.store.updateCreatorCollection({ ...collection, status: "deleted", deletedAt: now, updatedAt: now }, undefined, expectedRevision);
   }
 
-  async replaceWorks(tenantId: string, collectionId: string, requestedWorkIds: readonly string[], expectedWorkIds?: readonly string[]): Promise<C & { workIds: string[] }> {
+  async replaceWorks(tenantId: string, collectionId: string, requestedWorkIds: readonly string[], expectedWorkIds?: readonly string[], expectedRevision?: number): Promise<C & { workIds: string[] }> {
+    if (expectedRevision !== undefined && (!this.store.supportsExpectedMembershipRevision || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1 || expectedRevision >= Number.MAX_SAFE_INTEGER)) {
+      throw new CreatorCollectionError('revision_conflict', 'A supported, valid membership revision is required.');
+    }
     const collection = await this.get(tenantId, collectionId);
     if (collection.status === "deleted") throw new CreatorCollectionError("not_found", "Collection not found.");
     if (expectedWorkIds !== undefined && !this.store.supportsExpectedCollectionOrder) throw new CreatorCollectionError('invalid_works', 'Conditional collection ordering is unavailable in this adapter.');
@@ -165,7 +171,7 @@ export class CreatorCollectionService<C extends CreatorCollectionRecord> {
     }
     const addedAt = this.now();
     await this.store.replaceCollectionWorks(tenantId, collectionId,
-      workIds.map((workId, position) => ({ collectionId, workId, position, addedAt })), expectedWorkIds);
-    return { ...collection, workIds };
+      workIds.map((workId, position) => ({ collectionId, workId, position, addedAt })), expectedWorkIds, expectedRevision);
+    return expectedRevision === undefined ? { ...collection, workIds } : this.view(await this.get(tenantId, collectionId));
   }
 }

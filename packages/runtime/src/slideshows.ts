@@ -1,7 +1,8 @@
+import type { OwnedObjectWrites } from './owned-object-writes.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeSlideshowSettings, slideshowDurationSeconds, slideshowDimensions, SlideshowError, type SlideshowSettings } from '@ubeeq/core';
 import { repositoryItems, OptimisticConcurrencyError, type UbeeqRepositories, type AssetRecord, type CreatorRecord, type CollectionRecord, type WorkRecord, type PageRequest, type Page } from '@ubeeq/persistence';
-import { cellScopedObjectKey, requireCreatorScopedObject, type ObjectStorage, type StoredObject } from '@ubeeq/storage';
+import { requireCreatorScopedObject, type ObjectStorage, type StoredObject } from '@ubeeq/storage';
 import type { JobQueue } from '@ubeeq/jobs';
 import type { SlideshowRenderer } from '@ubeeq/processing';
 
@@ -25,71 +26,43 @@ const home = (record: CreatorRecord) => ({ homeCellId: record.homeCellId, dataHo
 /** Reference composition of durable rendition records and jobs. No source bytes enter job JSON. */
 export class ReferenceCollectionSlideshows {
   constructor(private readonly deps: {
-    repositories: UbeeqRepositories; storage: ObjectStorage; jobs: JobQueue; cellId: string; renderer?: SlideshowRenderer;
-    writable(creator: CreatorRecord): Promise<void>; admit(ids: readonly string[]): Promise<void>;
+    repositories: UbeeqRepositories; storage: ObjectStorage; jobs: JobQueue; cellId: string; renderer: SlideshowRenderer; orderedWorks(creator: CreatorRecord, id: string): Promise<readonly string[]>;
+    owned: OwnedObjectWrites; writable(creator: CreatorRecord): Promise<void>; admit(ids: readonly string[]): Promise<void>;
   }) {}
 
   private async collection(creator: CreatorRecord, id: string): Promise<CollectionRecord> {
+    const current = await this.deps.repositories.creators.get(creator.id);
+    if (!current || current.revision !== creator.revision) return fail('slideshow_conflict', 'Creator custody changed.');
     const collection = await this.deps.repositories.collections.get(id);
-    if (creator.homeCellId !== this.deps.cellId || !collection || collection.creatorId !== creator.id || collection.homeCellId !== this.deps.cellId || collection.routingRevision !== creator.routingRevision) return fail('slideshow_not_found', 'Collection was not found.');
+    if (creator.homeCellId !== this.deps.cellId || !collection || ('status' in collection && collection.status === 'deleted') || collection.instanceId !== creator.instanceId || collection.dataHomeRegion !== creator.dataHomeRegion || collection.creatorId !== creator.id || collection.homeCellId !== this.deps.cellId || collection.routingRevision !== creator.routingRevision) return fail('slideshow_not_found', 'Collection was not found.');
     await this.deps.writable(creator);
     return collection;
   }
 
   async catalogue(creator: CreatorRecord) {
-    const collections = [];
-    const memberships = await all(this.deps.repositories.workMemberships);
-    for await (const collection of repositoryItems(request => this.deps.repositories.collections.list(request))) {
-      if (collection.creatorId === creator.id && collection.homeCellId === this.deps.cellId) collections.push({ ...collection, workIds: memberships.filter(m => m.collectionId === collection.id).sort((a, b) => a.position - b.position || a.id.localeCompare(b.id)).map(m => m.workId) });
-    }
     const works: WorkRecord[] = [];
     for await (const work of repositoryItems(request => this.deps.repositories.works.list(request))) {
       if (work.creatorId === creator.id && work.homeCellId === this.deps.cellId && !['deleted', 'archived'].includes(work.status)) works.push(work);
     }
     const music = (await all<MediaAsset>(this.deps.repositories.assets)).filter(a => a.creatorId === creator.id && a.homeCellId === this.deps.cellId && a.status === 'ready' && a.mimeType.startsWith('audio/') && works.some(w => w.id === a.workId)).map(a => ({ assetId: a.id, title: works.find(w => w.id === a.workId)?.title ?? a.id }));
-    return { collections, works, music, slideshowEnabled: !!this.deps.renderer };
-  }
-
-  async replaceWorks(creator: CreatorRecord, id: string, workIds: unknown, expectedRevision: unknown) {
-    const collection = await this.collection(creator, id);
-    if (!Array.isArray(workIds) || workIds.length > 100 || workIds.some(w => typeof w !== 'string' || !w) || new Set(workIds).size !== workIds.length) return fail('invalid_slideshow', 'Choose up to 100 distinct Works in order.');
-    if (expectedRevision !== collection.revision) return fail('slideshow_conflict', 'Collection changed; reload before saving its order.');
-    for (const id of workIds) {
-      const work = await this.deps.repositories.works.get(id);
-      if (!work || work.creatorId !== creator.id || work.homeCellId !== this.deps.cellId || ['deleted', 'archived'].includes(work.status)) return fail('invalid_slideshow', 'Choose active Works owned by this Creator.');
-    }
-    return this.deps.repositories.transaction(async transaction => {
-      const updated = await this.deps.repositories.collections.update(collection.id, collection.revision, { title: collection.title }, { transaction });
-      const previous = [];
-      for await (const member of repositoryItems(request => this.deps.repositories.workMemberships.list(request, { transaction }))) {
-        if (member.collectionId === collection.id) previous.push(member);
-      }
-      for (const member of previous) await this.deps.repositories.workMemberships.remove(member.id, member.revision, { transaction });
-      for (const [position, workId] of workIds.entries()) await this.deps.repositories.workMemberships.create({ id: randomUUID(), instanceId: collection.instanceId, ...home(creator), collectionId: id, workId, position }, { transaction });
-      return { collection: updated, workIds };
-    }).catch(error => {
-      if (error instanceof OptimisticConcurrencyError) return fail('slideshow_conflict', 'Collection changed; reload before saving its order.');
-      throw error;
-    });
+    return { music, slideshowEnabled: !!this.deps.renderer };
   }
 
   private async source(creator: CreatorRecord, asset: MediaAsset): Promise<Source> {
     const work = asset.workId ? await this.deps.repositories.works.get(asset.workId) : undefined;
     const storage = asset.originalStorage ?? asset.storage;
-    if (!work || work.creatorId !== creator.id || work.homeCellId !== this.deps.cellId || work.routingRevision !== creator.routingRevision || ['deleted', 'archived'].includes(work.status) || asset.creatorId !== creator.id || asset.homeCellId !== this.deps.cellId || asset.routingRevision !== creator.routingRevision || asset.status !== 'ready' || !storage?.versionId || storage.versionId !== asset.objectVersion || storage.checksum !== asset.checksum || storage.contentType !== asset.mimeType || !Number.isSafeInteger(storage.byteLength) || storage.byteLength < 1) return fail('slideshow_source_unavailable', 'Slideshow sources must be ready, versioned assets owned by this Creator.');
+    if (!work || work.creatorId !== creator.id || work.instanceId !== creator.instanceId || work.dataHomeRegion !== creator.dataHomeRegion || work.homeCellId !== this.deps.cellId || work.routingRevision !== creator.routingRevision || ['deleted', 'archived'].includes(work.status) || asset.creatorId !== creator.id || asset.instanceId !== creator.instanceId || asset.dataHomeRegion !== creator.dataHomeRegion || asset.homeCellId !== this.deps.cellId || asset.routingRevision !== creator.routingRevision || asset.status !== 'ready' || !storage?.versionId || storage.versionId !== asset.objectVersion || storage.checksum !== asset.checksum || storage.contentType !== asset.mimeType || !Number.isSafeInteger(storage.byteLength) || storage.byteLength < 1) return fail('slideshow_source_unavailable', 'Slideshow sources must be ready, versioned assets owned by this Creator.');
     requireCreatorScopedObject(storage.key, { cellId: this.deps.cellId, creatorId: creator.id });
     return { workId: work.id, workRevision: work.revision, assetId: asset.id, assetRevision: asset.revision, sourceVersionId: asset.objectVersion, checksum: asset.checksum, contentType: asset.mimeType, storage: structuredClone(storage) };
   }
 
   private async snapshot(creator: CreatorRecord, id: string, settings: SlideshowSettings): Promise<Snapshot> {
     const collection = await this.collection(creator, id);
-    const memberships = [];
-    for await (const member of repositoryItems(request => this.deps.repositories.workMemberships.list(request))) if (member.collectionId === id) memberships.push(member);
-    memberships.sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+    const workIds = await this.deps.orderedWorks(creator, id);
     const assets = (await all<MediaAsset>(this.deps.repositories.assets)).filter(a => a.creatorId === creator.id);
     const slides: Source[] = [];
-    for (const member of memberships) {
-      const images = assets.filter(a => a.workId === member.workId && a.status !== 'deleted').sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    for (const workId of workIds) {
+      const images = assets.filter(a => a.workId === workId && a.status !== 'deleted').sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
       if (!images.length || images.some(a => !['image/jpeg', 'image/png', 'image/webp'].includes(a.mimeType))) return fail('invalid_slideshow', 'Every collection Work must contain only JPEG, PNG or WebP images.');
       for (const image of images) slides.push(await this.source(creator, image));
     }
@@ -115,7 +88,21 @@ export class ReferenceCollectionSlideshows {
     const id = `slideshow-${hash([creator.id, collectionId, requestId])}`;
     let asset = await this.deps.repositories.assets.get(id) as SlideshowAsset | undefined;
     if (asset && hash(asset.slideshow) !== hash(snapshot)) return fail('slideshow_conflict', 'This request ID already belongs to different slideshow sources or settings.');
-    if (!asset) asset = await this.deps.repositories.assets.create({ id, instanceId: creator.instanceId, ...home(creator), creatorId: creator.id, mimeType: 'video/mp4', checksum: hash(snapshot), objectVersion: hash(snapshot), status: 'pending', slideshow: snapshot, slideshowPending: true } as AssetRecord & { slideshow: Snapshot; slideshowPending: boolean }, { idempotencyKey: id }) as SlideshowAsset;
+    if (!asset) asset = await this.deps.repositories.transaction(async transaction => {
+      const {creators, collections, works, assets} = this.deps.repositories;
+      if (!creators.checkRevision || !collections.checkRevision || !works.checkRevision || !assets.checkRevision) {
+        throw new Error('Slideshow acceptance requires revision guards.');
+      }
+      await creators.checkRevision(creator.id, creator.revision, {transaction});
+      await collections.checkRevision(collectionId, snapshot.collectionRevision, {transaction});
+      for (const [id, revision] of new Map([...snapshot.slides, ...snapshot.music].map(source => [source.workId, source.workRevision]))) {
+        await works.checkRevision(id, revision, {transaction});
+      }
+      for (const [id, revision] of new Map([...snapshot.slides, ...snapshot.music].map(source => [source.assetId, source.assetRevision]))) {
+        await assets.checkRevision(id, revision, {transaction});
+      }
+      return this.deps.repositories.assets.create({ id, instanceId: creator.instanceId, ...home(creator), creatorId: creator.id, mimeType: 'video/mp4', checksum: hash(snapshot), objectVersion: hash(snapshot), status: 'pending', slideshow: snapshot, slideshowPending: true } as AssetRecord & { slideshow: Snapshot; slideshowPending: boolean }, { transaction, idempotencyKey: id });
+    });
     if (hash(asset.slideshow) !== hash(snapshot)) return fail('slideshow_conflict', 'This request ID already belongs to different slideshow sources or settings.');
     await this.enqueue(asset);
     return { rendition: await this.status(creator, collectionId, id) };
@@ -136,7 +123,7 @@ export class ReferenceCollectionSlideshows {
   private async rendition(creator: CreatorRecord, collectionId: string, id: string): Promise<SlideshowAsset & { slideshow: Snapshot }> {
     await this.collection(creator, collectionId);
     const asset = await this.deps.repositories.assets.get(id) as SlideshowAsset | undefined;
-    if (!asset?.slideshow || asset.creatorId !== creator.id || asset.homeCellId !== this.deps.cellId || asset.slideshow.collectionId !== collectionId || asset.status === 'deleted') return fail('slideshow_not_found', 'Slideshow rendition was not found.');
+    if (!asset?.slideshow || asset.creatorId !== creator.id || asset.instanceId !== creator.instanceId || asset.dataHomeRegion !== creator.dataHomeRegion || asset.homeCellId !== this.deps.cellId || asset.slideshow.collectionId !== collectionId || asset.status === 'deleted') return fail('slideshow_not_found', 'Slideshow rendition was not found.');
     return asset as SlideshowAsset & { slideshow: Snapshot };
   }
 
@@ -178,7 +165,6 @@ export class ReferenceCollectionSlideshows {
     }
     const lease = await this.deps.jobs.lease<{ assetId: string; creatorId: string; fingerprint: string }>({ cellId: this.deps.cellId, types: ['collection.slideshow'], workerId, leaseDurationSeconds: 600 });
     if (!lease) return undefined;
-    let output: StoredObject | undefined;
     try {
       if (lease.job.cellId !== this.deps.cellId) throw new Error('Foreign slideshow job rejected.');
       const creator = await this.deps.repositories.creators.get(lease.job.payload.creatorId);
@@ -192,38 +178,47 @@ export class ReferenceCollectionSlideshows {
       };
       await assertCurrent();
       if (asset.status !== 'ready') {
-        const read = async (source: Source) => {
-          const result = await this.deps.storage.get(source.storage);
-          if (result.body.byteLength !== source.storage.byteLength || digest(result.body) !== source.checksum) throw new Error('Slideshow source integrity validation failed.');
-          return { source: result.body, contentType: source.contentType };
-        };
-        const slides = [], music = [];
-        for (const source of asset.slideshow.slides) slides.push(await read(source));
-        for (const source of asset.slideshow.music) music.push(await read(source));
-        const result = await this.deps.renderer.render({ settings: asset.slideshow.settings, slides, music });
-        const expected = slideshowDimensions(asset.slideshow.settings.format);
-        if (result.contentType !== 'video/mp4' || !result.body.length || result.body.length > 512 * 1024 * 1024 || result.width !== expected.width || result.height !== expected.height || !Number.isFinite(result.durationSeconds) || Math.abs(result.durationSeconds - slideshowDurationSeconds(slides.length, asset.slideshow.settings)) > 1 / 30) throw new Error('Invalid slideshow renderer result.');
-        await assertCurrent();
-        output = { bucket: asset.slideshow.slides[0].storage.bucket, key: cellScopedObjectKey({ cellId: this.deps.cellId, creatorId: creator.id, kind: 'renditions', objectId: `${asset.id}-${randomUUID()}.mp4` }), versionId: randomUUID(), contentType: 'video/mp4', byteLength: result.body.byteLength, checksum: digest(result.body), scope: 'private' };
-        await this.deps.storage.put({ object: output, body: result.body });
+        const identity = {creatorId: creator.id, operation: 'collection.slideshow', idempotencyKey: asset.id};
+        let written = await this.deps.owned.recover(identity);
+        if (!written) {
+          const read = async (source: Source) => {
+            const result = await this.deps.storage.get(source.storage);
+            if (result.body.byteLength !== source.storage.byteLength || digest(result.body) !== source.checksum) throw new Error('Slideshow source integrity validation failed.');
+            return { source: result.body, contentType: source.contentType };
+          };
+          const slides = [], music = [];
+          for (const source of asset.slideshow.slides) slides.push(await read(source));
+          for (const source of asset.slideshow.music) music.push(await read(source));
+          const result = await this.deps.renderer.render({ settings: asset.slideshow.settings, slides, music });
+          const expected = slideshowDimensions(asset.slideshow.settings.format);
+          if (result.contentType !== 'video/mp4' || !result.body.length || result.body.length > 512 * 1024 * 1024 || result.width !== expected.width || result.height !== expected.height || !Number.isFinite(result.durationSeconds) || Math.abs(result.durationSeconds - slideshowDurationSeconds(slides.length, asset.slideshow.settings)) > 1 / 30) throw new Error('Invalid slideshow renderer result.');
+          await assertCurrent();
+          written = await this.deps.owned.write({
+            ...identity, home: asset, bucket: asset.slideshow.slides[0].storage.bucket,
+            metadata: {durationSeconds: result.durationSeconds, width: result.width, height: result.height, fingerprint: lease.job.payload.fingerprint},
+            kind: 'renditions', scope: 'private', contentType: 'video/mp4', body: result.body,
+            beforeNewPhysicalWrite: assertCurrent,
+            assertNewPhysicalWriteActive: () => {
+              if (Date.parse(lease.job.leaseExpiresAt ?? '') <= Date.now()) throw new Error('Slideshow lease expired.');
+            },
+          });
+        }
+        const {durationSeconds, width, height, fingerprint} = written.metadata;
+        if (typeof durationSeconds !== 'number' || typeof width !== 'number' || typeof height !== 'number' || fingerprint !== lease.job.payload.fingerprint) throw new Error('Slideshow output metadata does not match the accepted rendition.');
         await assertCurrent();
         const current = await this.deps.repositories.assets.get(asset.id) as SlideshowAsset;
-        const stored = output;
+        const stored = written.object;
         asset = await this.deps.repositories.transaction(async transaction => {
-          const ready = await this.deps.repositories.assets.update(asset.id, current.revision, { status: 'ready', checksum: stored.checksum!, objectVersion: stored.versionId!, storage: stored, renderMetadata: { durationSeconds: result.durationSeconds, width: result.width, height: result.height } } as Partial<SlideshowAsset>, { transaction });
-          await this.deps.repositories.usageEvents.create({ id: randomUUID(), instanceId: asset.instanceId, ...home(creator), accountId: creator.id, meter: 'transcode_seconds', quantity: result.durationSeconds, idempotencyKey: asset.id }, { transaction, idempotencyKey: asset.id });
+          const ready = await this.deps.repositories.assets.update(asset.id, current.revision, { status: 'ready', checksum: stored.checksum!, objectVersion: stored.versionId!, storage: stored, renderMetadata: { durationSeconds, width, height } } as Partial<SlideshowAsset>, { transaction });
+          await this.deps.repositories.usageEvents.create({ id: randomUUID(), instanceId: asset.instanceId, ...home(creator), accountId: creator.id, meter: 'transcode_seconds', quantity: durationSeconds, idempotencyKey: asset.id }, { transaction, idempotencyKey: asset.id });
           await this.deps.repositories.auditEvents.create({ id: randomUUID(), instanceId: asset.instanceId, ...home(creator), action: 'collection.slideshow_rendered', subjectId: asset.slideshow.collectionId, payload: { renditionId: asset.id, sourceFingerprint: lease.job.payload.fingerprint, jobId: lease.job.id } }, { transaction, idempotencyKey: asset.id });
           return ready as typeof asset;
         });
       }
       await assertCurrent();
       await this.deps.jobs.complete({ id: lease.job.id, leaseToken: lease.leaseToken });
-      output = undefined; // A committed rendition is now retained.
       return { rendition: await this.status(creator, asset.slideshow.collectionId, asset.id) };
     } catch (error) {
-      // If a ready record was saved before an interrupted completion, retain its bytes for recovery.
-      const saved = await this.deps.repositories.assets.get(lease.job.payload.assetId) as SlideshowAsset | undefined;
-      if (output && saved?.storage?.key !== output.key) await this.deps.storage.remove(output).catch(() => undefined);
       const details = { code: error instanceof SlideshowError ? error.code : 'slideshow_render_failed', message: 'Slideshow could not be rendered. Regenerate after checking its sources.' };
       if (error instanceof SlideshowError || lease.job.attempt >= lease.job.maxAttempts) await this.deps.jobs.deadLetter({ id: lease.job.id, leaseToken: lease.leaseToken, error: details });
       else await this.deps.jobs.retry({ id: lease.job.id, leaseToken: lease.leaseToken, retryAt: new Date(Date.now() + 1000).toISOString(), error: details });

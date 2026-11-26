@@ -89,10 +89,10 @@ export class LocalLibraryPublicationView {
     update: async (id: string, revision: number, change: Partial<Omit<WorkRecord, 'id' | 'revision' | 'createdAt' | 'updatedAt'>>,
       options?: { transaction?: PersistenceTransaction }): Promise<WorkRecord> => {
       if (!this.transactionId || options?.transaction?.id !== this.transactionId) throw new Error('Library publication requires its owned transaction.');
-      if (id !== this.scope.workId || change.status !== 'published' || Object.keys(change).some(key => key !== 'status')) throw new Error('Publication view only supports publishing its bound Work.');
+      if (id !== this.scope.workId || change.status !== 'ready' || Object.keys(change).some(key => key !== 'status')) throw new Error('Publication view only supports publishing its bound Work.');
       const current = this.current();
       if (!this.snapshot || JSON.stringify(current) !== JSON.stringify(this.snapshot) || current.work.revision !== revision) throw new OptimisticConcurrencyError(id, revision);
-      const next = { ...current.work, status: 'published', revision: revision + 1, updatedAt: new Date().toISOString() };
+      const next = { ...current.work, status: 'ready', revision: revision + 1, updatedAt: new Date().toISOString() };
       const result = this.local.database.prepare("UPDATE ubeeq_creator_library SET payload = ? WHERE cell_id = ? AND tenant_id = ? AND kind = 'work' AND id = ? AND creator_id = ? AND json_extract(payload, '$.revision') = ?")
         .run(JSON.stringify(next), this.local.configuration.cellId, this.scope.tenantId, id, this.scope.creatorId, revision);
       if (result.changes !== 1) throw new OptimisticConcurrencyError(id, revision);

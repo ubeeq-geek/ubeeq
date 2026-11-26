@@ -1,0 +1,7 @@
+# Retained preparation host helpers
+
+`@ubeeq/runtime/retained-preparation-host` shares the complete retained source intake, bounded original-byte inspection, metadata defaults, setup capture/application and collection hierarchy helpers. Bind them to the actual canonical store, source-key codec, unencoded original stream, metadata parser and provider-specific gallery review. The native host keeps its current actor/member/role evidence, conditional source/audit writer, original keys and full record types.
+
+Original inspection checks custody, upload readiness, bounds, local real paths, exact size and checksum, and closes the stream without copying or processing it. Metadata defaults expand subject variables once and retain existing affirmative declarations. Setup capture excludes subject text and inherited destinations while preserving exact per-publication gallery settings. Applying setup stages local intents and deselection tombstones; it does not authorize publication or remove remote copies. Hierarchy checks retain current ownership, availability, cycle checks, deterministic expansion and existing placement metadata.
+
+Generic constraints describe consumed fields. Full authoritative records pass through; only new pending files and intents use typed host factories. These helpers do not invent authentication, storage, provider success, metadata validation or empty history. Bind every capability to the same live authority as the retained workflow. Full default managed composition and three-product acceptance remain separate requirements.

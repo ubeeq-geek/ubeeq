@@ -70,10 +70,23 @@ remain as backward-compatible aliases.
 - `@ubeeq/deployment-machine-compact` — neutral configuration for a compact, single-cell machine deployment.
 - `@ubeeq/deployment-platform` — versioned deployment-artifact provenance and regional rollout contracts.
 - `@ubeeq/api` — startup validation for extension compatibility.
+- `@ubeeq/audience` — mailing lists, free offers, bookings and client galleries.
+- `@ubeeq/commerce` — customer commerce contracts and domain services.
+- `@ubeeq/commerce-runtime` — neutral storefront, account and checkout composition.
+- `@ubeeq/connector-reference` — shared connector implementations and reconciliation.
+- `@ubeeq/media-sharp` — image processing and text-watermark adapter.
+- `@ubeeq/media-ffmpeg` — audio/video processing adapter.
+- `@ubeeq/portability` — creator archive import/export and validation.
+- `@ubeeq/runtime` — composed creator API, publishing and worker runtime.
+- `@ubeeq/studio-ui` — unbranded creator views and host extension slots.
 - `apps/web-reference` and `apps/admin-reference` — minimal neutral composition examples.
 - `apps/reference-api` — runnable local API reference for the creator-to-public-Work flow.
 
 ## Extension compatibility
+
+Publication image contracts, durable commands, shared controls and consumer
+integration requirements are documented in
+[`docs/publication-images.md`](docs/publication-images.md).
 
 Extensions declare an API version and the contracts they implement. `@ubeeq/api` validates manifests at startup and fails clearly if a required extension is missing or incompatible. See [`packages/extension-sdk`](packages/extension-sdk) for the initial contracts.
 
@@ -93,8 +106,9 @@ Ubeeq separates reusable provider adapters from runnable deployment models:
 - **Compact machine cell** — [`deployments/machine/compact`](deployments/machine/compact): a low-operations, cloud-free, single authoritative cell. [`examples/machine/compact`](examples/machine/compact) runs the reference API, creator workspace, and operations workspace with Compose.
 - **AWS serverless single-cell** — [`deployments/aws-serverless/single-cell`](deployments/aws-serverless/single-cell): Lambda/API Gateway, DynamoDB, S3, SQS, Cognito, and optional CloudFront for one scalable regional cell.
 - **AWS serverless multi-cell** — [`deployments/aws-serverless/multi-cell`](deployments/aws-serverless/multi-cell): optional routing/migration control-plane infrastructure that composes independent single cells; it does not create a global mutable data plane.
-- **Scalable machine single-cell** — [`deployments/machine/scalable-single-cell`](deployments/machine/scalable-single-cell) composes PostgreSQL and an S3-compatible object store through `@ubeeq/adapter-machine`; its remaining identity and deployment composition work is tracked with that profile.
-- **Future profiles** — `deployments/machine/scalable-multi-cell` and `deployments/kubernetes/scalable-*` reserve provider-neutral multi-cell and Kubernetes paths.
+- **Scalable machine single-cell reference** — [`examples/machine/scalable-single-cell`](examples/machine/scalable-single-cell) contains the runnable reference composition. [`deployments/machine/scalable-single-cell`](deployments/machine/scalable-single-cell) is a README-only deployment-module placeholder; identity and operational qualification remain incomplete.
+- **Kubernetes single-cell reference** — [`deployments/kubernetes/scalable-single-cell`](deployments/kubernetes/scalable-single-cell) contains checked manifests. Manifest validation is distinct from a cluster deployment rehearsal.
+- **Design-only multi-cell profiles** — `deployments/machine/scalable-multi-cell` and `deployments/kubernetes/scalable-multi-cell` contain README plans, with no deployable module.
 
 [`deployments/machine/compact/reference-config.json`](deployments/machine/compact/reference-config.json) is the product-neutral starting point for compact machine configuration. It contains neither hosted product settings nor credentials.
 
@@ -105,3 +119,9 @@ Rekognition Image moderation-label and face-age-range capabilities, see
 ## Portable reference-instance plan
 
 The staged implementation plan for the local reference instance, durable adapters, optional AWS composition, and compatibility gates is in [`docs/portable-reference-instance-implementation-plan.md`](docs/portable-reference-instance-implementation-plan.md).
+
+## License
+
+Ubeeq is licensed under the [MIT License](LICENSE). Workspace packages include the same license. Third-party components retain their own licenses and notices.
+
+Public npm packages have not yet been published. Exact source commits and verified archive hashes identify current downstream builds. See [release preparation](RELEASE.md) for the complete package inventory and unpublished candidate manifest.

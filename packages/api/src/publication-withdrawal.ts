@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { OptimisticConcurrencyError, type UbeeqRepositories, type WorkRecord, type PublicationRecord, type PersistenceTransaction } from '@ubeeq/persistence';
 
 export class PublicationWithdrawalError extends Error {
-  constructor(readonly code: 'invalid_request' | 'publication_not_found' | 'publication_not_live', message: string) {
+  constructor(readonly code: 'invalid_request' | 'publication_not_found' | 'publication_not_live' | 'publication_reconciliation_required', message: string) {
     super(message); this.name = 'PublicationWithdrawalError';
   }
 }
@@ -30,6 +30,7 @@ export class PublicationWithdrawalService {
       if (!record || record.id !== publicationId || record.workId !== work.id || record.instanceId !== work.instanceId || record.homeCellId !== work.homeCellId) {
         throw new PublicationWithdrawalError('publication_not_found', 'Publication does not belong to the authorized Work.');
       }
+      if ('preparationVersion' in record || 'executionPolicy' in record) throw new PublicationWithdrawalError('publication_reconciliation_required', 'Use the provider-aware reviewed workflow for this Publication.');
       return record;
     };
     const initial = await read();

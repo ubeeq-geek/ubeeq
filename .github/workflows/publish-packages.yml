@@ -12,10 +12,18 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: public-npm-release
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: npm-publish
+    timeout-minutes: 90
+    env:
+      TEST_FFMPEG_PATH: /usr/bin/ffmpeg
+      TEST_FFPROBE_PATH: /usr/bin/ffprobe
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,10 +31,13 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
+      - name: Install native media test tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y ffmpeg
       - run: npm ci
       - run: npm run build
       - run: npm test
       - run: npm run pack:verify
-      - run: npm publish --workspace @ubeeq/core --workspace @ubeeq/auth --workspace @ubeeq/extension-sdk --workspace @ubeeq/ui --workspace @ubeeq/commerce --workspace @ubeeq/integrations --workspace @ubeeq/connector-reference --workspace @ubeeq/moderation --workspace @ubeeq/processing --workspace @ubeeq/media-sharp --workspace @ubeeq/media-ffmpeg --workspace @ubeeq/storage --workspace @ubeeq/jobs --workspace @ubeeq/persistence --workspace @ubeeq/portability --workspace @ubeeq/adapter-local --workspace @ubeeq/commerce-runtime --workspace @ubeeq/adapter-machine --workspace @ubeeq/adapter-aws --workspace @ubeeq/billing --workspace @ubeeq/federation --workspace @ubeeq/deployment-platform --workspace @ubeeq/deployment-machine-compact --workspace @ubeeq/api --access public --tag "${{ inputs.tag }}" --provenance
+      - run: npm publish --workspace @ubeeq/core --workspace @ubeeq/audience --workspace @ubeeq/auth --workspace @ubeeq/extension-sdk --workspace @ubeeq/ui --workspace @ubeeq/studio-ui --workspace @ubeeq/commerce --workspace @ubeeq/integrations --workspace @ubeeq/connector-reference --workspace @ubeeq/moderation --workspace @ubeeq/processing --workspace @ubeeq/media-sharp --workspace @ubeeq/media-ffmpeg --workspace @ubeeq/storage --workspace @ubeeq/jobs --workspace @ubeeq/persistence --workspace @ubeeq/portability --workspace @ubeeq/adapter-local --workspace @ubeeq/commerce-runtime --workspace @ubeeq/adapter-machine --workspace @ubeeq/adapter-aws --workspace @ubeeq/billing --workspace @ubeeq/federation --workspace @ubeeq/deployment-platform --workspace @ubeeq/deployment-machine-compact --workspace @ubeeq/api --workspace @ubeeq/runtime --access public --tag "$NPM_DIST_TAG" --provenance
         env:
+          NPM_DIST_TAG: ${{ inputs.tag }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

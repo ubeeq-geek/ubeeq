@@ -4,6 +4,12 @@ import { readBoundedResponseText } from './bounded-response-text.js';
 import { parseRetryAfterSeconds } from './provider-errors.js';
 
 export type HostingFetch = (url:string,init?:RequestInit)=>Promise<Response>;
+/** Stop scheduling after failure and settle every in-flight upload before returning. */
+export async function uploadWebsiteFiles<T>(items:readonly T[],upload:(item:T)=>Promise<void>,concurrency=4):Promise<void>{
+  let next=0,failed=false,failure:unknown;
+  await Promise.all(Array.from({length:Math.min(concurrency,items.length)},async()=>{while(!failed&&next<items.length){const index=next++;try{await upload(items[index]);}catch(error){failed=true;failure=error;}}}));
+  if(failed)throw failure;
+}
 export class HostingProviderError extends WebsiteError {
   constructor(code:string,readonly retryAfterSeconds?:number){super(code,'Hosting provider request failed. Reconnect, wait for the provider cooldown, or reconcile the recorded deployment.');}
 }

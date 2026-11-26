@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { mkdtemp, readFile, readdir, rm, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReferenceApi } from '../apps/reference-api/dist/server.js';
 import { createReferenceApp } from '../apps/web-reference/src/server.mjs';
 import { FfmpegSlideshowRenderer } from '@ubeeq/media-ffmpeg';
@@ -34,13 +34,13 @@ try {
     await execute(ffmpegPath, ['-nostdin', '-v', 'error', '-f', 'lavfi', '-i', audio ? 'sine=frequency=440:duration=1' : `color=${source}:size=128x96`, ...(audio ? [] : ['-frames:v', '1', '-threads', '1']), '-n', path]);
     const bytes = await readFile(path), checksum = createHash('sha256').update(bytes).digest('hex');
     const work = (await request('works', { title: audio ? 'Music track' : `Image ${index + 1}` })).work; works.push(work.id);
-    const upload = (await request('uploads', { workId: work.id, mimeType: audio ? 'audio/wav' : 'image/png', byteLength: bytes.length, checksum })).upload;
+    const upload = (await request('uploads', { workId: work.id, mimeType: audio ? 'audio/wav' : 'image/png', byteLength: bytes.length, checksum, idempotencyKey: randomUUID() })).upload;
     const uploaded = await fetch(apiBase + `/v1/uploads/${upload.uploadId}/content`, { method: 'PUT', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify({ base64: bytes.toString('base64') }) }); assert.ok(uploaded.ok);
     await request(`uploads/${upload.uploadId}/complete`, { workId: work.id, byteLength: bytes.length, checksum });
     await api.runNextJob('upload-worker');
   }
   const collection = (await request('collections', { title: 'Browser image collection' })).collection;
-  const membership = await fetch(apiBase + `/v1/collections/${collection.id}/works`, { method: 'PUT', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify({ workIds: works.slice(0, 2), expectedRevision: collection.revision }) }); assert.ok(membership.ok);
+  const membership = await fetch(apiBase + `/v1/collections/${collection.id}/works`, { method: 'PUT', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify({ workIds: works.slice(0, 2), revision: collection.revision, expectedWorkIds: [] }) }); assert.ok(membership.ok);
   browser = spawn(process.env.CHROMIUM_PATH ?? '/usr/bin/chromium', ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--remote-debugging-port=0', '--user-data-dir=' + join(directory, 'profile'), 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
   const endpoint = await new Promise((resolve, reject) => {
     let stderr = ''; const timer = setTimeout(() => reject(Error('Chromium endpoint timed out')), 15000);

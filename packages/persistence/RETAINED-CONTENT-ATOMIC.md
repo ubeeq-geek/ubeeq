@@ -1,0 +1,9 @@
+# Retained content transactions
+
+`RetainedContentAtomic<P>` extends the preparation record transaction port with the host's typed publication writer and an active-scope query. Canonical content, authorization/source dependencies, preparation progress, receipts and outbox records join the same accepting transaction. Every operation must be awaited. A caught nested or database failure aborts the owning transaction; closing and completed async scopes cannot be reused. A fresh independent operation remains available outside the inherited callback.
+
+`installSqliteRetainedContentAtomic` in `@ubeeq/adapter-local` wraps the existing host authority. Supply its actual array field names and a publication writer that mutates those watched fields. Existing SQLite tables, JSON payloads, warm-cache invalidation, detached caller values and rollback behavior are retained. An optional startup recovery callback runs before commands are wrapped.
+
+`createDynamoRetainedContentAtomic` in `@ubeeq/adapter-aws` accepts typed transport methods and the actual publication-to-item mapping. Bind these methods to the host's SDK constructors and its existing client. Source reads become conditional commit guards; dependent writes use the same policy fence. The returned transport intercepts known commands. Its `unmanaged` fallback forwards other host commands only outside every transaction scope, and rejects them within an active or expired scope.
+
+These adapters retain record fields and storage identities. They do not authenticate callers, invent permissions, configure providers, migrate a database or establish that a missing record means an empty history. Hosts must check current actor access and source custody inside the accepting transaction and bind all canonical writers to that authority. Provider calls and other external side effects belong outside the database transaction; accepted durable intents drive their recovery.

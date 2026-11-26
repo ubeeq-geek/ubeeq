@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
+import { isObjectKeyWithinPrefix } from './object-key-scope.js';
 export * from './object-key-scope.js';
 export { readBoundedBytes } from './bounded-bytes.js';
+export { writeBoundedUploadContent } from './bounded-upload-content.js';
+export {writeBoundedUploadStream} from './bounded-upload-stream.js';
+export { inspectStoredObjectStream } from './original-stream.js';
 export { transferVerifiedObject, type VerifiedObjectTransferPorts } from './verified-transfer.js';
 
 /** Storage and delivery ports with no product-specific retention or access policy. */
@@ -14,9 +18,35 @@ export interface StoredObject {
   byteLength: number;
   checksum?: string;
   scope: ObjectAccessScope;
+  /** Trusted provider write time of this physical version, never a client timestamp. */
+  writtenAt?: string;
 }
 
+export interface StoredObjectReadStream {
+  object:StoredObject;body:AsyncIterable<Uint8Array>;
+  /** Dispose the provider body even when the consumer stops before iteration. */
+  close():Promise<void>;
+}
+/** Bounded random access to one actual immutable version. Opening grants no
+ * publication/access authority; the domain caller retains that responsibility. */
+export interface StoredObjectRangeReader {
+  readonly object:StoredObject;
+  /** Exact positive range; at most 8 MiB per call, never a whole-video buffer. */
+  read(offset:number,length:number):Promise<Uint8Array>;
+  close():Promise<void>;
+}
+export interface RangeObjectStorage {
+  openRangeReader(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectRangeReader>;
+}
+export interface StreamingObjectStorage {
+  /** Exact immutable version only; never silently read the latest key. */
+  openReadStream(input:Pick<StoredObject,'bucket'|'key'>&{versionId:string}):Promise<StoredObjectReadStream>;
+}
 export interface ObjectStorage {
+  /** Exact immutable-version deletion plus permanent capability fence. */
+  removeOwnedVersion?:import('./owned-version-removal.js').OwnedVersionRemovalAdapter['removeOwnedVersion'];
+  openReadStream?:StreamingObjectStorage['openReadStream'];
+  openRangeReader?:RangeObjectStorage['openRangeReader'];
   put(input: { object: StoredObject; body: Uint8Array }): Promise<void>;
   get(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<{ object: StoredObject; body: Uint8Array }>;
   remove(input: Pick<StoredObject, "bucket" | "key" | "versionId">): Promise<void>;
@@ -36,7 +66,8 @@ export interface DeliveryAdapter {
 export interface UploadInitiation {
   uploadId: string;
   object: StoredObject;
-  parts?: readonly { partNumber: number; url: string; expiresAt: string }[];
+  /** Required application-set headers. Providers must omit browser-controlled headers such as Content-Length. */
+  parts?: readonly { partNumber: number; url: string; expiresAt: string; headers?: Readonly<Record<string, string>> }[];
   completeUrl?: string;
   expiresAt: string;
 }
@@ -51,11 +82,9 @@ export interface UploadCompletion {
   parts?: readonly { partNumber: number; checksum?: string }[];
 }
 export interface UploadAcceptance { uploadId: string; cellId: string; creatorId: string; body: Uint8Array; operation: "upload_content"; }
+export interface UploadSealInput { uploadId: string; cellId: string; creatorId: string; }
+export type UploadSealResult = { state:'completed'; object:StoredObject } | { state:'sealed'; proofId:string; closedAt:string; retainedFence?:StoredObject };
 
-export const requireCreatorScopedObject = (key: string, input: { cellId: string; creatorId: string }): void => {
-  const prefix = `cells/${input.cellId}/creators/${input.creatorId}/`;
-  if (!key.startsWith(prefix)) throw new Error(`Object key is not scoped to creator ${input.creatorId} in cell ${input.cellId}`);
-};
 
 export interface ObjectLifecycleSignal {
   type: "deleted" | "restored" | "eligible_for_garbage_collection";
@@ -66,13 +95,23 @@ export interface ObjectLifecycleSignal {
 
 /** Direct/multipart upload is optional so simple object stores can implement ObjectStorage alone. */
 export interface UploadAdapter {
-  initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string }): Promise<UploadInitiation>;
+  initiate(input: { object: StoredObject; checksumAlgorithm: "sha256"; multipart?: boolean; expiresAt: string; idempotencyKey?: string }): Promise<UploadInitiation>;
   complete(input: UploadCompletion): Promise<StoredObject>;
+  /** Recover the exact completed provider effect after a lost reply; never create a new version. */
+  recoverCompletion?(input: UploadCompletion): Promise<StoredObject | undefined>;
+  /** Prevent all later writes, including already-started writes. Retain an owned
+   * provider fence where needed. Accepted bytes must be returned, never discarded. */
+  seal?(input: UploadSealInput): Promise<UploadSealResult>;
   abort?(input: { uploadId: string; cellId: string; creatorId: string }): Promise<void>;
 }
 
 /** Storage endpoints that proxy upload bytes (compact/local profile) authenticate the same scope as completion. */
 export interface UploadContentAdapter extends UploadAdapter { accept(input: UploadAcceptance): Promise<void>; }
+export interface UploadStreamAcceptance {uploadId:string;cellId:string;creatorId:string;body:AsyncIterable<Uint8Array>;operation:'upload_content'}
+/** Transfer only. Completion, custody receipt, sealing and quota stay with the
+ * original UploadAdapter journal. Consumption must be bounded and complete. */
+export interface UploadContentStreamAdapter extends UploadAdapter {acceptStream(input:UploadStreamAcceptance):Promise<void>}
+
 
 export const verifyUploadContentAdapterContract = async (adapter: UploadContentAdapter): Promise<void> => {
   const body = new TextEncoder().encode("upload-contract"); const checksum = createHash("sha256").update(body).digest("hex");
@@ -123,7 +162,7 @@ export const cellScopedObjectKey = (input: { cellId: string; creatorId: string; 
 };
 
 export const requireCellScopedObject = (key: string, cellId: string): void => {
-  if (!key.startsWith(`cells/${cellId}/`)) throw new Error(`Object key is not scoped to cell ${cellId}`);
+  if (!isObjectKeyWithinPrefix(key,`cells/${cellId}/`)) throw new Error(`Object key is not scoped to cell ${cellId}`);
 };
 
 /** Executable baseline for provider-neutral object storage adapters. */
@@ -139,3 +178,4 @@ export const verifyObjectStorageContract = async (storage: ObjectStorage): Promi
   let removed = false; try { await storage.get(object); } catch { removed = true; }
   if (!removed) throw new Error("Object storage contract violation: removed object remains available.");
 };
+export * from './owned-version-removal.js';

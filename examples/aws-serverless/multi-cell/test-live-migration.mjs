@@ -1,9 +1,11 @@
+import {readReferenceOperator,releaseCreatedReferenceOperator} from '../single-cell/owned-reference-operator.mjs';
+import {publishReferenceWhenReady} from '../single-cell/reference-publication-retry.mjs';
 /**
  * Opt-in real AWS migration proof. It creates only marker-tagged disposable
  * data, proves cutover and rollback, then removes every tracked record/object.
  */
-import { createHash, randomUUID } from "node:crypto";
-import { AdminCreateUserCommand, AdminDeleteUserCommand, AdminSetUserPasswordCommand, CognitoIdentityProviderClient, InitiateAuthCommand } from "@aws-sdk/client-cognito-identity-provider";
+import { createHash, randomUUID, randomBytes } from "node:crypto";
+import { AdminCreateUserCommand, AdminDeleteUserCommand, AdminSetUserPasswordCommand, CognitoIdentityProviderClient, InitiateAuthCommand, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DeleteCommand, DynamoDBDocumentClient, GetCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { DeleteObjectCommand, HeadObjectCommand, ListObjectVersionsCommand, S3Client } from "@aws-sdk/client-s3";
@@ -37,9 +39,10 @@ if (missing.length) {
   const destinationS3 = new S3Client({ region: destination.region });
   const control = createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_AWS_ROUTING_TABLE, region: process.env.UBEEQ_AWS_ROUTING_REGION });
   const commands = createAwsMigrationCommandQueue({ queueUrl: process.env.UBEEQ_AWS_MIGRATION_QUEUE_URL, region: process.env.UBEEQ_AWS_ROUTING_REGION });
-  const createdIds = new Set(); let username; let creatorId; let checkpoint;
-  const call = async (path, { method = "GET", token, body } = {}) => {
-    const response = await fetch(`${source.api}${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  const createdIds = new Set(); let username; let creatorId; let checkpoint; let operatorFixture;
+  const instanceId=process.env.UBEEQ_AWS_INSTANCE_ID ?? "aws-reference";
+  const call = async (path, { method = "GET", token, body, headers = {} } = {}) => {
+    const response = await fetch(`${source.api}${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
     const value = response.status === 204 ? undefined : await response.json();
     return { response, value };
   };
@@ -84,16 +87,21 @@ if (missing.length) {
   };
   try {
     username = `${marker}@example.invalid`;
-    const password = `UbeeqMigration${Date.now()}Aa!`;
+    const password = randomBytes(32).toString("hex")+"Aa1!";
     const cognito = new CognitoIdentityProviderClient({ region: source.region });
     await cognito.send(new AdminCreateUserCommand({ UserPoolId: source.pool, Username: username, UserAttributes: [{ Name: "email", Value: username }, { Name: "email_verified", Value: "true" }], MessageAction: "SUPPRESS" }));
     await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId: source.pool, Username: username, Password: password, Permanent: true }));
     const auth = await cognito.send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: source.client, AuthParameters: { USERNAME: username, PASSWORD: password } }));
     const token = auth.AuthenticationResult?.AccessToken;
     if (!token) throw new Error("Disposable migration user did not receive an access token.");
+    const actualUser=await cognito.send(new GetUserCommand({AccessToken:token}));
+    const beforeOperator=await readReferenceOperator(sourceDynamo,source.table,instanceId);
     const creator = await call("/v1/creators", { method: "POST", token, body: { handle: marker, displayName: "AWS live migration" } });
     if (creator.response.status !== 201) throw new Error(`Creator creation failed: ${JSON.stringify(creator.value)}`);
     creatorId = creator.value.creator.id; createdIds.add(creatorId);
+    const actorId=creator.value.creator.subjectId;
+    if(creator.value.creator.instanceId!==instanceId||!actorId||![actualUser.Username,actualUser.UserAttributes?.find(attribute=>attribute.Name==="sub")?.Value].includes(actorId))throw Error("The migration Creator fixture does not match the configured instance and authenticated actor.");
+    operatorFixture={tableName:source.table,instanceId,actorId,before:beforeOperator,created:await readReferenceOperator(sourceDynamo,source.table,instanceId)};
     const work = await call("/v1/works", { method: "POST", token, body: { title: marker } });
     if (work.response.status !== 201) throw new Error(`Work creation failed: ${JSON.stringify(work.value)}`);
     createdIds.add(work.value.work.id);
@@ -101,19 +109,13 @@ if (missing.length) {
     const checksum = createHash("sha256").update(bytes).digest("hex");
     const upload = await call("/v1/uploads", { method: "POST", token, body: { workId: work.value.work.id, mimeType: "image/png", byteLength: bytes.byteLength, checksum } });
     if (upload.response.status !== 201) throw new Error(`Upload initiation failed: ${JSON.stringify(upload.value)}`);
-    const put = await fetch(upload.value.upload.parts[0].url, { method: "PUT", headers: { "content-type": "image/png", "x-amz-checksum-sha256": Buffer.from(checksum, "hex").toString("base64"), "x-amz-meta-checksum": checksum, "x-amz-meta-scope": "private", "x-amz-meta-bytelength": String(bytes.byteLength) }, body: bytes });
+    const put = await fetch(upload.value.upload.parts[0].url, { method: "PUT", headers: upload.value.upload.parts[0].headers, body: bytes });
     if (!put.ok) throw new Error(`Source direct upload failed: ${put.status}`);
     const completed = await call(`/v1/uploads/${upload.value.upload.uploadId}/complete`, { method: "POST", token, body: { workId: work.value.work.id, checksum, byteLength: bytes.byteLength } });
     if (completed.response.status !== 202) throw new Error(`Upload completion failed: ${JSON.stringify(completed.value)}`);
     createdIds.add(completed.value.asset.id); createdIds.add(completed.value.job.id);
-    let published;
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const result = await call(`/v1/works/${work.value.work.id}/publications`, { method: "POST", token, body: { destination: "reference" } });
-      if (result.response.status === 201) { published = result.value; createdIds.add(published.intent.id); createdIds.add(published.publication.id); break; }
-      if (result.value?.error?.code !== "processing_incomplete") throw new Error(`Publication failed: ${JSON.stringify(result.value)}`);
-      await new Promise((resolve) => setTimeout(resolve, 2_000));
-    }
-    if (!published) throw new Error("Source worker did not process the migration asset.");
+    const published=await publishReferenceWhenReady((path,options)=>call(path,{...options,token}),{workId:work.value.work.id,idempotencyKey:marker+'-publication'});
+    createdIds.add(published.intent.id);createdIds.add(published.publication.id);
     const sourceRoute = { creatorId, homeCellId: source.cellId, homeRegion: source.region, endpoint: `${source.api}/`, routingRevision: 1, state: "active", updatedAt: new Date().toISOString() };
     await control.routingDirectory.create(sourceRoute);
     const requestOnly = new MigrationOrchestrator(control.routingDirectory, control.migrationCheckpoints, {});
@@ -147,6 +149,14 @@ if (missing.length) {
     await removeMarkerRecords(destinationDynamo, destination.table);
     if (creatorId) await controlDynamo.send(new DeleteCommand({ TableName: process.env.UBEEQ_AWS_ROUTING_TABLE, Key: { pk: "route", sk: creatorId } })).catch(() => undefined);
     await controlDynamo.send(new DeleteCommand({ TableName: process.env.UBEEQ_AWS_ROUTING_TABLE, Key: { pk: "migration", sk: migrationId } })).catch(() => undefined);
-    if (username) await new CognitoIdentityProviderClient({ region: source.region }).send(new AdminDeleteUserCommand({ UserPoolId: source.pool, Username: username })).catch(() => undefined);
+    try{
+      if(operatorFixture){
+        for(const [client,table] of [[sourceDynamo,source.table],[destinationDynamo,destination.table]])if((await client.send(new GetCommand({TableName:table,Key:{pk:`creators#${creatorId}`,sk:'record'},ConsistentRead:true}))).Item)throw Error('Migration Creator cleanup is incomplete; its operator claim was retained.');
+        const released=await releaseCreatedReferenceOperator(sourceDynamo,operatorFixture);
+        if(!released&&operatorFixture.before===undefined)throw Error('The migration operator fixture changed during teardown; its claim was retained.');
+      }
+    }finally{
+      if (username) await new CognitoIdentityProviderClient({ region: source.region }).send(new AdminDeleteUserCommand({ UserPoolId: source.pool, Username: username })).catch(() => undefined);
+    }
   }
 }

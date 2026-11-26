@@ -5,6 +5,7 @@ export * from './block-content.js';
 export * from './website-renderer.js';
 export * from './website-workspace.js';
 export * from './website-client.js';
+export type {WebsitePreviewManifest,WebsitePreviewFiles} from './website-preview-files.js';
 export * from './asset-editor-options.js';
 export interface LocalizedText { defaultLocale: string; translations: Readonly<Record<string, string>>; }
 export interface AccessibleAction { id: string; label: LocalizedText; description?: LocalizedText; }

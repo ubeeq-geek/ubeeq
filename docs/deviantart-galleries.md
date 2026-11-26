@@ -4,6 +4,11 @@ The integrations package exports `deviantArtGalleryCreateForm` and
 `deviantArtGalleryPublicationForm`. Hosts provide OAuth transport, authorization,
 durable publication jobs and receipts. These functions make no network requests.
 
+Publication-specific image settings and durable preparation/review mechanisms are
+documented in [Publication images](publication-images.md). Hosts must finish their
+provider/Studio integration and live account qualification before enabling controls;
+the older generic copy helpers remain preparation primitives.
+
 Creation supports a regular folder name, optional description, and optional parent
 folder UUID for a sub-gallery. Hosts must verify that the selected parent belongs
 to the authenticated account and is top-level. Select a regular parent gallery;

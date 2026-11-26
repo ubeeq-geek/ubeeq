@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { WebsiteService, buildWebsiteArtifact, websiteDigest, normalizeWebsiteDocument } from '../dist/index.js';
+import { WebsiteService, buildWebsiteArtifact, createWebsiteZip, websiteDigest, normalizeWebsiteDocument } from '../dist/index.js';
 import { websiteRoutes, websitePath, resolveWebsiteGallery, parseContentBlocks } from '@ubeeq/core';
 import { STATIC_BLOCK_SUPPORT } from '@ubeeq/ui';
 import { SqliteWebsiteStore } from '../../../adapters/local/dist/index.js';
@@ -118,6 +118,35 @@ const harness=async(options={})=>{
   for(const doc of snapshot.documents)await service.saveDocument(actor,doc,0);await service.save(actor,snapshot.website,0);
   return {service,store,snapshot,actor,events,queued,setActive:v=>active=v,setAllowed:v=>allowed=v,setEligible:v=>eligible=v};
 };
+test('identity authority receives the exact website for save, publication, build and candidate access',async t=>{
+  const snapshot=fixture(),store=new SqliteWebsiteStore(':memory:');t.after(()=>store.close());
+  const actor={actorId:'actual-unit-actor',workspaceId:snapshot.website.workspaceId};
+  snapshot.website.contributingCreatorIds=['contributor'];
+  let allowed=true;const identities=[];
+  const service=new WebsiteService({
+    store,membership:async()=>({workspaceId:actor.workspaceId,userId:actor.actorId,role:'owner',status:'active'}),
+    creatorIdentityAllowed:async(current,id,websiteId)=>{assert.deepEqual(current,actor);identities.push({id,websiteId});return allowed&&websiteId===snapshot.website.id;},
+    capabilities:async()=>({apiVersion:'1',export:true,...limits,deploymentAdapters:[]}),
+    resolveSnapshot:async(_actor,website)=>({...structuredClone(snapshot),website}),
+    evaluateRelease:async()=>({decision:'allow',revision:'unit-policy',reasons:[]}),
+    dependenciesEligible:async()=>true,enqueue:async()=>{},audit:async()=>{},
+  });
+  for(const doc of snapshot.documents)await service.saveDocument(actor,doc,0);
+  await service.save(actor,snapshot.website,0);
+  await service.capturePublication(actor,snapshot.website.id,1);
+  const build=await service.requestBuild(actor,snapshot.website.id,1,'exact-site');
+  assert.equal((await service.execute(actor.workspaceId,build.id)).state,'ready');
+  await service.preview(actor,build.id,'index.html');
+  await service.previewArchive(actor,build.id);
+  await service.export(actor,build.id);
+  assert.ok(identities.some(row=>row.id==='contributor'));
+  assert.ok(identities.every(row=>row.websiteId===snapshot.website.id));
+  await assert.rejects(service.authorizePublication(actor,'ungranted-site',snapshot.website.creatorIdentityId,[]),{code:'foreign_reference'});
+  allowed=false;
+  await assert.rejects(service.preview(actor,build.id,'index.html'),{code:'foreign_reference'});
+  await assert.rejects(service.capturePublication(actor,snapshot.website.id,1),{code:'foreign_reference'});
+});
+
 test('durable build/export lifecycle reauthorizes queued work and immutable candidate downloads',async t=>{
   const h=await harness();t.after(()=>h.store.close());
   const {service,actor,store,snapshot}=h;
@@ -328,4 +357,63 @@ test('build document freshness checks use bounded concurrency and detect changed
  let active=0,peak=0;const read=h.store.getDocument.bind(h.store);
  h.store.getDocument=async(workspace,id)=>{if(!id.startsWith('parallel-'))return read(workspace,id);peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;return {id,revision:id==='parallel-11'?2:1};};
  assert.equal((await h.service.build(h.actor,base.id)).stale,true);assert.equal(peak,5);assert.equal(active,0);
+});
+
+test('renders resolved gallery links without changing the saved website', () => {
+  const snapshot = fixture();
+  snapshot.website.namedGalleries = [
+    {id:'gallery',title:'Preview',slug:'preview',kind:'works',access:'preview',publicationIds:['preview-private']}
+  ];
+  const url = 'https://example.com/premium';
+  snapshot.namedGalleryLinks = {gallery:{purchaseLinks:[{label:'Premium Volume',url}]}};
+  const artifact = buildWebsiteArtifact(snapshot, limits);
+  const html = Buffer.from(artifact.files.get('galleries/collections/preview/index.html')).toString();
+  assert.match(html, /Premium Volume/);
+  assert.ok(html.includes(url));
+  assert.equal(snapshot.website.namedGalleries[0].purchaseLinks, undefined);
+  snapshot.namedGalleryLinks = {other:{purchaseLinks:[{label:'Other',url}]}};
+  assert.throws(() => buildWebsiteArtifact(snapshot, limits), /existing website gallery/);
+});
+
+test('1000-image previews retrieve only selected immutable files, reauthorize conditional hits and reject corrupt bytes',async t=>{
+ const h=await harness();t.after(()=>h.store.close());
+ const requested=await h.service.requestBuild(h.actor,h.snapshot.website.id,1,'large-preview');
+ const source=h.snapshot,first=source.assets[0];
+ source.assets=[first,...Array.from({length:999},(_,index)=>{const bytes=Buffer.from('distinct approved rendition '+index);return {...first,id:'image-'+index,bytes,checksum:websiteDigest(bytes)};})];
+ source.galleries[0].publicAssetIds=source.assets.map(asset=>asset.id);
+ const artifact=buildWebsiteArtifact(source,{...limits,maxAssets:2000});assert.ok(artifact.files.size>1000);
+ await h.store.putArtifact(h.actor.workspaceId,artifact.digest,artifact.zip,artifact.files);
+ await h.store.saveBuild({...requested,revision:2,state:'ready',artifactDigest:artifact.digest,dependencies:artifact.dependencies},1);
+ h.store.getArtifact=async()=>assert.fail('Preview must not load the full archive');
+ const read=h.store.getArtifactFile.bind(h.store),reads=[];
+ h.store.getArtifactFile=async(...args)=>{reads.push(args[2]);return read(...args);};
+ const manifest=await h.service.previewManifest(h.actor,requested.id);assert.equal(Object.keys(manifest.files).length,artifact.files.size);assert.equal(reads.length,0);
+ const last=source.assets.at(-1),path='assets/'+last.checksum+'.png';
+ const batch=await h.service.previewFiles(h.actor,requested.id,['index.html',path]);assert.deepEqual(reads,['index.html',path]);assert.deepEqual(Buffer.from(batch.files[1].bytes),last.bytes);
+ reads.length=0;
+ const hit=await h.service.previewFiles(h.actor,requested.id,[path],{[path]:last.checksum});assert.equal(hit.files[0].bytes,undefined);assert.equal(reads.length,0);
+ h.setEligible(false);await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path],{[path]:last.checksum}),{code:'dependency_restricted'});h.setEligible(true);
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,['../private']),{code:'invalid_path'});
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,['missing.jpg']),{code:'file_not_found'});
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,Array(9).fill(path)),{code:'invalid_path'});
+ h.store.getArtifactFile=async()=>new Uint8Array([0]);
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path]),{code:'artifact_unavailable'});
+ h.store.getArtifactFile=async(...args)=>{const bytes=await read(...args);h.setAllowed(false);return bytes;};
+ await assert.rejects(h.service.previewFiles(h.actor,requested.id,[path]),{code:'release_restricted'});h.setAllowed(true);
+ h.setActive(false);await assert.rejects(h.service.previewManifest(h.actor,requested.id),{code:'authorization_denied'});
+});
+
+test('optimized ZIP CRC remains compatible with the standard CRC-32 check vector',()=>{
+ const bytes=Buffer.from('123456789'),zip=Buffer.from(createWebsiteZip(new Map([['index.html',bytes]])));
+ assert.equal(zip.readUInt32LE(14),0xcbf43926);
+});
+
+test('1000 individually published images fit the expanded reference page and file budgets',()=>{
+ const snapshot=fixture(),base=snapshot.assets[0],common=snapshot.galleries[0];
+ snapshot.assets=Array.from({length:1000},(_,index)=>{const bytes=Buffer.from('image '+index);return {...base,id:'image-'+index,bytes,checksum:websiteDigest(bytes)};});
+ snapshot.galleries=snapshot.assets.map((asset,index)=>({...common,publicationId:'publication-'+index,workId:'work-'+index,title:'Work '+index,slug:'work-'+index,premium:false,previewAssetIds:[asset.id],publicAssetIds:[asset.id]}));
+ snapshot.website.galleryPublicationIds=snapshot.galleries.map(gallery=>gallery.publicationId);
+ snapshot.documents=snapshot.documents.map(document=>({...document,blocks:[{id:'gallery-list',type:'gallery_list',data:{pageSize:100}}]}));
+ const artifact=buildWebsiteArtifact(snapshot,{maxPages:2000,maxAssets:2000,maxBytes:256*1024*1024});
+ assert.ok(artifact.report.pages>1000);assert.ok(artifact.files.size<5000);assert.equal(artifact.report.media,1000);
 });

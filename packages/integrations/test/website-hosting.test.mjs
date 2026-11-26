@@ -82,3 +82,20 @@ test('native hosting redirects preserve historical collection-gallery paths unde
  const files=hostingRedirectFiles(new Map([['redirects.json',Buffer.from(JSON.stringify({apiVersion:'1',redirects:[{from:'/artist/galleries/collections/old/',to:'/artist/galleries/collections/new/',status:301}]}))]]));
  assert.equal(files.get('_redirects').toString(),'/artist/galleries/collections/old/ /artist/galleries/collections/new/ 301\n');
 });
+
+test('provider upload scheduling bounds concurrency and settles in-flight work before a failure escapes',async()=>{
+ const {uploadWebsiteFiles}=await import('../dist/website-hosting-http.js');let active=0,peak=0;const settled=[];
+ await assert.rejects(uploadWebsiteFiles(Array.from({length:20},(_,index)=>index),async index=>{peak=Math.max(peak,++active);try{await new Promise(resolve=>setImmediate(resolve));if(index===0)throw Error('upload failed');}finally{active--;settled.push(index);}}),/upload failed/);
+ assert.equal(peak,4);assert.equal(active,0);assert.deepEqual(settled.sort(),[0,1,2,3]);
+});
+
+test('Netlify resolves 1000 missing digests once and uploads with bounded concurrency',async()=>{
+ const c=context('netlify');c.artifact.files=new Map(Array.from({length:1000},(_,index)=>['assets/image-'+index+'.jpg',Buffer.from('unique rendition '+index)]));
+ let active=0,peak=0,uploaded=0;const adapter=new NetlifyWebsiteHostingAdapter({credential:async()=> 'fixture',probe:goodProbe,fetch:async(url,init)=>{
+  if(url.endsWith('/sites/remote'))return json({id:'remote',published_deploy:{id:'prior'}});
+  if(url.includes('/sites/remote/deploys?'))return json({id:'large',state:'prepared',required:Object.values(JSON.parse(init.body).files)});
+  if(url.includes('/deploys/large/files/')){peak=Math.max(peak,++active);await new Promise(resolve=>setImmediate(resolve));active--;uploaded++;return json({});}
+  throw Error('Unexpected fixture route');
+ }});
+ await adapter.prepare(c);assert.equal(uploaded,1000);assert.equal(peak,4);assert.equal(active,0);
+});

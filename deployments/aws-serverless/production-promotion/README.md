@@ -1,5 +1,7 @@
 # AWS serverless production promotion
 
+Status: reference orchestration. Synthesis tests cover required configuration, approval ordering, shared source artifacts and the deploy role’s configured bootstrap-role boundary. They do not qualify a production deployment. The current Plan stage performs baseline synthesis; exact configured regional change-set generation, artifact packaging in that stage and a production-account rehearsal remain required before operational use.
+
 This optional stack keeps production deployment authority inside the production AWS account. Its CodePipeline source is `ubeeq-geek/ubeeq` on `main`, but deployment pauses at an AWS CodePipeline **Manual Approval** action. GitHub Actions receives no production AWS role.
 
 The deployment project deploys the control plane, both regional cells, then updates the control plane with the exact cell migration grants. It assumes only the CDK bootstrap deploy, file-publishing, and lookup roles for the two configured cell regions.
