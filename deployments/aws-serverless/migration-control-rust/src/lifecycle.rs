@@ -64,7 +64,7 @@ fn instant(value: &str) -> Result<OffsetDateTime> {
 }
 
 // The existing DynamoDB contract uses millisecond UTC timestamps.
-fn timestamp(value: OffsetDateTime) -> Result<String> {
+pub(crate) fn timestamp(value: OffsetDateTime) -> Result<String> {
     let value = value.to_offset(time::UtcOffset::UTC);
     let second = value.replace_nanosecond(0)?.format(&Rfc3339)?;
     Ok(format!(

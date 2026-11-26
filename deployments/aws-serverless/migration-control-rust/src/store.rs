@@ -24,7 +24,7 @@ pub fn document(value: AttributeValue) -> Result<Value, Failure> {
     })
 }
 
-fn attribute(value: &Value) -> AttributeValue {
+pub(crate) fn attribute(value: &Value) -> AttributeValue {
     match value {
         Value::Null => AttributeValue::Null(true),
         Value::Bool(value) => AttributeValue::Bool(*value),

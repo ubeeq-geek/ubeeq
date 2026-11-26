@@ -27,3 +27,10 @@ reuses existing bytes only after verifying the migration identity and digest.
 The Rust profile allocates 6 GiB of temporary storage. It uses single-object
 PUTs, as the Node migration adapter does. The regional migration cell command
 implementation is a separate port.
+
+## Regional cell port status
+
+The regional module validates command identity and cell/region scope, writes
+source holds and releases with the existing DynamoDB snapshot fences, and
+writes the existing destination audit records. The regional Lambda entry point
+also needs the export, import and retirement operations before deployment.
