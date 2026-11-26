@@ -42,3 +42,21 @@ test('API and worker account-status and group permissions are scoped to their co
     assert.equal(template.Resources[pool].Properties.AdminCreateUserConfig.AllowAdminCreateUserOnly, true);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test('the reference web function can use its own Rust bootstrap asset', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-web-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const web = join(directory, 'web');
+    await mkdir(api);
+    await mkdir(web);
+    await writeFile(join(api, 'lambda.js'), 'exports.handler=async()=>({statusCode:200});\n');
+    await writeFile(join(web, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'cdk.out'), context: { referenceApiAssetPath: api, rustWebAssetPath: web } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustWebTest', { env: { account: '000000000000', region: 'us-east-2' } });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'lambda.handler', Runtime: 'nodejs22.x' });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

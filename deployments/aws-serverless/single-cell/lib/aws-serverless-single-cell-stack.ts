@@ -55,7 +55,14 @@ export class AwsServerlessSingleCellStack extends Stack {
     if (routingDirectoryTableName && !routingDirectoryRegion) throw new Error("UBEEQ_ROUTING_DIRECTORY_REGION is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME.");
     const runtimeEnvironment = { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_CELL_ID: cellId, UBEEQ_CELL_REGION: cellRegion, UBEEQ_CELL_OPERATOR: "self-hosted", UBEEQ_RUNTIME_REVISION: runtimeRevision, UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_PASSWORD_AUTH_ENABLED: "true", UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials", ...(routingDirectoryTableName ? { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routingDirectoryTableName, UBEEQ_ROUTING_DIRECTORY_REGION: routingDirectoryRegion! } : {}) };
     const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
-    const web = new lambda.Function(this, "ReferenceWeb", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.web", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl } });
+    const rustWebAsset = this.node.tryGetContext("rustWebAssetPath") || process.env.UBEEQ_RUST_WEB_ASSET_PATH;
+    const web = new lambda.Function(this, "ReferenceWeb", {
+      runtime: rustWebAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustWebAsset ? "bootstrap" : "lambda.web",
+      timeout: Duration.seconds(30),
+      code: lambda.Code.fromAsset(rustWebAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl },
+    });
     const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
     // This private handler is intentionally distinct from the HTTP API. Only
     // the explicitly nominated multi-cell control worker may invoke it, and
