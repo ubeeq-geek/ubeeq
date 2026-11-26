@@ -36,14 +36,23 @@ jobs:
           curl --fail --silent --show-error https://sh.rustup.rs --output /tmp/rustup-init.sh
           sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.100.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: cargo test --locked
-      - name: Build the Linux Lambda ZIP
+      - run: cargo test --locked --features worker
+      - name: Build the Linux Lambda ZIPs
         run: |
-          cargo build --locked --release
+          cargo build --locked --release --features worker
           test -x target/release/bootstrap
           zip -j migration-control-api-rust.zip target/release/bootstrap
+          mkdir -p target/worker-package
+          cp target/release/migration-worker target/worker-package/bootstrap
+          test -x target/worker-package/bootstrap
+          zip -j migration-control-worker-rust.zip target/worker-package/bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: migration-control-api-rust-al2023-x86-64
           path: deployments/aws-serverless/migration-control-rust/migration-control-api-rust.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: migration-control-worker-rust-al2023-x86-64
+          path: deployments/aws-serverless/migration-control-rust/migration-control-worker-rust.zip
           if-no-files-found: error
