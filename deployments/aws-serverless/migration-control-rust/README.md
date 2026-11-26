@@ -34,3 +34,11 @@ The regional module validates command identity and cell/region scope, writes
 source holds and releases with the existing DynamoDB snapshot fences, and
 writes the existing destination audit records. The regional Lambda entry point
 also needs the export, import and retirement operations before deployment.
+
+The regional portability module implements the existing export checksum and
+record graph checks. Its canonical encoder uses English collation, JavaScript
+number formatting, and JSON array-index ordering. A vector from the Node
+implementation verifies the cross-runtime digest. The module also prepares
+asset transfer entries for the declared source and destination cells.
+Publication-image validation and the regional export/import/retirement
+handlers are still required before deploying the regional Lambda.

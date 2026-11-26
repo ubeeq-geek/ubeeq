@@ -1,3 +1,4 @@
+pub mod portability;
 mod records;
 
 pub use records::RegionalStore;
@@ -122,7 +123,9 @@ impl RegionalCommand {
             RegionalOperation::Enable => "regional_migration.destination_enabled",
             RegionalOperation::Rollback => "regional_migration.destination_rolled_back",
             _ => {
-                return Err("Migration command does not produce destination audit evidence.".into());
+                return Err(
+                    "Migration command does not produce destination audit evidence.".into(),
+                );
             }
         };
         let destination = &self.checkpoint["destination"];
