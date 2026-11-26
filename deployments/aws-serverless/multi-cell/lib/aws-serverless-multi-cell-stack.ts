@@ -36,11 +36,12 @@ export class AwsServerlessMultiCellStack extends Stack {
       environment: { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routes.tableName, UBEEQ_ROUTING_DIRECTORY_REGION: this.region },
     });
     const operatorPrincipalArn = this.node.tryGetContext("migrationOperatorPrincipalArn") || process.env.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN || "arn:aws:iam::000000000000:role/UNCONFIGURED";
+    const rustOperatorAsset = this.node.tryGetContext("rustMigrationControlApiAssetPath") || process.env.UBEEQ_RUST_MIGRATION_CONTROL_API_ASSET_PATH;
     const operatorApi = new lambda.Function(this, "MigrationControlApi", {
-      runtime: lambda.Runtime.NODEJS_22_X,
-      handler: "lambda.migrationControlApi",
+      runtime: rustOperatorAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustOperatorAsset ? "bootstrap" : "lambda.migrationControlApi",
       timeout: Duration.seconds(30),
-      code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      code: lambda.Code.fromAsset(rustOperatorAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routes.tableName, UBEEQ_ROUTING_DIRECTORY_REGION: this.region, UBEEQ_MIGRATION_COMMANDS_QUEUE_URL: commands.queueUrl, UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN: operatorPrincipalArn },
     });
     routes.grantReadWriteData(worker);

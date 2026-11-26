@@ -1,0 +1,49 @@
+name: Rust migration control API
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/rust-migration-control-api.yml
+      - deployments/aws-serverless/multi-cell/**
+      - deployments/aws-serverless/migration-control-rust/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rust-migration-control-api.yml
+      - deployments/aws-serverless/multi-cell/**
+      - deployments/aws-serverless/migration-control-rust/**
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: public.ecr.aws/amazonlinux/amazonlinux:2023
+    defaults:
+      run:
+        working-directory: deployments/aws-serverless/migration-control-rust
+    steps:
+      - name: Install build dependencies
+        working-directory: .
+        run: dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config git tar gzip zip
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: |
+          curl --fail --silent --show-error https://sh.rustup.rs --output /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.100.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: cargo test --locked
+      - name: Build the Linux Lambda ZIP
+        run: |
+          cargo build --locked --release
+          test -x target/release/bootstrap
+          zip -j migration-control-api-rust.zip target/release/bootstrap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: migration-control-api-rust-al2023-x86-64
+          path: deployments/aws-serverless/migration-control-rust/migration-control-api-rust.zip
+          if-no-files-found: error

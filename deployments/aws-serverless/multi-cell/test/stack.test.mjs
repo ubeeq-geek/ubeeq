@@ -26,3 +26,28 @@ test('multi-cell control preserves recovery state, requires IAM and confines mig
   }
  }finally{await rm(directory,{recursive:true,force:true});}
 });
+
+test('the Rust operator API uses its own asset and keeps the IAM Function URL', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'migration-api-rust-'));
+  try {
+    const referenceAsset = join(directory, 'node');
+    const rustAsset = join(directory, 'rust');
+    await mkdir(referenceAsset);
+    await mkdir(rustAsset);
+    await writeFile(join(referenceAsset, 'lambda.js'), 'synthetic worker asset');
+    await writeFile(join(rustAsset, 'bootstrap'), 'synthetic operator API asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: referenceAsset,
+      rustMigrationControlApiAssetPath: rustAsset,
+    } });
+    const stack = new AwsServerlessMultiCellStack(app, 'RustControl', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'lambda.migrationControlWorker', Runtime: 'nodejs22.x' });
+    template.hasResourceProperties('AWS::Lambda::Url', { AuthType: 'AWS_IAM' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
