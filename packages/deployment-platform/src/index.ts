@@ -1,5 +1,24 @@
 export interface DeploymentArtifact { path: string; fileCount: number; sha256: string; }
-export interface DeploymentArtifactManifest { schemaVersion: 1; product: string; revision: string; artifacts: Readonly<Record<string, DeploymentArtifact>>; }
+export interface DeploymentArtifactManifest {
+  schemaVersion: 1 | 2;
+  product: string;
+  revision: string;
+  artifacts: Readonly<Record<string, DeploymentArtifact>>;
+  appCode?: string;
+  coreCommit?: string;
+  commercialCommit?: string;
+  migrationReady?: boolean;
+}
+export interface DeploymentArtifactExpectation {
+  product: string;
+  revision: string;
+  artifacts: readonly string[];
+  appCode?: string;
+  coreCommit?: string;
+  commercialCommit?: string;
+  requireMigrationReady?: boolean;
+}
+export { hashDeploymentArtifactDirectory } from './artifact-files.js';
 export interface RegionalDeploymentPlan { regions: readonly string[]; artifactRegistryStackName: string; }
 
 /** Minimal, non-content directory entry suitable for an optional managed edge. */
@@ -298,11 +317,20 @@ export const rollbackCellRoute = (route: CellRoute, checkpoint: MigrationCheckpo
   return { creatorId: route.creatorId, homeCellId: checkpoint.source.homeCellId, homeRegion: checkpoint.source.homeRegion, endpoint: checkpoint.source.endpoint, routingRevision: route.routingRevision + 1, state: "active", updatedAt: now };
 };
 
-export const validateDeploymentArtifactManifest = (manifest: DeploymentArtifactManifest, expected: { product: string; revision: string; artifacts: readonly string[] }): DeploymentArtifactManifest => {
-  if (manifest.schemaVersion !== 1 || manifest.product !== expected.product || manifest.revision !== expected.revision) throw new Error("Deployment artifact manifest identity does not match the planned release");
-  if (JSON.stringify(Object.keys(manifest.artifacts).sort()) !== JSON.stringify([...expected.artifacts].sort())) throw new Error("Deployment artifact manifest components do not match the planned release");
-  for (const artifact of Object.values(manifest.artifacts)) {
-    if (!artifact.path || !Number.isInteger(artifact.fileCount) || artifact.fileCount < 1 || !/^[a-f0-9]{64}$/.test(artifact.sha256)) throw new Error("Deployment artifact manifest contains an invalid artifact");
+export const validateDeploymentArtifactManifest = (manifest: DeploymentArtifactManifest, expected: DeploymentArtifactExpectation): DeploymentArtifactManifest => {
+  const commit = /^[a-f0-9]{40}$/;
+  if (!manifest || ![1, 2].includes(manifest.schemaVersion) || manifest.product !== expected.product || manifest.revision !== expected.revision || !commit.test(manifest.revision)) throw new Error("Deployment artifact manifest identity does not match the planned release");
+  if (manifest.schemaVersion === 2) {
+    if (!manifest.appCode || !commit.test(manifest.coreCommit ?? '') || !commit.test(manifest.commercialCommit ?? '') || typeof manifest.migrationReady !== 'boolean') throw new Error("Deployment artifact source provenance is incomplete");
+  }
+  for (const key of ['appCode', 'coreCommit', 'commercialCommit'] as const) {
+    if (expected[key] !== undefined && manifest[key] !== expected[key]) throw new Error("Deployment artifact source provenance does not match the planned release");
+  }
+  if (expected.requireMigrationReady && manifest.migrationReady !== true) throw new Error("Deployment artifact migration gates are incomplete");
+  if (!manifest.artifacts || JSON.stringify(Object.keys(manifest.artifacts).sort()) !== JSON.stringify([...expected.artifacts].sort())) throw new Error("Deployment artifact manifest components do not match the planned release");
+  const safePath = (path: string) => typeof path === 'string' && path.length > 0 && path.split('/').every(part => part !== '' && part !== '.' && part !== '..' && !/[\\:\x00-\x1f\x7f]/.test(part));
+  for (const [name, artifact] of Object.entries(manifest.artifacts)) {
+    if (!/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(name) || !artifact || !safePath(artifact.path) || !Number.isSafeInteger(artifact.fileCount) || artifact.fileCount < 1 || !/^[a-f0-9]{64}$/.test(artifact.sha256)) throw new Error("Deployment artifact manifest contains an invalid artifact");
   }
   return manifest;
 };
