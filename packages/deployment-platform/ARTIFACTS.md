@@ -25,8 +25,8 @@ Schema 3 keeps schema 2 provenance and changes the digest format. SHA-256 starts
 with the UTF-8 prefix `ubeeq-deployment-artifact-v3` followed by a zero byte.
 For each file in the same sorted path order, hash an unsigned 64-bit big-endian
 path byte length, the UTF-8 path, an unsigned 64-bit big-endian content byte
-length, and the file bytes. Directory entries must decode without Unicode
-replacement characters. The lengths delimit empty files and arbitrary binary
+length, and the file bytes. Directory entries must be valid UTF-8.
+The lengths delimit empty files and arbitrary binary
 content. Consumers can pin the reviewed release format with
 `expected.schemaVersion`. Upgrade verifiers and producers together before
 promoting schema 3. Existing schema 2 digests retain their original format.

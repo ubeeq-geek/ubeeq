@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
-import {mkdtemp, mkdir, writeFile, symlink, rm} from 'node:fs/promises';
+import {cp, mkdtemp, mkdir, writeFile, symlink, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
@@ -20,6 +20,27 @@ test('v2 binds source provenance, components and readiness while retaining v1',(
  assert.equal(validateDeploymentArtifactManifest(v3,{...expected,schemaVersion:3}),v3);
  assert.throws(()=>validateDeploymentArtifactManifest(manifest,{...expected,schemaVersion:3}),/identity/);
  assert.throws(()=>validateDeploymentArtifactManifest({...v3,revision:v1.revision},{...expected,revision:v1.revision}),/identity/);
+});
+
+test('schema 3 staged artifact matches the producer manifest across a copy', async () => {
+ const root = await mkdtemp(join(tmpdir(), 'artifact-stage-v3-'));
+ try {
+  const producer = join(root, 'producer');
+  const staging = join(root, 'staging');
+  await mkdir(producer);
+  await writeFile(join(producer, 'replacement-\uFFFD.bin'), Buffer.from([0, 255, 0]));
+  const artifact = {path: 'api', ...await hashDeploymentArtifactDirectory(producer, 3)};
+  const produced = {...manifest, schemaVersion: 3, migrationReady: true, artifacts: {api: artifact}};
+  const plan = {...expected, schemaVersion: 3, requireMigrationReady: true};
+  const reviewed = validateDeploymentArtifactManifest(JSON.parse(JSON.stringify(produced)), plan);
+  await cp(producer, staging, {recursive: true});
+  const staged = await hashDeploymentArtifactDirectory(staging, reviewed.schemaVersion);
+  assert.deepEqual(staged, {fileCount: artifact.fileCount, sha256: artifact.sha256});
+  await writeFile(join(staging, 'replacement-\uFFFD.bin'), Buffer.from([0, 254, 0]));
+  assert.notEqual((await hashDeploymentArtifactDirectory(staging, 3)).sha256, artifact.sha256);
+ } finally {
+  await rm(root, {recursive: true, force: true});
+ }
 });
 
 test('schema 3 has a stable digest for empty and binary files',async()=>{

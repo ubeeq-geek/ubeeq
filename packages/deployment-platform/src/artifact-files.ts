@@ -12,8 +12,12 @@ export async function hashDeploymentArtifactDirectory(directory: string, schemaV
   const visit = async (relative = ''): Promise<void> => {
     const current = resolve(root, relative);
     if (!(await lstat(current)).isDirectory()) throw new Error('Artifact roots must be regular directories');
+    if (schemaVersion === 3) {
+      for (const name of await readdir(current, {encoding: 'buffer'})) {
+        if (!Buffer.from(name.toString('utf8')).equals(name)) throw new Error('Artifact paths must be valid UTF-8');
+      }
+    }
     for (const entry of await readdir(current, {withFileTypes: true})) {
-      if (schemaVersion === 3 && entry.name.includes('\uFFFD')) throw new Error('Artifact file paths must decode without replacement characters');
       const file = relative ? relative + '/' + entry.name : entry.name;
       if (entry.isDirectory()) {
         if (schemaVersion === 1 && legacyExcludedDirectories.includes(entry.name)) continue;
