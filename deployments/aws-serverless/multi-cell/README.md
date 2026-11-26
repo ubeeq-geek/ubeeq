@@ -26,3 +26,22 @@ It also creates a migration operations dashboard and alarms for visible command 
 See [`../../../docs/aws-multi-cell-operator-runbook.md`](../../../docs/aws-multi-cell-operator-runbook.md) for registration, region selection, backup/recovery disclosure, migration/rollback, and production-readiness procedures.
 
 The package native suite synthesizes the real stack and checks retained recovery state, IAM-only control access, queue/worker timing, operational alarms and exact configured migration-resource grants. Provider behavior is separately exercised by the opt-in two-cell development workflow. That workflow uses issued upload headers, stable publication retries, owned fixture teardown and serialized access to its fixed development cells.
+
+## Deploying reference profiles to AWS development
+
+Use the manual **Deploy Ubeeq AWS development profile** workflow from `main`.
+The standalone choice deploys `UbeeqStandaloneDev` in `us-east-2`. The regional
+choice updates the existing Ohio and Frankfurt development cells and their Ohio
+control plane. It shares the concurrency group used by live validation.
+
+Configure the protected `ubeeq-aws-dev-deploy` GitHub environment with
+`UBEEQ_DEV_AWS_ACCOUNT_ID` and `UBEEQ_DEV_DEPLOY_ROLE_ARN`. Grant the OIDC role
+access to the development CDK bootstrap roles, the selected stacks, and their
+outputs. Bootstrap each selected region separately before dispatching.
+
+For standalone, set `UBEEQ_DEV_SINGLE_BASE_URL` to the reviewed HTTPS API base
+URL. For regional, set `UBEEQ_DEV_SOURCE_BASE_URL`,
+`UBEEQ_DEV_DESTINATION_BASE_URL`, `UBEEQ_DEV_SOURCE_CELL_ID`,
+`UBEEQ_DEV_DESTINATION_CELL_ID`, and `UBEEQ_DEV_MIGRATION_OPERATOR_ARN` to the
+existing target identities. The workflow checks the account before deploying
+and verifies the resulting API health endpoints.

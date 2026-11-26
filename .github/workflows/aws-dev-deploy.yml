@@ -1,0 +1,103 @@
+name: Deploy Ubeeq AWS development profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Development topology
+        type: choice
+        options: [single-cell, regional-multi-cell]
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubeeq-dev-multi-cell-live
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ubeeq-aws-dev-deploy
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROFILE: ${{ inputs.profile }}
+      EXPECTED_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+      SINGLE_BASE_URL: ${{ vars.UBEEQ_DEV_SINGLE_BASE_URL }}
+      UBEEQ_SOURCE_BASE_URL: ${{ vars.UBEEQ_DEV_SOURCE_BASE_URL }}
+      UBEEQ_DESTINATION_BASE_URL: ${{ vars.UBEEQ_DEV_DESTINATION_BASE_URL }}
+      UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN: ${{ vars.UBEEQ_DEV_MIGRATION_OPERATOR_ARN }}
+      UBEEQ_SOURCE_REGION: us-east-2
+      UBEEQ_DESTINATION_REGION: eu-central-1
+      UBEEQ_CONTROL_REGION: us-east-2
+      UBEEQ_SOURCE_STACK: UbeeqSelfHostDev
+      UBEEQ_DESTINATION_STACK: UbeeqSelfHostDevEuCentral1
+      UBEEQ_CONTROL_STACK: UbeeqMultiCellDev
+      UBEEQ_SOURCE_CELL_ID: ${{ vars.UBEEQ_DEV_SOURCE_CELL_ID }}
+      UBEEQ_DESTINATION_CELL_ID: ${{ vars.UBEEQ_DEV_DESTINATION_CELL_ID }}
+      CODEBUILD_RESOLVED_SOURCE_VERSION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Validate development configuration
+        run: |
+          node <<'NODE'
+          const e = process.env;
+          if (!/^\d{12}$/.test(e.EXPECTED_ACCOUNT)) throw Error('Set the protected development account ID.');
+          function checkUrl(value) {
+            const url = new URL(value);
+            if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) throw Error('Use a reviewed HTTPS development base URL.');
+          }
+          if (e.PROFILE === 'single-cell') {
+            checkUrl(e.SINGLE_BASE_URL);
+          } else if (e.PROFILE === 'regional-multi-cell') {
+            checkUrl(e.UBEEQ_SOURCE_BASE_URL);
+            checkUrl(e.UBEEQ_DESTINATION_BASE_URL);
+            const ids = [e.UBEEQ_SOURCE_CELL_ID, e.UBEEQ_DESTINATION_CELL_ID];
+            if (ids[0] === ids[1] || !ids.every(id => /^[a-zA-Z0-9_-]+$/.test(id))) throw Error('Set distinct reviewed cell IDs.');
+            if (!e.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN.startsWith('arn:aws:iam::' + e.EXPECTED_ACCOUNT + ':role/')) throw Error('Set a migration operator role in the development account.');
+          } else {
+            throw Error('Unsupported development profile.');
+          }
+          NODE
+      - run: npm ci
+      - run: npm run build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.UBEEQ_DEV_DEPLOY_ROLE_ARN }}
+          allowed-account-ids: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+          aws-region: us-east-2
+      - name: Deploy the selected development profile
+        run: |
+          test "$(aws sts get-caller-identity --query Account --output text)" = "$EXPECTED_ACCOUNT"
+          if [ "$PROFILE" = single-cell ]; then
+            STACK_NAME=UbeeqStandaloneDev UBEEQ_DEPLOYMENT_REGION=us-east-2 \
+              UBEEQ_CELL_ID=standalone-dev UBEEQ_REFERENCE_API_PUBLIC_BASE_URL="$SINGLE_BASE_URL" \
+              UBEEQ_RUNTIME_REVISION="$GITHUB_SHA" \
+              npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell -- --require-approval never
+          else
+            node scripts/deploy-aws-serverless-regional-cells.mjs
+          fi
+      - name: Check the deployed API health
+        run: |
+          check_health() {
+            url=$(aws cloudformation describe-stacks --region "$1" --stack-name "$2" --query "Stacks[0].Outputs[?OutputKey=='ReferenceApiGatewayUrl'].OutputValue | [0]" --output text)
+            [[ "$url" = https://* ]]
+            curl --fail --silent --show-error --retry 5 "${url%/}/health" > /dev/null
+          }
+          if [ "$PROFILE" = single-cell ]; then
+            check_health us-east-2 UbeeqStandaloneDev
+          else
+            check_health "$UBEEQ_SOURCE_REGION" "$UBEEQ_SOURCE_STACK"
+            check_health "$UBEEQ_DESTINATION_REGION" "$UBEEQ_DESTINATION_STACK"
+          fi
