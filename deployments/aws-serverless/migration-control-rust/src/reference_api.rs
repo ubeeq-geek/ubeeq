@@ -49,7 +49,7 @@ struct HttpContext {
     method: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Response {
     status_code: u16,
@@ -782,7 +782,15 @@ fn build_record(
     item.extend([
         ("id".into(), AttributeValue::S(id.into())),
         ("repository".into(), AttributeValue::S(repository.into())),
-        ("revision".into(), AttributeValue::N("1".into())),
+        (
+            "revision".into(),
+            AttributeValue::N(
+                value["revision"]
+                    .as_u64()
+                    .ok_or("Missing record revision")?
+                    .to_string(),
+            ),
+        ),
         ("value".into(), attribute(value)),
     ]);
     Ok(item)
@@ -918,6 +926,27 @@ impl CreatorRecords<'_> {
         Ok(Some(work))
     }
 
+    fn item_guard(
+        &self,
+        pk: &str,
+        sk: &str,
+        expected: Option<(&str, AttributeValue)>,
+    ) -> Result<TransactWriteItem, Failure> {
+        let check = ConditionCheck::builder()
+            .table_name(self.table)
+            .set_key(Some(item_key(pk, sk)));
+        let check = match expected {
+            Some((field, value)) => check
+                .condition_expression("#field = :value")
+                .expression_attribute_names("#field", field)
+                .expression_attribute_values(":value", value),
+            None => check.condition_expression("attribute_not_exists(pk)"),
+        };
+        Ok(TransactWriteItem::builder()
+            .condition_check(check.build()?)
+            .build())
+    }
+
     async fn write_work(
         &self,
         creator: &Value,
@@ -975,37 +1004,22 @@ impl CreatorRecords<'_> {
                 )
                 .build())
         };
-        let creator_guard = ConditionCheck::builder()
-            .table_name(self.table)
-            .set_key(Some(item_key(&format!("creators#{creator_id}"), "record")))
-            .condition_expression("#revision = :revision")
-            .expression_attribute_names("#revision", "revision")
-            .expression_attribute_values(":revision", AttributeValue::N(revision.to_string()))
-            .build()
-            .map_err(|_| WorkWriteError::Failed)?;
         let mut actions = vec![
             record_put("works", &work).map_err(failed)?,
-            TransactWriteItem::builder()
-                .condition_check(creator_guard)
-                .build(),
+            self.item_guard(
+                &format!("creators#{creator_id}"),
+                "record",
+                Some(("revision", AttributeValue::N(revision.to_string()))),
+            )
+            .map_err(failed)?,
+            self.item_guard(
+                hold_fence,
+                "fence",
+                hold_version.map(|version| ("version", AttributeValue::S(version))),
+            )
+            .map_err(failed)?,
+            self.item_guard(global, "fence", None).map_err(failed)?,
         ];
-        for (pk, version) in [(hold_fence, hold_version), (global, None)] {
-            let mut check = ConditionCheck::builder()
-                .table_name(self.table)
-                .set_key(Some(item_key(pk, "fence")));
-            check = match version {
-                Some(version) => check
-                    .condition_expression("#version = :version")
-                    .expression_attribute_names("#version", "version")
-                    .expression_attribute_values(":version", AttributeValue::S(version)),
-                None => check.condition_expression("attribute_not_exists(pk)"),
-            };
-            actions.push(
-                TransactWriteItem::builder()
-                    .condition_check(check.build().map_err(|_| WorkWriteError::Failed)?)
-                    .build(),
-            );
-        }
         if let Some(digest) = digest {
             let mut receipt = stamp(&format!("work-intake-{digest}"));
             receipt["namespace"] = json!("runtime-work-intake");
@@ -1140,6 +1154,213 @@ async fn create_work(
     }
 }
 
+fn work_edit(work: &Value, body: &Value, id: &str) -> Result<Value, Response> {
+    let conflict = || {
+        error(
+            409,
+            id,
+            "revision_conflict",
+            "Reload the work before saving changes.",
+        )
+    };
+    let revision = work["revision"]
+        .as_u64()
+        .filter(|revision| *revision < 9_007_199_254_740_991)
+        .ok_or_else(conflict)?;
+    if body["revision"].as_u64() != Some(revision) {
+        return Err(conflict());
+    }
+    let title = body
+        .get("title")
+        .filter(|title| !title.is_null())
+        .unwrap_or(&work["title"])
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .ok_or_else(|| error(400, id, "invalid_request", "title is required"))?;
+    let mut updated = work.clone();
+    updated["revision"] = json!(revision + 1);
+    updated["title"] = json!(title);
+    updated["updatedAt"] = json!(
+        OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| error(500, id, "internal_error", "Unable to update Work"))?
+    );
+    Ok(updated)
+}
+
+impl CreatorRecords<'_> {
+    async fn patch_work(
+        &self,
+        creator: &Value,
+        work: &Value,
+        updated: &Value,
+        hold_version: Option<String>,
+    ) -> Result<bool, Failure> {
+        let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+        let revision = creator["revision"]
+            .as_u64()
+            .ok_or("Missing Creator revision")?;
+        let prior = work["revision"].as_u64().ok_or("Missing Work revision")?;
+        let put = Put::builder()
+            .table_name(self.table)
+            .set_item(Some(build_record("works", updated)?))
+            .condition_expression("#revision = :revision")
+            .expression_attribute_names("#revision", "revision")
+            .expression_attribute_values(":revision", AttributeValue::N(prior.to_string()))
+            .build()?;
+        let actions = vec![
+            TransactWriteItem::builder().put(put).build(),
+            self.item_guard(
+                &format!("creators#{creator_id}"),
+                "record",
+                Some(("revision", AttributeValue::N(revision.to_string()))),
+            )?,
+            self.item_guard(
+                "__ubeeq_repository_snapshot#moderationHolds",
+                "fence",
+                hold_version.map(|version| ("version", AttributeValue::S(version))),
+            )?,
+            self.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        ];
+        match self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(actions))
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(failure)
+                if failure
+                    .as_service_error()
+                    .is_some_and(|error| match error {
+                        aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled) =>
+                            cancelled.cancellation_reasons().first().and_then(|reason| reason.code()) == Some("ConditionalCheckFailed"),
+                        _ => false,
+                    }) =>
+            {
+                Ok(false)
+            }
+            Err(failure) => Err(failure.into()),
+        }
+    }
+}
+
+async fn private_work(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    work: Value,
+    region: &str,
+    id: &str,
+) -> Response {
+    let unavailable = || error(500, id, "internal_error", "Unable to read or update Work");
+    let Some(creator_id) = creator["id"].as_str() else {
+        return unavailable();
+    };
+    let writing = request.request_context.http.method == "PATCH";
+    let hold_version = if writing {
+        match repository
+            .marker("__ubeeq_repository_snapshot#moderationHolds")
+            .await
+        {
+            Ok(version) => version,
+            Err(_) => return unavailable(),
+        }
+    } else {
+        None
+    };
+    match repository.migration_held(creator_id).await {
+        Ok(true) => {
+            return error(
+                409,
+                id,
+                "migration_source_held",
+                "Creator writes are paused while a regional migration is in progress",
+            );
+        }
+        Ok(false) => {}
+        Err(_) => return unavailable(),
+    }
+    if work["creatorId"] != creator_id {
+        return error(
+            403,
+            id,
+            "work_not_owned",
+            "Work does not belong to the current creator",
+        );
+    }
+    if work["dataHomeRegion"] != creator["dataHomeRegion"]
+        || work["routingRevision"] != creator["routingRevision"]
+    {
+        return error(
+            409,
+            id,
+            "data_home_mismatch",
+            "Work and creator data homes do not match",
+        );
+    }
+    if !writing {
+        let assets = match repository.list("assets").await {
+            Ok(assets) => assets
+                .into_iter()
+                .filter(|asset| asset["workId"] == work["id"] && asset["creatorId"] == creator_id)
+                .collect::<Vec<_>>(),
+            Err(_) => return unavailable(),
+        };
+        let publications = match repository.list("publications").await {
+            Ok(publications) => publications
+                .into_iter()
+                .filter(|publication| publication["workId"] == work["id"])
+                .collect::<Vec<_>>(),
+            Err(_) => return unavailable(),
+        };
+        return respond(
+            200,
+            id,
+            json!({"work":work,"assets":assets,"publications":publications,"requestId":id}),
+        );
+    }
+    if creator["dataHomeRegion"] != region
+        || creator["dataHomeAssignedAt"] != work["dataHomeAssignedAt"]
+        || creator
+            .get("deletion")
+            .is_some_and(|value| !value.is_null() && value != false)
+        || creator
+            .get("status")
+            .is_some_and(|status| status != "active")
+    {
+        return error(
+            403,
+            id,
+            "work_edit_denied",
+            "Current Work editing access is required.",
+        );
+    }
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let updated = match work_edit(&work, &body, id) {
+        Ok(updated) => updated,
+        Err(response) => return response,
+    };
+    match repository
+        .patch_work(creator, &work, &updated, hold_version)
+        .await
+    {
+        Ok(true) => respond(200, id, json!({"work":updated,"requestId":id})),
+        Ok(false) => error(
+            409,
+            id,
+            "revision_conflict",
+            "Reload the work before saving changes.",
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -1154,6 +1375,21 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         table,
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
+    };
+    let work = if let Some(work_id) = single_path_id(&request.raw_path, "/v1/works/") {
+        match repository.read("works", work_id).await {
+            Ok(Some(work))
+                if work["id"] == work_id
+                    && work["homeCellId"] == repository.cell
+                    && work["instanceId"] == repository.instance =>
+            {
+                Some(work)
+            }
+            Ok(_) => return error(404, id, "work_not_found", "Work was not found"),
+            Err(_) => return unavailable(),
+        }
+    } else {
+        None
     };
     let collection = if let Some((collection_id, false)) = collection_path(&request.raw_path) {
         match repository.read("collections", collection_id).await {
@@ -1215,13 +1451,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     ) {
         None
     } else {
-        creator_selection(request).or_else(|| {
-            collection
-                .as_ref()?
-                .get("creatorId")?
-                .as_str()
-                .map(str::to_owned)
-        })
+        if let Some(work) = &work {
+            work["creatorId"].as_str().map(str::to_owned)
+        } else {
+            creator_selection(request).or_else(|| {
+                collection
+                    .as_ref()?
+                    .get("creatorId")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+        }
     };
     if requested
         .as_ref()
@@ -1237,6 +1477,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let creator_id = requested.as_ref().unwrap_or(default_id);
     match repository.owned_creator(creator_id, &subject).await {
         Ok(Some(record)) => {
+            if let Some(work) = work {
+                return private_work(
+                    request,
+                    &repository,
+                    &record,
+                    work,
+                    &runtime.cell.region,
+                    id,
+                )
+                .await;
+            }
             if request.raw_path == "/v1/migrations" {
                 return migration_request(request, runtime.routing.is_some(), id);
             }
@@ -1490,6 +1741,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "operations_unavailable",
             "Operator operations are not configured",
         );
+    }
+    if matches!(method, "GET" | "PATCH") && single_path_id(path, "/v1/works/").is_some() {
+        return creator_read(&request, runtime, &id).await;
     }
     if method == "GET" && collection_path(path).is_some_and(|(_, works)| works) {
         return error(
@@ -1799,6 +2053,20 @@ mod tests {
         assert_eq!(creator_selection(&request).as_deref(), Some("first"));
     }
 
+    #[test]
+    fn work_edits_reject_stale_revisions_and_preserve_status() {
+        let work = json!({"id":"w","revision":3,"title":"old","status":"published"});
+        assert_eq!(
+            work_edit(&work, &json!({"revision":2,"title":"new"}), "id")
+                .unwrap_err()
+                .status_code,
+            409
+        );
+        let updated = work_edit(&work, &json!({"revision":3,"title":" new "}), "id").unwrap();
+        assert_eq!(updated["revision"], 4);
+        assert_eq!(updated["title"], "new");
+        assert_eq!(updated["status"], "published");
+    }
     #[test]
     fn work_intake_uses_existing_node_receipt_identity_and_dynamo_envelope() {
         assert!(valid_intent("intent_1"));
