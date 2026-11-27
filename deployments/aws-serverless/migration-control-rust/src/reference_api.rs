@@ -4050,6 +4050,178 @@ fn disabled_feature(path: &str, method: &str) -> Option<&'static str> {
         .then_some("Contributor management")
 }
 
+fn publication_destination(path: &str) -> Option<(&str, &str)> {
+    let suffix = path
+        .strip_prefix("/v1/works/")
+        .or_else(|| path.strip_prefix("/studio/works/"))?;
+    let (work, destination) = suffix.split_once("/publications/")?;
+    (!work.is_empty()
+        && !work.contains('/')
+        && !destination.is_empty()
+        && destination
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some((work, destination))
+}
+
+async fn withdraw_publication(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    work: &Value,
+    actor: &str,
+    destination: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    if body["published"] != false {
+        return Ok(error(404, id, "not_found", "Route was not found"));
+    }
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    let work_id = work["id"].as_str().ok_or("Missing Work ID")?;
+    if !same_creator_region(work, creator)
+        || work["routingRevision"] != creator["routingRevision"]
+        || work["dataHomeAssignedAt"] != creator["dataHomeAssignedAt"]
+    {
+        return Ok(error(
+            409,
+            id,
+            "data_home_mismatch",
+            "Work and creator data homes do not match",
+        ));
+    }
+    if creator
+        .get("deletion")
+        .is_some_and(|value| !value.is_null() && value != false)
+        || creator
+            .get("status")
+            .is_some_and(|status| status != "active")
+    {
+        return Ok(error(
+            403,
+            id,
+            "work_edit_denied",
+            "Current Work editing access is required.",
+        ));
+    }
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let fence = "__ubeeq_repository_snapshot#publications";
+    let version = repository.marker(fence).await?;
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    let mut actions = Vec::new();
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    loop {
+        let page = repository.client.scan().table_name(repository.table).consistent_read(true)
+            .filter_expression("begins_with(pk, :prefix) AND sk = :record AND #row.#work = :work AND #row.#dest = :dest AND #row.#state = :live")
+            .expression_attribute_names("#row","value").expression_attribute_names("#work","workId")
+            .expression_attribute_names("#dest","destination").expression_attribute_names("#state","status")
+            .expression_attribute_values(":prefix",AttributeValue::S("publications#".into()))
+            .expression_attribute_values(":record",AttributeValue::S("record".into()))
+            .expression_attribute_values(":work",AttributeValue::S(work_id.into()))
+            .expression_attribute_values(":dest",AttributeValue::S(destination.into()))
+            .expression_attribute_values(":live",AttributeValue::S("live".into()))
+            .set_exclusive_start_key(cursor).send().await?;
+        for mut item in page.items.unwrap_or_default() {
+            let mut publication =
+                document(item.remove("value").ok_or("Missing publication record")?)?;
+            if publication["instanceId"] != repository.instance
+                || publication["homeCellId"] != repository.cell
+            {
+                return Ok(error(
+                    409,
+                    id,
+                    "publication_reconciliation_required",
+                    "Publication custody requires reconciliation.",
+                ));
+            }
+            if publication.get("preparationVersion").is_some()
+                || publication.get("executionPolicy").is_some()
+            {
+                return Ok(error(
+                    409,
+                    id,
+                    "publication_reconciliation_required",
+                    "Use the provider-aware reviewed workflow for this Publication.",
+                ));
+            }
+            let revision = publication["revision"]
+                .as_u64()
+                .filter(|revision| *revision < 9_007_199_254_740_991)
+                .ok_or("Invalid publication revision")?;
+            ids.push(
+                publication["id"]
+                    .as_str()
+                    .ok_or("Missing publication ID")?
+                    .to_owned(),
+            );
+            publication["status"] = json!("removed");
+            publication["revision"] = json!(revision + 1);
+            publication["updatedAt"] = json!(now);
+            actions.push(repository.replace_revisioned("publications", &publication, revision)?);
+        }
+        cursor = page.last_evaluated_key;
+        if cursor.as_ref().is_none_or(HashMap::is_empty) {
+            break;
+        }
+    }
+    if ids.is_empty() {
+        actions.push(repository.item_guard(
+            fence,
+            "fence",
+            version.map(|version| ("version", AttributeValue::S(version))),
+        )?);
+    } else {
+        actions.push(repository.advance_fence(fence, version)?);
+        let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"work.withdrawn","actorId":actor,
+            "subjectId":work_id,"payload":{"destination":destination,"publicationIds":ids}});
+        rehome_import(&mut audit, work, &now);
+        actions.push(repository.create_item("auditEvents", &audit)?);
+    }
+    let revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    actions.extend([
+        repository.item_guard(
+            &format!("creators#{creator_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(revision.to_string()))),
+        )?,
+        repository.item_guard(
+            hold_fence,
+            "fence",
+            hold_version.map(|version| ("version", AttributeValue::S(version))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ]);
+    if actions.len() > 100 {
+        return Err("Withdrawal exceeds atomic transaction capacity".into());
+    }
+    repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await?;
+    Ok(respond(
+        200,
+        id,
+        json!({"workId":work_id,"status":"withdrawn","requestId":id}),
+    ))
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -4085,8 +4257,9 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         .as_ref()
         .and_then(|body| body["workId"].as_str())
         .map(str::trim);
-    let work = if let Some(work_id) =
-        upload_work.or_else(|| single_path_id(&request.raw_path, "/v1/works/"))
+    let work = if let Some(work_id) = upload_work
+        .or_else(|| single_path_id(&request.raw_path, "/v1/works/"))
+        .or_else(|| publication_destination(&request.raw_path).map(|(work, _)| work))
     {
         match repository.read("works", work_id).await {
             Ok(Some(work))
@@ -4197,6 +4370,24 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                 };
             }
             if let Some(work) = work {
+                if let Some((_, destination)) = publication_destination(&request.raw_path) {
+                    return match withdraw_publication(
+                        request,
+                        &repository,
+                        &record,
+                        &work,
+                        &subject,
+                        destination,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => {
+                            error(500, id, "internal_error", "Unable to withdraw Publication")
+                        }
+                    };
+                }
                 if let Some(body) = upload {
                     if let Some(upload_id) = completion_id {
                         return match complete_upload(
@@ -4564,6 +4755,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         );
     }
     if method == "PUT" && content_upload_id(path).is_some() {
+        return creator_read(&request, runtime, &id).await;
+    }
+    if method == "PUT" && publication_destination(path).is_some() {
         return creator_read(&request, runtime, &id).await;
     }
     if matches!(method, "GET" | "PATCH" | "DELETE") && single_path_id(path, "/v1/works/").is_some()
@@ -5011,6 +5205,22 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn withdrawal_routes_accept_only_named_destinations() {
+        assert_eq!(
+            publication_destination("/studio/works/work/publications/native"),
+            Some(("work", "native"))
+        );
+        assert_eq!(
+            publication_destination("/v1/works/work/publications/a-B_1"),
+            Some(("work", "a-B_1"))
+        );
+        assert_eq!(
+            publication_destination("/v1/works/work/publications/a/b"),
+            None
+        );
     }
 
     #[test]
