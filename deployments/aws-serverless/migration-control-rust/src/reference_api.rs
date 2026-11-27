@@ -675,6 +675,264 @@ impl CreatorRecords<'_> {
     }
 }
 
+fn ordered_work_ids(value: &Value) -> Option<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    value
+        .as_array()?
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .filter(|id| !id.trim().is_empty() && seen.insert(*id))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn membership_intent(body: &Value, id: &str) -> Result<(u64, Vec<String>, Vec<String>), Response> {
+    let revision = body["revision"]
+        .as_u64()
+        .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
+        .ok_or_else(|| {
+            error(
+                400,
+                id,
+                "invalid_request",
+                "A current collection revision is required.",
+            )
+        })?;
+    if body.as_object().is_none_or(|fields| {
+        fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "revision" | "workIds" | "expectedWorkIds"))
+    }) {
+        return Err(error(
+            400,
+            id,
+            "invalid_request",
+            "Collection request contains unsupported fields.",
+        ));
+    }
+    let invalid = || {
+        error(
+            400,
+            id,
+            "invalid_request",
+            "Unique Work IDs and the previous order are required.",
+        )
+    };
+    let requested = ordered_work_ids(&body["workIds"]).ok_or_else(invalid)?;
+    let expected = ordered_work_ids(&body["expectedWorkIds"]).ok_or_else(invalid)?;
+    if body.to_string().len() > 300 * 1024 {
+        return Err(error(
+            413,
+            id,
+            "collection_too_large",
+            "Collection order exceeds the safe aggregate size.",
+        ));
+    }
+    Ok((revision, requested, expected))
+}
+
+fn revised_members(collection: &Value, requested: &[String], now: &str) -> Value {
+    let old = collection["collectionManagement"]["members"]
+        .as_array()
+        .into_iter()
+        .flatten();
+    let dates: HashMap<_, _> = old
+        .filter_map(|row| Some((row["workId"].as_str()?, row["addedAt"].as_str()?)))
+        .collect();
+    let members = requested
+        .iter()
+        .enumerate()
+        .map(|(position, id)| {
+            json!({
+                "collectionId":collection["id"], "workId":id, "position":position,
+                "addedAt":dates.get(id.as_str()).copied().unwrap_or(now)
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"schemaVersion":1,"members":members})
+}
+
+impl CreatorRecords<'_> {
+    fn replace_revisioned(
+        &self,
+        repository: &str,
+        record: &Value,
+        revision: u64,
+    ) -> Result<TransactWriteItem, Failure> {
+        let put = Put::builder()
+            .table_name(self.table)
+            .set_item(Some(build_record(repository, record)?))
+            .condition_expression("#revision = :revision")
+            .expression_attribute_names("#revision", "revision")
+            .expression_attribute_values(":revision", AttributeValue::N(revision.to_string()))
+            .build()?;
+        Ok(TransactWriteItem::builder().put(put).build())
+    }
+
+    async fn advance_host_fence(&self) -> Result<TransactWriteItem, Failure> {
+        let pk = "__ubeeq_repository_snapshot#hostRecords";
+        let mut item = item_key(pk, "fence");
+        item.insert(
+            "version".into(),
+            AttributeValue::S(Uuid::new_v4().to_string()),
+        );
+        let put = Put::builder().table_name(self.table).set_item(Some(item));
+        let put = match self.marker(pk).await? {
+            Some(version) => put
+                .condition_expression("#version = :version")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":version", AttributeValue::S(version)),
+            None => put.condition_expression("attribute_not_exists(pk)"),
+        };
+        Ok(TransactWriteItem::builder().put(put.build()?).build())
+    }
+}
+
+async fn replace_collection_members(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    mut collection: Value,
+    id: &str,
+) -> Result<Response, Failure> {
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let (revision, requested, expected) = match membership_intent(&body, id) {
+        Ok(intent) => intent,
+        Err(response) => return Ok(response),
+    };
+    let directory_id = collection_directory_id(repository.instance, creator_id)?;
+    let directory_row = repository.read("hostRecords", &directory_id).await?;
+    let Some((mut directory, old)) = directory_row
+        .map(|directory| -> Result<_, Failure> {
+            let (ids, ready) = collection_directory(&directory, creator)?;
+            Ok(ready
+                .then(|| aggregate_members(&collection))
+                .flatten()
+                .filter(|_| ids.iter().any(|id| collection["id"] == id.as_str()))
+                .map(|old| (directory, old)))
+        })
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(error(
+            500,
+            id,
+            "internal_error",
+            "This collection needs a reviewed migration before management is enabled.",
+        ));
+    };
+    let conflict = || {
+        error(
+            409,
+            id,
+            "revision_conflict",
+            "Collection changed; refresh before saving.",
+        )
+    };
+    if collection["revision"].as_u64() != Some(revision) || revision >= 9_007_199_254_740_991 {
+        return Ok(conflict());
+    }
+    if collection["status"] == "deleted" {
+        return Ok(collection_not_found(id));
+    }
+    if old != expected {
+        return Ok(error(
+            409,
+            id,
+            "revision_conflict",
+            "Collection order changed; refresh before saving.",
+        ));
+    }
+    for work_id in &requested {
+        if repository.read("works", work_id).await?.is_none_or(|work| {
+            work["id"] != work_id.as_str()
+                || !same_creator_region(&work, creator)
+                || work["status"] == "deleted"
+        }) {
+            return Ok(error(
+                400,
+                id,
+                "invalid_works",
+                "Choose active Works owned by this Creator.",
+            ));
+        }
+    }
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    collection["collectionManagement"] = revised_members(&collection, &requested, &now);
+    collection["revision"] = json!(revision + 1);
+    collection["updatedAt"] = json!(now);
+    if collection.to_string().len() > 300 * 1024 {
+        return Ok(error(
+            500,
+            id,
+            "internal_error",
+            "Collection management exceeds the safe aggregate size. Split the collection or reconcile the library before continuing.",
+        ));
+    }
+    let directory_revision = directory["revision"]
+        .as_u64()
+        .filter(|revision| *revision < 9_007_199_254_740_991)
+        .ok_or(DIRECTORY_ERROR)?;
+    directory["revision"] = json!(directory_revision + 1);
+    directory["updatedAt"] = json!(now);
+    let creator_revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    let actions = vec![
+        repository.replace_revisioned("collections", &collection, revision)?,
+        repository.replace_revisioned("hostRecords", &directory, directory_revision)?,
+        repository.item_guard(
+            &format!("creators#{creator_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(creator_revision.to_string()))),
+        )?,
+        repository.item_guard(
+            hold_fence,
+            "fence",
+            hold_version.map(|version| ("version", AttributeValue::S(version))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        repository.advance_host_fence().await?,
+    ];
+    match repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(respond(
+            200,
+            id,
+            json!({"collection":collection_view(&collection, requested, true),"requestId":id}),
+        )),
+        Err(failure)
+            if matches!(failure.as_service_error(),
+            Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                if cancelled.cancellation_reasons().iter().any(|reason| reason.code() == Some("ConditionalCheckFailed"))) =>
+        {
+            Ok(conflict())
+        }
+        Err(failure) => Err(failure.into()),
+    }
+}
+
 fn collection_path(path: &str) -> Option<(&str, bool)> {
     let remainder = path.strip_prefix("/v1/collections/")?;
     let (id, works) = match remainder.strip_suffix("/works") {
@@ -1478,7 +1736,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     } else {
         None
     };
-    let collection = if let Some((collection_id, false)) = collection_path(&request.raw_path) {
+    let collection = if let Some((collection_id, _)) = collection_path(&request.raw_path) {
         match repository.read("collections", collection_id).await {
             Ok(Some(record))
                 if record["homeCellId"] == runtime.cell.id
@@ -1600,6 +1858,28 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                 }
                 if record["dataHomeRegion"] != runtime.cell.region {
                     return error(404, id, "creator_not_found", "Creator not found.");
+                }
+                if request.request_context.http.method == "PUT" {
+                    return match replace_collection_members(
+                        request,
+                        &repository,
+                        &record,
+                        collection,
+                        id,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(failure) if failure.to_string() == DIRECTORY_ERROR => {
+                            error(500, id, "internal_error", DIRECTORY_ERROR)
+                        }
+                        Err(_) => error(
+                            500,
+                            id,
+                            "internal_error",
+                            "Unable to update Collection order",
+                        ),
+                    };
                 }
                 let result = async {
                     let (ids, ready) = repository.read_collection_directory(&record).await?;
@@ -1832,6 +2112,19 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     if matches!(method, "GET" | "PATCH" | "DELETE") && single_path_id(path, "/v1/works/").is_some()
     {
         return creator_read(&request, runtime, &id).await;
+    }
+    if method == "PUT"
+        && let Some((_, works)) = collection_path(path)
+    {
+        if works {
+            return creator_read(&request, runtime, &id).await;
+        }
+        return error(
+            405,
+            &id,
+            "method_not_allowed",
+            "Collection method is not supported.",
+        );
     }
     if method == "GET" && collection_path(path).is_some_and(|(_, works)| works) {
         return error(
@@ -2229,6 +2522,29 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn membership_changes_validate_order_and_keep_existing_added_dates() {
+        assert!(
+            membership_intent(
+                &json!({"revision":1,"workIds":["a","a"],"expectedWorkIds":[]}),
+                "id"
+            )
+            .is_err()
+        );
+        let (_, requested, _) = membership_intent(
+            &json!({"revision":1,"workIds":["b","a"],"expectedWorkIds":["a"]}),
+            "id",
+        )
+        .unwrap();
+        let collection = json!({"id":"c","collectionManagement":{"members":[{"workId":"a","addedAt":"earlier"}]}});
+        let revised = revised_members(&collection, &requested, "now");
+        assert_eq!(
+            revised["members"][0],
+            json!({"collectionId":"c","workId":"b","position":0,"addedAt":"now"})
+        );
+        assert_eq!(revised["members"][1]["addedAt"], "earlier");
     }
 
     #[test]
