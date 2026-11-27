@@ -4222,6 +4222,349 @@ async fn withdraw_publication(
     ))
 }
 
+fn publication_request_work(path: &str) -> Option<&str> {
+    single_path_id(path.strip_suffix("/publications")?, "/v1/works/")
+}
+
+impl CreatorRecords<'_> {
+    async fn publication_receipt(
+        &self,
+        work: &Value,
+        destination: &str,
+        key: &str,
+        digest: &str,
+        id: &str,
+    ) -> Result<Option<Response>, Failure> {
+        let Some(intent) = self
+            .read(
+                "publicationIntents",
+                &format!("publication-request-{digest}"),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if intent["instanceId"] != self.instance
+            || intent["homeCellId"] != self.cell
+            || intent["workId"] != work["id"]
+            || intent["destination"] != destination
+            || intent["idempotencyKey"] != key
+        {
+            return Ok(Some(error(
+                409,
+                id,
+                "idempotency_conflict",
+                "The idempotency key was already used for a different publication request",
+            )));
+        }
+        let publication = self
+            .read("publications", &format!("publication-{digest}"))
+            .await?;
+        let Some(publication) = publication.filter(|row| {
+            row["instanceId"] == self.instance
+                && row["homeCellId"] == self.cell
+                && row["workId"] == work["id"]
+                && row["destination"] == destination
+        }) else {
+            return Ok(Some(error(
+                409,
+                id,
+                "publication_receipt_invalid",
+                "The stored publication request is incomplete",
+            )));
+        };
+        let current = self
+            .read("works", work["id"].as_str().ok_or("Missing Work ID")?)
+            .await?
+            .filter(|row| {
+                row["creatorId"] == work["creatorId"]
+                    && row["instanceId"] == self.instance
+                    && row["homeCellId"] == self.cell
+                    && row["routingRevision"] == work["routingRevision"]
+            })
+            .ok_or("Publication Work custody changed")?;
+        Ok(Some(respond(
+            200,
+            id,
+            json!({"intent":intent,"publication":publication,"work":current,"idempotent":true,"requestId":id}),
+        )))
+    }
+
+    async fn publication_sources(
+        &self,
+        repository: &str,
+        field: &str,
+        expected: Option<&str>,
+    ) -> Result<Vec<Value>, Failure> {
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let mut query = self
+                .client
+                .scan()
+                .table_name(self.table)
+                .consistent_read(true)
+                .expression_attribute_values(":prefix", AttributeValue::S(format!("{repository}#")))
+                .expression_attribute_values(":record", AttributeValue::S("record".into()))
+                .set_exclusive_start_key(cursor);
+            query = if let Some(expected) = expected {
+                query
+                    .filter_expression(
+                        "begins_with(pk, :prefix) AND sk = :record AND #row.#field = :expected",
+                    )
+                    .expression_attribute_names("#row", "value")
+                    .expression_attribute_names("#field", field)
+                    .expression_attribute_values(":expected", AttributeValue::S(expected.into()))
+            } else {
+                query.filter_expression("begins_with(pk, :prefix) AND sk = :record")
+            };
+            let page = query.send().await?;
+            for mut row in page.items.unwrap_or_default() {
+                let value = document(
+                    row.remove("value")
+                        .ok_or("Missing publication authority record")?,
+                )?;
+                if value["homeCellId"] == self.cell {
+                    records.push(value);
+                }
+            }
+            cursor = page.last_evaluated_key;
+            if cursor.as_ref().is_none_or(HashMap::is_empty) {
+                return Ok(records);
+            }
+        }
+    }
+}
+
+async fn publish_work(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    work: &Value,
+    actor: &str,
+    fixed_destination: Option<&str>,
+    id: &str,
+) -> Result<Response, Failure> {
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    if let Some(destination) = fixed_destination
+        && body["published"] == false
+    {
+        return withdraw_publication(request, repository, creator, work, actor, destination, id)
+            .await;
+    }
+    let Some(destination) = fixed_destination
+        .or_else(|| body["destination"].as_str().map(str::trim))
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(error(400, id, "invalid_request", "destination is required"));
+    };
+    if !matches!(
+        work["status"].as_str(),
+        Some("draft" | "ready" | "published")
+    ) {
+        return Ok(error(
+            409,
+            id,
+            "work_not_publishable",
+            "Restore the Work before publishing it.",
+        ));
+    }
+    let header = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+        .map(|(_, value)| value);
+    if header.is_some_and(|key| key.trim().is_empty() || key.encode_utf16().count() > 200) {
+        return Ok(error(
+            400,
+            id,
+            "invalid_idempotency_key",
+            "Use a non-empty idempotency key of at most 200 characters",
+        ));
+    }
+    let key = header
+        .map(|key| key.trim().to_owned())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let creator_id = field_for_publication(creator, "id")?;
+    let work_id = field_for_publication(work, "id")?;
+    if !same_creator_region(work, creator)
+        || work["routingRevision"] != creator["routingRevision"]
+        || work["dataHomeAssignedAt"] != creator["dataHomeAssignedAt"]
+    {
+        return Ok(error(
+            409,
+            id,
+            "data_home_mismatch",
+            "Work and creator data homes do not match",
+        ));
+    }
+    if creator
+        .get("deletion")
+        .is_some_and(|value| !value.is_null() && value != false)
+        || creator
+            .get("status")
+            .is_some_and(|status| status != "active")
+    {
+        return Ok(error(
+            403,
+            id,
+            "work_edit_denied",
+            "Current Work editing access is required.",
+        ));
+    }
+    let hold = "__ubeeq_repository_snapshot#moderationHolds";
+    let assets_fence = "__ubeeq_repository_snapshot#assets";
+    let host = "__ubeeq_repository_snapshot#hostRecords";
+    let publication_fence = "__ubeeq_repository_snapshot#publications";
+    let hold_version = repository.marker(hold).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let digest = upload_digest(&json!([repository.instance, creator_id, work_id, key]));
+    if let Some(receipt) = repository
+        .publication_receipt(work, destination, &key, &digest, id)
+        .await?
+    {
+        return Ok(receipt);
+    }
+    let assets_version = repository.marker(assets_fence).await?;
+    let host_version = repository.marker(host).await?;
+    let assets = repository
+        .publication_sources("assets", "workId", Some(work_id))
+        .await?;
+    if assets.is_empty()
+        || assets
+            .iter()
+            .any(|asset| asset["status"] != "ready" || asset["creatorId"] != creator_id)
+    {
+        return Ok(error(
+            409,
+            id,
+            "processing_incomplete",
+            "All Work assets must belong to its Creator and finish processing before publication",
+        ));
+    }
+    if assets.iter().any(|asset| {
+        !same_creator_region(asset, creator)
+            || asset["routingRevision"] != work["routingRevision"]
+            || asset["dataHomeAssignedAt"] != work["dataHomeAssignedAt"]
+    }) {
+        return Ok(error(
+            409,
+            id,
+            "publication_source_scope_mismatch",
+            "Every publication source must belong to the current Work and data home.",
+        ));
+    }
+    let holds = repository
+        .publication_sources("moderationHolds", "state", Some("active"))
+        .await?;
+    let mut subjects = std::collections::BTreeSet::new();
+    let mut reasons = std::collections::BTreeSet::new();
+    for row in &holds {
+        if let Some(subject) = row["subjectId"].as_str()
+            && (subject == work_id
+                || subject == creator_id
+                || assets.iter().any(|asset| asset["id"] == subject))
+        {
+            subjects.insert(subject);
+            reasons.insert(row["reason"].as_str().unwrap_or("review_hold"));
+        }
+    }
+    if !subjects.is_empty() {
+        return Ok(respond(
+            409,
+            id,
+            json!({"error":{"code":"admission_blocked","message":"Publication is blocked by an active review hold.",
+            "requestId":id,"details":{"allowed":false,"blockedSubjectIds":subjects,"activeHoldReasonCodes":reasons}}}),
+        ));
+    }
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    let mut intent = json!({"id":format!("publication-request-{digest}"),"workId":work_id,"destination":destination,"idempotencyKey":key});
+    let mut publication = json!({"id":format!("publication-{digest}"),"workId":work_id,"destination":destination,"status":"live"});
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"work.published","actorId":actor,
+        "subjectId":work_id,"payload":{"publicationId":publication["id"],"destination":destination}});
+    for record in [&mut intent, &mut publication, &mut audit] {
+        rehome_import(record, work, &now);
+    }
+    let revision = work["revision"]
+        .as_u64()
+        .filter(|revision| *revision < 9_007_199_254_740_991)
+        .ok_or("Invalid Work revision")?;
+    let mut updated = work.clone();
+    updated["status"] = json!("ready");
+    updated["revision"] = json!(revision + 1);
+    updated["updatedAt"] = json!(now);
+    let creator_revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    let mut actions = vec![
+        repository.create_item("publicationIntents", &intent)?,
+        repository.create_item("publications", &publication)?,
+        repository.create_item("auditEvents", &audit)?,
+        repository.replace_revisioned("works", &updated, revision)?,
+        repository.item_guard(
+            &format!("creators#{creator_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(creator_revision.to_string()))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        repository.advance_fence(
+            publication_fence,
+            repository.marker(publication_fence).await?,
+        )?,
+    ];
+    for (fence, version) in [
+        (hold, hold_version),
+        (assets_fence, assets_version),
+        (host, host_version),
+    ] {
+        actions.push(repository.item_guard(
+            fence,
+            "fence",
+            version.map(|version| ("version", AttributeValue::S(version))),
+        )?);
+    }
+    match repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(respond(
+            201,
+            id,
+            json!({"intent":intent,"publication":publication,"work":updated,"idempotent":false,"requestId":id}),
+        )),
+        Err(failure) => {
+            if let Some(receipt) = repository
+                .publication_receipt(work, destination, &key, &digest, id)
+                .await?
+            {
+                Ok(receipt)
+            } else {
+                Err(failure.into())
+            }
+        }
+    }
+}
+
+fn field_for_publication<'a>(record: &'a Value, field: &str) -> Result<&'a str, Failure> {
+    record[field]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Missing publication field {field}").into())
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -4260,6 +4603,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let work = if let Some(work_id) = upload_work
         .or_else(|| single_path_id(&request.raw_path, "/v1/works/"))
         .or_else(|| publication_destination(&request.raw_path).map(|(work, _)| work))
+        .or_else(|| publication_request_work(&request.raw_path))
     {
         match repository.read("works", work_id).await {
             Ok(Some(work))
@@ -4370,8 +4714,10 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                 };
             }
             if let Some(work) = work {
-                if let Some((_, destination)) = publication_destination(&request.raw_path) {
-                    return match withdraw_publication(
+                let destination =
+                    publication_destination(&request.raw_path).map(|(_, destination)| destination);
+                if destination.is_some() || publication_request_work(&request.raw_path).is_some() {
+                    return match publish_work(
                         request,
                         &repository,
                         &record,
@@ -4383,9 +4729,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                     .await
                     {
                         Ok(response) => response,
-                        Err(_) => {
-                            error(500, id, "internal_error", "Unable to withdraw Publication")
-                        }
+                        Err(_) => error(500, id, "internal_error", "Unable to update Publication"),
                     };
                 }
                 if let Some(body) = upload {
@@ -4757,7 +5101,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     if method == "PUT" && content_upload_id(path).is_some() {
         return creator_read(&request, runtime, &id).await;
     }
-    if method == "PUT" && publication_destination(path).is_some() {
+    if (method == "PUT" && publication_destination(path).is_some())
+        || (method == "POST" && publication_request_work(path).is_some())
+    {
         return creator_read(&request, runtime, &id).await;
     }
     if matches!(method, "GET" | "PATCH" | "DELETE") && single_path_id(path, "/v1/works/").is_some()
