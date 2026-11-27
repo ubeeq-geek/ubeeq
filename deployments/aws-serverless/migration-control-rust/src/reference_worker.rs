@@ -23,6 +23,17 @@ type Item = HashMap<String, AttributeValue>;
 struct Batch {
     #[serde(rename = "Records", default)]
     records: Vec<Message>,
+    source: Option<String>,
+    #[serde(rename = "detail-type")]
+    detail_type: Option<String>,
+}
+
+impl Batch {
+    fn is_recovery_tick(&self) -> bool {
+        self.records.is_empty()
+            && self.source.as_deref() == Some("aws.events")
+            && self.detail_type.as_deref() == Some("Scheduled Event")
+    }
 }
 
 #[derive(Deserialize)]
@@ -522,6 +533,15 @@ async fn main() -> Result<(), Error> {
         if worker.repair_upload_notifications().await.is_err() {
             eprintln!("Upload processing notification repair deferred");
         }
+        if event.payload.is_recovery_tick() {
+            worker
+                .one(&Message {
+                    message_id: event.context.request_id,
+                    body: None,
+                })
+                .await
+                .map_err(|_| Error::from("Scheduled processing job could not be completed"))?;
+        }
         let mut failures = Vec::new();
         for message in event.payload.records {
             if worker.one(&message).await.is_err() {
@@ -531,4 +551,31 @@ async fn main() -> Result<(), Error> {
         Ok::<_, Error>(json!({"batchItemFailures":failures}))
     }))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_eventbridge_tick_runs_scheduled_job_recovery() {
+        for (payload, expected) in [
+            (
+                json!({"source":"aws.events","detail-type":"Scheduled Event"}),
+                true,
+            ),
+            (json!({"Records":[]}), false),
+            (
+                json!({"source":"aws.events","detail-type":"Other Event"}),
+                false,
+            ),
+            (
+                json!({"source":"aws.events","detail-type":"Scheduled Event","Records":[{"messageId":"queued"}]}),
+                false,
+            ),
+        ] {
+            let batch: Batch = serde_json::from_value(payload).unwrap();
+            assert_eq!(batch.is_recovery_tick(), expected);
+        }
+    }
 }
