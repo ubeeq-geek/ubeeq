@@ -2730,6 +2730,14 @@ async fn validate_import(
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
     };
+    let plan = current_import_plan(&repository, &manifest).await?;
+    Ok(respond(200, id, json!({"plan":plan,"requestId":id})))
+}
+
+async fn current_import_plan(
+    repository: &CreatorRecords<'_>,
+    manifest: &Value,
+) -> Result<Value, Failure> {
     let mut existing = HashMap::new();
     for (_, name) in IMPORT_RESOURCES {
         if manifest[name].as_array().is_none_or(Vec::is_empty) {
@@ -2743,11 +2751,347 @@ async fn validate_import(
             .collect();
         existing.insert(name, ids);
     }
-    Ok(respond(
-        200,
-        id,
-        json!({"plan":import_plan(&manifest, &existing),"requestId":id}),
-    ))
+    Ok(import_plan(manifest, &existing))
+}
+
+fn rehome_import(record: &mut Value, creator: &Value, now: &str) {
+    for field in [
+        "instanceId",
+        "homeCellId",
+        "dataHomeRegion",
+        "dataHomeAssignedAt",
+        "routingRevision",
+    ] {
+        record[field] = creator[field].clone();
+    }
+    record["revision"] = json!(1);
+    record["createdAt"] = json!(now);
+    record["updatedAt"] = json!(now);
+}
+
+fn imported_record(
+    repository: &str,
+    source: &Value,
+    manifest: &Value,
+    creator: &Value,
+    import_id: &str,
+    now: &str,
+) -> Value {
+    let mut record = source.clone();
+    rehome_import(&mut record, creator, now);
+    match repository {
+        "works" | "assets" | "collections" | "integrationAccounts" => {
+            record["creatorId"] = creator["id"].clone()
+        }
+        _ => {}
+    }
+    match repository {
+        "works" if record["status"] == "published" => record["status"] = json!("ready"),
+        "assets" => {
+            for field in [
+                "storage",
+                "originalStorage",
+                "processedRenditions",
+                "deliveryMimeType",
+            ] {
+                record.as_object_mut().unwrap().remove(field);
+            }
+            record["status"] = json!("pending");
+        }
+        "publications" => {
+            let mut history = record["restoredPublicationHistory"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            history
+                .entry("sourcePublicationId")
+                .or_insert_with(|| source["id"].clone());
+            let fields = record.as_object_mut().unwrap();
+            for (field, key) in [("remoteId", "remoteId"), ("lastConfirmedImage", "image")] {
+                if let Some(value) = fields.remove(field) {
+                    history.insert(key.into(), value);
+                }
+            }
+            record["restoredPublicationHistory"] = Value::Object(history);
+            record["status"] = json!("draft");
+            let context = &record["imageSelection"]["context"];
+            if context["mode"] == "collection"
+                && !manifest["collections"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|row| row["id"] == context["collectionId"])
+                && record["unresolvedImageContext"].is_null()
+            {
+                record["unresolvedImageContext"] =
+                    json!({"sourceCollectionId":context["collectionId"]});
+            }
+        }
+        "publicationIntents" => {
+            record["idempotencyKey"] = json!(format!(
+                "restored:{import_id}:{}",
+                source["id"].as_str().unwrap_or_default()
+            ))
+        }
+        "auditEvents" => {
+            record.as_object_mut().unwrap().remove("actorId");
+        }
+        "usageEvents" => record["accountId"] = creator["id"].clone(),
+        "integrationAccounts" => {
+            record.as_object_mut().unwrap().remove("credentialExcluded");
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("credentialReference");
+            record["health"] = json!("blocked");
+        }
+        _ => {}
+    }
+    record
+}
+
+fn check_import_checkpoint(
+    checkpoint: &Value,
+    creator: &Value,
+    import_id: &str,
+    digest: &str,
+    id: &str,
+) -> Result<(), Response> {
+    if checkpoint["importId"] != import_id
+        || !same_creator_region(checkpoint, creator)
+        || checkpoint["dataHomeAssignedAt"] != creator["dataHomeAssignedAt"]
+        || checkpoint["routingRevision"] != creator["routingRevision"]
+    {
+        return Err(error(
+            409,
+            id,
+            "import_id_conflict",
+            "Import ID is unavailable for this creator.",
+        ));
+    }
+    if checkpoint["cursor"] != digest {
+        return Err(error(
+            409,
+            id,
+            "import_manifest_conflict",
+            "Import ID is already bound to a different manifest.",
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_import(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    actor: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let manifest = match verified_unsigned(&body["manifest"]).and_then(|unsigned| {
+        verify_record_graph(&unsigned)?;
+        Ok(unsigned)
+    }) {
+        Ok(manifest) => manifest,
+        Err(failure) => {
+            return Ok(error(
+                400,
+                id,
+                "invalid_export_manifest",
+                &failure.to_string(),
+            ));
+        }
+    };
+    let digest = body["manifest"]["checksum"]
+        .as_str()
+        .ok_or("Missing import checksum")?;
+    let import_id = match body.get("importId") {
+        None => Uuid::new_v4().to_string(),
+        Some(value) => match value
+            .as_str()
+            .filter(|text| !text.trim().is_empty() && text.encode_utf16().count() <= 200)
+        {
+            Some(text) => text.trim().to_owned(),
+            None => {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_import_id",
+                    "Import ID must be a non-empty string of at most 200 characters.",
+                ));
+            }
+        },
+    };
+    let mut fences = HashMap::new();
+    for field in ["moderationHolds", "assets", "publications", "hostRecords"] {
+        let pk = format!("__ubeeq_repository_snapshot#{field}");
+        fences.insert(field, repository.marker(&pk).await?);
+    }
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let existing = repository.read("importCheckpoints", &import_id).await?;
+    if let Some(checkpoint) = &existing {
+        if let Err(response) = check_import_checkpoint(checkpoint, creator, &import_id, digest, id)
+        {
+            return Ok(response);
+        }
+        if checkpoint["state"] == "completed" {
+            return Ok(respond(
+                200,
+                id,
+                json!({"importId":import_id,"checkpoint":checkpoint,"idempotent":true,"requestId":id}),
+            ));
+        }
+    }
+    let plan = current_import_plan(repository, &manifest).await?;
+    if body["dryRun"] != false || plan["valid"] != true {
+        return Ok(respond(
+            200,
+            id,
+            json!({"dryRun":true,"plan":plan,"requestId":id}),
+        ));
+    }
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let mut actions = Vec::new();
+    for (_, name) in IMPORT_RESOURCES {
+        for row in manifest[name].as_array().into_iter().flatten() {
+            let record = imported_record(name, row, &manifest, creator, &import_id, &now);
+            actions.push(repository.create_item(name, &record)?);
+        }
+    }
+    for field in ["assets", "publications", "moderationHolds"] {
+        let pk = format!("__ubeeq_repository_snapshot#{field}");
+        let version = fences.remove(field).flatten();
+        if manifest[field]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            actions.push(repository.advance_fence(&pk, version)?);
+        } else if field == "moderationHolds" {
+            actions.push(repository.item_guard(
+                &pk,
+                "fence",
+                version.map(|version| ("version", AttributeValue::S(version))),
+            )?);
+        }
+    }
+    if let Some(rows) = manifest["collections"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        let directory_id = collection_directory_id(repository.instance, creator_id)?;
+        let current = repository.read("hostRecords", &directory_id).await?;
+        let (mut ids, _) = current
+            .as_ref()
+            .map(|row| collection_directory(row, creator))
+            .transpose()?
+            .unwrap_or_default();
+        ids.extend(
+            rows.iter()
+                .filter_map(|row| row["id"].as_str().map(str::to_owned)),
+        );
+        let mut seen = std::collections::HashSet::new();
+        ids.retain(|key| seen.insert(key.clone()));
+        let mut directory = current.clone().unwrap_or_else(|| {
+            json!({"id":directory_id,
+            "scopeId":creator_id,"namespace":"runtime-collection-directory","key":"directory"})
+        });
+        rehome_import(&mut directory, creator, &now);
+        directory["value"] =
+            json!({"schemaVersion":1,"collectionIds":ids,"requiresMigration":true});
+        if directory["value"].to_string().len() > 300 * 1024 {
+            return Err("Collection directory exceeds its safe aggregate size".into());
+        }
+        actions.push(if let Some(prior) = current {
+            let revision = prior["revision"]
+                .as_u64()
+                .filter(|revision| *revision < 9_007_199_254_740_991)
+                .ok_or(DIRECTORY_ERROR)?;
+            directory["createdAt"] = prior["createdAt"].clone();
+            directory["revision"] = json!(revision + 1);
+            repository.replace_revisioned("hostRecords", &directory, revision)?
+        } else {
+            repository.create_item("hostRecords", &directory)?
+        });
+        actions.push(repository.advance_fence(
+            "__ubeeq_repository_snapshot#hostRecords",
+            fences.remove("hostRecords").flatten(),
+        )?);
+    }
+    let mut checkpoint = json!({"id":import_id,"importId":import_id,"creatorId":creator_id,"state":"completed","cursor":digest});
+    rehome_import(&mut checkpoint, creator, &now);
+    actions.push(if let Some(prior) = existing {
+        let revision = prior["revision"]
+            .as_u64()
+            .filter(|revision| *revision < 9_007_199_254_740_991)
+            .ok_or("Invalid import checkpoint revision")?;
+        checkpoint["createdAt"] = prior["createdAt"].clone();
+        checkpoint["revision"] = json!(revision + 1);
+        repository.replace_revisioned("importCheckpoints", &checkpoint, revision)?
+    } else {
+        repository.create_item("importCheckpoints", &checkpoint)?
+    });
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"creator.import_completed","actorId":actor,
+        "subjectId":creator_id,"payload":{"importId":import_id,"checksum":digest,"plan":plan["itemCounts"],"originalFilesTransferred":false}});
+    rehome_import(&mut audit, creator, &now);
+    actions.push(repository.create_item("auditEvents", &audit)?);
+    let revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    actions.push(repository.item_guard(
+        &format!("creators#{creator_id}"),
+        "record",
+        Some(("revision", AttributeValue::N(revision.to_string()))),
+    )?);
+    actions.push(repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?);
+    if actions.len() > 100 {
+        return Ok(error(
+            500,
+            id,
+            "internal_error",
+            "Import exceeds the maximum atomic transaction size",
+        ));
+    }
+    match repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(respond(
+            201,
+            id,
+            json!({"importId":import_id,"checkpoint":checkpoint,"plan":plan,"originalFilesTransferred":false,"requestId":id}),
+        )),
+        Err(failure) => {
+            if let Some(committed) = repository.read("importCheckpoints", &import_id).await? {
+                if let Err(response) =
+                    check_import_checkpoint(&committed, creator, &import_id, digest, id)
+                {
+                    return Ok(response);
+                }
+                if committed["state"] == "completed" {
+                    return Ok(respond(
+                        200,
+                        id,
+                        json!({"importId":import_id,"checkpoint":committed,"idempotent":true,"originalFilesTransferred":false,"requestId":id}),
+                    ));
+                }
+            }
+            Err(failure.into())
+        }
+    }
 }
 
 async fn export_creator(
@@ -2970,7 +3314,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     };
     let requested = if matches!(
         request.raw_path.as_str(),
-        "/v1/migrations/me" | "/v1/migrations" | "/v1/exports/me"
+        "/v1/migrations/me" | "/v1/migrations" | "/v1/exports/me" | "/v1/imports"
     ) {
         None
     } else {
@@ -3084,6 +3428,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                     "retained_content_routes_unavailable",
                     "This Creator requires the retained content routes.",
                 );
+            }
+            if request.raw_path == "/v1/imports" {
+                return match execute_import(request, &repository, &record, &subject, id).await {
+                    Ok(response) => response,
+                    Err(_) => error(
+                        500,
+                        id,
+                        "internal_error",
+                        "Unable to import Creator content",
+                    ),
+                };
             }
             if request.raw_path == "/v1/exports/me" {
                 return match export_creator(&repository, &record, &subject, id).await {
@@ -3356,7 +3711,12 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             ));
         }
     }
-    if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works" | "/v1/collections") {
+    if method == "POST"
+        && matches!(
+            path,
+            "/v1/migrations" | "/v1/works" | "/v1/collections" | "/v1/imports"
+        )
+    {
         return creator_read(&request, runtime, &id).await;
     }
     if (method, path) == ("POST", "/v1/imports/validate") {
