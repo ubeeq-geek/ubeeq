@@ -20,14 +20,38 @@ pub struct SourceImage {
 
 impl SourceImage {
     pub fn decode(source: &[u8], budget: DecodeLimits) -> Result<Self, Error> {
-        let (decoder, size) = source_decoder(source, budget, None)?;
+        let (decoder, size, _) = source_decoder(source, budget, None)?;
         Ok(Self {
             pixels: DynamicImage::from_decoder(decoder)?,
             size,
         })
     }
 
+    pub(crate) fn jpeg_fitted(&self, target: ImageSize, quality: u8) -> Result<Vec<u8>, Error> {
+        self.encode_jpeg(
+            Crop {
+                x: 0,
+                y: 0,
+                width: self.size.width.get(),
+                height: self.size.height.get(),
+            },
+            target,
+            quality,
+            false,
+        )
+    }
+
     pub fn jpeg(&self, crop: Crop, target: ImageSize, quality: u8) -> Result<Vec<u8>, Error> {
+        self.encode_jpeg(crop, target, quality, true)
+    }
+
+    fn encode_jpeg(
+        &self,
+        crop: Crop,
+        target: ImageSize,
+        quality: u8,
+        fill: bool,
+    ) -> Result<Vec<u8>, Error> {
         if !(1..=100).contains(&quality) {
             return Err("Invalid JPEG quality".into());
         }
@@ -50,7 +74,11 @@ impl SourceImage {
         // Crop to the target aspect in source coordinates before resizing.
         // Scaling to cover before cropping can create a very large intermediate
         // image for a narrow or wide source crop.
-        let crop = center_to_fill(crop, target);
+        let crop = if fill {
+            center_to_fill(crop, target)
+        } else {
+            crop
+        };
         let resized = self
             .pixels
             .crop_imm(crop.x, crop.y, crop.width, crop.height)
@@ -76,13 +104,41 @@ impl SourceImage {
     }
 }
 
+pub(crate) fn decode_rendition_source(
+    source: &[u8],
+    mime: &str,
+    limits: DecodeLimits,
+    oriented: bool,
+) -> Result<(SourceImage, ImageSize, u8, &'static str), Error> {
+    let (mut decoder, raw_size, format) = source_decoder(source, limits, Some(mime))?;
+    let orientation = if oriented {
+        decoder.orientation()?
+    } else {
+        image::metadata::Orientation::NoTransforms
+    };
+    let mut pixels = DynamicImage::from_decoder(decoder)?;
+    if oriented {
+        pixels.apply_orientation(orientation);
+    }
+    let size = ImageSize {
+        width: pixels.width().try_into()?,
+        height: pixels.height().try_into()?,
+    };
+    Ok((
+        SourceImage { pixels, size },
+        raw_size,
+        orientation.to_exif(),
+        format,
+    ))
+}
+
 /// Validate a source header and its declared MIME type without decoding pixels.
 pub fn inspect_dimensions(
     source: &[u8],
     mime: &str,
     budget: DecodeLimits,
 ) -> Result<ImageSize, Error> {
-    let (_, size) = source_decoder(source, budget, Some(mime))?;
+    let (_, size, _) = source_decoder(source, budget, Some(mime))?;
     Ok(size)
 }
 
@@ -90,7 +146,7 @@ fn source_decoder<'a>(
     source: &'a [u8],
     budget: DecodeLimits,
     mime: Option<&str>,
-) -> Result<(impl ImageDecoder + 'a, ImageSize), Error> {
+) -> Result<(impl ImageDecoder + 'a, ImageSize, &'static str), Error> {
     if source.is_empty() || source.len() > budget.bytes {
         return Err("Image source exceeds the input byte limit".into());
     }
@@ -120,7 +176,7 @@ fn source_decoder<'a>(
     };
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
-    Ok((decoder, size))
+    Ok((decoder, size, detected))
 }
 
 fn center_to_fill(mut crop: Crop, target: ImageSize) -> Crop {
