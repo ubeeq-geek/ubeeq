@@ -61,3 +61,10 @@ immutable source version require reconciliation before retirement.
 
 Run the full live regional migration proof with disposable fixtures before
 promoting any of the Rust migration functions.
+
+The `reference-worker-rust-al2023-x86-64` CI artifact contains the reference
+asset-processing Lambda ZIP. Set single-cell CDK context
+`rustReferenceWorkerAssetPath` or `UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH` to that ZIP
+for development qualification. The function uses the existing SQS event source
+and durable DynamoDB job records. Verify source reads, rendition recovery,
+and processing evidence before using this asset for a release.

@@ -95,3 +95,36 @@ test('the Rust migration cell gets only point reads on the control directory', a
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('the Rust reference worker retains the SQS trigger and runtime configuration', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-worker-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const worker = join(directory, 'worker');
+    await mkdir(api);
+    await mkdir(worker);
+    await writeFile(join(api, 'lambda.js'), 'synthetic Node asset');
+    await writeFile(join(worker, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: api, rustReferenceWorkerAssetPath: worker,
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustReferenceWorker', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const resources = Template.fromStack(stack).toJSON().Resources;
+    const [workerId, workerResource] = Object.entries(resources)
+      .find(([id, resource]) => id.startsWith('ReferenceWorker') && resource.Type === 'AWS::Lambda::Function');
+    assert.equal(workerResource.Properties.Runtime, 'provided.al2023');
+    assert.equal(workerResource.Properties.Handler, 'bootstrap');
+    assert.equal(workerResource.Properties.Timeout, 120);
+    for (const name of ['UBEEQ_RECORDS_TABLE', 'UBEEQ_SOURCE_BUCKET', 'UBEEQ_CELL_ID']) {
+      assert.ok(workerResource.Properties.Environment.Variables[name]);
+    }
+    const trigger = Object.values(resources).find(resource => resource.Type === 'AWS::Lambda::EventSourceMapping');
+    assert.deepEqual(trigger.Properties.FunctionName, { Ref: workerId });
+    assert.deepEqual(trigger.Properties.FunctionResponseTypes, ['ReportBatchItemFailures']);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

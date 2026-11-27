@@ -52,6 +52,10 @@ jobs:
           cp target/release/migration-cell target/cell-package/bootstrap
           test -x target/cell-package/bootstrap
           zip -j migration-cell-rust.zip target/cell-package/bootstrap
+          mkdir -p target/reference-worker-package
+          cp target/release/reference-worker target/reference-worker-package/bootstrap
+          test -x target/reference-worker-package/bootstrap
+          zip -j reference-worker-rust.zip target/reference-worker-package/bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: migration-control-api-rust-al2023-x86-64
@@ -66,4 +70,9 @@ jobs:
         with:
           name: migration-cell-rust-al2023-x86-64
           path: deployments/aws-serverless/migration-control-rust/migration-cell-rust.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-worker-rust-al2023-x86-64
+          path: deployments/aws-serverless/migration-control-rust/reference-worker-rust.zip
           if-no-files-found: error

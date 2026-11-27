@@ -63,7 +63,14 @@ export class AwsServerlessSingleCellStack extends Stack {
       code: lambda.Code.fromAsset(rustWebAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl },
     });
-    const worker = new lambda.Function(this, "ReferenceWorker", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.worker", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
+    const rustReferenceWorkerAsset = this.node.tryGetContext("rustReferenceWorkerAssetPath") || process.env.UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH;
+    const worker = new lambda.Function(this, "ReferenceWorker", {
+      runtime: rustReferenceWorkerAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustReferenceWorkerAsset ? "bootstrap" : "lambda.worker",
+      timeout: Duration.minutes(2),
+      code: lambda.Code.fromAsset(rustReferenceWorkerAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      environment: runtimeEnvironment,
+    });
     // This private handler is intentionally distinct from the HTTP API. Only
     // the explicitly nominated multi-cell control worker may invoke it, and
     // it receives regional migration commands rather than viewer traffic.
