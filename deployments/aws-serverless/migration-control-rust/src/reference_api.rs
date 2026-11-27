@@ -931,6 +931,382 @@ fn collection_changes(
     Ok(())
 }
 
+fn collection_intake_details(body: &Value, id: &str) -> Result<Value, Response> {
+    let invalid = || {
+        error(
+            400,
+            id,
+            "invalid_request",
+            "Collection details are invalid.",
+        )
+    };
+    if body.as_object().is_none_or(|fields| {
+        fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "title"
+                    | "description"
+                    | "slug"
+                    | "type"
+                    | "visibility"
+                    | "coverAssetId"
+                    | "idempotencyKey"
+            )
+        })
+    }) {
+        return Err(error(
+            400,
+            id,
+            "invalid_request",
+            "Collection request contains unsupported fields.",
+        ));
+    }
+    let required_text = |name: &str| {
+        body[name]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| error(400, id, "invalid_request", &format!("{name} is required")))
+    };
+    let title = required_text("title")?;
+    if body.get("type").is_some_and(|value| {
+        !matches!(
+            value.as_str(),
+            Some("collection" | "gallery" | "series" | "playlist")
+        )
+    }) || body
+        .get("visibility")
+        .is_some_and(|value| !matches!(value.as_str(), Some("private" | "unlisted" | "public")))
+        || body
+            .get("description")
+            .is_some_and(|value| !value.is_string())
+        || body
+            .get("coverAssetId")
+            .is_some_and(|value| !value.is_null() && value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(invalid());
+    }
+    // The receipt stores the JSON string, so preserve the Node field order.
+    let mut details = json!({"title":title});
+    if let Some(value) = body.get("description") {
+        details["description"] = value.clone();
+    }
+    details["slug"] = json!(collection_slug(if body.get("slug").is_some() {
+        required_text("slug")?
+    } else {
+        title
+    }));
+    details["type"] = body.get("type").cloned().unwrap_or(json!("collection"));
+    details["visibility"] = body.get("visibility").cloned().unwrap_or(json!("private"));
+    if let Some(value) = body.get("coverAssetId").filter(|value| !value.is_null()) {
+        details["coverAssetId"] = value.clone();
+    }
+    Ok(details)
+}
+
+impl CreatorRecords<'_> {
+    fn create_item(&self, repository: &str, record: &Value) -> Result<TransactWriteItem, Failure> {
+        let put = Put::builder()
+            .table_name(self.table)
+            .set_item(Some(build_record(repository, record)?))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()?;
+        Ok(TransactWriteItem::builder().put(put).build())
+    }
+
+    async fn collection_receipt(
+        &self,
+        creator: &Value,
+        actor: &str,
+        key: &str,
+        intent: &str,
+        id: &str,
+    ) -> Result<Option<Response>, Failure> {
+        let Some(receipt) = self
+            .read("hostRecords", &format!("collection-intake-{key}"))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let collection_id = format!("collection-{key}");
+        let invalid = "The saved collection request requires reconciliation.";
+        if receipt["instanceId"] != self.instance
+            || receipt["homeCellId"] != self.cell
+            || receipt["dataHomeRegion"] != creator["dataHomeRegion"]
+            || receipt["scopeId"] != creator["id"]
+            || receipt["namespace"] != "runtime-collection-intake"
+            || receipt["key"] != key
+            || receipt["value"]["schemaVersion"] != 1
+            || receipt["value"]["collectionId"] != collection_id
+            || receipt["value"]["actorId"] != actor
+        {
+            return Err(invalid.into());
+        }
+        if receipt["value"]["intent"] != intent {
+            return Ok(Some(error(
+                500,
+                id,
+                "internal_error",
+                "This request identity already belongs to different collection details.",
+            )));
+        }
+        let creator_id = creator["id"].as_str().ok_or(invalid)?;
+        if self
+            .owned_creator(creator_id, actor)
+            .await?
+            .is_none_or(|current| current["revision"] != creator["revision"])
+        {
+            return Err(invalid.into());
+        }
+        let collection = self
+            .read("collections", &collection_id)
+            .await?
+            .filter(|record| same_creator_region(record, creator))
+            .ok_or(invalid)?;
+        let (ids, ready) = self.read_collection_directory(creator).await?;
+        let view = self
+            .collection_with_members(&collection, creator, &ids, ready, &mut None)
+            .await?;
+        Ok(Some(respond(
+            201,
+            id,
+            json!({"collection":view,"requestId":id}),
+        )))
+    }
+}
+
+async fn create_collection(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    actor: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let body = match json_body(request, id) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let details = match collection_intake_details(&body, id) {
+        Ok(value) => value,
+        Err(response) => return Ok(response),
+    };
+    let intent = details.to_string();
+    let digest = match body.get("idempotencyKey") {
+        None => None,
+        Some(value) => match value.as_str().filter(|key| valid_intent(key)) {
+            Some(key) => Some(work_intent_digest(
+                repository.instance,
+                creator_id,
+                actor,
+                key,
+            )?),
+            None => {
+                return Ok(error(
+                    500,
+                    id,
+                    "internal_error",
+                    "Collection request identity is invalid.",
+                ));
+            }
+        },
+    };
+    if let Some(key) = &digest
+        && let Some(response) = repository
+            .collection_receipt(creator, actor, key, &intent, id)
+            .await?
+    {
+        return Ok(response);
+    }
+    let directory_id = collection_directory_id(repository.instance, creator_id)?;
+    let Some(mut directory) = repository.read("hostRecords", &directory_id).await? else {
+        return Ok(error(
+            500,
+            id,
+            "internal_error",
+            "This library needs a reviewed collection migration before management is enabled.",
+        ));
+    };
+    let (mut ids, ready) = collection_directory(&directory, creator)?;
+    if !ready {
+        return Ok(error(
+            500,
+            id,
+            "internal_error",
+            "This library needs a reviewed collection migration before management is enabled.",
+        ));
+    }
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let stamp = |id: &str| {
+        json!({"id":id,"instanceId":repository.instance,"homeCellId":repository.cell,
+        "dataHomeRegion":creator["dataHomeRegion"],"dataHomeAssignedAt":creator["dataHomeAssignedAt"],
+        "routingRevision":creator["routingRevision"],"revision":1,"createdAt":now,"updatedAt":now})
+    };
+    let collection_id = digest
+        .as_ref()
+        .map(|key| format!("collection-{key}"))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut record = stamp(&collection_id);
+    record
+        .as_object_mut()
+        .unwrap()
+        .extend(details.as_object().unwrap().clone());
+    record["status"] = json!("draft");
+    record["creatorId"] = json!(creator_id);
+    record["slugHistory"] = json!([record["slug"]]);
+    record["collectionManagement"] = json!({"schemaVersion":1,"members":[]});
+    if let Err(response) = collection_changes(&mut record, &json!({}), false, &now, id) {
+        return Ok(response);
+    }
+    for other in &ids {
+        let row = repository
+            .read("collections", other)
+            .await?
+            .filter(|row| same_creator_region(row, creator))
+            .ok_or(DIRECTORY_ERROR)?;
+        let history = row["slugHistory"]
+            .as_array()
+            .filter(|_| row["slug"].is_string())
+            .ok_or(DIRECTORY_ERROR)?;
+        if row["status"] != "deleted"
+            && (row["slug"] == record["slug"] || history.contains(&record["slug"]))
+        {
+            return Ok(error(
+                409,
+                id,
+                "slug_conflict",
+                "Collection slug is already in use.",
+            ));
+        }
+    }
+    let mut cover_guard = None;
+    if let Some(cover_id) = record["coverAssetId"].as_str() {
+        let asset = repository.read("assets", cover_id).await?;
+        let Some(asset) = asset.filter(|asset| {
+            same_creator_region(asset, creator)
+                && asset["status"] == "ready"
+                && asset["mimeType"]
+                    .as_str()
+                    .is_some_and(|mime| mime.starts_with("image/"))
+        }) else {
+            return Ok(error(
+                400,
+                id,
+                "invalid_cover",
+                "Choose an active private image owned by this Creator.",
+            ));
+        };
+        let source = asset
+            .get("originalStorage")
+            .filter(|value| !value.is_null())
+            .unwrap_or(&asset["storage"]);
+        if source["scope"] != "private"
+            || source["bucket"].as_str().is_none_or(str::is_empty)
+            || source["byteLength"]
+                .as_u64()
+                .is_none_or(|length| !(1..=9_007_199_254_740_991).contains(&length))
+        {
+            return Ok(error(
+                400,
+                id,
+                "invalid_cover",
+                "Choose an active private image owned by this Creator.",
+            ));
+        }
+        if source["key"]
+            .as_str()
+            .is_none_or(|key| !delivery_key(key, repository.cell, creator_id))
+        {
+            return Ok(error(
+                400,
+                id,
+                "invalid_cover",
+                "Cover source custody requires reconciliation.",
+            ));
+        }
+        let revision = asset["revision"].as_u64().ok_or("Missing cover revision")?;
+        cover_guard = Some(repository.item_guard(
+            &format!("assets#{cover_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(revision.to_string()))),
+        )?);
+    }
+    ids.push(collection_id.clone());
+    let directory_revision = directory["revision"]
+        .as_u64()
+        .filter(|revision| *revision < 9_007_199_254_740_991)
+        .ok_or(DIRECTORY_ERROR)?;
+    directory["value"]["collectionIds"] = json!(ids);
+    directory["updatedAt"] = json!(now);
+    directory["revision"] = json!(directory_revision + 1);
+    if directory["value"].to_string().len() > 300 * 1024 {
+        return Err("Collection management exceeds the safe aggregate size. Split the collection or reconcile the library before continuing.".into());
+    }
+    let creator_revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    let mut actions = vec![
+        repository.create_item("collections", &record)?,
+        repository.replace_revisioned("hostRecords", &directory, directory_revision)?,
+        repository.item_guard(
+            &format!("creators#{creator_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(creator_revision.to_string()))),
+        )?,
+        repository.item_guard(
+            hold_fence,
+            "fence",
+            hold_version.map(|version| ("version", AttributeValue::S(version))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        repository.advance_host_fence().await?,
+    ];
+    actions.extend(cover_guard);
+    if let Some(key) = &digest {
+        let mut receipt = stamp(&format!("collection-intake-{key}"));
+        receipt["namespace"] = json!("runtime-collection-intake");
+        receipt["scopeId"] = json!(creator_id);
+        receipt["key"] = json!(key);
+        receipt["value"] =
+            json!({"schemaVersion":1,"collectionId":collection_id,"actorId":actor,"intent":intent});
+        actions.push(repository.create_item("hostRecords", &receipt)?);
+    }
+    match repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(respond(
+            201,
+            id,
+            json!({"collection":collection_view(&record, Vec::new(), true),"requestId":id}),
+        )),
+        Err(failure) => {
+            if let Some(key) = &digest
+                && !repository.migration_held(creator_id).await?
+                && let Some(response) = repository
+                    .collection_receipt(creator, actor, key, &intent, id)
+                    .await?
+            {
+                return Ok(response);
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 async fn mutate_collection(
     request: &Request,
     repository: &CreatorRecords<'_>,
@@ -2178,6 +2554,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                     Err(_) => error(500, id, "internal_error", "Unable to read Collection"),
                 };
             }
+            if request.raw_path == "/v1/collections"
+                && request.request_context.http.method == "POST"
+            {
+                if record["dataHomeRegion"] != runtime.cell.region {
+                    return error(404, id, "creator_not_found", "Creator not found.");
+                }
+                return match create_collection(request, &repository, &record, &subject, id).await {
+                    Ok(response) => response,
+                    Err(_) => error(500, id, "internal_error", "Unable to create Collection"),
+                };
+            }
             if record["contentAuthority"] == "retained-v1" {
                 return error(
                     503,
@@ -2450,7 +2837,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             ));
         }
     }
-    if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works") {
+    if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works" | "/v1/collections") {
         return creator_read(&request, runtime, &id).await;
     }
     if (method, path) == ("POST", "/v1/auth/sign-up") {
@@ -2804,6 +3191,22 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn collection_intake_receipt_preserves_node_field_order_and_defaults() {
+        let details = collection_intake_details(
+            &json!({
+                "title":" A Test ", "description":"notes", "coverAssetId":null
+            }),
+            "id",
+        )
+        .unwrap();
+        assert_eq!(
+            details.to_string(),
+            r#"{"title":"A Test","description":"notes","slug":"a-test","type":"collection","visibility":"private"}"#
+        );
+        assert!(collection_intake_details(&json!({"title":"A","type":null}), "id").is_err());
     }
 
     #[test]
