@@ -23,7 +23,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
-    reference_jobs::{processing_job_id, transaction_revision_conflict},
+    reference_jobs::{processing_job_id, public_job, transaction_revision_conflict},
+    reference_processing::ProcessingWorker,
     regional::portability::{
         asset_inventory, create_export, verified_unsigned, verify_record_graph,
     },
@@ -160,6 +161,7 @@ struct Runtime {
     delivery: Option<(aws_sdk_s3::Client, String)>,
     public_base_url: String,
     queue: Option<(aws_sdk_sqs::Client, String)>,
+    processing: Option<ProcessingWorker>,
     routing: Option<MigrationStore>,
     identity: Option<CognitoIdentity>,
     password_authentication: bool,
@@ -5206,19 +5208,55 @@ fn private_response(mut response: Response) -> Response {
     response
 }
 
-fn public_job(mut job: Value) -> Value {
-    if let Some(fields) = job.as_object_mut() {
-        match fields.remove("requestCorrelationId") {
-            Some(Value::String(trace)) => {
-                fields.insert("correlationId".into(), Value::String(trace));
-            }
-            None if fields.get("attempt").and_then(Value::as_u64) == Some(0) => {}
-            _ => {
-                fields.remove("correlationId");
-            }
-        }
+async fn run_processing_job(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<Response, Failure> {
+    let (Some((client, table)), Some(processing)) = (&runtime.records, &runtime.processing) else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, subject) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    if operator_claim(&repository, &subject).await?.is_none() {
+        return Ok(operator_denied(id));
     }
-    job
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let worker = body["workerId"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local-reference-worker");
+    if worker.len() > 200 {
+        return Ok(error(400, id, "invalid_request", "Worker ID is too long."));
+    }
+    let result = tokio::time::timeout(
+        StdDuration::from_secs(23),
+        processing.run_next(worker, &subject),
+    )
+    .await
+    .map_err(|_| "Processing will resume under scheduled recovery")??;
+    Ok(private_response(respond(
+        200,
+        id,
+        json!({"result":result,"requestId":id}),
+    )))
 }
 
 fn operator_denied(id: &str) -> Response {
@@ -5938,6 +5976,18 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if (method, path) == ("POST", "/v1/operations/jobs/run-next") {
+        return run_processing_job(&request, runtime, &id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "processing_unavailable",
+                    "The worker could not complete the processing request.",
+                )
+            });
+    }
     let review_case_id = single_path_id(path, "/v1/operations/review-cases/");
     if method == "POST" && (path == "/v1/operations/review-cases" || review_case_id.is_some()) {
         return write_review_case(&request, runtime, &id, review_case_id)
@@ -6298,14 +6348,26 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    let instance_id = env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into());
+    let queue_url = env::var("UBEEQ_JOBS_QUEUE_URL").ok();
+    let processing = match (&records, &delivery, &queue_url) {
+        (Some((_, table)), Some((_, bucket)), Some(queue)) => Some(ProcessingWorker::new(
+            &configuration,
+            table.clone(),
+            cell.id.clone(),
+            instance_id.clone(),
+            bucket.clone(),
+            queue.clone(),
+        )),
+        _ => None,
+    };
     let runtime = Runtime {
-        instance_id: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
+        instance_id,
         cell,
         records,
         delivery,
-        queue: env::var("UBEEQ_JOBS_QUEUE_URL")
-            .ok()
-            .map(|queue| (aws_sdk_sqs::Client::new(&configuration), queue)),
+        queue: queue_url.map(|queue| (aws_sdk_sqs::Client::new(&configuration), queue)),
+        processing,
         public_base_url: env::var("UBEEQ_PUBLIC_BASE_URL").unwrap_or_default(),
         routing,
         identity,
@@ -6404,6 +6466,7 @@ mod tests {
             delivery: None,
             public_base_url: String::new(),
             queue: None,
+            processing: None,
             routing: None,
             identity: None,
             password_authentication: false,

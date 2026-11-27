@@ -395,6 +395,21 @@ pub fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a 
     conflict
 }
 
+pub fn public_job(mut job: Value) -> Value {
+    if let Some(fields) = job.as_object_mut() {
+        match fields.remove("requestCorrelationId") {
+            Some(Value::String(trace)) => {
+                fields.insert("correlationId".into(), Value::String(trace));
+            }
+            None if fields.get("attempt").and_then(Value::as_u64) == Some(0) => {}
+            _ => {
+                fields.remove("correlationId");
+            }
+        }
+    }
+    job
+}
+
 pub fn failed_asset(mut asset: Value, now: &str) -> Result<Option<(Value, u64)>, Failure> {
     if !matches!(asset["status"].as_str(), Some("pending" | "processing")) {
         return Ok(None);
