@@ -5233,6 +5233,125 @@ fn public_job(mut job: Value) -> Value {
     job
 }
 
+fn operator_denied(id: &str) -> Response {
+    error(
+        403,
+        id,
+        "operator_authorization_denied",
+        "Current instance operator access is required.",
+    )
+}
+
+async fn operator_claim(
+    repository: &CreatorRecords<'_>,
+    subject: &str,
+) -> Result<Option<Value>, Failure> {
+    Ok(repository
+        .read("instanceOperators", repository.instance)
+        .await?
+        .filter(|claim| claim["actorId"] == subject && claim["instanceId"] == repository.instance))
+}
+
+fn event_cursor(repository: &str, input: &str) -> Option<HashMap<String, AttributeValue>> {
+    if input.len() > 2048 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(input).ok()?;
+    let document: Value = serde_json::from_slice(&decoded).ok()?;
+    let id = document["id"].as_str().filter(|id| !id.is_empty())?;
+    if document.as_object()?.len() != 4
+        || document["repository"] != repository
+        || document["sk"] != "record"
+        || document["pk"] != format!("{repository}#{id}")
+    {
+        return None;
+    }
+    document
+        .as_object()?
+        .iter()
+        .map(|(key, value)| Some((key.clone(), AttributeValue::S(value.as_str()?.to_owned()))))
+        .collect()
+}
+
+async fn list_operator_events(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    name: &str,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, subject) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Some(claim) = operator_claim(&repository, &subject).await? else {
+        return Ok(operator_denied(id));
+    };
+    let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
+    let param = |key| {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_ref())
+    };
+    let limit = param("limit")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|limit| *limit != 0)
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let cursor = match param("cursor").filter(|value| !value.is_empty()) {
+        Some(input) => match event_cursor(name, input) {
+            Some(cursor) => Some(cursor),
+            None => {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_cursor",
+                    "The event page cursor is invalid.",
+                ));
+            }
+        },
+        None => None,
+    };
+    let page = repository_page(client, table, cursor, limit, name)
+        .send()
+        .await?;
+    let mut events = Vec::new();
+    for mut item in page.items.unwrap_or_default() {
+        if in_cell(&item, repository.cell) {
+            let record = document(item.remove("value").ok_or("Missing operator event")?)?;
+            if record["instanceId"] == repository.instance {
+                events.push(record);
+            }
+        }
+    }
+    if operator_claim(&repository, &subject).await?.as_ref() != Some(&claim) {
+        return Ok(operator_denied(id));
+    }
+    let mut body = json!({"cell":{"cellId":runtime.cell.id,"region":runtime.cell.region,"routingRevision":1},"events":events,"requestId":id});
+    if let Some(key) = page.last_evaluated_key.filter(|key| !key.is_empty()) {
+        let parts: BTreeMap<_, _> = key
+            .iter()
+            .map(|(name, value)| Ok((name, value.as_s().map_err(|_| "Invalid event page key")?)))
+            .collect::<Result<_, Failure>>()?;
+        body["nextCursor"] = json!(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&parts)?));
+    }
+    Ok(private_response(respond(200, id, body)))
+}
+
 async fn list_processing_jobs(
     request: &Request,
     runtime: &Runtime,
@@ -5256,22 +5375,9 @@ async fn list_processing_jobs(
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
     };
-    let denied = || {
-        error(
-            403,
-            id,
-            "operator_authorization_denied",
-            "Current instance operator access is required.",
-        )
+    let Some(claim) = operator_claim(&repository, &subject).await? else {
+        return Ok(operator_denied(id));
     };
-    let claim = repository
-        .read("instanceOperators", repository.instance)
-        .await?;
-    if !claim.as_ref().is_some_and(|claim| {
-        claim["actorId"] == subject && claim["instanceId"] == repository.instance
-    }) {
-        return Ok(denied());
-    }
     let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
     let limit = params
         .iter()
@@ -5341,12 +5447,8 @@ async fn list_processing_jobs(
             break;
         }
     }
-    if repository
-        .read("instanceOperators", repository.instance)
-        .await?
-        != claim
-    {
-        return Ok(denied());
+    if operator_claim(&repository, &subject).await?.as_ref() != Some(&claim) {
+        return Ok(operator_denied(id));
     }
     Ok(private_response(respond(
         200,
@@ -5364,6 +5466,22 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if let Some(name) = match (method, path) {
+        ("GET", "/v1/operations/audit-events") => Some("auditEvents"),
+        ("GET", "/v1/operations/usage-events") => Some("usageEvents"),
+        _ => None,
+    } {
+        return list_operator_events(&request, runtime, &id, name)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "operations_unavailable",
+                    "Operator events are temporarily unavailable.",
+                )
+            });
+    }
     if (method, path) == ("GET", "/v1/operations/jobs") {
         return list_processing_jobs(&request, runtime, &id)
             .await
@@ -5691,6 +5809,19 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_event_cursor_uses_node_key_shape_and_stays_in_its_repository() {
+        let payload = json!({"pk":"auditEvents#event-1","sk":"record","repository":"auditEvents","id":"event-1"});
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let key = event_cursor("auditEvents", &encoded).unwrap();
+        assert_eq!(key["pk"], AttributeValue::S("auditEvents#event-1".into()));
+        assert!(event_cursor("usageEvents", &encoded).is_none());
+        let forged = payload
+            .to_string()
+            .replace("auditEvents#event-1", "assets#asset-1");
+        assert!(event_cursor("auditEvents", &URL_SAFE_NO_PAD.encode(forged)).is_none());
+    }
 
     #[test]
     fn public_job_keeps_request_trace_and_excludes_worker_claim() {
