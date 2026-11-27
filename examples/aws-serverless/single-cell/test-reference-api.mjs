@@ -143,6 +143,47 @@ if (missing.length) {
     if (publicWork.response.status !== 200 || !publicWork.value.assets?.[0]?.delivery?.url) throw new Error(`Public work or delivery grant failed: ${JSON.stringify(publicWork.value)}`);
     const delivery = await fetch(publicWork.value.assets[0].delivery.url);
     if (!delivery.ok || !Buffer.from(await delivery.arrayBuffer()).equals(bytes)) throw new Error("Delivered object differs from the uploaded source version.");
+    if (process.env.UBEEQ_AWS_VERIFY_OPERATOR_READS === "true") {
+      const holdsPath = "/v1/operations/holds";
+      const holdRequest = {
+        method: "POST",
+        token,
+        headers: { "idempotency-key": marker + "-hold" },
+        body: { subjectType: "work", subjectId: work.value.work.id, reason: marker },
+      };
+      const opened = await call(holdsPath, holdRequest);
+      const hold = opened.value?.hold;
+      if (hold?.id && hold.subjectId === work.value.work.id) created.add(hold.id);
+      if (opened.response.status !== 201 || !hold?.id || hold.state !== "active"
+        || hold.subjectId !== work.value.work.id || hold.homeCellId !== creator.value.creator.homeCellId) {
+        throw new Error("The Rust API did not create the scoped moderation hold.");
+      }
+      const duplicate = await call(holdsPath, holdRequest);
+      if (duplicate.response.status !== 200 || duplicate.value?.hold?.id !== hold.id
+        || duplicate.value.hold.revision !== hold.revision) {
+        throw new Error("A retried hold creation did not return the original hold.");
+      }
+      const conflict = await call(holdsPath, { ...holdRequest, body: { ...holdRequest.body, reason: marker + "-different" } });
+      if (conflict.response.status !== 409 || conflict.value?.error?.code !== "idempotency_conflict") {
+        throw new Error("Reusing a hold creation key with a different reason must conflict.");
+      }
+      const publicPath = `/v1/public/works/${work.value.work.id}`;
+      if ((await call(publicPath)).response.status !== 404) {
+        throw new Error("An active Work hold must prevent new public delivery grants.");
+      }
+      const releasePath = `${holdsPath}/${encodeURIComponent(hold.id)}/release`;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const released = await call(releasePath, { method: "POST", token });
+        if (released.response.status !== 200 || released.value?.hold?.state !== "released"
+          || released.value.hold.id !== hold.id || released.value.hold.revision !== hold.revision + 1) {
+          throw new Error("Hold release must advance its revision exactly once.");
+        }
+      }
+      const restored = await call(publicPath);
+      if (restored.response.status !== 200 || !restored.value.assets?.[0]?.delivery?.url) {
+        throw new Error("Releasing the hold did not restore eligibility for public delivery.");
+      }
+    }
     console.log("AWS reference sign-in, upload, processing, publication, and delivery flow passed.");
   } finally {
     if (object?.key) await s3.send(new DeleteObjectCommand({ Bucket: process.env.UBEEQ_AWS_OBJECT_BUCKET, Key: object.key, VersionId: object.versionId })).catch(() => undefined);
