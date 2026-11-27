@@ -72,11 +72,18 @@ impl SourceImage {
             return Err("Crop extends beyond the source image".into());
         }
 
-        let resized = self.pixels.crop_imm(x, y, width, height).resize_to_fill(
-            target.width.get(),
-            target.height.get(),
-            image::imageops::FilterType::Lanczos3,
-        );
+        // Crop to the target aspect in source coordinates before resizing.
+        // Scaling to cover before cropping can create a very large intermediate
+        // image for a narrow or wide source crop.
+        let crop = center_to_fill(crop, target);
+        let resized = self
+            .pixels
+            .crop_imm(crop.x, crop.y, crop.width, crop.height)
+            .resize_exact(
+                target.width.get(),
+                target.height.get(),
+                image::imageops::FilterType::Lanczos3,
+            );
         let rgb = if resized.color().has_alpha() {
             let rgba = resized.into_rgba8();
             image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
@@ -94,9 +101,65 @@ impl SourceImage {
     }
 }
 
+fn center_to_fill(mut crop: Crop, target: ImageSize) -> Crop {
+    let (width, height) = (u64::from(crop.width), u64::from(crop.height));
+    let (target_width, target_height) = (
+        u64::from(target.width.get()),
+        u64::from(target.height.get()),
+    );
+    if width * target_height > target_width * height {
+        let fitted = (height * target_width / target_height).max(1) as u32;
+        crop.x += (crop.width - fitted) / 2;
+        crop.width = fitted;
+    } else if width * target_height < target_width * height {
+        let fitted = (width * target_height / target_width).max(1) as u32;
+        crop.y += (crop.height - fitted) / 2;
+        crop.height = fitted;
+    }
+    crop
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extreme_aspect_crops_stay_within_the_source() {
+        let target = ImageSize {
+            width: 100.try_into().unwrap(),
+            height: 100.try_into().unwrap(),
+        };
+        let crop = Crop {
+            x: 3,
+            y: 4,
+            width: 100_000,
+            height: 1,
+        };
+        assert_eq!(
+            center_to_fill(crop, target),
+            Crop {
+                x: 50_002,
+                y: 4,
+                width: 1,
+                height: 1
+            }
+        );
+        let crop = Crop {
+            x: 3,
+            y: 4,
+            width: 1,
+            height: 100_000,
+        };
+        assert_eq!(
+            center_to_fill(crop, target),
+            Crop {
+                x: 3,
+                y: 50_003,
+                width: 1,
+                height: 1
+            }
+        );
+    }
 
     #[test]
     fn png_crop_produces_a_jpeg_from_only_the_selected_pixels() {
