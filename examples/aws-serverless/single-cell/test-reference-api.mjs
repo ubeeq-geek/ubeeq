@@ -132,6 +132,41 @@ if (missing.length) {
           || event.homeCellId !== creator.value.creator.homeCellId)) {
         throw new Error("Operator evidence did not match the fixture actor, usage, or cell.");
       }
+      const casesPath = "/v1/operations/review-cases";
+      const openRequest = {
+        method: "POST", token,
+        headers: { "idempotency-key": marker + "-review-case" },
+        body: { subjectId: work.value.work.id },
+      };
+      const opened = await call(casesPath, openRequest);
+      const reviewCase = opened.value?.reviewCase;
+      if (reviewCase?.id && reviewCase.subjectId === work.value.work.id) created.add(reviewCase.id);
+      if (opened.response.status !== 201 || !reviewCase?.id || reviewCase.state !== "open"
+        || reviewCase.subjectId !== work.value.work.id || reviewCase.homeCellId !== creator.value.creator.homeCellId) {
+        throw new Error("The Rust API did not open an in-scope review case.");
+      }
+      const repeated = await call(casesPath, openRequest);
+      if (repeated.response.status !== 200 || repeated.value?.reviewCase?.id !== reviewCase.id
+        || repeated.value.reviewCase.revision !== reviewCase.revision) {
+        throw new Error("Review case creation replay did not return the original case.");
+      }
+      const casePath = `${casesPath}/${encodeURIComponent(reviewCase.id)}`;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const assigned = await call(casePath, { method: "POST", token, body: { state: "assigned", assigneeId: actorId } });
+        if (assigned.response.status !== 200 || assigned.value?.reviewCase?.state !== "assigned"
+          || assigned.value.reviewCase.id !== reviewCase.id || assigned.value.reviewCase.assigneeId !== actorId
+          || assigned.value.reviewCase.revision !== reviewCase.revision + 1) {
+          throw new Error("Repeating a review case assignment must advance its revision exactly once.");
+        }
+      }
+      const openedAudit = await findEvent("audit", event =>
+        event.action === "moderation.review_case_opened" && event.payload?.reviewCaseId === reviewCase.id);
+      const assignedAudit = await findEvent("audit", event =>
+        event.action === "moderation.review_case_updated" && event.payload?.reviewCaseId === reviewCase.id
+        && event.payload?.state === "assigned");
+      if ([openedAudit, assignedAudit].some(event => event.actorId !== actorId || event.subjectId !== work.value.work.id)) {
+        throw new Error("Review case audit events did not match the fixture actor and Work.");
+      }
     }
     const replay = await publishReferenceWhenReady((path, options) => call(path, { ...options, token }), {
       workId: work.value.work.id, idempotencyKey: marker + '-publication', attempts: 1,
