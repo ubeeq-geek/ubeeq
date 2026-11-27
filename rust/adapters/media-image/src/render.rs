@@ -20,32 +20,7 @@ pub struct SourceImage {
 
 impl SourceImage {
     pub fn decode(source: &[u8], budget: DecodeLimits) -> Result<Self, Error> {
-        if source.is_empty() || source.len() > budget.bytes {
-            return Err("Image source exceeds the input byte limit".into());
-        }
-
-        let mut reader = ImageReader::new(Cursor::new(source)).with_guessed_format()?;
-        if !matches!(
-            reader.format(),
-            Some(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Gif | ImageFormat::WebP)
-        ) {
-            return Err("Unsupported source image format".into());
-        }
-        // Crop coordinates refer to stored pixels, so leave EXIF orientation unapplied.
-        let mut limits = image::Limits::default();
-        limits.max_alloc = Some(budget.allocation_bytes);
-        reader.limits(limits.clone());
-        let mut decoder = reader.into_decoder()?;
-        let (width, height) = decoder.dimensions();
-        if u64::from(width) * u64::from(height) > budget.pixels {
-            return Err("Image source exceeds the input pixel limit".into());
-        }
-        let size = ImageSize {
-            width: width.try_into()?,
-            height: height.try_into()?,
-        };
-        limits.reserve(decoder.total_bytes())?;
-        decoder.set_limits(limits)?;
+        let (decoder, size) = source_decoder(source, budget, None)?;
         Ok(Self {
             pixels: DynamicImage::from_decoder(decoder)?,
             size,
@@ -99,6 +74,53 @@ impl SourceImage {
         JpegEncoder::new_with_quality(&mut output, quality).encode_image(&rgb)?;
         Ok(output)
     }
+}
+
+/// Validate a source header and its declared MIME type without decoding pixels.
+pub fn inspect_dimensions(
+    source: &[u8],
+    mime: &str,
+    budget: DecodeLimits,
+) -> Result<ImageSize, Error> {
+    let (_, size) = source_decoder(source, budget, Some(mime))?;
+    Ok(size)
+}
+
+fn source_decoder<'a>(
+    source: &'a [u8],
+    budget: DecodeLimits,
+    mime: Option<&str>,
+) -> Result<(impl ImageDecoder + 'a, ImageSize), Error> {
+    if source.is_empty() || source.len() > budget.bytes {
+        return Err("Image source exceeds the input byte limit".into());
+    }
+    let mut reader = ImageReader::new(Cursor::new(source)).with_guessed_format()?;
+    let detected = match reader.format() {
+        Some(ImageFormat::Jpeg) => "image/jpeg",
+        Some(ImageFormat::Png) => "image/png",
+        Some(ImageFormat::Gif) => "image/gif",
+        Some(ImageFormat::WebP) => "image/webp",
+        _ => return Err("Unsupported source image format".into()),
+    };
+    if mime.is_some_and(|mime| mime != detected) {
+        return Err("Image does not match its declared MIME type".into());
+    }
+    // Crop coordinates refer to stored pixels, so leave EXIF orientation unapplied.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(budget.allocation_bytes);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > budget.pixels {
+        return Err("Image source exceeds the input pixel limit".into());
+    }
+    let size = ImageSize {
+        width: width.try_into()?,
+        height: height.try_into()?,
+    };
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    Ok((decoder, size))
 }
 
 fn center_to_fill(mut crop: Crop, target: ImageSize) -> Crop {
@@ -179,6 +201,9 @@ mod tests {
             pixels: 64,
             allocation_bytes: 1024 * 1024,
         };
+        let inspected = inspect_dimensions(source_bytes.get_ref(), "image/png", limits).unwrap();
+        assert_eq!((inspected.width.get(), inspected.height.get()), (8, 8));
+        assert!(inspect_dimensions(source_bytes.get_ref(), "image/jpeg", limits).is_err());
         let decoded = SourceImage::decode(source_bytes.get_ref(), limits).unwrap();
         assert!(
             SourceImage::decode(
