@@ -4308,7 +4308,7 @@ fn publication_request_work(path: &str) -> Option<&str> {
     single_path_id(path.strip_suffix("/publications")?, "/v1/works/")
 }
 
-fn publication_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
+fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
     let mut conflict = false;
     for code in codes {
         match code {
@@ -4648,7 +4648,7 @@ async fn publish_work(
             } else if matches!(
                 failure.as_service_error(),
                 Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
-                    if publication_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+                    if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
             ) {
                 Ok(error(
                     409,
@@ -5252,6 +5252,127 @@ async fn operator_claim(
         .filter(|claim| claim["actorId"] == subject && claim["instanceId"] == repository.instance))
 }
 
+async fn release_moderation_hold(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    hold_id: &str,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Some(claim) = operator_claim(&repository, &actor).await? else {
+        return Ok(operator_denied(id));
+    };
+    let local_hold = |hold: &Value| {
+        hold["id"] == hold_id
+            && hold["instanceId"] == repository.instance
+            && hold["homeCellId"] == repository.cell
+            && hold["dataHomeRegion"] == runtime.cell.region
+    };
+    let response = |hold| private_response(respond(200, id, json!({"hold":hold,"requestId":id})));
+    let Some(mut hold) = repository
+        .read("moderationHolds", hold_id)
+        .await?
+        .filter(local_hold)
+    else {
+        return Ok(error(
+            404,
+            id,
+            "hold_not_found",
+            "Moderation hold was not found",
+        ));
+    };
+    if hold["state"] == "released" {
+        return Ok(
+            if operator_claim(&repository, &actor).await?.as_ref() == Some(&claim) {
+                response(hold)
+            } else {
+                operator_denied(id)
+            },
+        );
+    }
+    if hold["state"] != "active" {
+        return Ok(error(
+            409,
+            id,
+            "hold_state_conflict",
+            "The moderation hold is not active.",
+        ));
+    }
+    let revision = hold["revision"]
+        .as_u64()
+        .filter(|revision| *revision < 9_007_199_254_740_991)
+        .ok_or("Invalid hold revision")?;
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"moderation.hold_released",
+        "actorId":actor,"subjectId":hold["subjectId"],"payload":{"holdId":hold_id}});
+    rehome_import(&mut audit, &hold, &now);
+    hold["state"] = json!("released");
+    hold["revision"] = json!(revision + 1);
+    hold["updatedAt"] = json!(now);
+    let fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let actions = vec![
+        repository.replace_revisioned("moderationHolds", &hold, revision)?,
+        repository.create_item("auditEvents", &audit)?,
+        repository.advance_fence(fence, repository.marker(fence).await?)?,
+        repository.item_guard(
+            &format!("instanceOperators#{}", repository.instance),
+            "record",
+            Some(("value", attribute(&claim))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ];
+    match client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(response(hold)),
+        Err(failure) => {
+            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+                return Ok(operator_denied(id));
+            }
+            if let Some(current) = repository
+                .read("moderationHolds", hold_id)
+                .await?
+                .filter(|hold| local_hold(hold) && hold["state"] == "released")
+            {
+                return Ok(response(current));
+            }
+            if matches!(
+                failure.as_service_error(),
+                Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                    if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+            ) {
+                return Ok(error(
+                    409,
+                    id,
+                    "revision_conflict",
+                    "Moderation evidence changed. Retry the same request.",
+                ));
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 fn operator_cursor(repository: &str, input: &str) -> Option<HashMap<String, AttributeValue>> {
     if input.len() > 2048 {
         return None;
@@ -5468,6 +5589,22 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if method == "POST"
+        && let Some(hold_id) = path
+            .strip_suffix("/release")
+            .and_then(|path| single_path_id(path, "/v1/operations/holds/"))
+    {
+        return release_moderation_hold(&request, runtime, &id, hold_id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "operations_unavailable",
+                    "Moderation holds are temporarily unavailable.",
+                )
+            });
+    }
     if let Some((name, response_key)) = match (method, path) {
         ("GET", "/v1/operations/audit-events") => Some(("auditEvents", "events")),
         ("GET", "/v1/operations/usage-events") => Some(("usageEvents", "events")),
@@ -5854,16 +5991,16 @@ mod tests {
 
     #[test]
     fn publication_retries_only_explicit_transaction_conflicts() {
-        assert!(publication_revision_conflict(
+        assert!(transaction_revision_conflict(
             [Some("None"), Some("ConditionalCheckFailed")].into_iter()
         ));
-        assert!(publication_revision_conflict(
+        assert!(transaction_revision_conflict(
             [Some("TransactionConflict")].into_iter()
         ));
-        assert!(!publication_revision_conflict([Some("None")].into_iter()));
-        assert!(!publication_revision_conflict([None].into_iter()));
-        assert!(!publication_revision_conflict(std::iter::empty()));
-        assert!(!publication_revision_conflict(
+        assert!(!transaction_revision_conflict([Some("None")].into_iter()));
+        assert!(!transaction_revision_conflict([None].into_iter()));
+        assert!(!transaction_revision_conflict(std::iter::empty()));
+        assert!(!transaction_revision_conflict(
             [Some("ConditionalCheckFailed"), Some("ValidationError")].into_iter()
         ));
     }
