@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
-    reference_jobs::{JobOutcome, JobQueue},
+    reference_jobs::{JobOutcome, JobQueue, processing_job_id},
     reference_media::{copy_rendition, plan_rendition, verify_source},
     store::{attribute, document},
 };
@@ -45,6 +45,8 @@ struct Worker {
     db: Client,
     s3: aws_sdk_s3::Client,
     queue: JobQueue,
+    sqs: aws_sdk_sqs::Client,
+    queue_url: String,
     table: String,
     bucket: String,
     instance: String,
@@ -319,6 +321,135 @@ impl Worker {
         .await
     }
 
+    async fn repair_upload_notifications(&self) -> Result<(), Failure> {
+        let mut cursor = None;
+        let mut repaired = 0;
+        loop {
+            let page = self.db.query().table_name(&self.table)
+                .index_name("repository-id-index")
+                .key_condition_expression("#repository = :repository")
+                .filter_expression("#value.#namespace = :namespace AND #value.#instance = :instance AND #value.#cell = :cell AND #value.#intent.#phase = :completed AND #value.#intent.#queue = :pending")
+                .expression_attribute_names("#repository","repository")
+                .expression_attribute_names("#value","value")
+                .expression_attribute_names("#namespace","namespace")
+                .expression_attribute_names("#instance","instanceId")
+                .expression_attribute_names("#cell","homeCellId")
+                .expression_attribute_names("#intent","value")
+                .expression_attribute_names("#phase","phase")
+                .expression_attribute_names("#queue","queueState")
+                .expression_attribute_values(":repository",AttributeValue::S("hostRecords".into()))
+                .expression_attribute_values(":namespace",AttributeValue::S("runtime-upload".into()))
+                .expression_attribute_values(":instance",AttributeValue::S(self.instance.clone()))
+                .expression_attribute_values(":cell",AttributeValue::S(self.cell.clone()))
+                .expression_attribute_values(":completed",AttributeValue::S("completed".into()))
+                .expression_attribute_values(":pending",AttributeValue::S("pending".into()))
+                .limit(100).set_exclusive_start_key(cursor).send().await?;
+            for entry in page.items() {
+                let Some(id) = entry.get("id").and_then(|value| value.as_s().ok()) else {
+                    continue;
+                };
+                match self.reoffer_upload(id).await {
+                    Ok(true) => repaired += 1,
+                    Ok(false) => {}
+                    Err(_) => eprintln!("Upload processing notification remains pending"),
+                }
+                if repaired >= 25 {
+                    return Ok(());
+                }
+            }
+            cursor = page.last_evaluated_key;
+            if cursor.as_ref().is_none_or(HashMap::is_empty) {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn reoffer_upload(&self, id: &str) -> Result<bool, Failure> {
+        let Some(mut row) = self.read("hostRecords", id).await? else {
+            return Ok(false);
+        };
+        let intent = &row["value"];
+        if row["namespace"] != "runtime-upload"
+            || row["instanceId"] != self.instance
+            || row["homeCellId"] != self.cell
+            || intent["phase"] != "completed"
+            || intent["queueState"] != "pending"
+        {
+            return Ok(false);
+        }
+        let asset_id = field(intent, "assetId")?;
+        let version = field(&intent["completedObject"], "versionId")?;
+        if row["scopeId"] != intent["creatorId"] || row["key"] != intent["uploadId"] {
+            return Err("Invalid upload processing receipt".into());
+        }
+        let asset = self
+            .read("assets", asset_id)
+            .await?
+            .ok_or("Missing upload asset")?;
+        if asset["instanceId"] != self.instance
+            || asset["homeCellId"] != self.cell
+            || asset["creatorId"] != intent["creatorId"]
+            || asset["workId"] != intent["workId"]
+            || asset["objectVersion"] != version
+        {
+            return Err("Upload asset is outside its recorded scope".into());
+        }
+        let queue_key = format!("asset-process:{asset_id}:{version}");
+        let job_id = processing_job_id(&self.cell, &queue_key);
+        let job = match self.read("durableJobs", &job_id).await? {
+            Some(job) => job,
+            None => {
+                let now = timestamp(OffsetDateTime::now_utc())?;
+                let job = json!({"id":job_id,"type":"asset.process","cellId":self.cell,"payload":{"assetId":asset_id},
+                    "idempotencyKey":queue_key,"state":"queued","attempt":0,"maxAttempts":3,"availableAt":now,
+                    "revision":1,"createdAt":now,"updatedAt":now,"requestCorrelationId":intent["correlationId"]});
+                let actions = vec![
+                    self.put("durableJobs", &job, None)?,
+                    self.check(&pk("assets", asset_id), "record", Some(revision(&asset)?))?,
+                    self.check(&pk("hostRecords", id), "record", Some(revision(&row)?))?,
+                ];
+                if let Err(error) = self.commit(actions).await {
+                    self.read("durableJobs", &job_id).await?.ok_or(error)?
+                } else {
+                    job
+                }
+            }
+        };
+        if job["id"] != job_id
+            || job["cellId"] != self.cell
+            || job["type"] != "asset.process"
+            || job["payload"]["assetId"] != asset_id
+            || job["idempotencyKey"] != queue_key
+        {
+            return Err("Invalid upload processing job".into());
+        }
+        if !matches!(
+            job["state"].as_str(),
+            Some("completed" | "cancelled" | "dead_lettered")
+        ) {
+            self.sqs
+                .send_message()
+                .queue_url(&self.queue_url)
+                .message_body(
+                    json!({"id":job_id,"type":"asset.process","cellId":self.cell}).to_string(),
+                )
+                .send()
+                .await?;
+        }
+        let rev = revision(&row)?;
+        row["value"]["queueState"] = json!("queued");
+        row["value"]["jobId"] = json!(job_id);
+        row["revision"] = json!(rev + 1);
+        row["updatedAt"] = json!(timestamp(OffsetDateTime::now_utc())?);
+        self.commit(vec![
+            self.put("hostRecords", &row, Some(rev))?,
+            self.fence("hostRecords").await?,
+            self.check("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        ])
+        .await?;
+        Ok(true)
+    }
+
     async fn one(&self, message: &Message) -> Result<(), Failure> {
         let worker = format!("aws-worker:{}", message.message_id);
         let notification = message
@@ -378,6 +509,8 @@ async fn main() -> Result<(), Error> {
     let cell = env::var("UBEEQ_CELL_ID").or_else(|_| env::var("AWS_REGION"))?;
     let worker = Worker {
         queue: JobQueue::new(db.clone(), table.clone(), cell.clone()),
+        sqs: aws_sdk_sqs::Client::new(&config),
+        queue_url: env::var("UBEEQ_JOBS_QUEUE_URL")?,
         db,
         table,
         cell,
@@ -386,6 +519,9 @@ async fn main() -> Result<(), Error> {
         instance: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
     };
     run(service_fn(|event: LambdaEvent<Batch>| async {
+        if worker.repair_upload_notifications().await.is_err() {
+            eprintln!("Upload processing notification repair deferred");
+        }
         let mut failures = Vec::new();
         for message in event.payload.records {
             if worker.one(&message).await.is_err() {

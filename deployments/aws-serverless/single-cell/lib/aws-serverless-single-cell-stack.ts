@@ -7,6 +7,7 @@ import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as events from "aws-cdk-lib/aws-events";
+import * as eventTargets from "aws-cdk-lib/aws-events-targets";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -37,7 +38,7 @@ export class AwsServerlessSingleCellStack extends Stack {
     records.addGlobalSecondaryIndex({ indexName: "repository-id-index", partitionKey: { name: "repository", type: dynamodb.AttributeType.STRING }, sortKey: { name: "id", type: dynamodb.AttributeType.STRING } });
     const deadLetters = new sqs.Queue(this, "DeadLetters", { encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14), removalPolicy: RemovalPolicy.RETAIN });
     const jobs = new sqs.Queue(this, "Jobs", { encryption: sqs.QueueEncryption.SQS_MANAGED, deadLetterQueue: { queue: deadLetters, maxReceiveCount: 3 }, visibilityTimeout: Duration.minutes(5), removalPolicy: RemovalPolicy.RETAIN });
-    new events.Rule(this, "RecoverySchedule", { schedule: events.Schedule.rate(Duration.minutes(5)), description: "Neutral scheduled recovery trigger for Ubeeq durable jobs" });
+    const recoverySchedule = new events.Rule(this, "RecoverySchedule", { schedule: events.Schedule.rate(Duration.minutes(5)), description: "Neutral scheduled recovery trigger for Ubeeq durable jobs" });
     const userPool = new cognito.UserPool(this, "Users", { selfSignUpEnabled: false, signInAliases: { email: true }, removalPolicy: RemovalPolicy.RETAIN, passwordPolicy: { minLength: 12, requireDigits: true, requireLowercase: true, requireUppercase: true, requireSymbols: false } });
     const userPoolClient = userPool.addClient("ReferenceApi", { authFlows: { userPassword: true, userSrp: true } });
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
@@ -108,6 +109,7 @@ export class AwsServerlessSingleCellStack extends Stack {
     health.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
     worker.addToRolePolicy(new iam.PolicyStatement({ actions: ["secretsmanager:CreateSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret"], resources: [this.formatArn({ service: "secretsmanager", resource: "secret", resourceName: "ubeeq/credentials/*" })] }));
     worker.addEventSource(new lambdaEventSources.SqsEventSource(jobs, { batchSize: 1, reportBatchItemFailures: true }));
+    if (rustReferenceWorkerAsset) recoverySchedule.addTarget(new eventTargets.LambdaFunction(worker));
     const jobDeadLetterAlarm = new cloudwatch.Alarm(this, "JobDeadLetterAlarm", { metric: deadLetters.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq durable jobs require manual recovery" });
     const url = health.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
     const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });

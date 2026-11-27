@@ -124,6 +124,8 @@ test('the Rust reference worker retains the SQS trigger and runtime configuratio
     const trigger = Object.values(resources).find(resource => resource.Type === 'AWS::Lambda::EventSourceMapping');
     assert.deepEqual(trigger.Properties.FunctionName, { Ref: workerId });
     assert.deepEqual(trigger.Properties.FunctionResponseTypes, ['ReportBatchItemFailures']);
+    const schedule = Object.values(resources).find(resource => resource.Type === 'AWS::Events::Rule');
+    assert.deepEqual(schedule.Properties.Targets[0].Arn, { 'Fn::GetAtt': [workerId, 'Arn'] });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
