@@ -4035,6 +4035,88 @@ async fn direct_upload_content(
     ))
 }
 
+fn federation_url(value: &Value, field: &str) -> Result<Url, String> {
+    let url = value
+        .as_str()
+        .and_then(|value| Url::parse(value).ok())
+        .ok_or_else(|| format!("{field} must be an absolute HTTPS URL"))?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "{field} must be an absolute HTTPS URL without credentials"
+        ));
+    }
+    Ok(url)
+}
+
+fn validate_federation_reference(event: &Value) -> Result<(), String> {
+    if !matches!(
+        event["type"].as_str(),
+        Some("publication_reference" | "publication_updated" | "publication_withdrawn")
+    ) {
+        return Err("Federation publication event type is unsupported".into());
+    }
+    let actor = &event["actor"];
+    let publication = &event["publication"];
+    let nonempty = |value: &Value| value.as_str().is_some_and(|value| !value.trim().is_empty());
+    if !nonempty(&actor["id"]) || !nonempty(&actor["handle"]) {
+        return Err("Remote actor id and handle are required".into());
+    }
+    let host = federation_url(
+        &json!(format!(
+            "https://{}",
+            actor["host"].as_str().unwrap_or_default()
+        )),
+        "host",
+    )?;
+    if host.path() != "/" || host.query().is_some() || host.fragment().is_some() {
+        return Err("host must not include a path, query, or fragment".into());
+    }
+    let profile = federation_url(&actor["profileUrl"], "profileUrl")?;
+    let inbox = federation_url(&actor["inboxUrl"], "inboxUrl")?;
+    if profile.origin() != host.origin() || inbox.origin() != host.origin() {
+        return Err("Remote actor URLs must belong to its declared host".into());
+    }
+    if !nonempty(&publication["id"]) || !nonempty(&publication["actorId"]) {
+        return Err("Remote publication id and actor id are required".into());
+    }
+    federation_url(&publication["canonicalUrl"], "canonicalUrl")?;
+    if publication["publishedAt"]
+        .as_str()
+        .is_none_or(|date| OffsetDateTime::parse(date, &Rfc3339).is_err())
+    {
+        return Err("publishedAt must be an ISO date-time".into());
+    }
+    if publication["actorId"] != actor["id"] {
+        return Err("Federation publication event actor does not match the publication".into());
+    }
+    Ok(())
+}
+
+fn federation_inbox(request: &Request, id: &str) -> Response {
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let payload = &body["envelope"]["payload"];
+    if payload.is_null() || payload == false || payload == 0 || payload == "" {
+        return error(
+            400,
+            id,
+            "invalid_federation_reference",
+            "A signed federation event is required",
+        );
+    }
+    if let Err(message) = validate_federation_reference(payload) {
+        return error(500, id, "internal_error", &message);
+    }
+    error(
+        403,
+        id,
+        "federation_not_accepted",
+        "The instance policy did not accept this remote reference",
+    )
+}
+
 fn disabled_feature(path: &str, method: &str) -> Option<&'static str> {
     if method == "GET" {
         return None;
@@ -5138,6 +5220,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "Website publishing is not configured.",
         ));
     }
+    if (method, path) == ("POST", "/v1/federation/inbox") {
+        return federation_inbox(&request, &id);
+    }
     if (method, path) == ("POST", "/v1/activity/command") {
         if let Err(response) = creator_session(&request, runtime, &id).await {
             return response;
@@ -5602,6 +5687,30 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn aws_federation_inbox_defaults_to_deny_after_validating_the_reference() {
+        let request = |payload| {
+            serde_json::from_value(json!({
+                "rawPath":"/v1/federation/inbox","requestContext":{"http":{"method":"POST"}},
+                "body":json!({"envelope":{"payload":payload}}).to_string()
+            }))
+            .unwrap()
+        };
+        let mut payload = json!({"type":"publication_reference",
+            "actor":{"id":"actor","handle":"someone","host":"remote.example","profileUrl":"https://remote.example/profile","inboxUrl":"https://remote.example/inbox"},
+            "publication":{"id":"publication","actorId":"actor","canonicalUrl":"https://remote.example/work","publishedAt":"2026-01-01T00:00:00Z"}});
+        assert_eq!(
+            federation_inbox(&request(payload.clone()), "id").status_code,
+            403
+        );
+        payload["actor"]["inboxUrl"] = json!("https://elsewhere.example/inbox");
+        assert_eq!(federation_inbox(&request(payload), "id").status_code, 500);
+        assert_eq!(
+            federation_inbox(&request(Value::Null), "id").status_code,
+            400
+        );
     }
 
     #[test]
