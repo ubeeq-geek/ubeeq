@@ -4987,7 +4987,12 @@ async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, 
     {
         return Ok(None);
     }
-    let assets: Vec<_> = repository
+    let assets_fence = "__ubeeq_repository_snapshot#assets";
+    let publications_fence = "__ubeeq_repository_snapshot#publications";
+    let assets_version = repository.marker(assets_fence).await?;
+    let publications_version = repository.marker(publications_fence).await?;
+    let mut assets = Vec::new();
+    for candidate in repository
         .list("assets")
         .await?
         .into_iter()
@@ -4996,22 +5001,59 @@ async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, 
                 && asset["creatorId"] == creator
                 && asset["status"] == "ready"
         })
-        .collect();
-    let publications: Vec<_> = repository
+    {
+        let Some(id) = candidate["id"].as_str() else {
+            continue;
+        };
+        if let Some(asset) = repository.read("assets", id).await?.filter(|asset| {
+            local(asset)
+                && asset["id"] == id
+                && asset["workId"] == work_id
+                && asset["creatorId"] == creator
+                && asset["status"] == "ready"
+                && asset["routingRevision"] == work["routingRevision"]
+                && asset["dataHomeRegion"] == work["dataHomeRegion"]
+        }) {
+            assets.push(asset);
+        }
+    }
+    let mut publications = Vec::new();
+    for candidate in repository
         .list("publications")
         .await?
         .into_iter()
         .filter(|publication| publication["workId"] == work_id && publication["status"] == "live")
-        .collect();
-    if assets.is_empty()
-        || publications.is_empty()
-        || has_public_hold(
-            &repository.list("moderationHolds").await?,
-            creator,
-            work_id,
-            &assets,
-        )
     {
+        let Some(id) = candidate["id"].as_str() else {
+            continue;
+        };
+        if let Some(publication) =
+            repository
+                .read("publications", id)
+                .await?
+                .filter(|publication| {
+                    local(publication)
+                        && publication["id"] == id
+                        && publication["workId"] == work_id
+                        && publication["status"] == "live"
+                })
+        {
+            publications.push(publication);
+        }
+    }
+    if assets.is_empty() || publications.is_empty() {
+        return Ok(None);
+    }
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if has_public_hold(
+        &repository
+            .publication_sources("moderationHolds", "state", Some("active"))
+            .await?,
+        creator,
+        work_id,
+        &assets,
+    ) {
         return Ok(None);
     }
 
@@ -5027,11 +5069,20 @@ async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, 
             .as_str()
             .filter(|key| delivery_key(key, &runtime.cell.id, creator))
             .ok_or("Invalid Work asset key")?;
+        let Some(version) = storage["versionId"]
+            .as_str()
+            .filter(|version| !version.is_empty() && *version != "null")
+        else {
+            return Ok(None);
+        };
+        if storage["scope"] != "public" || storage["bucket"] != bucket.as_str() {
+            return Ok(None);
+        }
         let url = s3
             .get_object()
             .bucket(bucket)
             .key(key)
-            .set_version_id(storage["versionId"].as_str().map(str::to_owned))
+            .version_id(version)
             .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(
                 StdDuration::from_secs(3600),
             )?)
