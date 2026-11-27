@@ -262,7 +262,7 @@ async fn creator_session<'a>(
     }
 }
 
-fn password_input(request: &Request, id: &str) -> Result<(String, String), Response> {
+fn json_body(request: &Request, id: &str) -> Result<Value, Response> {
     let body = request.body.as_deref().unwrap_or_default();
     let bytes = if request.is_base64_encoded {
         STANDARD
@@ -279,12 +279,16 @@ fn password_input(request: &Request, id: &str) -> Result<(String, String), Respo
             "Request body exceeds 10 MiB",
         ));
     }
-    let body: Value = if bytes.is_empty() {
-        json!({})
+    if bytes.is_empty() {
+        Ok(json!({}))
     } else {
         serde_json::from_slice(&bytes)
-            .map_err(|_| error(400, id, "invalid_json", "Request body must be JSON"))?
-    };
+            .map_err(|_| error(400, id, "invalid_json", "Request body must be JSON"))
+    }
+}
+
+fn password_input(request: &Request, id: &str) -> Result<(String, String), Response> {
+    let body = json_body(request, id)?;
     let field = |name: &str| {
         body[name]
             .as_str()
@@ -676,6 +680,27 @@ fn collection_not_found(id: &str) -> Response {
     error(404, id, "collection_not_found", "Collection not found.")
 }
 
+fn migration_request(request: &Request, routing_configured: bool, id: &str) -> Response {
+    if let Err(response) = json_body(request, id) {
+        return response;
+    }
+    if routing_configured {
+        error(
+            503,
+            id,
+            "migration_worker_unavailable",
+            "This cell has read-only routing access; migration execution is not configured",
+        )
+    } else {
+        error(
+            503,
+            id,
+            "regional_control_unavailable",
+            "This cell is not configured with a managed routing control plane",
+        )
+    }
+}
+
 async fn migration_history(
     request: &Request,
     runtime: &Runtime,
@@ -806,7 +831,10 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
             "This account does not have creator access in this instance.",
         );
     };
-    let requested = if request.raw_path == "/v1/migrations/me" {
+    let requested = if matches!(
+        request.raw_path.as_str(),
+        "/v1/migrations/me" | "/v1/migrations"
+    ) {
         None
     } else {
         creator_selection(request).or_else(|| {
@@ -831,6 +859,9 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let creator_id = requested.as_ref().unwrap_or(default_id);
     match repository.owned_creator(creator_id, &subject).await {
         Ok(Some(record)) => {
+            if request.raw_path == "/v1/migrations" {
+                return migration_request(request, runtime.routing.is_some(), id);
+            }
             if request.raw_path == "/v1/migrations/me" {
                 return migration_history(request, runtime, &record, id).await;
             }
@@ -959,6 +990,29 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             ))
     {
         return creator_read(&request, runtime, &id).await;
+    }
+    if (method, path) == ("POST", "/v1/migrations") {
+        return creator_read(&request, runtime, &id).await;
+    }
+    if (method, path) == ("POST", "/v1/auth/sign-up") {
+        return error(
+            404,
+            &id,
+            "local_auth_unavailable",
+            "This instance uses an external identity provider",
+        );
+    }
+    if matches!(
+        (method, path),
+        ("GET" | "POST", "/v1/auth/email-verification")
+            | ("POST", "/v1/auth/email-verification/complete")
+    ) {
+        return error(
+            404,
+            &id,
+            "email_verification_unavailable",
+            "Account email verification is unavailable.",
+        );
     }
     if (method, path) == ("GET", "/v1/host-capabilities") {
         if let Err(response) = creator_session(&request, runtime, &id).await {
@@ -1201,6 +1255,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(creator_selection(&request).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn migration_requests_parse_body_before_reporting_read_only_control() {
+        let request = |body| {
+            serde_json::from_value(json!({
+                "rawPath":"/v1/migrations", "requestContext":{"http":{"method":"POST"}}, "body":body
+            }))
+            .unwrap()
+        };
+        for (configured, body, status, code) in [
+            (false, "{", 400, "invalid_json"),
+            (false, "{}", 503, "regional_control_unavailable"),
+            (true, "{}", 503, "migration_worker_unavailable"),
+        ] {
+            let response = migration_request(&request(body), configured, "req");
+            assert_eq!(response.status_code, status);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body).unwrap()["error"]["code"],
+                code
+            );
+        }
     }
 
     #[test]
