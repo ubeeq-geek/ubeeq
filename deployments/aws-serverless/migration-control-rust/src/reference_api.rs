@@ -676,6 +676,67 @@ fn collection_not_found(id: &str) -> Response {
     error(404, id, "collection_not_found", "Collection not found.")
 }
 
+async fn migration_history(
+    request: &Request,
+    runtime: &Runtime,
+    creator: &Value,
+    id: &str,
+) -> Response {
+    let Some(store) = &runtime.routing else {
+        return error(
+            503,
+            id,
+            "regional_control_unavailable",
+            "This cell is not configured with a managed routing control plane",
+        );
+    };
+    let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
+    let param = |key| {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_ref())
+    };
+    let limit = param("limit")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| !value.is_nan() && *value != 0.0)
+        .unwrap_or(50.0)
+        .clamp(1.0, 100.0);
+    let Some(creator_id) = creator["id"].as_str().filter(|value| !value.is_empty()) else {
+        return error(500, id, "internal_error", "Creator ID is missing");
+    };
+    if limit.fract() != 0.0 {
+        return error(
+            500,
+            id,
+            "internal_error",
+            "Migration page limit must be an integer",
+        );
+    }
+    match store
+        .creator_migrations(
+            creator_id,
+            limit as i32,
+            param("cursor").filter(|value| !value.is_empty()),
+        )
+        .await
+    {
+        Ok((migrations, cursor)) => {
+            let mut body = json!({"migrations":migrations, "requestId":id});
+            if let Some(cursor) = cursor {
+                body["nextCursor"] = json!(cursor);
+            }
+            respond(200, id, body)
+        }
+        Err(_) => error(
+            500,
+            id,
+            "internal_error",
+            "Unable to read migration history",
+        ),
+    }
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -745,13 +806,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
             "This account does not have creator access in this instance.",
         );
     };
-    let requested = creator_selection(request).or_else(|| {
-        collection
-            .as_ref()?
-            .get("creatorId")?
-            .as_str()
-            .map(str::to_owned)
-    });
+    let requested = if request.raw_path == "/v1/migrations/me" {
+        None
+    } else {
+        creator_selection(request).or_else(|| {
+            collection
+                .as_ref()?
+                .get("creatorId")?
+                .as_str()
+                .map(str::to_owned)
+        })
+    };
     if requested
         .as_ref()
         .is_some_and(|requested| !ids.contains(requested))
@@ -766,6 +831,9 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let creator_id = requested.as_ref().unwrap_or(default_id);
     match repository.owned_creator(creator_id, &subject).await {
         Ok(Some(record)) => {
+            if request.raw_path == "/v1/migrations/me" {
+                return migration_history(request, runtime, &record, id).await;
+            }
             if request.raw_path == "/v1/creators/me" {
                 return respond(200, id, json!({"creator": record, "requestId": id}));
             }
@@ -883,7 +951,11 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         && (collection_path(path).is_some()
             || matches!(
                 path,
-                "/v1/creators" | "/v1/creators/me" | "/v1/works" | "/v1/collections"
+                "/v1/creators"
+                    | "/v1/creators/me"
+                    | "/v1/works"
+                    | "/v1/collections"
+                    | "/v1/migrations/me"
             ))
     {
         return creator_read(&request, runtime, &id).await;
