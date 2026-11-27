@@ -790,7 +790,7 @@ impl CreatorRecords<'_> {
     }
 }
 
-async fn replace_collection_members(
+async fn mutate_collection(
     request: &Request,
     repository: &CreatorRecords<'_>,
     creator: &Value,
@@ -812,9 +812,33 @@ async fn replace_collection_members(
         Ok(body) => body,
         Err(response) => return Ok(response),
     };
-    let (revision, requested, expected) = match membership_intent(&body, id) {
-        Ok(intent) => intent,
-        Err(response) => return Ok(response),
+    let deleting = request.request_context.http.method == "DELETE";
+    let (revision, membership) = if deleting {
+        let Some(revision) = body["revision"]
+            .as_u64()
+            .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
+        else {
+            return Ok(error(
+                400,
+                id,
+                "invalid_request",
+                "A current collection revision is required.",
+            ));
+        };
+        if body.as_object().is_none_or(|fields| fields.len() != 1) {
+            return Ok(error(
+                400,
+                id,
+                "invalid_request",
+                "Collection request contains unsupported fields.",
+            ));
+        }
+        (revision, None)
+    } else {
+        match membership_intent(&body, id) {
+            Ok((revision, requested, expected)) => (revision, Some((requested, expected))),
+            Err(response) => return Ok(response),
+        }
     };
     let directory_id = collection_directory_id(repository.instance, creator_id)?;
     let directory_row = repository.read("hostRecords", &directory_id).await?;
@@ -848,33 +872,113 @@ async fn replace_collection_members(
     if collection["revision"].as_u64() != Some(revision) || revision >= 9_007_199_254_740_991 {
         return Ok(conflict());
     }
-    if collection["status"] == "deleted" {
-        return Ok(collection_not_found(id));
-    }
-    if old != expected {
-        return Ok(error(
-            409,
-            id,
-            "revision_conflict",
-            "Collection order changed; refresh before saving.",
-        ));
-    }
-    for work_id in &requested {
-        if repository.read("works", work_id).await?.is_none_or(|work| {
-            work["id"] != work_id.as_str()
-                || !same_creator_region(&work, creator)
-                || work["status"] == "deleted"
-        }) {
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let mut cover_guard = None;
+    let requested = if let Some((requested, expected)) = membership {
+        if collection["status"] == "deleted" {
+            return Ok(collection_not_found(id));
+        }
+        if old != expected {
             return Ok(error(
-                400,
+                409,
                 id,
-                "invalid_works",
-                "Choose active Works owned by this Creator.",
+                "revision_conflict",
+                "Collection order changed; refresh before saving.",
             ));
         }
-    }
-    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    collection["collectionManagement"] = revised_members(&collection, &requested, &now);
+        for work_id in &requested {
+            if repository.read("works", work_id).await?.is_none_or(|work| {
+                work["id"] != work_id.as_str()
+                    || !same_creator_region(&work, creator)
+                    || work["status"] == "deleted"
+            }) {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_works",
+                    "Choose active Works owned by this Creator.",
+                ));
+            }
+        }
+        collection["collectionManagement"] = revised_members(&collection, &requested, &now);
+        requested
+    } else {
+        if collection["status"] == "deleted" {
+            return Ok(respond(
+                200,
+                id,
+                json!({"collection":collection_view(&collection, old, true),"requestId":id}),
+            ));
+        }
+        if collection["workPublicationHistoryAt"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Ok(error(
+                500,
+                id,
+                "internal_error",
+                "Works have been published to this collection. Archive it instead of deleting it.",
+            ));
+        }
+        if let Some(cover_id) = collection["coverAssetId"].as_str() {
+            let asset = repository.read("assets", cover_id).await?;
+            let Some(asset) = asset.filter(|asset| {
+                same_creator_region(asset, creator)
+                    && asset["status"] == "ready"
+                    && asset["mimeType"]
+                        .as_str()
+                        .is_some_and(|mime| mime.starts_with("image/"))
+            }) else {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_cover",
+                    "Choose an active private image owned by this Creator.",
+                ));
+            };
+            let source = asset
+                .get("originalStorage")
+                .filter(|value| !value.is_null())
+                .unwrap_or(&asset["storage"]);
+            if source["scope"] != "private"
+                || source["bucket"].as_str().is_none_or(str::is_empty)
+                || source["byteLength"]
+                    .as_u64()
+                    .is_none_or(|length| !(1..=9_007_199_254_740_991).contains(&length))
+            {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_cover",
+                    "Choose an active private image owned by this Creator.",
+                ));
+            }
+            if source["key"]
+                .as_str()
+                .is_none_or(|key| !delivery_key(key, repository.cell, creator_id))
+            {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_cover",
+                    "Cover source custody requires reconciliation.",
+                ));
+            }
+            let revision = asset["revision"].as_u64().ok_or("Missing cover revision")?;
+            cover_guard = Some(repository.item_guard(
+                &format!("assets#{cover_id}"),
+                "record",
+                Some(("revision", AttributeValue::N(revision.to_string()))),
+            )?);
+        }
+        collection["status"] = json!("deleted");
+        collection["deletedAt"] = json!(now);
+        if let Some(fields) = collection.as_object_mut() {
+            fields.remove("archivedAt");
+        }
+        old
+    };
     collection["revision"] = json!(revision + 1);
     collection["updatedAt"] = json!(now);
     if collection.to_string().len() > 300 * 1024 {
@@ -894,7 +998,7 @@ async fn replace_collection_members(
     let creator_revision = creator["revision"]
         .as_u64()
         .ok_or("Missing Creator revision")?;
-    let actions = vec![
+    let mut actions = vec![
         repository.replace_revisioned("collections", &collection, revision)?,
         repository.replace_revisioned("hostRecords", &directory, directory_revision)?,
         repository.item_guard(
@@ -910,6 +1014,7 @@ async fn replace_collection_members(
         repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
         repository.advance_host_fence().await?,
     ];
+    actions.extend(cover_guard);
     match repository
         .client
         .transact_write_items()
@@ -1859,26 +1964,18 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                 if record["dataHomeRegion"] != runtime.cell.region {
                     return error(404, id, "creator_not_found", "Creator not found.");
                 }
-                if request.request_context.http.method == "PUT" {
-                    return match replace_collection_members(
-                        request,
-                        &repository,
-                        &record,
-                        collection,
-                        id,
-                    )
-                    .await
+                if matches!(
+                    request.request_context.http.method.as_str(),
+                    "PUT" | "DELETE"
+                ) {
+                    return match mutate_collection(request, &repository, &record, collection, id)
+                        .await
                     {
                         Ok(response) => response,
                         Err(failure) if failure.to_string() == DIRECTORY_ERROR => {
                             error(500, id, "internal_error", DIRECTORY_ERROR)
                         }
-                        Err(_) => error(
-                            500,
-                            id,
-                            "internal_error",
-                            "Unable to update Collection order",
-                        ),
+                        Err(_) => error(500, id, "internal_error", "Unable to update Collection"),
                     };
                 }
                 let result = async {
@@ -2113,10 +2210,10 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     {
         return creator_read(&request, runtime, &id).await;
     }
-    if method == "PUT"
+    if matches!(method, "PUT" | "DELETE")
         && let Some((_, works)) = collection_path(path)
     {
-        if works {
+        if works == (method == "PUT") {
             return creator_read(&request, runtime, &id).await;
         }
         return error(
