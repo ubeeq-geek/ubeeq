@@ -5252,6 +5252,154 @@ async fn operator_claim(
         .filter(|claim| claim["actorId"] == subject && claim["instanceId"] == repository.instance))
 }
 
+async fn create_moderation_hold(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Some(claim) = operator_claim(&repository, &actor).await? else {
+        return Ok(operator_denied(id));
+    };
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let required = |field| {
+        body[field]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(subject_type), Some(subject_id)) = (required("subjectType"), required("subjectId"))
+    else {
+        return Ok(error(
+            400,
+            id,
+            "invalid_request",
+            "Hold subjectType and subjectId are required.",
+        ));
+    };
+    let reason = body["reason"].as_str();
+    let key = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+        .map(|(_, value)| value.trim());
+    if key.is_some_and(|key| key.is_empty() || key.encode_utf16().count() > 200) {
+        return Ok(error(
+            400,
+            id,
+            "invalid_idempotency_key",
+            "Use a non-empty idempotency key of at most 200 characters",
+        ));
+    }
+    let hold_id = key
+        .map(|key| {
+            format!(
+                "hold-{}",
+                upload_digest(&json!([repository.instance, repository.cell, actor, key]))
+            )
+        })
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let reply =
+        |status, hold| private_response(respond(status, id, json!({"hold":hold,"requestId":id})));
+    let replay = |hold: Value| {
+        if hold["id"] == hold_id
+            && hold["instanceId"] == repository.instance
+            && hold["homeCellId"] == repository.cell
+            && hold["dataHomeRegion"] == runtime.cell.region
+            && hold["subjectType"] == subject_type
+            && hold["subjectId"] == subject_id
+            && hold["reason"].as_str() == reason
+        {
+            reply(200, hold)
+        } else {
+            error(
+                409,
+                id,
+                "idempotency_conflict",
+                "The idempotency key belongs to a different moderation hold.",
+            )
+        }
+    };
+    if let Some(existing) = repository.read("moderationHolds", &hold_id).await? {
+        if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+            return Ok(operator_denied(id));
+        }
+        return Ok(replay(existing));
+    }
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    let mut hold = json!({"id":hold_id,"instanceId":repository.instance,"homeCellId":repository.cell,
+        "dataHomeRegion":runtime.cell.region,"dataHomeAssignedAt":now,"routingRevision":1,
+        "revision":1,"createdAt":now,"updatedAt":now,"subjectType":subject_type,"subjectId":subject_id,"state":"active"});
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"moderation.hold_created",
+        "actorId":actor,"subjectId":subject_id,"payload":{"holdId":hold_id}});
+    if let Some(reason) = reason {
+        hold["reason"] = json!(reason);
+        audit["payload"]["reason"] = json!(reason);
+    }
+    rehome_import(&mut audit, &hold, &now);
+    let fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let actions = vec![
+        repository.create_item("moderationHolds", &hold)?,
+        repository.create_item("auditEvents", &audit)?,
+        repository.advance_fence(fence, repository.marker(fence).await?)?,
+        repository.item_guard(
+            &format!("instanceOperators#{}", repository.instance),
+            "record",
+            Some(("value", attribute(&claim))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ];
+    match client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(reply(201, hold)),
+        Err(failure) => {
+            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+                return Ok(operator_denied(id));
+            }
+            if let Some(existing) = repository.read("moderationHolds", &hold_id).await? {
+                return Ok(replay(existing));
+            }
+            if matches!(
+                failure.as_service_error(),
+                Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                    if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+            ) {
+                return Ok(error(
+                    409,
+                    id,
+                    "revision_conflict",
+                    "Moderation evidence changed. Retry the same request.",
+                ));
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 async fn release_moderation_hold(
     request: &Request,
     runtime: &Runtime,
@@ -5589,6 +5737,18 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if (method, path) == ("POST", "/v1/operations/holds") {
+        return create_moderation_hold(&request, runtime, &id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "operations_unavailable",
+                    "Moderation holds are temporarily unavailable.",
+                )
+            });
+    }
     if method == "POST"
         && let Some(hold_id) = path
             .strip_suffix("/release")
