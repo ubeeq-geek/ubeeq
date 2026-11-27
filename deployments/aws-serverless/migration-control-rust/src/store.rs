@@ -54,19 +54,56 @@ fn required<'a>(document: &'a Value, key: &str) -> Result<&'a str, Failure> {
         .ok_or_else(|| format!("Missing control-plane field {key}.").into())
 }
 
-pub fn migration_cursor(input: &str) -> Result<HashMap<String, AttributeValue>, Failure> {
+fn control_cursor(
+    partition: &str,
+    input: &str,
+) -> Result<HashMap<String, AttributeValue>, Failure> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let value: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(input)?)?;
     let sk = value["sk"].as_str().filter(|sk| !sk.is_empty());
     match sk {
         Some(sk)
-            if value["pk"] == "migration"
+            if value["pk"] == partition
                 && value.as_object().is_some_and(|object| object.len() == 2) =>
         {
-            Ok(key("migration", sk))
+            Ok(key(partition, sk))
         }
         _ => Err("Invalid control-plane cursor.".into()),
     }
+}
+
+fn nonempty(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| !text.trim().is_empty())
+}
+
+fn valid_endpoint(value: &Value) -> bool {
+    value
+        .as_str()
+        .and_then(|endpoint| url::Url::parse(endpoint).ok())
+        .is_some_and(|url| {
+            url.scheme() == "https"
+                && url.path() == "/"
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+}
+
+fn valid_route(value: &Value) -> bool {
+    [
+        &value["creatorId"],
+        &value["homeCellId"],
+        &value["homeRegion"],
+    ]
+    .into_iter()
+    .all(nonempty)
+        && valid_endpoint(&value["endpoint"])
+        && value["routingRevision"]
+            .as_u64()
+            .is_some_and(|revision| (1..=9_007_199_254_740_991).contains(&revision))
+        && value["updatedAt"].as_str().is_some_and(|date| {
+            time::OffsetDateTime::parse(date, &time::format_description::well_known::Rfc3339)
+                .is_ok()
+        })
 }
 
 fn migration_matches(value: &Value, creator: &str) -> Result<bool, Failure> {
@@ -75,18 +112,6 @@ fn migration_matches(value: &Value, creator: &str) -> Result<bool, Failure> {
     }
     let source = &value["source"];
     let destination = &value["destination"];
-    let nonempty = |value: &Value| value.as_str().is_some_and(|text| !text.trim().is_empty());
-    let valid_endpoint = |value: &Value| {
-        value
-            .as_str()
-            .and_then(|endpoint| url::Url::parse(endpoint).ok())
-            .is_some_and(|url| {
-                url.scheme() == "https"
-                    && url.path() == "/"
-                    && url.username().is_empty()
-                    && url.password().is_none()
-            })
-    };
     let valid = [
         &value["id"],
         &source["homeCellId"],
@@ -181,37 +206,78 @@ impl MigrationStore {
         limit: i32,
         cursor: Option<&str>,
     ) -> Result<(Vec<Value>, Option<String>), Failure> {
+        self.migrations(Some(creator), limit, cursor).await
+    }
+
+    pub async fn migrations(
+        &self,
+        creator: Option<&str>,
+        limit: i32,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Value>, Option<String>), Failure> {
+        let (mut items, cursor) = self
+            .list_control("migration", "checkpoint", limit, cursor)
+            .await?;
+        if let Some(creator) = creator {
+            items.retain(|item| item["creatorId"] == creator);
+        }
+        for item in &items {
+            let creator = required(item, "creatorId")?;
+            migration_matches(item, creator)?;
+        }
+        Ok((items, cursor))
+    }
+
+    pub async fn routes(
+        &self,
+        limit: i32,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Value>, Option<String>), Failure> {
+        let (items, cursor) = self.list_control("route", "route", limit, cursor).await?;
+        if !items.iter().all(valid_route) {
+            return Err("Cell route is invalid".into());
+        }
+        Ok((items, cursor))
+    }
+
+    async fn list_control(
+        &self,
+        partition: &str,
+        field: &str,
+        limit: i32,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<Value>, Option<String>), Failure> {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let page = self
             .client
             .query()
             .table_name(&self.table)
             .key_condition_expression("pk = :pk")
-            .expression_attribute_values(":pk", AttributeValue::S("migration".into()))
+            .expression_attribute_values(":pk", AttributeValue::S(partition.into()))
             .limit(limit)
-            .set_exclusive_start_key(cursor.map(migration_cursor).transpose()?)
+            .set_exclusive_start_key(
+                cursor
+                    .map(|value| control_cursor(partition, value))
+                    .transpose()?,
+            )
             .send()
             .await?;
-        let mut items = Vec::new();
-        for mut item in page.items.unwrap_or_default() {
-            let checkpoint = document(
-                item.remove("checkpoint")
-                    .ok_or("Missing migration checkpoint")?,
-            )?;
-            if migration_matches(&checkpoint, creator)? {
-                items.push(checkpoint);
-            }
-        }
+        let items = page
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut item| document(item.remove(field).ok_or("Missing control-plane document")?))
+            .collect::<Result<Vec<_>, Failure>>()?;
         let cursor = page
             .last_evaluated_key
             .filter(|key| !key.is_empty())
             .map(|key| -> Result<String, Failure> {
                 let sk = key
                     .get("sk")
-                    .and_then(|key| key.as_s().ok())
-                    .ok_or("Missing migration cursor key")?;
+                    .and_then(|value| value.as_s().ok())
+                    .ok_or("Missing control-plane cursor key")?;
                 Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(
-                    &serde_json::json!({"pk":"migration","sk":sk}),
+                    &serde_json::json!({"pk":partition,"sk":sk}),
                 )?))
             })
             .transpose()?;
@@ -303,10 +369,15 @@ mod migration_history_tests {
         let encode =
             |pk: &str| URL_SAFE_NO_PAD.encode(format!(r#"{{"pk":"{pk}","sk":"checkpoint"}}"#));
         assert_eq!(
-            migration_cursor(&encode("migration")).unwrap(),
+            control_cursor("migration", &encode("migration")).unwrap(),
             key("migration", "checkpoint")
         );
-        assert!(migration_cursor(&encode("route")).is_err());
+        assert!(control_cursor("migration", &encode("route")).is_err());
+        assert!(control_cursor("route", &encode("migration")).is_err());
+        assert_eq!(
+            control_cursor("route", &encode("route")).unwrap(),
+            key("route", "checkpoint")
+        );
         assert!(!migration_matches(&serde_json::json!({"creatorId":"other"}), "creator").unwrap());
         assert!(migration_matches(&serde_json::json!({"creatorId":"creator"}), "creator").is_err());
     }

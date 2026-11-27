@@ -1666,35 +1666,15 @@ async fn migration_history(
             "This cell is not configured with a managed routing control plane",
         );
     };
-    let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
-    let param = |key| {
-        params
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.as_ref())
+    let (limit, cursor, _) = match regional_page(request, id) {
+        Ok(page) => page,
+        Err(response) => return response,
     };
-    let limit = param("limit")
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| !value.is_nan() && *value != 0.0)
-        .unwrap_or(50.0)
-        .clamp(1.0, 100.0);
     let Some(creator_id) = creator["id"].as_str().filter(|value| !value.is_empty()) else {
         return error(500, id, "internal_error", "Creator ID is missing");
     };
-    if limit.fract() != 0.0 {
-        return error(
-            500,
-            id,
-            "internal_error",
-            "Migration page limit must be an integer",
-        );
-    }
     match store
-        .creator_migrations(
-            creator_id,
-            limit as i32,
-            param("cursor").filter(|value| !value.is_empty()),
-        )
+        .creator_migrations(creator_id, limit, cursor.as_deref())
         .await
     {
         Ok((migrations, cursor)) => {
@@ -1711,6 +1691,90 @@ async fn migration_history(
             "Unable to read migration history",
         ),
     }
+}
+
+fn regional_page(
+    request: &Request,
+    id: &str,
+) -> Result<(i32, Option<String>, Option<String>), Response> {
+    let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
+    let param = |key| {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_ref())
+    };
+    let limit = param("limit")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| !value.is_nan() && *value != 0.0)
+        .unwrap_or(50.0)
+        .clamp(1.0, 100.0);
+    if limit.fract() != 0.0 {
+        return Err(error(
+            500,
+            id,
+            "internal_error",
+            "Regional page limit must be an integer",
+        ));
+    }
+    let optional = |key| {
+        param(key)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    Ok((limit as i32, optional("cursor"), optional("creatorId")))
+}
+
+async fn list_regional_control(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    routes: bool,
+) -> Result<Response, Failure> {
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let Some((client, table)) = &runtime.records else {
+        return Ok(operator_denied(id));
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    if operator_claim(&repository, &actor).await?.is_none() {
+        return Ok(operator_denied(id));
+    }
+    let Some(store) = &runtime.routing else {
+        return Ok(error(
+            503,
+            id,
+            "regional_control_unavailable",
+            "This cell is not configured with a managed routing control plane",
+        ));
+    };
+    let (limit, cursor, creator) = match regional_page(request, id) {
+        Ok(page) => page,
+        Err(response) => return Ok(response),
+    };
+    let (field, (items, cursor)) = if routes {
+        ("routes", store.routes(limit, cursor.as_deref()).await?)
+    } else {
+        (
+            "migrations",
+            store
+                .migrations(creator.as_deref(), limit, cursor.as_deref())
+                .await?,
+        )
+    };
+    let mut body = json!({"requestId":id});
+    body[field] = json!(items);
+    if let Some(cursor) = cursor {
+        body["nextCursor"] = json!(cursor);
+    }
+    Ok(private_response(respond(200, id, body)))
 }
 
 fn item_key(pk: &str, sk: &str) -> HashMap<String, AttributeValue> {
@@ -6188,6 +6252,23 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if method == "GET"
+        && matches!(
+            path,
+            "/v1/operations/regional/routes" | "/v1/operations/regional/migrations"
+        )
+    {
+        return list_regional_control(&request, runtime, &id, path.ends_with("/routes"))
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    500,
+                    &id,
+                    "internal_error",
+                    "Unable to read regional control metadata",
+                )
+            });
+    }
     if (method, path) == ("POST", "/v1/operations/jobs/run-next") {
         return run_processing_job(&request, runtime, &id)
             .await
@@ -6770,6 +6851,16 @@ mod tests {
                 "/ready",
                 500,
                 json!({"error": {"code": "internal_error", "message": "UBEEQ_RECORDS_TABLE is not configured", "requestId": "test-id"}}),
+            ),
+            (
+                "/v1/operations/regional/routes",
+                401,
+                json!({"error":{"code":"authentication_required","message":"A bearer session is required","requestId":"test-id"}}),
+            ),
+            (
+                "/v1/operations/regional/migrations",
+                401,
+                json!({"error":{"code":"authentication_required","message":"A bearer session is required","requestId":"test-id"}}),
             ),
         ] {
             let request = serde_json::from_value(json!({
