@@ -158,6 +158,7 @@ struct Runtime {
     records: Option<(Client, String)>,
     delivery: Option<(aws_sdk_s3::Client, String)>,
     public_base_url: String,
+    queue: Option<(aws_sdk_sqs::Client, String)>,
     routing: Option<MigrationStore>,
     identity: Option<CognitoIdentity>,
     password_authentication: bool,
@@ -3535,6 +3536,369 @@ async fn initiate_upload(
     upload_response(&row["value"], runtime, id)
 }
 
+fn completion_upload_id(path: &str) -> Option<&str> {
+    single_path_id(path.strip_suffix("/complete")?, "/v1/uploads/")
+}
+
+fn processing_job_id(cell: &str, intent: &str) -> String {
+    let hash: String = Sha256::digest(format!("{cell}:{intent}").as_bytes())
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("job-{hash}")
+}
+
+async fn complete_upload(
+    body: &Value,
+    repository: &CreatorRecords<'_>,
+    runtime: &Runtime,
+    creator: &Value,
+    work: &Value,
+    actor: &str,
+    upload_id: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    let work_id = work["id"].as_str().ok_or("Missing Work ID")?;
+    if !same_creator_region(work, creator) || work["routingRevision"] != creator["routingRevision"]
+    {
+        return Ok(error(
+            409,
+            id,
+            "data_home_mismatch",
+            "Work and creator data homes do not match",
+        ));
+    }
+    let invalid = || {
+        error(
+            400,
+            id,
+            "invalid_upload_completion",
+            "An exact checksum and byte length are required.",
+        )
+    };
+    let Some(checksum) = body["checksum"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+    else {
+        return Ok(invalid());
+    };
+    let Some(length) = body["byteLength"]
+        .as_u64()
+        .or_else(|| {
+            body["byteLength"]
+                .as_str()
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .filter(|length| *length <= 9_007_199_254_740_991)
+    else {
+        return Ok(invalid());
+    };
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let row_id = format!(
+        "upload-{}",
+        upload_digest(&json!([repository.instance, "runtime-upload", upload_id]))
+    );
+    let Some(mut row) = repository.read("hostRecords", &row_id).await? else {
+        return Ok(error(
+            404,
+            id,
+            "upload_not_found",
+            "Upload session was not found.",
+        ));
+    };
+    if row["instanceId"] != repository.instance
+        || row["homeCellId"] != repository.cell
+        || row["namespace"] != "runtime-upload"
+        || row["key"] != upload_id
+        || row["scopeId"] != creator_id
+        || row["value"]["workId"] != work_id
+        || row["value"]["creatorId"] != creator_id
+        || row["value"]["uploadId"] != upload_id
+        || row["value"]["schemaVersion"] != 1
+    {
+        return Ok(error(
+            409,
+            id,
+            "upload_scope_conflict",
+            "Upload belongs to a different Work or Creator.",
+        ));
+    }
+    let completion = json!({"checksum":checksum,"byteLength":length});
+    let intent = &row["value"];
+    if !intent["provider"].is_object() {
+        return Ok(error(
+            409,
+            id,
+            "upload_not_issued",
+            "Upload initiation must finish first.",
+        ));
+    }
+    if intent["expected"]["byteLength"] != length
+        || intent["expected"]["checksum"] != checksum
+        || intent
+            .get("completion")
+            .is_some_and(|recorded| recorded != &completion)
+    {
+        return Ok(error(
+            409,
+            id,
+            "upload_completion_conflict",
+            "Upload completion differs from its requested size or checksum.",
+        ));
+    }
+    let asset_id = format!(
+        "asset-{}",
+        upload_digest(&json!([repository.instance, upload_id]))
+    );
+    if intent["assetId"] != asset_id {
+        return Err("Invalid upload asset identity".into());
+    }
+    if intent["phase"] != "completed" {
+        if intent["phase"] != "issued" || intent.get("accounting").is_some() {
+            return Ok(error(
+                409,
+                id,
+                "upload_recovery_pending",
+                "This upload is being recovered. Retry shortly.",
+            ));
+        }
+        if work["status"] == "deleted" {
+            return Ok(error(
+                409,
+                id,
+                "upload_work_unavailable",
+                "The upload Work is no longer writable.",
+            ));
+        }
+        let (s3, bucket) = runtime
+            .delivery
+            .as_ref()
+            .ok_or("Upload storage is not configured")?;
+        let mut object = intent["provider"]["object"].clone();
+        let key = format!(
+            "cells/{}/creators/{creator_id}/uploads/{upload_id}",
+            repository.cell
+        );
+        let mime = intent["expected"]["mimeType"]
+            .as_str()
+            .ok_or("Missing upload content type")?;
+        if object["bucket"] != bucket.as_str()
+            || object["key"] != key
+            || !delivery_key(&key, repository.cell, creator_id)
+            || object["scope"] != "private"
+            || object["checksum"] != checksum
+            || object["contentType"] != mime
+            || object["byteLength"] != length
+        {
+            return Err("Upload provider evidence is invalid".into());
+        }
+        let bytes: Result<Vec<_>, _> = (0..64)
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&checksum[offset..offset + 2], 16))
+            .collect();
+        let encoded = STANDARD.encode(bytes?);
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+            .send()
+            .await?;
+        let metadata = head.metadata().ok_or("Missing upload metadata")?;
+        let version = head
+            .version_id()
+            .filter(|version| !version.is_empty() && *version != "null")
+            .ok_or("Missing immutable upload version")?;
+        if head.checksum_sha256() != Some(&encoded)
+            || head.content_length() != Some(length as i64)
+            || head.content_type() != Some(mime)
+            || metadata.get("checksum") != Some(&checksum)
+            || metadata.get("scope").map(String::as_str) != Some("private")
+            || metadata.get("bytelength") != Some(&length.to_string())
+        {
+            return Err("S3 object differs from signed upload".into());
+        }
+        object["versionId"] = json!(version);
+        if let Some(written) = head.last_modified() {
+            let timestamp = OffsetDateTime::from_unix_timestamp(written.secs())?
+                .replace_nanosecond(written.subsec_nanos())?;
+            object["writtenAt"] = json!(iso_millis(timestamp)?);
+        }
+        let now = iso_millis(OffsetDateTime::now_utc())?;
+        let mut asset = json!({"id":asset_id,"creatorId":creator_id,"workId":work_id,"mimeType":mime,"checksum":checksum,
+            "objectVersion":version,"status":"pending","storage":object,"uploadId":upload_id});
+        let mut evidence = json!({"id":format!("upload-evidence-{upload_id}"),"subjectType":"asset","subjectId":asset_id,
+            "source":"reference.upload","payload":{"checksum":checksum,"byteLength":length}});
+        let mut audit = json!({"id":format!("upload-audit-{upload_id}"),"action":"asset.upload_completed","actorId":actor,
+            "subjectId":asset_id,"payload":{"workId":work_id,"uploadId":upload_id}});
+        for record in [&mut asset, &mut evidence, &mut audit] {
+            rehome_import(record, creator, &now);
+        }
+        let job_intent = format!("asset-process:{asset_id}:{version}");
+        let job_id = processing_job_id(repository.cell, &job_intent);
+        let job = json!({"id":job_id,"cellId":repository.cell,"type":"asset.process","payload":{"assetId":asset_id},
+            "idempotencyKey":job_intent,"maxAttempts":3,"correlationId":id,"requestCorrelationId":id,
+            "state":"queued","attempt":0,"availableAt":now,"revision":1,"createdAt":now,"updatedAt":now});
+        let revision = row["revision"]
+            .as_u64()
+            .filter(|revision| *revision < 9_007_199_254_740_991)
+            .ok_or("Invalid upload revision")?;
+        row["value"]["completion"] = completion.clone();
+        row["value"]["completedObject"] = object;
+        row["value"]["phase"] = json!("completed");
+        row["value"]["completedAt"] = json!(now);
+        row["value"]["correlationId"] = json!(id);
+        row["revision"] = json!(revision + 1);
+        row["updatedAt"] = json!(now);
+        let asset_fence = "__ubeeq_repository_snapshot#assets";
+        let actions = vec![
+            repository.create_item("assets", &asset)?,
+            repository.create_item("moderationEvidence", &evidence)?,
+            repository.create_item("auditEvents", &audit)?,
+            repository.create_item("durableJobs", &job)?,
+            repository.replace_revisioned("hostRecords", &row, revision)?,
+            repository.advance_host_fence().await?,
+            repository.advance_fence(asset_fence, repository.marker(asset_fence).await?)?,
+            repository.item_guard(
+                &format!("works#{work_id}"),
+                "record",
+                Some((
+                    "revision",
+                    AttributeValue::N(
+                        work["revision"]
+                            .as_u64()
+                            .ok_or("Missing Work revision")?
+                            .to_string(),
+                    ),
+                )),
+            )?,
+            repository.item_guard(
+                &format!("creators#{creator_id}"),
+                "record",
+                Some((
+                    "revision",
+                    AttributeValue::N(
+                        creator["revision"]
+                            .as_u64()
+                            .ok_or("Missing Creator revision")?
+                            .to_string(),
+                    ),
+                )),
+            )?,
+            repository.item_guard(
+                hold_fence,
+                "fence",
+                hold_version.map(|version| ("version", AttributeValue::S(version))),
+            )?,
+            repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+        ];
+        if let Err(failure) = repository
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(actions))
+            .send()
+            .await
+        {
+            let saved = repository
+                .read("hostRecords", &row_id)
+                .await?
+                .ok_or("Upload disappeared")?;
+            if saved["value"]["phase"] != "completed" || saved["value"]["completion"] != completion
+            {
+                return Err(failure.into());
+            }
+            row = saved;
+        }
+    }
+    let version = row["value"]["completedObject"]["versionId"]
+        .as_str()
+        .ok_or("Missing completed object version")?;
+    let asset = repository
+        .read("assets", &asset_id)
+        .await?
+        .filter(|asset| {
+            same_creator_region(asset, creator)
+                && asset["workId"] == work_id
+                && asset["objectVersion"] == version
+        })
+        .ok_or("Completed upload asset requires reconciliation")?;
+    let job_intent = format!("asset-process:{asset_id}:{version}");
+    let job_id = processing_job_id(repository.cell, &job_intent);
+    let mut job = repository
+        .read("durableJobs", &job_id)
+        .await?
+        .filter(|job| {
+            job["cellId"] == repository.cell
+                && job["type"] == "asset.process"
+                && job["payload"]["assetId"] == asset_id
+                && job["idempotencyKey"] == job_intent
+        });
+    let mut pending = row["value"]["queueState"] != "queued";
+    if pending
+        && job.is_some()
+        && let Some((sqs, queue)) = &runtime.queue
+    {
+        if sqs
+            .send_message()
+            .queue_url(queue)
+            .message_body(
+                json!({"id":job_id,"type":"asset.process","cellId":repository.cell}).to_string(),
+            )
+            .send()
+            .await
+            .is_ok()
+        {
+            pending = false;
+            let revision = row["revision"]
+                .as_u64()
+                .filter(|revision| *revision < 9_007_199_254_740_991)
+                .ok_or("Invalid upload revision")?;
+            row["value"]["queueState"] = json!("queued");
+            row["value"]["jobId"] = json!(job_id);
+            row["revision"] = json!(revision + 1);
+            row["updatedAt"] = json!(iso_millis(OffsetDateTime::now_utc())?);
+            let actions = vec![
+                repository.replace_revisioned("hostRecords", &row, revision)?,
+                repository.advance_host_fence().await?,
+                repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+            ];
+            let _ = repository
+                .client
+                .transact_write_items()
+                .set_transact_items(Some(actions))
+                .send()
+                .await;
+        }
+    }
+    if let Some(fields) = job.as_mut().and_then(Value::as_object_mut) {
+        let trace = fields
+            .remove("requestCorrelationId")
+            .filter(Value::is_string);
+        fields.remove("correlationId");
+        if let Some(trace) = trace {
+            fields.insert("correlationId".into(), trace);
+        }
+    }
+    Ok(respond(
+        202,
+        id,
+        json!({"asset":asset,"job":if pending { None } else { job },"queuePending":pending,"requestId":id}),
+    ))
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -3550,7 +3914,8 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
     };
-    let upload = if request.raw_path == "/v1/uploads" {
+    let completion_id = completion_upload_id(&request.raw_path);
+    let upload = if request.raw_path == "/v1/uploads" || completion_id.is_some() {
         let body = match json_body(request, id) {
             Ok(body) => body,
             Err(response) => return response,
@@ -3674,6 +4039,23 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         Ok(Some(record)) => {
             if let Some(work) = work {
                 if let Some(body) = upload {
+                    if let Some(upload_id) = completion_id {
+                        return match complete_upload(
+                            &body,
+                            &repository,
+                            runtime,
+                            &record,
+                            &work,
+                            &subject,
+                            upload_id,
+                            id,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => error(500, id, "internal_error", "Unable to complete upload"),
+                        };
+                    }
                     return match initiate_upload(
                         &body,
                         &repository,
@@ -4063,6 +4445,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     {
         return creator_read(&request, runtime, &id).await;
     }
+    if method == "POST" && completion_upload_id(path).is_some() {
+        return creator_read(&request, runtime, &id).await;
+    }
     if (method, path) == ("POST", "/v1/imports/validate") {
         return match validate_import(&request, runtime, &id).await {
             Ok(response) => response,
@@ -4239,6 +4624,9 @@ async fn main() -> Result<(), Error> {
         cell,
         records,
         delivery,
+        queue: env::var("UBEEQ_JOBS_QUEUE_URL")
+            .ok()
+            .map(|queue| (aws_sdk_sqs::Client::new(&configuration), queue)),
         public_base_url: env::var("UBEEQ_PUBLIC_BASE_URL").unwrap_or_default(),
         routing,
         identity,
@@ -4271,6 +4659,7 @@ mod tests {
             records: None,
             delivery: None,
             public_base_url: String::new(),
+            queue: None,
             routing: None,
             identity: None,
             password_authentication: false,
@@ -4433,6 +4822,16 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn upload_completion_uses_the_existing_job_identity() {
+        assert_eq!(
+            processing_job_id("cell", "asset-process:asset:version"),
+            "job-05fb6223eb3b4ac075b9c7d9fa621b05"
+        );
+        assert_eq!(completion_upload_id("/v1/uploads/id/complete"), Some("id"));
+        assert_eq!(completion_upload_id("/v1/uploads/id/other/complete"), None);
     }
 
     #[test]
