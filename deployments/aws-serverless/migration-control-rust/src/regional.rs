@@ -1,3 +1,5 @@
+#[cfg(feature = "worker")]
+mod export;
 pub mod portability;
 mod records;
 

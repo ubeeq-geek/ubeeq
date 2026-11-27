@@ -1,3 +1,5 @@
+pub mod publication;
+
 use std::{cmp::Ordering, collections::HashSet};
 
 use icu_collator::{Collator, CollatorBorrowed, options::CollatorOptions};
@@ -241,6 +243,48 @@ pub fn verified_unsigned(manifest: &Value) -> Result<Value, Failure> {
     Ok(unsigned)
 }
 
+/// Build and sign metadata from a source cell's gathered records.
+pub fn create_export(mut input: Value) -> Result<Value, Failure> {
+    let records = input["publications"]
+        .as_array()
+        .ok_or("Missing publication export records.")?;
+    let publications = records
+        .iter()
+        .map(publication::project)
+        .collect::<Result<Vec<_>, _>>()?;
+    input["publications"] = json!(publications);
+    input["schemaVersion"] = json!("2");
+    input["secretsExcluded"] = json!(true);
+    input["exclusions"] = json!([
+        "credentials",
+        "secrets",
+        "transient_worker_leases",
+        "live_queue_state",
+        "provider_runtime_state",
+        "original_object_bytes"
+    ]);
+    let fields = input
+        .as_object()
+        .ok_or("Export manifest must be an object.")?;
+    let unsigned: Map<_, _> = MANIFEST_FIELDS
+        .iter()
+        .map(|field| {
+            fields
+                .get(*field)
+                .cloned()
+                .map(|value| ((*field).to_owned(), value))
+                .ok_or("Export manifest is incomplete.")
+        })
+        .collect::<Result<_, _>>()?;
+    let mut manifest = Value::Object(unsigned);
+    if contains_secret(&manifest) {
+        return Err("Export manifest contains credentials or secrets.".into());
+    }
+    verify_record_graph(&manifest)?;
+    manifest["checksum"] = json!(checksum(&manifest)?);
+    Ok(manifest)
+}
+
 /// Validate the record graph before the regional restore begins writing records.
 pub fn verify_record_graph(unsigned: &Value) -> Result<(), Failure> {
     let creator = &unsigned["creator"];
@@ -320,6 +364,9 @@ pub fn verify_record_graph(unsigned: &Value) -> Result<(), Failure> {
                 return Err("Export contains an unredacted integration account.".into());
             }
         }
+    }
+    for record in records("publications")? {
+        publication::validate(record)?;
     }
     let work_ids: HashSet<_> = records("works")?
         .iter()
@@ -532,6 +579,15 @@ mod tests {
         publication["id"] = json!("publication");
         publication["workId"] = json!("work");
         manifest["publications"] = json!([publication]);
+        manifest["publications"][0]["executionAuthority"] = json!({"token":"fixture"});
+        let signed = create_export(manifest.clone()).unwrap();
+        let decoded = verified_unsigned(&signed).unwrap();
+        assert!(
+            decoded["publications"][0]
+                .get("executionAuthority")
+                .is_none()
+        );
+        assert!(verify_record_graph(&decoded).is_ok());
         assert!(verify_record_graph(&manifest).is_ok());
         manifest["publications"][0]["workId"] = json!("foreign");
         assert!(verify_record_graph(&manifest).is_err());

@@ -107,7 +107,11 @@ impl RegionalStore {
             .transpose()
     }
 
-    async fn record(&self, repository: &str, id: &str) -> Result<Option<Value>, Failure> {
+    pub(super) async fn record(
+        &self,
+        repository: &str,
+        id: &str,
+    ) -> Result<Option<Value>, Failure> {
         let Some(mut item) = self.get(record_key(repository, id)).await? else {
             return Ok(None);
         };
@@ -139,7 +143,47 @@ impl RegionalStore {
         Ok(Some(value))
     }
 
-    fn owns(&self, value: &Value) -> bool {
+    pub(super) async fn records(&self, repository: &str) -> Result<Vec<Value>, Failure> {
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let output = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name("repository-id-index")
+                .key_condition_expression("#repository = :repository")
+                .expression_attribute_names("#repository", "repository")
+                .expression_attribute_values(":repository", AttributeValue::S(repository.into()))
+                .set_exclusive_start_key(cursor)
+                .limit(100)
+                .send()
+                .await?;
+            for mut item in output.items.unwrap_or_default() {
+                let value = document(
+                    item.remove("value")
+                        .ok_or("Missing regional repository document.")?,
+                )?;
+                if self.owns(&value) {
+                    let expected = record_item(repository, &value)?;
+                    if ["id", "pk", "sk", "repository", "revision"]
+                        .iter()
+                        .any(|field| item.get(*field) != expected.get(*field))
+                    {
+                        return Err("Regional repository record envelope conflicts.".into());
+                    }
+                    records.push(value);
+                }
+            }
+            cursor = output.last_evaluated_key.filter(|key| !key.is_empty());
+            if cursor.is_none() {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
+    pub(super) fn owns(&self, value: &Value) -> bool {
         value["instanceId"] == self.instance
             && value["homeCellId"] == self.cell
             && value["dataHomeRegion"] == self.region
@@ -206,7 +250,11 @@ impl RegionalStore {
         .await
     }
 
-    fn require_hold(&self, command: &RegionalCommand, value: &Value) -> Result<(), Failure> {
+    pub(super) fn require_hold(
+        &self,
+        command: &RegionalCommand,
+        value: &Value,
+    ) -> Result<(), Failure> {
         if value["subjectType"] != "creator"
             || value["subjectId"] != command.creator()
             || value["reason"] != command.hold_reason()
