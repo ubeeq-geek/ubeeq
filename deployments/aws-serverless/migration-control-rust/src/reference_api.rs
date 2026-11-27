@@ -5279,11 +5279,31 @@ fn cancelled_job(mut job: Value, reason: Option<&str>, now: &str) -> Result<Valu
     Ok(job)
 }
 
-async fn cancel_processing_job(
+fn recovered_job(mut job: Value, now: &str) -> Result<Value, Failure> {
+    let revision = job["revision"]
+        .as_u64()
+        .and_then(|revision| revision.checked_add(1))
+        .ok_or("Invalid job revision")?;
+    let fields = job.as_object_mut().ok_or("Invalid job record")?;
+    fields.remove("leaseExpiresAt");
+    fields.insert("state".into(), json!("queued"));
+    fields.insert("availableAt".into(), json!(now));
+    fields.insert("updatedAt".into(), json!(now));
+    fields.insert("revision".into(), json!(revision));
+    Ok(job)
+}
+
+enum JobOperation {
+    Cancel,
+    Recover,
+}
+
+async fn change_processing_job(
     request: &Request,
     runtime: &Runtime,
     id: &str,
     job_id: &str,
+    operation: JobOperation,
 ) -> Result<Response, Failure> {
     let Some((client, table)) = &runtime.records else {
         return Ok(error(
@@ -5306,9 +5326,14 @@ async fn cancel_processing_job(
     let Some(claim) = operator_claim(&repository, &actor).await? else {
         return Ok(operator_denied(id));
     };
-    let body = match json_body(request, id) {
-        Ok(body) => body,
-        Err(response) => return Ok(response),
+    let recover = matches!(operation, JobOperation::Recover);
+    let body = if recover {
+        Value::Null
+    } else {
+        match json_body(request, id) {
+            Ok(body) => body,
+            Err(response) => return Ok(response),
+        }
     };
     let missing = || error(404, id, "job_not_found", "Job was not found");
     let Some(job) = repository.read("durableJobs", job_id).await?.filter(|job| {
@@ -5316,10 +5341,10 @@ async fn cancel_processing_job(
     }) else {
         return Ok(missing());
     };
-    let Some(asset_id) = job["payload"]["assetId"].as_str() else {
+    let Some(asset_id) = job["payload"]["assetId"].as_str().map(str::to_owned) else {
         return Ok(missing());
     };
-    let Some(asset) = repository.read("assets", asset_id).await?.filter(|asset| {
+    let Some(asset) = repository.read("assets", &asset_id).await?.filter(|asset| {
         asset["id"] == asset_id
             && asset["instanceId"] == repository.instance
             && asset["homeCellId"] == repository.cell
@@ -5331,20 +5356,40 @@ async fn cancel_processing_job(
         response.body.clear();
         response
     };
-    if job["state"] == "cancelled" {
+    if !recover && job["state"] == "cancelled" {
         return Ok(reply());
+    }
+    if recover
+        && !matches!(
+            job["state"].as_str(),
+            Some("retry_scheduled" | "dead_lettered")
+        )
+    {
+        return Ok(error(
+            409,
+            id,
+            "job_not_recoverable",
+            "Only retry-scheduled or dead-lettered jobs can be recovered.",
+        ));
     }
     let now = iso_millis(OffsetDateTime::now_utc())?;
     let revision = job["revision"].as_u64().ok_or("Invalid job revision")?;
     let asset_key = format!("assets#{asset_id}");
-    let next = cancelled_job(job, body["reason"].as_str(), &now)?;
+    let next = if recover {
+        recovered_job(job, &now)?
+    } else {
+        cancelled_job(job, body["reason"].as_str(), &now)?
+    };
     let audit_id = Uuid::new_v4().to_string();
     let mut audit = json!({"id":audit_id,"action":"job.cancelled","actorId":actor,"subjectId":job_id,"payload":{}});
+    if recover {
+        audit["action"] = json!("job.recovered");
+        audit["payload"]["type"] = json!("asset.process");
+    }
     rehome_import(&mut audit, &asset, &now);
-    let writes = vec![
+    let mut writes = vec![
         repository.replace_revisioned("durableJobs", &next, revision)?,
         repository.create_item("auditEvents", &audit)?,
-        repository.item_guard(&asset_key, "record", Some(("value", attribute(&asset))))?,
         repository.item_guard(
             &format!("instanceOperators#{}", repository.instance),
             "record",
@@ -5352,20 +5397,41 @@ async fn cancel_processing_job(
         )?,
         repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
     ];
-    match client
+    if recover && asset["status"] == "failed" {
+        let mut pending = asset;
+        let revision = pending["revision"]
+            .as_u64()
+            .ok_or("Invalid asset revision")?;
+        let version = pending["objectVersion"]
+            .as_str()
+            .filter(|version| !version.is_empty())
+            .ok_or("Missing asset object version")?;
+        pending["processingUsageKey"] = json!(format!(
+            "asset-processing:{asset_id}:{version}:recovery:{audit_id}"
+        ));
+        pending["status"] = json!("pending");
+        pending["revision"] = json!(revision.checked_add(1).ok_or("Invalid asset revision")?);
+        pending["updatedAt"] = json!(now);
+        let fence = "__ubeeq_repository_snapshot#assets";
+        writes.push(repository.replace_revisioned("assets", &pending, revision)?);
+        writes.push(repository.advance_fence(fence, repository.marker(fence).await?)?);
+    } else {
+        writes.push(repository.item_guard(
+            &asset_key,
+            "record",
+            Some(("value", attribute(&asset))),
+        )?);
+    }
+    if let Err(failure) = client
         .transact_write_items()
         .set_transact_items(Some(writes))
         .send()
         .await
     {
-        Ok(_) => Ok(reply()),
-        Err(failure) => {
-            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
-                return Ok(operator_denied(id));
-            }
-            if repository.read("auditEvents", &audit_id).await?.as_ref() == Some(&audit) {
-                return Ok(reply());
-            }
+        if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+            return Ok(operator_denied(id));
+        }
+        if repository.read("auditEvents", &audit_id).await?.as_ref() != Some(&audit) {
             if matches!(failure.as_service_error(),
                 Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
                     if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
@@ -5377,9 +5443,32 @@ async fn cancel_processing_job(
                     "The processing job changed. Try the request again.",
                 ));
             }
-            Err(failure.into())
+            return Err(failure.into());
         }
     }
+    if !recover {
+        return Ok(reply());
+    }
+    if let Some((sqs, queue)) = &runtime.queue {
+        // The scheduled worker can reclaim the durable job if SQS does not acknowledge.
+        if sqs
+            .send_message()
+            .queue_url(queue)
+            .message_body(
+                json!({"id":job_id,"type":"asset.process","cellId":repository.cell}).to_string(),
+            )
+            .send()
+            .await
+            .is_err()
+        {
+            eprintln!("Unable to notify worker of a committed processing job recovery");
+        }
+    }
+    Ok(private_response(respond(
+        200,
+        id,
+        json!({"job":public_job(next),"requestId":id}),
+    )))
 }
 
 fn operator_denied(id: &str) -> Response {
@@ -6111,21 +6200,27 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
                 )
             });
     }
-    if method == "POST"
-        && let Some(job_id) = path
-            .strip_suffix("/cancel")
-            .and_then(|path| single_path_id(path, "/v1/operations/jobs/"))
-    {
-        return cancel_processing_job(&request, runtime, &id, job_id)
-            .await
-            .unwrap_or_else(|_| {
-                error(
-                    503,
-                    &id,
-                    "processing_unavailable",
-                    "The worker could not cancel the processing job.",
-                )
-            });
+    if method == "POST" {
+        for (suffix, operation) in [
+            ("/cancel", JobOperation::Cancel),
+            ("/recover", JobOperation::Recover),
+        ] {
+            if let Some(job_id) = path
+                .strip_suffix(suffix)
+                .and_then(|path| single_path_id(path, "/v1/operations/jobs/"))
+            {
+                return change_processing_job(&request, runtime, &id, job_id, operation)
+                    .await
+                    .unwrap_or_else(|_| {
+                        error(
+                            503,
+                            &id,
+                            "processing_unavailable",
+                            "The worker could not update the processing job.",
+                        )
+                    });
+            }
+        }
     }
     let review_case_id = single_path_id(path, "/v1/operations/review-cases/");
     if method == "POST" && (path == "/v1/operations/review-cases" || review_case_id.is_some()) {
@@ -6526,6 +6621,21 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_preserves_attempts_trace_and_failure_evidence() {
+        let job = json!({"state":"dead_lettered","revision":4,"attempt":3,"maxAttempts":3,
+            "leaseExpiresAt":"stale","requestCorrelationId":"original","lastError":{"code":"previous"}});
+        let next = recovered_job(job, "now").unwrap();
+        assert_eq!(next["state"], "queued");
+        assert_eq!(next["revision"], 5);
+        assert_eq!(next["attempt"], 3);
+        assert_eq!(next["maxAttempts"], 3);
+        assert_eq!(next["availableAt"], "now");
+        assert_eq!(next["requestCorrelationId"], "original");
+        assert_eq!(next["lastError"]["code"], "previous");
+        assert!(next.get("leaseExpiresAt").is_none());
+    }
 
     #[test]
     fn cancellation_fences_leases_and_preserves_attempts_and_trace() {

@@ -342,7 +342,7 @@ impl ProcessingWorker {
         let mut evidence = json!({"id":Uuid::new_v4().to_string(),"subjectType":"asset","subjectId":asset_id,
             "source":"local.processing","payload":payload});
         let mut usage = json!({"id":Uuid::new_v4().to_string(),"accountId":asset["creatorId"],
-            "meter":"processing_units","quantity":1,"idempotencyKey":format!("asset-processing:{asset_id}:{}",field(&asset,"objectVersion")?)});
+            "meter":"processing_units","quantity":1,"idempotencyKey":plan.usage_key});
         let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"asset.processing_completed","subjectId":asset_id,
             "payload":{"jobId":lease["id"],"sourceVersionId":asset["objectVersion"]}});
         if let Some(actor) = actor {
