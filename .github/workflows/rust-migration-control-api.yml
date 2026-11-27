@@ -1,6 +1,7 @@
 name: Rust migration control API
 
 on:
+  workflow_call:
   pull_request:
     paths:
       - .github/workflows/rust-migration-control-api.yml
@@ -29,7 +30,7 @@ jobs:
     steps:
       - name: Install build dependencies
         working-directory: .
-        run: dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config git tar gzip zip
+        run: dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config git tar gzip zip unzip binutils
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -42,24 +43,22 @@ jobs:
       - name: Build the Linux Lambda ZIPs
         run: |
           cargo build --locked --release --features worker
-          test -x target/release/bootstrap
-          zip -j migration-control-api-rust.zip target/release/bootstrap
-          mkdir -p target/worker-package
-          cp target/release/migration-worker target/worker-package/bootstrap
-          test -x target/worker-package/bootstrap
-          zip -j migration-control-worker-rust.zip target/worker-package/bootstrap
-          mkdir -p target/cell-package
-          cp target/release/migration-cell target/cell-package/bootstrap
-          test -x target/cell-package/bootstrap
-          zip -j migration-cell-rust.zip target/cell-package/bootstrap
-          mkdir -p target/reference-api-package
-          cp target/release/reference-api target/reference-api-package/bootstrap
-          test -x target/reference-api-package/bootstrap
-          zip -j reference-api-rust.zip target/reference-api-package/bootstrap
-          mkdir -p target/reference-worker-package
-          cp target/release/reference-worker target/reference-worker-package/bootstrap
-          test -x target/reference-worker-package/bootstrap
-          zip -j reference-worker-rust.zip target/reference-worker-package/bootstrap
+          while read -r binary package; do
+            bootstrap="target/lambda/$package/bootstrap"
+            install -D -m 0755 "target/release/$binary" "$bootstrap"
+            LC_ALL=C readelf -h "$bootstrap" | grep 'Advanced Micro Devices X86-64'
+            archive="$package-rust.zip"
+            rm -f "$archive"
+            zip -j "$archive" "$bootstrap"
+            test "$(unzip -Z1 "$archive")" = bootstrap
+            unzip -tq "$archive"
+          done <<'PACKAGES'
+          bootstrap migration-control-api
+          migration-worker migration-control-worker
+          migration-cell migration-cell
+          reference-api reference-api
+          reference-worker reference-worker
+          PACKAGES
       - uses: actions/upload-artifact@v4
         with:
           name: migration-control-api-rust-al2023-x86-64

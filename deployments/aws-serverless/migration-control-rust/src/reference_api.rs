@@ -4308,6 +4308,18 @@ fn publication_request_work(path: &str) -> Option<&str> {
     single_path_id(path.strip_suffix("/publications")?, "/v1/works/")
 }
 
+fn publication_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut conflict = false;
+    for code in codes {
+        match code {
+            Some("ConditionalCheckFailed" | "TransactionConflict") => conflict = true,
+            Some("None") => {}
+            _ => return false,
+        }
+    }
+    conflict
+}
+
 impl CreatorRecords<'_> {
     async fn publication_receipt(
         &self,
@@ -4633,6 +4645,17 @@ async fn publish_work(
                 .await?
             {
                 Ok(receipt)
+            } else if matches!(
+                failure.as_service_error(),
+                Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                    if publication_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+            ) {
+                Ok(error(
+                    409,
+                    id,
+                    "revision_conflict",
+                    "Publication evidence changed. Retry the same request.",
+                ))
             } else {
                 Err(failure.into())
             }
@@ -5062,13 +5085,13 @@ async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, 
         .as_str()
         .filter(|creator| !creator.is_empty())
         .ok_or("Missing Work Creator")?;
-    if !repository
+    let Some(creator_record) = repository
         .read("creators", creator)
         .await?
-        .is_some_and(|record| local(&record) && record["id"] == creator)
-    {
+        .filter(|record| local(record) && record["id"] == creator)
+    else {
         return Ok(None);
-    }
+    };
     let assets_fence = "__ubeeq_repository_snapshot#assets";
     let publications_fence = "__ubeeq_repository_snapshot#publications";
     let assets_version = repository.marker(assets_fence).await?;
@@ -5174,6 +5197,14 @@ async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, 
         }
         asset["delivery"] = json!({"url":url.uri(), "expiresAt":expires_at});
         delivered.push(asset);
+    }
+    if repository.marker(assets_fence).await? != assets_version
+        || repository.marker(publications_fence).await? != publications_version
+        || repository.marker(hold_fence).await? != hold_version
+        || repository.read("works", work_id).await?.as_ref() != Some(&work)
+        || repository.read("creators", creator).await?.as_ref() != Some(&creator_record)
+    {
+        return Ok(None);
     }
     Ok(Some(
         json!({"work": work, "assets": delivered, "publications": publications}),
@@ -5511,6 +5542,22 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_retries_only_explicit_transaction_conflicts() {
+        assert!(publication_revision_conflict(
+            [Some("None"), Some("ConditionalCheckFailed")].into_iter()
+        ));
+        assert!(publication_revision_conflict(
+            [Some("TransactionConflict")].into_iter()
+        ));
+        assert!(!publication_revision_conflict([Some("None")].into_iter()));
+        assert!(!publication_revision_conflict([None].into_iter()));
+        assert!(!publication_revision_conflict(std::iter::empty()));
+        assert!(!publication_revision_conflict(
+            [Some("ConditionalCheckFailed"), Some("ValidationError")].into_iter()
+        ));
+    }
 
     #[tokio::test]
     async fn health_preserves_request_id_and_routes_require_configuration() {

@@ -43,7 +43,8 @@ export class AwsServerlessSingleCellStack extends Stack {
     const userPoolClient = userPool.addClient("ReferenceApi", { authFlows: { userPassword: true, userSrp: true } });
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
     const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../../apps/reference-api/lambda-package");
-    const referenceApiPublicBaseUrl = this.node.tryGetContext("referenceApiPublicBaseUrl") || process.env.UBEEQ_REFERENCE_API_PUBLIC_BASE_URL || "https://reference.invalid";
+    const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });
+    const referenceApiPublicBaseUrl = this.node.tryGetContext("referenceApiPublicBaseUrl") || process.env.UBEEQ_REFERENCE_API_PUBLIC_BASE_URL || api.apiEndpoint;
     const routingDirectoryTableName = this.node.tryGetContext("routingDirectoryTableName") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_NAME;
     const routingDirectoryTableArn = this.node.tryGetContext("routingDirectoryTableArn") || process.env.UBEEQ_ROUTING_DIRECTORY_TABLE_ARN;
     const routingDirectoryRegion = this.node.tryGetContext("routingDirectoryRegion") || process.env.UBEEQ_ROUTING_DIRECTORY_REGION;
@@ -112,7 +113,6 @@ export class AwsServerlessSingleCellStack extends Stack {
     if (rustReferenceWorkerAsset) recoverySchedule.addTarget(new eventTargets.LambdaFunction(worker));
     const jobDeadLetterAlarm = new cloudwatch.Alarm(this, "JobDeadLetterAlarm", { metric: deadLetters.metricApproximateNumberOfMessagesVisible(), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq durable jobs require manual recovery" });
     const url = health.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
-    const api = new apigwv2.HttpApi(this, "ReferenceApiGateway", { description: "Authenticated HTTP edge for the neutral Ubeeq reference API" });
     api.addRoutes({ path: "/{proxy+}", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiIntegration", health) });
     api.addRoutes({ path: "/", methods: [apigwv2.HttpMethod.ANY], integration: new apigwv2Integrations.HttpLambdaIntegration("ReferenceApiRootIntegration", health) });
     const apiErrorAlarm = new cloudwatch.Alarm(this, "ReferenceApiErrorAlarm", { metric: health.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }), threshold: 1, evaluationPeriods: 1, alarmDescription: "Ubeeq cell API Lambda returned an error" });
@@ -154,6 +154,19 @@ export class AwsServerlessSingleCellStack extends Stack {
       }
       new CfnOutput(this, "ReferenceApiCustomDomainUrl", { value: `https://${customDomainName}` });
     }
+    // The workspace uploads directly with a signed, conditional S3 PUT.
+    sourceStore.addCorsRule({
+      allowedMethods: [s3.HttpMethods.PUT],
+      allowedOrigins: [
+        webApi.apiEndpoint,
+        ...(webCustomDomainName && customDomainName ? [`https://${webCustomDomainName.replace(/\.$/, "")}`] : []),
+      ],
+      allowedHeaders: [
+        "content-type", "if-none-match", "x-amz-checksum-sha256",
+        "x-amz-meta-checksum", "x-amz-meta-scope", "x-amz-meta-bytelength",
+        "x-amz-sdk-checksum-algorithm",
+      ],
+    });
     new CfnOutput(this, "ReferenceApiUrl", { value: url.url });
     /** Private target registered with an operator multi-cell control plane. */
     new CfnOutput(this, "MigrationCellFunctionArn", { value: migrationCell.functionArn });

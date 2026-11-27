@@ -80,3 +80,27 @@ test('the native migration worker keeps partial SQS retries and allocates transf
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('a control plane supplied with both Rust assets synthesizes without a Node package', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'rust-multi-cell-'));
+  try {
+    const context = { referenceApiAssetPath: join(directory, 'missing-node-package') };
+    for (const option of ['rustMigrationControlApiAssetPath', 'rustMigrationControlWorkerAssetPath']) {
+      const asset = join(directory, option + '.zip');
+      await writeFile(asset, option);
+      context[option] = asset;
+    }
+    const app = new App({ outdir: join(directory, 'cdk.out'), context });
+    const stack = new AwsServerlessMultiCellStack(app, 'RustControlPlane', { env: { account: '111111111111', region: 'us-east-2' } });
+    const functions = Object.values(Template.fromStack(stack).findResources('AWS::Lambda::Function'));
+    assert.equal(functions.length, 2);
+    assert.equal(new Set(functions.map(({ Properties }) => Properties.Code.S3Key)).size, 2);
+    for (const { Properties } of functions) {
+      assert.equal(Properties.Runtime, 'provided.al2023');
+      assert.equal(Properties.Handler, 'bootstrap');
+      assert.deepEqual(Properties.Architectures ?? ['x86_64'], ['x86_64']);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

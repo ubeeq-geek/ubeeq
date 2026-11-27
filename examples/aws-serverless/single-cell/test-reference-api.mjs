@@ -2,19 +2,22 @@ import {publishReferenceWhenReady} from './reference-publication-retry.mjs';
 import {readReferenceOperator,releaseCreatedReferenceOperator} from './owned-reference-operator.mjs';
 /** Opt-in AWS example flow: Cognito bearer auth -> API Gateway -> direct S3 -> SQS worker -> publication -> delivery. */
 import { createHash, randomUUID } from "node:crypto";
-import { CognitoIdentityProviderClient, InitiateAuthCommand, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
+import { CognitoIdentityProviderClient, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { DeleteCommand, GetCommand, DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 
-const required = ["UBEEQ_AWS_API_URL", "UBEEQ_AWS_REGION", "UBEEQ_AWS_RECORDS_TABLE", "UBEEQ_AWS_OBJECT_BUCKET", "UBEEQ_AWS_USER_POOL_CLIENT_ID", "UBEEQ_AWS_TEST_USERNAME", "UBEEQ_AWS_TEST_PASSWORD"];
+const required = ["UBEEQ_AWS_API_URL", "UBEEQ_AWS_REGION", "UBEEQ_AWS_RECORDS_TABLE", "UBEEQ_AWS_OBJECT_BUCKET", "UBEEQ_AWS_TEST_USERNAME", "UBEEQ_AWS_TEST_PASSWORD"];
 const missing = required.filter((name) => !process.env[name]);
 if (missing.length) {
   console.error(`AWS reference API test requires: ${missing.join(", ")}`);
   process.exitCode = 2;
 } else {
   const region = process.env.UBEEQ_AWS_REGION;
-  const apiUrl = process.env.UBEEQ_AWS_API_URL.replace(/\/$/, "");
+  const webOrigin = process.env.UBEEQ_AWS_WEB_ORIGIN
+    ? new URL(process.env.UBEEQ_AWS_WEB_ORIGIN).origin
+    : undefined;
+  const apiUrl = webOrigin ? `${webOrigin}/api` : process.env.UBEEQ_AWS_API_URL.replace(/\/$/, "");
   const marker = `aws-api-e2e-${Date.now()}-${randomUUID().slice(0, 8)}`;
   const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
   const s3 = new S3Client({ region });
@@ -26,9 +29,13 @@ if (missing.length) {
     return { response, value };
   };
   try {
-    const auth = await new CognitoIdentityProviderClient({ region }).send(new InitiateAuthCommand({ AuthFlow: "USER_PASSWORD_AUTH", ClientId: process.env.UBEEQ_AWS_USER_POOL_CLIENT_ID, AuthParameters: { USERNAME: process.env.UBEEQ_AWS_TEST_USERNAME, PASSWORD: process.env.UBEEQ_AWS_TEST_PASSWORD } }));
-    const token = auth.AuthenticationResult?.AccessToken;
-    if (!token) throw new Error("Cognito did not return an access token for the disposable test identity.");
+    const auth = await call("/v1/auth/sign-in", { method: "POST", body: {
+      email: process.env.UBEEQ_AWS_TEST_USERNAME, password: process.env.UBEEQ_AWS_TEST_PASSWORD,
+    } });
+    const token = auth.value?.token;
+    if (auth.response.status !== 200 || typeof token !== "string" || !token) {
+      throw new Error(`The reference API sign-in failed (${auth.response.status}).`);
+    }
     const actualUser=await new CognitoIdentityProviderClient({region}).send(new GetUserCommand({AccessToken:token}));
     const beforeOperator=await readReferenceOperator(dynamo,process.env.UBEEQ_AWS_RECORDS_TABLE,instanceId);
     const creator = await call("/v1/creators", { method: "POST", token, body: { handle: marker, displayName: "AWS API E2E" } });
@@ -41,11 +48,25 @@ if (missing.length) {
     const work = await call("/v1/works", { method: "POST", token, body: { title: marker } });
     if (work.response.status !== 201) throw new Error(`Work creation failed: ${JSON.stringify(work.value)}`);
     created.add(work.value.work.id);
-    const bytes = Buffer.from("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89", "binary");
+    const bytes = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
     const checksum = createHash("sha256").update(bytes).digest("hex");
     const upload = await call("/v1/uploads", { method: "POST", token, body: { workId: work.value.work.id, mimeType: "image/png", byteLength: bytes.byteLength, checksum } });
     if (upload.response.status !== 201 || !upload.value.upload.parts?.[0]?.url) throw new Error(`Upload initiation did not issue a direct S3 URL: ${JSON.stringify(upload.value)}`);
-    const put = await fetch(upload.value.upload.parts[0].url, { method: "PUT", headers: upload.value.upload.parts[0].headers, body: bytes });
+    const part = upload.value.upload.parts[0];
+    if (webOrigin) {
+      const preflight = await fetch(part.url, { method: "OPTIONS", headers: {
+        origin: webOrigin,
+        "access-control-request-method": "PUT",
+        "access-control-request-headers": Object.keys(part.headers).join(","),
+      } });
+      if (!preflight.ok || preflight.headers.get("access-control-allow-origin") !== webOrigin) {
+        throw new Error(`S3 rejected the workspace upload preflight (${preflight.status}).`);
+      }
+    }
+    const put = await fetch(part.url, { method: "PUT", headers: { ...part.headers, ...(webOrigin ? { origin: webOrigin } : {}) }, body: bytes });
+    if (webOrigin && put.headers.get("access-control-allow-origin") !== webOrigin) {
+      throw new Error(`S3 did not allow the workspace to read the upload response (${put.status}).`);
+    }
     if (!put.ok) {
       // Provider XML may contain signed requests and temporary access tokens.
       const code = /<Code>([A-Za-z0-9]+)<\/Code>/.exec(await put.text())?.[1] ?? "UnknownProviderError";
@@ -56,11 +77,17 @@ if (missing.length) {
     created.add(completed.value.asset.id); created.add(completed.value.job.id); object = completed.value.asset.storage;
     const published=await publishReferenceWhenReady((path,options)=>call(path,{...options,token}),{workId:work.value.work.id,idempotencyKey:marker+'-publication'});
     created.add(published.intent.id);created.add(published.publication.id);
+    const replay = await publishReferenceWhenReady((path, options) => call(path, { ...options, token }), {
+      workId: work.value.work.id, idempotencyKey: marker + '-publication', attempts: 1,
+    });
+    if (!replay.idempotent || replay.intent.id !== published.intent.id || replay.publication.id !== published.publication.id) {
+      throw new Error("Publication replay did not return the original receipt.");
+    }
     const publicWork = await call(`/v1/public/works/${work.value.work.id}`);
     if (publicWork.response.status !== 200 || !publicWork.value.assets?.[0]?.delivery?.url) throw new Error(`Public work or delivery grant failed: ${JSON.stringify(publicWork.value)}`);
     const delivery = await fetch(publicWork.value.assets[0].delivery.url);
     if (!delivery.ok || !Buffer.from(await delivery.arrayBuffer()).equals(bytes)) throw new Error("Delivered object differs from the uploaded source version.");
-    console.log("AWS authenticated API upload, processing, publication, and delivery flow passed.");
+    console.log("AWS reference sign-in, upload, processing, publication, and delivery flow passed.");
   } finally {
     if (object?.key) await s3.send(new DeleteObjectCommand({ Bucket: process.env.UBEEQ_AWS_OBJECT_BUCKET, Key: object.key, VersionId: object.versionId })).catch(() => undefined);
     let cursor;

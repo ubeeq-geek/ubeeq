@@ -165,3 +165,45 @@ test('the Rust reference API retains its HTTP integrations and Cognito configura
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('a cell supplied with all Rust assets synthesizes without a Node package', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'rust-single-cell-'));
+  try {
+    const context = { referenceApiAssetPath: join(directory, 'missing-node-package') };
+    for (const option of ['rustReferenceApiAssetPath', 'rustWebAssetPath', 'rustReferenceWorkerAssetPath', 'rustMigrationCellAssetPath']) {
+      const asset = join(directory, option + '.zip');
+      await writeFile(asset, option);
+      context[option] = asset;
+    }
+    const app = new App({ outdir: join(directory, 'cdk.out'), context });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustCell', { env: { account: '111111111111', region: 'us-east-2' } });
+    const template = Template.fromStack(stack);
+    const functions = Object.values(template.findResources('AWS::Lambda::Function'));
+    assert.equal(functions.length, 4);
+    const endpoint = template.toJSON().Outputs.ReferenceApiGatewayUrl.Value;
+    template.hasResourceProperties('AWS::S3::Bucket', {
+      CorsConfiguration: { CorsRules: [{
+        AllowedMethods: ['PUT'],
+        AllowedOrigins: [template.toJSON().Outputs.ReferenceWebGatewayUrl.Value],
+        AllowedHeaders: [
+          'content-type', 'if-none-match', 'x-amz-checksum-sha256',
+          'x-amz-meta-checksum', 'x-amz-meta-scope', 'x-amz-meta-bytelength',
+          'x-amz-sdk-checksum-algorithm',
+        ],
+      }] },
+    });
+    const web = functions.find(({ Properties }) => 'UBEEQ_REFERENCE_WEB_API_URL' in Properties.Environment.Variables);
+    assert.deepEqual(web.Properties.Environment.Variables.UBEEQ_REFERENCE_WEB_API_URL, endpoint);
+    for (const { Properties } of functions.filter(({ Properties }) => 'UBEEQ_PUBLIC_BASE_URL' in Properties.Environment.Variables)) {
+      assert.deepEqual(Properties.Environment.Variables.UBEEQ_PUBLIC_BASE_URL, endpoint);
+    }
+    assert.equal(new Set(functions.map(({ Properties }) => Properties.Code.S3Key)).size, 4);
+    for (const { Properties } of functions) {
+      assert.equal(Properties.Runtime, 'provided.al2023');
+      assert.equal(Properties.Handler, 'bootstrap');
+      assert.deepEqual(Properties.Architectures ?? ['x86_64'], ['x86_64']);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
