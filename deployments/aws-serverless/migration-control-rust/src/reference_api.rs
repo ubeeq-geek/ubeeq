@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
-    store::MigrationStore,
+    store::{MigrationStore, document},
 };
 use url::Url;
 use uuid::Uuid;
@@ -155,6 +155,7 @@ fn creator_page(
     client: &Client,
     table: &str,
     cursor: Option<HashMap<String, AttributeValue>>,
+    limit: i32,
 ) -> QueryFluentBuilder {
     client
         .query()
@@ -163,7 +164,7 @@ fn creator_page(
         .key_condition_expression("#repository = :repository")
         .expression_attribute_names("#repository", "repository")
         .expression_attribute_values(":repository", AttributeValue::S("creators".into()))
-        .limit(1)
+        .limit(limit)
         .set_exclusive_start_key(cursor)
 }
 
@@ -186,7 +187,7 @@ async fn readiness(runtime: &Runtime, id: &str) -> Response {
     };
     let mut cursor = None;
     loop {
-        let page = match creator_page(client, table, cursor).send().await {
+        let page = match creator_page(client, table, cursor, 1).send().await {
             Ok(page) => page,
             Err(_) => return error(500, id, "internal_error", "Unable to check persistence"),
         };
@@ -225,7 +226,7 @@ async fn creator_session<'a>(
     request: &'a Request,
     runtime: &Runtime,
     id: &str,
-) -> Result<&'a str, Response> {
+) -> Result<(&'a str, String), Response> {
     let token = bearer(request).ok_or_else(|| {
         error(
             401,
@@ -239,8 +240,8 @@ async fn creator_session<'a>(
         None => None,
     };
     match scope {
-        Some(AccountScope::Creator) => Ok(token),
-        Some(AccountScope::Customer) => Err(error(
+        Some((AccountScope::Creator, subject)) => Ok((token, subject)),
+        Some((AccountScope::Customer, _)) => Err(error(
             403,
             id,
             "creator_access_denied",
@@ -349,6 +350,189 @@ fn sign_in_unavailable(id: &str) -> Response {
     )
 }
 
+fn creator_selection(request: &Request) -> Option<String> {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-creator-id"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            url::form_urlencoded::parse(request.raw_query_string.as_bytes())
+                .find_map(|(name, value)| (name == "creatorId").then(|| value.trim().to_owned()))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn accessible_creator_ids(
+    records: &mut [Value],
+    operator: Option<&str>,
+    subject: &str,
+) -> Vec<String> {
+    records.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    let operator = operator.or_else(|| {
+        records
+            .first()
+            .and_then(|first| first["subjectId"].as_str())
+    });
+    if operator.is_some_and(|operator| !operator.is_empty() && operator != subject) {
+        return Vec::new();
+    }
+    records
+        .iter()
+        .filter(|record| record["subjectId"].as_str() == Some(subject))
+        .filter_map(|record| record["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+struct CreatorRecords<'a> {
+    client: &'a Client,
+    table: &'a str,
+    cell: &'a str,
+    instance: &'a str,
+}
+
+impl CreatorRecords<'_> {
+    async fn read(
+        &self,
+        repository: &str,
+        id: &str,
+    ) -> Result<Option<Value>, ubeeq_migration_control_api::lifecycle::Failure> {
+        let item = self
+            .client
+            .get_item()
+            .table_name(self.table)
+            .key("pk", AttributeValue::S(format!("{repository}#{id}")))
+            .key("sk", AttributeValue::S("record".into()))
+            .consistent_read(true)
+            .send()
+            .await?
+            .item;
+        item.and_then(|mut item| item.remove("value"))
+            .map(document)
+            .transpose()
+    }
+
+    async fn list(&self) -> Result<Vec<Value>, ubeeq_migration_control_api::lifecycle::Failure> {
+        let mut records = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = creator_page(self.client, self.table, cursor, 100)
+                .send()
+                .await?;
+            for mut item in page.items.unwrap_or_default() {
+                if in_cell(&item, self.cell) {
+                    let record = document(item.remove("value").ok_or("Missing Creator record")?)?;
+                    if record["instanceId"].as_str() == Some(self.instance) {
+                        records.push(record);
+                    }
+                }
+            }
+            cursor = page.last_evaluated_key;
+            if cursor.as_ref().is_none_or(HashMap::is_empty) {
+                return Ok(records);
+            }
+        }
+    }
+
+    async fn owned_creator(
+        &self,
+        id: &str,
+        subject: &str,
+    ) -> Result<Option<Value>, ubeeq_migration_control_api::lifecycle::Failure> {
+        Ok(self.read("creators", id).await?.filter(|record| {
+            record["homeCellId"].as_str() == Some(self.cell)
+                && record["instanceId"].as_str() == Some(self.instance)
+                && record["subjectId"].as_str() == Some(subject)
+        }))
+    }
+}
+
+async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
+    let (_, subject) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let unavailable = || error(500, id, "internal_error", "Unable to read Creator records");
+    let Some((client, table)) = &runtime.records else {
+        return unavailable();
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Ok(claim) = repository
+        .read("instanceOperators", &runtime.instance_id)
+        .await
+    else {
+        return unavailable();
+    };
+    let operator = match &claim {
+        Some(record) => match record["actorId"].as_str().filter(|actor| !actor.is_empty()) {
+            Some(actor) => Some(actor),
+            None => return unavailable(),
+        },
+        None => None,
+    };
+    let ids = if operator.is_some_and(|actor| actor != subject) {
+        Vec::new()
+    } else {
+        let Ok(mut records) = repository.list().await else {
+            return unavailable();
+        };
+        accessible_creator_ids(&mut records, operator, &subject)
+    };
+    if request.raw_path == "/v1/creators" {
+        let mut creators = Vec::new();
+        for creator_id in ids {
+            match repository.owned_creator(&creator_id, &subject).await {
+                Ok(Some(record)) => creators.push(record),
+                Ok(None) => {}
+                Err(_) => return unavailable(),
+            }
+        }
+        return respond(200, id, json!({"creators": creators, "requestId": id}));
+    }
+    let Some(default_id) = ids.first() else {
+        return error(
+            403,
+            id,
+            "creator_access_denied",
+            "This account does not have creator access in this instance.",
+        );
+    };
+    let requested = creator_selection(request);
+    if requested
+        .as_ref()
+        .is_some_and(|requested| !ids.contains(requested))
+    {
+        return error(
+            403,
+            id,
+            "creator_not_accessible",
+            "The requested creator identity does not belong to your account.",
+        );
+    }
+    let creator_id = requested.as_ref().unwrap_or(default_id);
+    match repository.owned_creator(creator_id, &subject).await {
+        Ok(Some(record)) => respond(200, id, json!({"creator": record, "requestId": id})),
+        Ok(None) => error(
+            404,
+            id,
+            "creator_not_found",
+            if requested.is_some() {
+                "The selected creator was not found"
+            } else {
+                "No creator profile belongs to the current subject"
+            },
+        ),
+        Err(_) => unavailable(),
+    }
+}
+
 async fn handle(request: Request, runtime: &Runtime) -> Response {
     let id = request
         .headers
@@ -365,6 +549,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "operations_unavailable",
             "Operator operations are not configured",
         );
+    }
+    if method == "GET" && matches!(path, "/v1/creators" | "/v1/creators/me") {
+        return creator_read(&request, runtime, &id).await;
     }
     if (method, path) == ("GET", "/v1/host-capabilities") {
         if let Err(response) = creator_session(&request, runtime, &id).await {
@@ -383,7 +570,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     }
     if (method, path) == ("POST", "/v1/auth/sign-out") {
         let token = match creator_session(&request, runtime, &id).await {
-            Ok(token) => token,
+            Ok((token, _)) => token,
             Err(response) => return response,
         };
         if let Some(identity) = &runtime.identity
@@ -582,6 +769,31 @@ mod tests {
                 fields
             );
         }
+    }
+
+    #[test]
+    fn creator_reads_respect_claims_legacy_operator_and_selection() {
+        let mut records = [
+            json!({"id":"later","subjectId":"actor","createdAt":"2026-03-01T00:00:00.000Z"}),
+            json!({"id":"first","subjectId":"actor","createdAt":"2026-01-01T00:00:00.000Z"}),
+            json!({"id":"other","subjectId":"foreign","createdAt":"2026-02-01T00:00:00.000Z"}),
+        ];
+        assert_eq!(
+            accessible_creator_ids(&mut records, None, "actor"),
+            ["first", "later"]
+        );
+        assert!(accessible_creator_ids(&mut records, None, "foreign").is_empty());
+        assert!(accessible_creator_ids(&mut records, Some("foreign"), "actor").is_empty());
+        assert_eq!(
+            accessible_creator_ids(&mut records, Some("foreign"), "foreign"),
+            ["other"]
+        );
+        let request = serde_json::from_value(json!({
+            "rawPath":"/v1/creators/me", "rawQueryString":"creatorId=other",
+            "requestContext":{"http":{"method":"GET"}}, "headers":{"x-creator-id":" first "}
+        }))
+        .unwrap();
+        assert_eq!(creator_selection(&request).as_deref(), Some("first"));
     }
 
     #[test]

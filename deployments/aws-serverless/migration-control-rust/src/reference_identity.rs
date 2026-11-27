@@ -266,19 +266,19 @@ impl CognitoIdentity {
         Some((claims, user, scope))
     }
 
-    pub async fn verify_session(&self, token: &str) -> Option<AccountScope> {
-        let (claims, _, scope) = self.verified_user(token).await?;
-        Some(
-            if claims.groups.as_array().is_some_and(|groups| {
+    pub async fn verify_session(&self, token: &str) -> Option<(AccountScope, String)> {
+        let (claims, user, scope) = self.verified_user(token).await?;
+        let customer = scope == AccountScope::Customer
+            || claims.groups.as_array().is_some_and(|groups| {
                 groups
                     .iter()
                     .any(|role| role.as_str() == Some("customer_account"))
-            }) {
-                AccountScope::Customer
-            } else {
-                scope
-            },
-        )
+            });
+        Some(if customer {
+            (AccountScope::Customer, claims.sub)
+        } else {
+            (scope, user.username)
+        })
     }
 
     pub async fn authenticate(
