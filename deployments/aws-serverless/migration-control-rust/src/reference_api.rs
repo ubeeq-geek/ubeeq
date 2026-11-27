@@ -1635,6 +1635,10 @@ fn migration_request(request: &Request, routing_configured: bool, id: &str) -> R
     if let Err(response) = json_body(request, id) {
         return response;
     }
+    regional_write_unavailable(routing_configured, id)
+}
+
+fn regional_write_unavailable(routing_configured: bool, id: &str) -> Response {
     if routing_configured {
         error(
             503,
@@ -1725,18 +1729,22 @@ fn regional_page(
     Ok((limit as i32, optional("cursor"), optional("creatorId")))
 }
 
-async fn list_regional_control(
+fn regional_migration_command(path: &str) -> bool {
+    path.strip_prefix("/v1/operations/regional/migrations/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(id, command)| {
+            !id.is_empty() && matches!(command, "resume" | "rollback" | "retire")
+        })
+}
+
+async fn require_regional_operator(
     request: &Request,
     runtime: &Runtime,
     id: &str,
-    routes: bool,
-) -> Result<Response, Failure> {
-    let (_, actor) = match creator_session(request, runtime, id).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
-    };
+) -> Result<(), Response> {
+    let (_, actor) = creator_session(request, runtime, id).await?;
     let Some((client, table)) = &runtime.records else {
-        return Ok(operator_denied(id));
+        return Err(operator_denied(id));
     };
     let repository = CreatorRecords {
         client,
@@ -1744,16 +1752,29 @@ async fn list_regional_control(
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
     };
-    if operator_claim(&repository, &actor).await?.is_none() {
-        return Ok(operator_denied(id));
-    }
-    let Some(store) = &runtime.routing else {
-        return Ok(error(
+    match operator_claim(&repository, &actor).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(operator_denied(id)),
+        Err(_) => Err(error(
             503,
             id,
-            "regional_control_unavailable",
-            "This cell is not configured with a managed routing control plane",
-        ));
+            "operations_unavailable",
+            "Operator authorization is temporarily unavailable.",
+        )),
+    }
+}
+
+async fn list_regional_control(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    routes: bool,
+) -> Result<Response, Failure> {
+    if let Err(response) = require_regional_operator(request, runtime, id).await {
+        return Ok(response);
+    }
+    let Some(store) = &runtime.routing else {
+        return Ok(regional_write_unavailable(false, id));
     };
     let (limit, cursor, creator) = match regional_page(request, id) {
         Ok(page) => page,
@@ -6269,6 +6290,12 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
                 )
             });
     }
+    if method == "POST" && regional_migration_command(path) {
+        return match require_regional_operator(&request, runtime, &id).await {
+            Ok(()) => regional_write_unavailable(runtime.routing.is_some(), &id),
+            Err(response) => response,
+        };
+    }
     if (method, path) == ("POST", "/v1/operations/jobs/run-next") {
         return run_processing_job(&request, runtime, &id)
             .await
@@ -6970,6 +6997,22 @@ mod tests {
             "work",
             &assets
         ));
+    }
+
+    #[test]
+    fn regional_migration_commands_require_an_exact_path() {
+        for operation in ["resume", "rollback", "retire"] {
+            assert!(regional_migration_command(&format!(
+                "/v1/operations/regional/migrations/id/{operation}"
+            )));
+        }
+        for path in [
+            "/v1/operations/regional/migrations//resume",
+            "/v1/operations/regional/migrations/id/not-a-command",
+            "/v1/operations/regional/migrations/id/resume/extra",
+        ] {
+            assert!(!regional_migration_command(path));
+        }
     }
 
     #[test]

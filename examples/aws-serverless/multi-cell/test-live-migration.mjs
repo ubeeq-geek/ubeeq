@@ -148,6 +148,16 @@ if (missing.length) {
     await control.routingDirectory.create(sourceRoute);
     const requestOnly = new MigrationOrchestrator(control.routingDirectory, control.migrationCheckpoints, {});
     await requestOnly.request({ id: migrationId, creatorId, destination: { cellId: destination.cellId, region: destination.region, endpoint: `${destination.api}/` } });
+    if (process.env.UBEEQ_AWS_VERIFY_REGIONAL_OPERATOR_READS === "true") {
+      const path = `/v1/operations/regional/migrations/${encodeURIComponent(migrationId)}/resume`;
+      if ((await call(path, { method: "POST" })).response.status !== 401) {
+        throw new Error("Reference migration commands must require an operator session.");
+      }
+      const unavailable = await call(path, { method: "POST", token });
+      if (unavailable.response.status !== 503 || unavailable.value?.error?.code !== "migration_worker_unavailable") {
+        throw new Error("The reference API did not report a read-only migration control plane.");
+      }
+    }
     await commands.enqueue({ migrationId, operation: "resume", rollbackWindowSeconds: 300 });
     checkpoint = await waitFor(async () => { const value = await control.migrationCheckpoints.get(migrationId); return value?.state === "cutover" ? value : undefined; }, "migration cutover");
     if (checkpoint.objectCount !== checkpoint.verifiedObjectCount || checkpoint.objectCount !== 3) throw new Error(`Migration inventory verification failed: ${JSON.stringify(checkpoint)}`);
