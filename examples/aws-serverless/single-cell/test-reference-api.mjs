@@ -2,6 +2,7 @@ import {publishReferenceWhenReady} from './reference-publication-retry.mjs';
 import {readReferenceOperator,releaseCreatedReferenceOperator} from './owned-reference-operator.mjs';
 /** Opt-in AWS example flow: Cognito bearer auth -> API Gateway -> direct S3 -> SQS worker -> publication -> delivery. */
 import { createHash, randomUUID } from "node:crypto";
+import { setTimeout as wait } from "node:timers/promises";
 import { CognitoIdentityProviderClient, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { DeleteCommand, GetCommand, DynamoDBDocumentClient, ScanCommand } from "@aws-sdk/lib-dynamodb";
@@ -77,6 +78,27 @@ if (missing.length) {
     created.add(completed.value.asset.id); created.add(completed.value.job.id); object = completed.value.asset.storage;
     const published=await publishReferenceWhenReady((path,options)=>call(path,{...options,token}),{workId:work.value.work.id,idempotencyKey:marker+'-publication'});
     created.add(published.intent.id);created.add(published.publication.id);
+    if (process.env.UBEEQ_AWS_VERIFY_PROCESSING_JOBS === "true") {
+      const jobsPath = "/v1/operations/jobs?state=completed&limit=250";
+      const unauthenticated = await call(jobsPath);
+      if (unauthenticated.response.status !== 401) throw new Error("Processing jobs must require authentication.");
+      let job;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const result = await call(jobsPath, { token });
+        if (result.response.status !== 200 || !Array.isArray(result.value?.jobs)) {
+          throw new Error(`Processing job listing failed (${result.response.status}).`);
+        }
+        job = result.value.jobs.find(({ id }) => id === completed.value.job.id);
+        if (job || attempt === 4) break;
+        await wait(1000);
+      }
+      if (job?.state !== "completed" || job?.payload?.assetId !== completed.value.asset.id) {
+        throw new Error("The processing job list did not contain the completed upload fixture.");
+      }
+      if (job.correlationId !== completed.value.job.correlationId || Object.hasOwn(job, "requestCorrelationId")) {
+        throw new Error("The processing job list did not preserve the public request trace.");
+      }
+    }
     const replay = await publishReferenceWhenReady((path, options) => call(path, { ...options, token }), {
       workId: work.value.work.id, idempotencyKey: marker + '-publication', attempts: 1,
     });

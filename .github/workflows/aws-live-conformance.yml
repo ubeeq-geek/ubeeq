@@ -122,7 +122,7 @@ jobs:
           UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_JOBS_QUEUE_URL="$JobsQueueUrl" UBEEQ_AWS_USER_POOL_ID="$UserPoolId" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapter-aws
       - name: Run authenticated API upload, worker, publication, and delivery flow
         run: |
-          UBEEQ_AWS_WEB_ORIGIN="$ReferenceWebGatewayUrl" UBEEQ_AWS_API_URL="$ReferenceApiGatewayUrl" UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
+          UBEEQ_AWS_VERIFY_PROCESSING_JOBS="${{ inputs.runtime == 'rust' }}" UBEEQ_AWS_WEB_ORIGIN="$ReferenceWebGatewayUrl" UBEEQ_AWS_API_URL="$ReferenceApiGatewayUrl" UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
       - name: Delete disposable identity
         if: always()
         run: aws cognito-idp admin-delete-user --user-pool-id "$UserPoolId" --username "$TEST_USERNAME" || true
