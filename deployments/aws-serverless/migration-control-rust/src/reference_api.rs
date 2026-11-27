@@ -20,6 +20,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
+    regional::portability::{asset_inventory, create_export},
     store::{MigrationStore, attribute, document},
 };
 use url::Url;
@@ -2645,6 +2646,140 @@ async fn create_creator(
     }
 }
 
+async fn export_creator(
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    actor: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+    let hold_version = repository.marker(hold_fence).await?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let mut manifest = json!({"creator":creator});
+    for (field, source) in [
+        ("works", "works"),
+        ("assets", "assets"),
+        ("collections", "collections"),
+        ("integrationAccounts", "integrationAccounts"),
+        ("exportCheckpoints", "exportManifests"),
+        ("importCheckpoints", "importCheckpoints"),
+    ] {
+        let mut records: Vec<_> = repository
+            .list(source)
+            .await?
+            .into_iter()
+            .filter(|row| row["creatorId"] == creator_id)
+            .collect();
+        if field == "integrationAccounts" {
+            for record in &mut records {
+                let fields = record.as_object_mut().ok_or("Invalid integration record")?;
+                fields.remove("credentialReference");
+                fields.insert("credentialExcluded".into(), json!(true));
+            }
+        }
+        manifest[field] = json!(records);
+    }
+    let works: std::collections::HashSet<String> = manifest["works"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|work| work["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut subjects = works.clone();
+    subjects.insert(creator_id.to_owned());
+    let mut inventory = Vec::new();
+    let mut processing = Vec::new();
+    for asset in manifest["assets"].as_array().into_iter().flatten() {
+        let asset_id = asset["id"].as_str().ok_or("Missing asset ID")?;
+        subjects.insert(asset_id.to_owned());
+        inventory.push(asset_inventory(asset, repository.cell, creator_id)?);
+        processing.push(json!({"id":format!("asset-processing:{asset_id}"),"assetId":asset_id,
+            "homeCellId":asset["homeCellId"],"dataHomeRegion":asset["dataHomeRegion"],
+            "dataHomeAssignedAt":asset["dataHomeAssignedAt"],"routingRevision":asset["routingRevision"],"state":asset["status"]}));
+    }
+    manifest["objectInventory"] = json!(inventory);
+    manifest["processing"] = json!(processing);
+    for (source, field, allowed) in [
+        ("publications", "workId", &works),
+        ("publicationIntents", "workId", &works),
+        ("moderationEvidence", "subjectId", &subjects),
+        ("moderationHolds", "subjectId", &subjects),
+        ("reviewCases", "subjectId", &subjects),
+        ("auditEvents", "subjectId", &subjects),
+    ] {
+        let records: Vec<_> = repository
+            .list(source)
+            .await?
+            .into_iter()
+            .filter(|row| row[field].as_str().is_some_and(|key| allowed.contains(key)))
+            .collect();
+        manifest[source] = json!(records);
+    }
+    manifest["usageEvents"] = json!(
+        repository
+            .list("usageEvents")
+            .await?
+            .into_iter()
+            .filter(|row| row["accountId"] == creator_id)
+            .collect::<Vec<_>>()
+    );
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    manifest["exportedAt"] = json!(now);
+    let mut manifest = create_export(manifest)?;
+    let digest = manifest["checksum"]
+        .as_str()
+        .ok_or("Missing export checksum")?;
+    let stamp = |record_id: &str| {
+        json!({"id":record_id,"instanceId":repository.instance,
+        "homeCellId":repository.cell,"dataHomeRegion":creator["dataHomeRegion"],"dataHomeAssignedAt":creator["dataHomeAssignedAt"],
+        "routingRevision":creator["routingRevision"],"revision":1,"createdAt":now,"updatedAt":now})
+    };
+    let checkpoint_id = format!("export-{digest}");
+    let mut checkpoint = stamp(&checkpoint_id);
+    checkpoint["creatorId"] = json!(creator_id);
+    checkpoint["schemaVersion"] = manifest["schemaVersion"].clone();
+    checkpoint["checksum"] = json!(digest);
+    checkpoint["objectReference"] = json!(format!("inline:{digest}"));
+    let mut audit = stamp(&Uuid::new_v4().to_string());
+    audit["action"] = json!("creator.export_generated");
+    audit["actorId"] = json!(actor);
+    audit["subjectId"] = json!(creator_id);
+    audit["payload"] = json!({"checksum":digest});
+    let revision = creator["revision"]
+        .as_u64()
+        .ok_or("Missing Creator revision")?;
+    let actions = vec![
+        repository.create_item("exportManifests", &checkpoint)?,
+        repository.create_item("auditEvents", &audit)?,
+        repository.item_guard(
+            &format!("creators#{creator_id}"),
+            "record",
+            Some(("revision", AttributeValue::N(revision.to_string()))),
+        )?,
+        repository.item_guard(
+            hold_fence,
+            "fence",
+            hold_version.map(|version| ("version", AttributeValue::S(version))),
+        )?,
+    ];
+    repository
+        .client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await?;
+    manifest["requestId"] = json!(id);
+    Ok(respond(200, id, manifest))
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -2731,7 +2866,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     };
     let requested = if matches!(
         request.raw_path.as_str(),
-        "/v1/migrations/me" | "/v1/migrations"
+        "/v1/migrations/me" | "/v1/migrations" | "/v1/exports/me"
     ) {
         None
     } else {
@@ -2845,6 +2980,12 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                     "retained_content_routes_unavailable",
                     "This Creator requires the retained content routes.",
                 );
+            }
+            if request.raw_path == "/v1/exports/me" {
+                return match export_creator(&repository, &record, &subject, id).await {
+                    Ok(response) => response,
+                    Err(_) => error(500, id, "internal_error", "Unable to export Creator"),
+                };
             }
             if request.raw_path == "/v1/works" && request.request_context.http.method == "POST" {
                 if record["dataHomeRegion"] != runtime.cell.region {
@@ -3085,6 +3226,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
                     | "/v1/works"
                     | "/v1/collections"
                     | "/v1/migrations/me"
+                    | "/v1/exports/me"
             ))
     {
         return creator_read(&request, runtime, &id).await;
