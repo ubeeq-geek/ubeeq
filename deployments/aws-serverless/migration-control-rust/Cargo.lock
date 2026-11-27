@@ -2303,10 +2303,12 @@ name = "ubeeq-migration-control-api"
 version = "0.1.0"
 dependencies = [
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-lambda",
  "aws-sdk-s3",
  "aws-sdk-sqs",
+ "aws-sigv4",
  "base64 0.22.1",
  "icu_collator",
  "icu_locale",

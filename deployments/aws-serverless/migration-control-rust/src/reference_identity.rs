@@ -1,4 +1,10 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_sigv4::{
+    http_request::{SignableBody, SignableRequest, SigningSettings, sign},
+    sign::v4,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
@@ -128,6 +134,8 @@ pub fn bind_user(
 pub struct CognitoIdentity {
     http: reqwest::Client,
     endpoint: String,
+    pool_id: String,
+    region: String,
     issuer: String,
     client_id: String,
     keys: Mutex<Option<KeySet>>,
@@ -181,6 +189,8 @@ impl CognitoIdentity {
                 .build()?,
             issuer: format!("{endpoint}/{pool_id}"),
             endpoint,
+            pool_id: pool_id.into(),
+            region: region.into(),
             client_id,
             keys: Mutex::new(None),
         })
@@ -200,7 +210,10 @@ impl CognitoIdentity {
             .filter(|response| response.status().is_success())
     }
 
-    pub async fn verify_session(&self, token: &str) -> Option<AccountScope> {
+    async fn verified_user(
+        &self,
+        token: &str,
+    ) -> Option<(AccessClaims, CurrentUser, AccountScope)> {
         let (header, _) = token.split_once('.')?;
         if token.len() > 32_768 {
             return None;
@@ -250,6 +263,11 @@ impl CognitoIdentity {
             return None;
         }
         let scope = bind_user(&claims, &user.username, &user.user_attributes)?;
+        Some((claims, user, scope))
+    }
+
+    pub async fn verify_session(&self, token: &str) -> Option<AccountScope> {
+        let (claims, _, scope) = self.verified_user(token).await?;
         Some(
             if claims.groups.as_array().is_some_and(|groups| {
                 groups
@@ -263,6 +281,102 @@ impl CognitoIdentity {
         )
     }
 
+    pub async fn authenticate(
+        &self,
+        email: &str,
+        password: &str,
+        provider: Option<&SharedCredentialsProvider>,
+    ) -> Result<(String, i64), SignInError> {
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                "AWSCognitoIdentityProviderService.InitiateAuth",
+            )
+            .json(&json!({
+                "AuthFlow": "USER_PASSWORD_AUTH", "ClientId": self.client_id,
+                "AuthParameters": {"USERNAME": email, "PASSWORD": password}
+            }))
+            .send()
+            .await
+            .map_err(|_| SignInError::Unavailable)?;
+        let success = response.status().is_success();
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|_| SignInError::Unavailable)?;
+        let token = sign_in_token(success, &payload)?;
+        let (claims, user, scope) = self
+            .verified_user(token)
+            .await
+            .ok_or(SignInError::Unavailable)?;
+        let subject = if scope == AccountScope::Customer {
+            &claims.sub
+        } else {
+            &user.username
+        };
+        self.require_active_account(subject, &claims.sub, scope, provider)
+            .await?;
+        if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
+            return Err(SignInError::Unavailable);
+        }
+        Ok((token.to_owned(), claims.exp))
+    }
+
+    async fn require_active_account(
+        &self,
+        subject: &str,
+        sub: &str,
+        scope: AccountScope,
+        provider: Option<&SharedCredentialsProvider>,
+    ) -> Result<(), SignInError> {
+        let credentials = provider
+            .ok_or(SignInError::Unavailable)?
+            .provide_credentials()
+            .await
+            .map_err(|_| SignInError::Unavailable)?
+            .into();
+        let body = json!({"UserPoolId": self.pool_id, "Username": subject}).to_string();
+        let headers = [
+            ("content-type", "application/x-amz-json-1.1"),
+            (
+                "x-amz-target",
+                "AWSCognitoIdentityProviderService.AdminGetUser",
+            ),
+        ];
+        let params = v4::SigningParams::builder()
+            .identity(&credentials)
+            .region(&self.region)
+            .name("cognito-idp")
+            .time(SystemTime::now())
+            .settings(SigningSettings::default())
+            .build()
+            .map_err(|_| SignInError::Unavailable)?;
+        let request = SignableRequest::new(
+            "POST",
+            &self.endpoint,
+            headers.into_iter(),
+            SignableBody::Bytes(body.as_bytes()),
+        )
+        .map_err(|_| SignInError::Unavailable)?;
+        let (signature, _) = sign(request, &params.into())
+            .map_err(|_| SignInError::Unavailable)?
+            .into_parts();
+        let mut request = self.http.post(&self.endpoint).body(body);
+        for (key, value) in headers.into_iter().chain(signature.headers()) {
+            request = request.header(key, value);
+        }
+        let response = request.send().await.map_err(|_| SignInError::Unavailable)?;
+        let success = response.status().is_success();
+        let payload = response
+            .json()
+            .await
+            .map_err(|_| SignInError::Unavailable)?;
+        active_account(success, &payload, subject, sub, scope)
+    }
+
     pub async fn sign_out(&self, token: &str) -> bool {
         self.current_user_operation("AWSCognitoIdentityProviderService.GlobalSignOut", token)
             .await
@@ -270,9 +384,148 @@ impl CognitoIdentity {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum SignInError {
+    Invalid,
+    Challenge,
+    Unavailable,
+}
+
+fn exception(payload: &Value) -> Option<&str> {
+    payload["__type"]
+        .as_str()
+        .and_then(|name| name.rsplit('#').next())
+}
+
+fn sign_in_token(success: bool, payload: &Value) -> Result<&str, SignInError> {
+    if !success {
+        return Err(match exception(payload) {
+            Some("NotAuthorizedException" | "UserNotFoundException") => SignInError::Invalid,
+            Some("UserNotConfirmedException" | "PasswordResetRequiredException") => {
+                SignInError::Challenge
+            }
+            _ => SignInError::Unavailable,
+        });
+    }
+    if payload["ChallengeName"]
+        .as_str()
+        .is_some_and(|challenge| !challenge.is_empty())
+    {
+        return Err(SignInError::Challenge);
+    }
+    payload["AuthenticationResult"]["AccessToken"]
+        .as_str()
+        .filter(|token| !token.is_empty() && token.trim() == *token)
+        .ok_or(SignInError::Unavailable)
+}
+
+fn active_account(
+    success: bool,
+    payload: &Value,
+    subject: &str,
+    sub: &str,
+    scope: AccountScope,
+) -> Result<(), SignInError> {
+    if !success {
+        return Err(if exception(payload) == Some("UserNotFoundException") {
+            SignInError::Invalid
+        } else {
+            SignInError::Unavailable
+        });
+    }
+    let attributes = payload["UserAttributes"]
+        .as_array()
+        .ok_or(SignInError::Unavailable)?;
+    let attribute = |name: &str| {
+        let mut values = attributes
+            .iter()
+            .filter(|item| item["Name"].as_str() == Some(name));
+        let value = values.next().and_then(|item| item["Value"].as_str());
+        if values.next().is_none() { value } else { None }
+    };
+    let provider_name = payload["Username"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .ok_or(SignInError::Unavailable)?;
+    if attribute("sub") != Some(sub) || (scope == AccountScope::Creator && provider_name != subject)
+    {
+        return Err(SignInError::Unavailable);
+    }
+    let enabled = payload["Enabled"]
+        .as_bool()
+        .ok_or(SignInError::Unavailable)?;
+    let status = payload["UserStatus"]
+        .as_str()
+        .ok_or(SignInError::Unavailable)?;
+    let active = match status {
+        "CONFIRMED" | "EXTERNAL_PROVIDER" => true,
+        "FORCE_CHANGE_PASSWORD" => {
+            scope == AccountScope::Customer
+                && attribute("custom:account_scope") == Some("customer_account")
+                && attribute("email_verified") == Some("true")
+        }
+        "UNCONFIRMED" | "ARCHIVED" | "COMPROMISED" | "RESET_REQUIRED" => false,
+        _ => return Err(SignInError::Unavailable),
+    };
+    if enabled && active {
+        Ok(())
+    } else {
+        Err(SignInError::Invalid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_in_requires_an_access_token_and_active_account_evidence() {
+        assert_eq!(
+            sign_in_token(false, &json!({"__type":"NotAuthorizedException"})),
+            Err(SignInError::Invalid)
+        );
+        assert_eq!(
+            sign_in_token(
+                false,
+                &json!({"__type":"provider#PasswordResetRequiredException"})
+            ),
+            Err(SignInError::Challenge)
+        );
+        assert_eq!(
+            sign_in_token(
+                true,
+                &json!({"ChallengeName":"SMS_MFA","AuthenticationResult":{"AccessToken":"token"}})
+            ),
+            Err(SignInError::Challenge)
+        );
+        assert_eq!(
+            sign_in_token(true, &json!({"AuthenticationResult":{"IdToken":"token"}})),
+            Err(SignInError::Unavailable)
+        );
+        assert_eq!(
+            sign_in_token(
+                true,
+                &json!({"AuthenticationResult":{"AccessToken":"token"}})
+            ),
+            Ok("token")
+        );
+
+        let mut account = json!({"Enabled":true, "UserStatus":"CONFIRMED", "Username":"username",
+            "UserAttributes":[{"Name":"sub", "Value":"subject"}]});
+        assert_eq!(
+            active_account(true, &account, "username", "subject", AccountScope::Creator),
+            Ok(())
+        );
+        assert_eq!(
+            active_account(true, &account, "username", "another", AccountScope::Creator),
+            Err(SignInError::Unavailable)
+        );
+        account["Enabled"] = json!(false);
+        assert_eq!(
+            active_account(true, &account, "username", "subject", AccountScope::Creator),
+            Err(SignInError::Invalid)
+        );
+    }
 
     #[test]
     fn binds_current_user_scope_to_signed_scope_and_subject() {

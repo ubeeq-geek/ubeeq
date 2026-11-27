@@ -32,6 +32,8 @@ aws-sdk-s3 = { version = "1", optional = true, default-features = false, feature
 sha2 = "0.11"
 tempfile = { version = "3", optional = true }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 base64 = "0.22"

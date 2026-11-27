@@ -4,14 +4,17 @@ use std::{
 };
 
 use aws_config::{BehaviorVersion, Region};
+use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_dynamodb::{
     Client, operation::query::builders::QueryFluentBuilder, types::AttributeValue,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
-    reference_identity::{AccountScope, CognitoIdentity},
+    reference_identity::{AccountScope, CognitoIdentity, SignInError},
     store::MigrationStore,
 };
 use url::Url;
@@ -26,6 +29,9 @@ struct Request {
     #[serde(default)]
     headers: BTreeMap<String, String>,
     request_context: RequestContext,
+    body: Option<String>,
+    #[serde(default)]
+    is_base64_encoded: bool,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +147,8 @@ struct Runtime {
     records: Option<(Client, String)>,
     routing: Option<MigrationStore>,
     identity: Option<CognitoIdentity>,
+    password_authentication: bool,
+    credentials: Option<SharedCredentialsProvider>,
 }
 
 fn creator_page(
@@ -247,6 +255,100 @@ async fn creator_session<'a>(
     }
 }
 
+fn password_input(request: &Request, id: &str) -> Result<(String, String), Response> {
+    let body = request.body.as_deref().unwrap_or_default();
+    let bytes = if request.is_base64_encoded {
+        STANDARD
+            .decode(body)
+            .map_err(|_| error(400, id, "invalid_json", "Request body must be JSON"))?
+    } else {
+        body.as_bytes().to_vec()
+    };
+    if bytes.len() > 10 * 1024 * 1024 {
+        return Err(error(
+            413,
+            id,
+            "payload_too_large",
+            "Request body exceeds 10 MiB",
+        ));
+    }
+    let body: Value = if bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|_| error(400, id, "invalid_json", "Request body must be JSON"))?
+    };
+    let field = |name: &str| {
+        body[name]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| error(400, id, "invalid_request", &format!("{name} is required")))
+    };
+    Ok((field("email")?, field("password")?))
+}
+
+async fn sign_in(request: &Request, runtime: &Runtime, id: &str) -> Response {
+    let Some(identity) = runtime
+        .identity
+        .as_ref()
+        .filter(|_| runtime.password_authentication)
+    else {
+        return error(
+            404,
+            id,
+            "local_auth_unavailable",
+            "This instance uses an external identity provider",
+        );
+    };
+    let (email, password) = match password_input(request, id) {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+    match identity
+        .authenticate(&email, &password, runtime.credentials.as_ref())
+        .await
+    {
+        Ok((token, exp)) => {
+            if let Some(timestamp) = OffsetDateTime::from_unix_timestamp(exp)
+                .ok()
+                .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+            {
+                let expires_at = timestamp.replace('Z', ".000Z");
+                return respond(
+                    200,
+                    id,
+                    json!({"token": token, "expiresAt": expires_at, "requestId": id}),
+                );
+            }
+            sign_in_unavailable(id)
+        }
+        Err(SignInError::Invalid) => error(
+            401,
+            id,
+            "invalid_credentials",
+            "Sign-in could not be completed with these credentials.",
+        ),
+        Err(SignInError::Challenge) => error(
+            409,
+            id,
+            "authentication_challenge_required",
+            "Complete the required account confirmation, password reset or sign-in challenge before signing in.",
+        ),
+        Err(SignInError::Unavailable) => sign_in_unavailable(id),
+    }
+}
+
+fn sign_in_unavailable(id: &str) -> Response {
+    error(
+        503,
+        id,
+        "identity_provider_unavailable",
+        "Sign-in is temporarily unavailable.",
+    )
+}
+
 async fn handle(request: Request, runtime: &Runtime) -> Response {
     let id = request
         .headers
@@ -275,6 +377,9 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
                 "slots": {}, "transforms": {"graphicWatermark": false, "imageAdjustments": false}, "requestId": id
             }),
         );
+    }
+    if (method, path) == ("POST", "/v1/auth/sign-in") {
+        return sign_in(&request, runtime, &id).await;
     }
     if (method, path) == ("POST", "/v1/auth/sign-out") {
         let token = match creator_session(&request, runtime, &id).await {
@@ -388,12 +493,23 @@ async fn main() -> Result<(), Error> {
         (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => None,
         _ => return Err("Cognito user pool and app client must both be configured".into()),
     };
+    let password_authentication = env::var("UBEEQ_PASSWORD_AUTH_ENABLED").as_deref() == Ok("true");
+    let credentials = if password_authentication && identity.is_some() {
+        aws_config::defaults(BehaviorVersion::latest())
+            .load()
+            .await
+            .credentials_provider()
+    } else {
+        None
+    };
     let runtime = Runtime {
         instance_id: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
         cell,
         records,
         routing,
         identity,
+        password_authentication,
+        credentials,
     };
     run(service_fn(|event: LambdaEvent<Request>| {
         handle_event(event, &runtime)
@@ -421,6 +537,8 @@ mod tests {
             records: None,
             routing: None,
             identity: None,
+            password_authentication: false,
+            credentials: None,
         };
         for (path, status, fields) in [
             (
