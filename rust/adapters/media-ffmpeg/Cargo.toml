@@ -1,0 +1,13 @@
+[package]
+name = "ubeeq-media-ffmpeg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "LICENSE"
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "process", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
