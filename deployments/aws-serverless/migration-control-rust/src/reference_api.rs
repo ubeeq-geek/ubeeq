@@ -773,13 +773,21 @@ impl CreatorRecords<'_> {
 
     async fn advance_host_fence(&self) -> Result<TransactWriteItem, Failure> {
         let pk = "__ubeeq_repository_snapshot#hostRecords";
+        self.advance_fence(pk, self.marker(pk).await?)
+    }
+
+    fn advance_fence(
+        &self,
+        pk: &str,
+        previous: Option<String>,
+    ) -> Result<TransactWriteItem, Failure> {
         let mut item = item_key(pk, "fence");
         item.insert(
             "version".into(),
             AttributeValue::S(Uuid::new_v4().to_string()),
         );
         let put = Put::builder().table_name(self.table).set_item(Some(item));
-        let put = match self.marker(pk).await? {
+        let put = match previous {
             Some(version) => put
                 .condition_expression("#version = :version")
                 .expression_attribute_names("#version", "version")
@@ -2372,6 +2380,271 @@ async fn private_work(
     }
 }
 
+fn operator_limit(id: &str) -> Response {
+    error(
+        403,
+        id,
+        "SINGLE_OPERATOR_INSTANCE_LIMIT",
+        "Self-hosted Ubeeq instances allow one Creator operator user. Additional Creator Identities and customer accounts remain supported.",
+    )
+}
+
+fn creator_intake_digest(instance: &str, actor: &str, key: &str) -> Result<String, Failure> {
+    let digest = Sha256::digest(serde_json::to_vec(&[instance, actor, key])?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+struct CreatorIntent<'a> {
+    actor: &'a str,
+    handle: &'a str,
+    display_name: &'a str,
+    region: &'a str,
+}
+
+impl CreatorRecords<'_> {
+    async fn recover_creator(
+        &self,
+        intent: &CreatorIntent<'_>,
+        key: &str,
+        id: &str,
+    ) -> Result<Option<Response>, Failure> {
+        let Some(receipt) = self
+            .read("hostRecords", &format!("creator-intake-{key}"))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let creator_id = format!("creator-{key}");
+        let reconcile = || {
+            error(
+                409,
+                id,
+                "creator_intake_requires_reconciliation",
+                "The saved Creator request requires reconciliation.",
+            )
+        };
+        if receipt["instanceId"] != self.instance
+            || receipt["homeCellId"] != self.cell
+            || receipt["dataHomeRegion"] != intent.region
+            || receipt["namespace"] != "runtime-creator-intake"
+            || receipt["scopeId"] != creator_id
+            || receipt["key"] != key
+            || receipt["value"]["schemaVersion"] != 1
+            || receipt["value"]["actorId"] != intent.actor
+            || receipt["value"]["creatorId"] != creator_id
+        {
+            return Ok(Some(reconcile()));
+        }
+        if receipt["value"]["handle"] != intent.handle
+            || receipt["value"]["displayName"] != intent.display_name
+            || receipt["value"].get("requestFingerprint").is_some()
+        {
+            return Ok(Some(error(
+                409,
+                id,
+                "creator_intent_conflict",
+                "This Creator request identity already belongs to different profile details.",
+            )));
+        }
+        let Some(creator) = self
+            .owned_creator(&creator_id, intent.actor)
+            .await?
+            .filter(|creator| creator["dataHomeRegion"] == intent.region)
+        else {
+            return Ok(Some(reconcile()));
+        };
+        if self
+            .read("instanceOperators", self.instance)
+            .await?
+            .is_some_and(|claim| claim["actorId"] != intent.actor)
+        {
+            return Ok(Some(error(
+                403,
+                id,
+                "creator_not_accessible",
+                "Current access to this Creator is required.",
+            )));
+        }
+        Ok(Some(respond(
+            201,
+            id,
+            json!({"creator":creator,"requestId":id}),
+        )))
+    }
+}
+
+async fn create_creator(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<Response, Failure> {
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let field = |name: &str| {
+        body[name]
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let (Some(handle), Some(display_name)) = (field("handle"), field("displayName")) else {
+        let field = if field("handle").is_none() {
+            "handle"
+        } else {
+            "displayName"
+        };
+        return Ok(error(
+            400,
+            id,
+            "invalid_request",
+            &format!("{field} is required"),
+        ));
+    };
+    let intent = CreatorIntent {
+        actor: &actor,
+        handle,
+        display_name,
+        region: &runtime.cell.region,
+    };
+    let (client, table) = runtime
+        .records
+        .as_ref()
+        .ok_or("Persistence is not configured")?;
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let digest = match body.get("idempotencyKey") {
+        None => None,
+        Some(value) => match value.as_str().filter(|key| valid_intent(key)) {
+            Some(key) => Some(creator_intake_digest(repository.instance, &actor, key)?),
+            None => {
+                return Ok(error(
+                    400,
+                    id,
+                    "invalid_creator_intent",
+                    "Creator request identity is invalid.",
+                ));
+            }
+        },
+    };
+    if let Some(key) = &digest
+        && let Some(response) = repository.recover_creator(&intent, key, id).await?
+    {
+        return Ok(response);
+    }
+    let claim = repository
+        .read("instanceOperators", repository.instance)
+        .await?;
+    if claim.as_ref().is_some_and(|row| row["actorId"] != actor) {
+        return Ok(operator_limit(id));
+    }
+    let fence = "__ubeeq_repository_snapshot#creators";
+    let version = repository.marker(fence).await?;
+    if repository
+        .has_current_record("creators", |row| {
+            row["subjectId"]
+                .as_str()
+                .is_some_and(|subject| !subject.is_empty() && subject != actor)
+        })
+        .await?
+    {
+        return Ok(operator_limit(id));
+    }
+    let creator_id = digest
+        .as_ref()
+        .map(|key| format!("creator-{key}"))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if repository.read("creators", &creator_id).await?.is_some() {
+        if let Some(key) = &digest
+            && let Some(response) = repository.recover_creator(&intent, key, id).await?
+        {
+            return Ok(response);
+        }
+        return Ok(error(
+            409,
+            id,
+            "creator_intake_requires_reconciliation",
+            "This Creator already exists without the matching intake receipt.",
+        ));
+    }
+    let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let stamp = |record_id: &str| {
+        json!({"id":record_id,"instanceId":repository.instance,"homeCellId":repository.cell,
+        "dataHomeRegion":intent.region,"dataHomeAssignedAt":now,"routingRevision":1,
+        "revision":1,"createdAt":now,"updatedAt":now})
+    };
+    let mut creator = stamp(&creator_id);
+    creator["subjectId"] = json!(actor);
+    creator["handle"] = json!(intent.handle);
+    creator["displayName"] = json!(intent.display_name);
+    let mut directory = stamp(&collection_directory_id(repository.instance, &creator_id)?);
+    directory["namespace"] = json!("runtime-collection-directory");
+    directory["scopeId"] = json!(creator_id);
+    directory["key"] = json!("directory");
+    directory["value"] = json!({"schemaVersion":1,"collectionIds":[]});
+    let mut actions = vec![
+        repository.create_item("creators", &creator)?,
+        repository.create_item("hostRecords", &directory)?,
+        repository.advance_fence(fence, version)?,
+        repository.advance_host_fence().await?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ];
+    if let Some(claim) = claim {
+        let revision = claim["revision"]
+            .as_u64()
+            .ok_or("Missing operator revision")?;
+        actions.push(repository.item_guard(
+            &format!("instanceOperators#{}", repository.instance),
+            "record",
+            Some(("revision", AttributeValue::N(revision.to_string()))),
+        )?);
+    } else {
+        let claim = json!({"id":repository.instance,"instanceId":repository.instance,"actorId":actor,
+            "revision":1,"createdAt":now,"updatedAt":now});
+        actions.push(repository.create_item("instanceOperators", &claim)?);
+    }
+    if let Some(key) = &digest {
+        let mut receipt = stamp(&format!("creator-intake-{key}"));
+        receipt["namespace"] = json!("runtime-creator-intake");
+        receipt["scopeId"] = json!(creator_id);
+        receipt["key"] = json!(key);
+        receipt["value"] = json!({"schemaVersion":1,"actorId":actor,"creatorId":creator_id,
+            "handle":intent.handle,"displayName":intent.display_name});
+        actions.push(repository.create_item("hostRecords", &receipt)?);
+    }
+    match client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(respond(201, id, json!({"creator":creator,"requestId":id}))),
+        Err(failure) => {
+            if let Some(key) = &digest
+                && let Some(response) = repository.recover_creator(&intent, key, id).await?
+            {
+                return Ok(response);
+            }
+            if repository
+                .read("instanceOperators", repository.instance)
+                .await?
+                .is_some_and(|row| row["actorId"] != actor)
+            {
+                return Ok(operator_limit(id));
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -2839,6 +3112,12 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     }
     if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works" | "/v1/collections") {
         return creator_read(&request, runtime, &id).await;
+    }
+    if (method, path) == ("POST", "/v1/creators") {
+        return match create_creator(&request, runtime, &id).await {
+            Ok(response) => response,
+            Err(_) => error(500, &id, "internal_error", "Unable to create Creator"),
+        };
     }
     if (method, path) == ("POST", "/v1/auth/sign-up") {
         return error(
