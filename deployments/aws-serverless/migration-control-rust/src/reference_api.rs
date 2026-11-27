@@ -7,7 +7,9 @@ use std::{
 use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_dynamodb::{
-    Client, operation::query::builders::QueryFluentBuilder, types::AttributeValue,
+    Client,
+    operation::query::builders::QueryFluentBuilder,
+    types::{AttributeValue, ConditionCheck, Put, TransactWriteItem},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
@@ -18,7 +20,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
-    store::{MigrationStore, document},
+    store::{MigrationStore, attribute, document},
 };
 use url::Url;
 use uuid::Uuid;
@@ -764,6 +766,380 @@ async fn migration_history(
     }
 }
 
+fn item_key(pk: &str, sk: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".into(), AttributeValue::S(pk.into())),
+        ("sk".into(), AttributeValue::S(sk.into())),
+    ])
+}
+
+fn build_record(
+    repository: &str,
+    value: &Value,
+) -> Result<HashMap<String, AttributeValue>, Failure> {
+    let id = value["id"].as_str().ok_or("Missing record ID")?;
+    let mut item = item_key(&format!("{repository}#{id}"), "record");
+    item.extend([
+        ("id".into(), AttributeValue::S(id.into())),
+        ("repository".into(), AttributeValue::S(repository.into())),
+        ("revision".into(), AttributeValue::N("1".into())),
+        ("value".into(), attribute(value)),
+    ]);
+    Ok(item)
+}
+
+fn valid_intent(key: &str) -> bool {
+    (1..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn work_intent_digest(
+    instance: &str,
+    creator: &str,
+    actor: &str,
+    key: &str,
+) -> Result<String, Failure> {
+    let digest = Sha256::digest(serde_json::to_vec(&[instance, creator, actor, key])?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+enum WorkWriteError {
+    Held,
+    Conflict,
+    Reconcile,
+    Failed,
+}
+
+impl CreatorRecords<'_> {
+    async fn raw_get(
+        &self,
+        pk: &str,
+        sk: &str,
+    ) -> Result<Option<HashMap<String, AttributeValue>>, Failure> {
+        Ok(self
+            .client
+            .get_item()
+            .table_name(self.table)
+            .set_key(Some(item_key(pk, sk)))
+            .consistent_read(true)
+            .send()
+            .await?
+            .item)
+    }
+
+    async fn marker(&self, pk: &str) -> Result<Option<String>, Failure> {
+        self.raw_get(pk, "fence")
+            .await?
+            .map(|item| {
+                item.get("version")
+                    .and_then(|value| value.as_s().ok())
+                    .filter(|version| !version.is_empty())
+                    .cloned()
+                    .ok_or_else(|| "Repository fence is invalid".into())
+            })
+            .transpose()
+    }
+
+    async fn migration_held(&self, creator: &str) -> Result<bool, Failure> {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .client
+                .scan()
+                .table_name(self.table)
+                .consistent_read(true)
+                .filter_expression("begins_with(pk, :prefix) AND sk = :record")
+                .expression_attribute_values(
+                    ":prefix",
+                    AttributeValue::S("moderationHolds#".into()),
+                )
+                .expression_attribute_values(":record", AttributeValue::S("record".into()))
+                .set_exclusive_start_key(cursor)
+                .send()
+                .await?;
+            for mut item in page.items.unwrap_or_default() {
+                if in_cell(&item, self.cell) {
+                    let hold = document(item.remove("value").ok_or("Missing hold record")?)?;
+                    if hold["instanceId"] == self.instance
+                        && hold["subjectId"] == creator
+                        && hold["state"] == "active"
+                        && hold["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.starts_with("migration:"))
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            cursor = page.last_evaluated_key;
+            if cursor.as_ref().is_none_or(HashMap::is_empty) {
+                return Ok(false);
+            }
+        }
+    }
+
+    async fn recover_work(
+        &self,
+        creator: &Value,
+        actor: &str,
+        title: &str,
+        digest: &str,
+    ) -> Result<Option<Value>, WorkWriteError> {
+        let read = self
+            .read("hostRecords", &format!("work-intake-{digest}"))
+            .await
+            .map_err(|_| WorkWriteError::Failed)?;
+        let Some(receipt) = read else {
+            return Ok(None);
+        };
+        let id = format!("work-{digest}");
+        if receipt["instanceId"] != self.instance
+            || receipt["homeCellId"] != self.cell
+            || receipt["namespace"] != "runtime-work-intake"
+            || receipt["scopeId"] != creator["id"]
+            || receipt["key"] != digest
+            || receipt["value"]["schemaVersion"] != 1
+            || receipt["value"]["actorId"] != actor
+            || receipt["value"]["workId"] != id
+        {
+            return Err(WorkWriteError::Failed);
+        }
+        if receipt["value"]["title"] != title {
+            return Err(WorkWriteError::Conflict);
+        }
+        let work = self
+            .read("works", &id)
+            .await
+            .map_err(|_| WorkWriteError::Failed)?
+            .filter(|work| same_creator_region(work, creator))
+            .ok_or(WorkWriteError::Reconcile)?;
+        Ok(Some(work))
+    }
+
+    async fn write_work(
+        &self,
+        creator: &Value,
+        actor: &str,
+        title: &str,
+        digest: Option<&str>,
+    ) -> Result<Value, WorkWriteError> {
+        let failed = |_| WorkWriteError::Failed;
+        let creator_id = creator["id"].as_str().ok_or(WorkWriteError::Failed)?;
+        let revision = creator["revision"].as_u64().ok_or(WorkWriteError::Failed)?;
+        let hold_fence = "__ubeeq_repository_snapshot#moderationHolds";
+        let global = "__ubeeq_repository_snapshot#global-v2";
+        let host_fence = "__ubeeq_repository_snapshot#hostRecords";
+        let hold_version = self.marker(hold_fence).await.map_err(failed)?;
+        if self.migration_held(creator_id).await.map_err(failed)? {
+            return Err(WorkWriteError::Held);
+        }
+        if let Some(digest) = digest
+            && let Some(work) = self.recover_work(creator, actor, title, digest).await?
+        {
+            return self
+                .owned_creator(creator_id, actor)
+                .await
+                .map_err(failed)?
+                .filter(|current| current["revision"] == revision)
+                .map(|_| work)
+                .ok_or(WorkWriteError::Failed);
+        }
+
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| WorkWriteError::Failed)?;
+        let work_id = digest
+            .map(|key| format!("work-{key}"))
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let stamp = |id: &str| {
+            json!({"id":id,"instanceId":self.instance,
+            "homeCellId":self.cell,"dataHomeRegion":creator["dataHomeRegion"],
+            "dataHomeAssignedAt":creator["dataHomeAssignedAt"],"routingRevision":creator["routingRevision"],
+            "revision":1,"createdAt":now,"updatedAt":now})
+        };
+        let mut work = stamp(&work_id);
+        work["creatorId"] = json!(creator_id);
+        work["title"] = json!(title);
+        work["status"] = json!("draft");
+
+        let record_put = |repository: &str, record: &Value| -> Result<_, Failure> {
+            Ok(TransactWriteItem::builder()
+                .put(
+                    Put::builder()
+                        .table_name(self.table)
+                        .set_item(Some(build_record(repository, record)?))
+                        .condition_expression("attribute_not_exists(pk)")
+                        .build()?,
+                )
+                .build())
+        };
+        let creator_guard = ConditionCheck::builder()
+            .table_name(self.table)
+            .set_key(Some(item_key(&format!("creators#{creator_id}"), "record")))
+            .condition_expression("#revision = :revision")
+            .expression_attribute_names("#revision", "revision")
+            .expression_attribute_values(":revision", AttributeValue::N(revision.to_string()))
+            .build()
+            .map_err(|_| WorkWriteError::Failed)?;
+        let mut actions = vec![
+            record_put("works", &work).map_err(failed)?,
+            TransactWriteItem::builder()
+                .condition_check(creator_guard)
+                .build(),
+        ];
+        for (pk, version) in [(hold_fence, hold_version), (global, None)] {
+            let mut check = ConditionCheck::builder()
+                .table_name(self.table)
+                .set_key(Some(item_key(pk, "fence")));
+            check = match version {
+                Some(version) => check
+                    .condition_expression("#version = :version")
+                    .expression_attribute_names("#version", "version")
+                    .expression_attribute_values(":version", AttributeValue::S(version)),
+                None => check.condition_expression("attribute_not_exists(pk)"),
+            };
+            actions.push(
+                TransactWriteItem::builder()
+                    .condition_check(check.build().map_err(|_| WorkWriteError::Failed)?)
+                    .build(),
+            );
+        }
+        if let Some(digest) = digest {
+            let mut receipt = stamp(&format!("work-intake-{digest}"));
+            receipt["namespace"] = json!("runtime-work-intake");
+            receipt["scopeId"] = json!(creator_id);
+            receipt["key"] = json!(digest);
+            receipt["value"] =
+                json!({"schemaVersion":1,"actorId":actor,"title":title,"workId":work_id});
+            actions.push(record_put("hostRecords", &receipt).map_err(failed)?);
+            let mut item = item_key(host_fence, "fence");
+            item.insert(
+                "version".into(),
+                AttributeValue::S(Uuid::new_v4().to_string()),
+            );
+            let mut put = Put::builder().table_name(self.table).set_item(Some(item));
+            put = match self.marker(host_fence).await.map_err(failed)? {
+                Some(version) => put
+                    .condition_expression("#version = :version")
+                    .expression_attribute_names("#version", "version")
+                    .expression_attribute_values(":version", AttributeValue::S(version)),
+                None => put.condition_expression("attribute_not_exists(pk)"),
+            };
+            actions.push(
+                TransactWriteItem::builder()
+                    .put(put.build().map_err(|_| WorkWriteError::Failed)?)
+                    .build(),
+            );
+        }
+        if self
+            .client
+            .transact_write_items()
+            .set_transact_items(Some(actions))
+            .send()
+            .await
+            .is_ok()
+        {
+            return Ok(work);
+        }
+        if let Some(digest) = digest
+            && self
+                .owned_creator(creator_id, actor)
+                .await
+                .map_err(failed)?
+                .is_some_and(|current| current["revision"] == revision)
+            && !self.migration_held(creator_id).await.map_err(failed)?
+            && let Some(work) = self.recover_work(creator, actor, title, digest).await?
+        {
+            return Ok(work);
+        }
+        Err(WorkWriteError::Failed)
+    }
+}
+
+async fn create_work(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    actor: &str,
+    id: &str,
+) -> Response {
+    if creator["subjectId"] != actor
+        || creator
+            .get("deletion")
+            .is_some_and(|value| !value.is_null() && value != false)
+        || creator
+            .get("status")
+            .is_some_and(|status| status != "active")
+    {
+        return error(
+            403,
+            id,
+            "work_edit_denied",
+            "Current Work editing access is required.",
+        );
+    }
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(title) = body["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return error(400, id, "invalid_request", "title is required");
+    };
+    let digest = match body.get("idempotencyKey") {
+        Some(value) => {
+            let Some(key) = value.as_str().filter(|key| valid_intent(key)) else {
+                return error(
+                    400,
+                    id,
+                    "invalid_work_intent",
+                    "Work request identity is invalid.",
+                );
+            };
+            match work_intent_digest(
+                repository.instance,
+                creator["id"].as_str().unwrap_or_default(),
+                actor,
+                key,
+            ) {
+                Ok(digest) => Some(digest),
+                Err(_) => return error(500, id, "internal_error", "Unable to create Work"),
+            }
+        }
+        None => None,
+    };
+    match repository
+        .write_work(creator, actor, title, digest.as_deref())
+        .await
+    {
+        Ok(work) => respond(201, id, json!({"work":work,"requestId":id})),
+        Err(WorkWriteError::Held) => error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ),
+        Err(WorkWriteError::Conflict) => error(
+            409,
+            id,
+            "work_intent_conflict",
+            "This Work request identity already belongs to a different title.",
+        ),
+        Err(WorkWriteError::Reconcile) => error(
+            409,
+            id,
+            "work_intake_requires_reconciliation",
+            "The saved Work request requires reconciliation.",
+        ),
+        Err(WorkWriteError::Failed) => error(500, id, "internal_error", "Unable to create Work"),
+    }
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -909,6 +1285,17 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                     "retained_content_routes_unavailable",
                     "This Creator requires the retained content routes.",
                 );
+            }
+            if request.raw_path == "/v1/works" && request.request_context.http.method == "POST" {
+                if record["dataHomeRegion"] != runtime.cell.region {
+                    return error(
+                        403,
+                        id,
+                        "work_edit_denied",
+                        "Current Work editing access is required.",
+                    );
+                }
+                return create_work(request, &repository, &record, &subject, id).await;
             }
             if request.raw_path == "/v1/works" {
                 return match repository.list("works").await {
@@ -1146,7 +1533,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             ));
         }
     }
-    if (method, path) == ("POST", "/v1/migrations") {
+    if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works") {
         return creator_read(&request, runtime, &id).await;
     }
     if (method, path) == ("POST", "/v1/auth/sign-up") {
@@ -1410,6 +1797,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(creator_selection(&request).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn work_intake_uses_existing_node_receipt_identity_and_dynamo_envelope() {
+        assert!(valid_intent("intent_1"));
+        assert!(!valid_intent("intent/1"));
+        assert!(!valid_intent(&"a".repeat(129)));
+        assert_eq!(
+            work_intent_digest("instance", "creator", "actor", "intent_1").unwrap(),
+            "efbab9816cbb65cf1424b708a6d7708aebb86d647e59f31d38208d283f7397cb"
+        );
+        let work = json!({"id":"work","revision":1,"status":"draft"});
+        let item = build_record("works", &work).unwrap();
+        assert_eq!(item["pk"], AttributeValue::S("works#work".into()));
+        assert_eq!(item["sk"], AttributeValue::S("record".into()));
+        assert_eq!(document(item["value"].clone()).unwrap(), work);
     }
 
     #[test]
