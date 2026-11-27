@@ -167,41 +167,20 @@ impl JobQueue {
             return Ok(None);
         };
         let next = claim(job, &format!("{worker}:{}", Uuid::new_v4()), due, now)?;
-        let put = Put::builder().table_name(&self.table).set_item(Some(job_item(&next)?))
-                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now AND #value.#payload.#asset = :asset")
-                    .expression_attribute_names("#rev","revision")
-                    .expression_attribute_names("#value","value")
-                    .expression_attribute_names("#cell","cellId")
-                    .expression_attribute_names("#state","state")
-                    .expression_attribute_names("#due",due)
-                    .expression_attribute_names("#payload","payload")
-                    .expression_attribute_names("#asset","assetId")
-                    .expression_attribute_values(":rev",AttributeValue::N(number(job,"revision")?.to_string()))
-                    .expression_attribute_values(":cell",AttributeValue::S(self.cell.clone()))
-                    .expression_attribute_values(":state",text(job,"state")?)
-                    .expression_attribute_values(":now",AttributeValue::S(timestamp(now)?))
-                    .expression_attribute_values(":asset",AttributeValue::S(asset_id.to_owned()))
-                    .build()?;
-        let asset = ConditionCheck::builder()
-            .table_name(&self.table)
-            .key("pk", AttributeValue::S(format!("assets#{asset_id}")))
-            .key("sk", AttributeValue::S("record".into()))
-            .condition_expression(
-                "#value.#id = :asset AND #value.#instance = :instance AND #value.#cell = :cell",
-            )
-            .expression_attribute_names("#value", "value")
-            .expression_attribute_names("#id", "id")
-            .expression_attribute_names("#instance", "instanceId")
-            .expression_attribute_names("#cell", "homeCellId")
-            .expression_attribute_values(":asset", AttributeValue::S(asset_id.to_owned()))
-            .expression_attribute_values(":instance", AttributeValue::S(self.instance.clone()))
-            .expression_attribute_values(":cell", AttributeValue::S(self.cell.clone()))
-            .build()?;
+        let actions = claim_transaction(
+            &self.table,
+            &self.instance,
+            &self.cell,
+            asset_id,
+            job,
+            &next,
+            due,
+            now,
+        )?;
         match self
             .client
             .transact_write_items()
-            .transact_items(TransactWriteItem::builder().put(put).build())
-            .transact_items(TransactWriteItem::builder().condition_check(asset).build())
+            .set_transact_items(Some(actions))
             .send()
             .await
         {
@@ -326,6 +305,52 @@ impl JobQueue {
     }
 }
 
+fn claim_transaction(
+    table: &str,
+    instance: &str,
+    cell: &str,
+    asset_id: &str,
+    job: &Value,
+    next: &Value,
+    due: &str,
+    now: OffsetDateTime,
+) -> Result<Vec<TransactWriteItem>, Failure> {
+    let put = Put::builder().table_name(table).set_item(Some(job_item(next)?))
+                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now AND #value.#payload.#asset = :asset")
+                    .expression_attribute_names("#rev","revision")
+                    .expression_attribute_names("#value","value")
+                    .expression_attribute_names("#cell","cellId")
+                    .expression_attribute_names("#state","state")
+                    .expression_attribute_names("#due",due)
+                    .expression_attribute_names("#payload","payload")
+                    .expression_attribute_names("#asset","assetId")
+                    .expression_attribute_values(":rev",AttributeValue::N(number(job,"revision")?.to_string()))
+                    .expression_attribute_values(":cell",AttributeValue::S(cell.to_owned()))
+                    .expression_attribute_values(":state",text(job,"state")?)
+                    .expression_attribute_values(":now",AttributeValue::S(timestamp(now)?))
+                    .expression_attribute_values(":asset",AttributeValue::S(asset_id.to_owned()))
+                    .build()?;
+    let asset = ConditionCheck::builder()
+        .table_name(table)
+        .key("pk", AttributeValue::S(format!("assets#{asset_id}")))
+        .key("sk", AttributeValue::S("record".into()))
+        .condition_expression(
+            "#value.#id = :asset AND #value.#instance = :instance AND #value.#cell = :cell",
+        )
+        .expression_attribute_names("#value", "value")
+        .expression_attribute_names("#id", "id")
+        .expression_attribute_names("#instance", "instanceId")
+        .expression_attribute_names("#cell", "homeCellId")
+        .expression_attribute_values(":asset", AttributeValue::S(asset_id.to_owned()))
+        .expression_attribute_values(":instance", AttributeValue::S(instance.to_owned()))
+        .expression_attribute_values(":cell", AttributeValue::S(cell.to_owned()))
+        .build()?;
+    Ok(vec![
+        TransactWriteItem::builder().put(put).build(),
+        TransactWriteItem::builder().condition_check(asset).build(),
+    ])
+}
+
 pub fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
     let mut conflict = false;
     for code in codes {
@@ -359,6 +384,50 @@ fn job_item(job: &Value) -> Result<HashMap<String, AttributeValue>, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claim_transaction_binds_the_job_to_the_current_asset_instance_and_cell() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let job = json!({"id":"job-1","state":"queued","availableAt":"1970-01-01T00:00:00.000Z",
+            "revision":1,"attempt":0,"maxAttempts":2,"payload":{"assetId":"asset-1"}});
+        let next = claim(&job, "worker:token", "availableAt", now).unwrap();
+        let actions = claim_transaction(
+            "records",
+            "instance-1",
+            "cell-1",
+            "asset-1",
+            &job,
+            &next,
+            "availableAt",
+            now,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 2);
+        let put = actions[0].put.as_ref().unwrap();
+        assert_eq!(
+            put.item["pk"],
+            AttributeValue::S("durableJobs#job-1".into())
+        );
+        assert!(
+            put.condition_expression
+                .as_deref()
+                .unwrap()
+                .contains("#value.#payload.#asset = :asset")
+        );
+        let guard = actions[1].condition_check.as_ref().unwrap();
+        assert_eq!(guard.key["pk"], AttributeValue::S("assets#asset-1".into()));
+        assert_eq!(
+            guard.condition_expression,
+            "#value.#id = :asset AND #value.#instance = :instance AND #value.#cell = :cell"
+        );
+        let values = guard.expression_attribute_values.as_ref().unwrap();
+        assert_eq!(values[":instance"], AttributeValue::S("instance-1".into()));
+        assert_eq!(values[":cell"], AttributeValue::S("cell-1".into()));
+        assert_eq!(
+            values[":asset"],
+            put.expression_attribute_values.as_ref().unwrap()[":asset"]
+        );
+    }
 
     #[test]
     fn claims_due_jobs_and_preserves_the_request_trace_on_recovery() {
