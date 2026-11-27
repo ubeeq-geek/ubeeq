@@ -23,7 +23,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
-    reference_jobs::processing_job_id,
+    reference_jobs::{processing_job_id, transaction_revision_conflict},
     regional::portability::{
         asset_inventory, create_export, verified_unsigned, verify_record_graph,
     },
@@ -4306,18 +4306,6 @@ async fn withdraw_publication(
 
 fn publication_request_work(path: &str) -> Option<&str> {
     single_path_id(path.strip_suffix("/publications")?, "/v1/works/")
-}
-
-fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
-    let mut conflict = false;
-    for code in codes {
-        match code {
-            Some("ConditionalCheckFailed" | "TransactionConflict") => conflict = true,
-            Some("None") => {}
-            _ => return false,
-        }
-    }
-    conflict
 }
 
 impl CreatorRecords<'_> {

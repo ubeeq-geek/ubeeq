@@ -518,8 +518,9 @@ async fn main() -> Result<(), Error> {
     let db = Client::new(&config);
     let table = env::var("UBEEQ_RECORDS_TABLE")?;
     let cell = env::var("UBEEQ_CELL_ID").or_else(|_| env::var("AWS_REGION"))?;
+    let instance = env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into());
     let worker = Worker {
-        queue: JobQueue::new(db.clone(), table.clone(), cell.clone()),
+        queue: JobQueue::new(db.clone(), table.clone(), cell.clone(), instance.clone()),
         sqs: aws_sdk_sqs::Client::new(&config),
         queue_url: env::var("UBEEQ_JOBS_QUEUE_URL")?,
         db,
@@ -527,7 +528,7 @@ async fn main() -> Result<(), Error> {
         cell,
         s3: aws_sdk_s3::Client::new(&config),
         bucket: env::var("UBEEQ_SOURCE_BUCKET")?,
-        instance: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
+        instance,
     };
     run(service_fn(|event: LambdaEvent<Batch>| async {
         if worker.repair_upload_notifications().await.is_err() {

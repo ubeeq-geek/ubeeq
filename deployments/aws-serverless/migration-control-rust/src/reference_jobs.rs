@@ -100,14 +100,16 @@ pub struct JobQueue {
     client: Client,
     table: String,
     cell: String,
+    instance: String,
 }
 
 impl JobQueue {
-    pub fn new(client: Client, table: String, cell: String) -> Self {
+    pub fn new(client: Client, table: String, cell: String, instance: String) -> Self {
         Self {
             client,
             table,
             cell,
+            instance,
         }
     }
 
@@ -158,35 +160,58 @@ impl JobQueue {
         due: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Value>, Failure> {
+        let Some(asset_id) = job["payload"]["assetId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(None);
+        };
         let next = claim(job, &format!("{worker}:{}", Uuid::new_v4()), due, now)?;
         let put = Put::builder().table_name(&self.table).set_item(Some(job_item(&next)?))
-                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now")
+                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now AND #value.#payload.#asset = :asset")
                     .expression_attribute_names("#rev","revision")
                     .expression_attribute_names("#value","value")
                     .expression_attribute_names("#cell","cellId")
                     .expression_attribute_names("#state","state")
                     .expression_attribute_names("#due",due)
+                    .expression_attribute_names("#payload","payload")
+                    .expression_attribute_names("#asset","assetId")
                     .expression_attribute_values(":rev",AttributeValue::N(number(job,"revision")?.to_string()))
                     .expression_attribute_values(":cell",AttributeValue::S(self.cell.clone()))
                     .expression_attribute_values(":state",text(job,"state")?)
                     .expression_attribute_values(":now",AttributeValue::S(timestamp(now)?))
+                    .expression_attribute_values(":asset",AttributeValue::S(asset_id.to_owned()))
                     .build()?;
+        let asset = ConditionCheck::builder()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(format!("assets#{asset_id}")))
+            .key("sk", AttributeValue::S("record".into()))
+            .condition_expression(
+                "#value.#id = :asset AND #value.#instance = :instance AND #value.#cell = :cell",
+            )
+            .expression_attribute_names("#value", "value")
+            .expression_attribute_names("#id", "id")
+            .expression_attribute_names("#instance", "instanceId")
+            .expression_attribute_names("#cell", "homeCellId")
+            .expression_attribute_values(":asset", AttributeValue::S(asset_id.to_owned()))
+            .expression_attribute_values(":instance", AttributeValue::S(self.instance.clone()))
+            .expression_attribute_values(":cell", AttributeValue::S(self.cell.clone()))
+            .build()?;
         match self
             .client
-            .put_item()
-            .table_name(put.table_name)
-            .set_item(Some(put.item))
-            .set_condition_expression(put.condition_expression)
-            .set_expression_attribute_names(put.expression_attribute_names)
-            .set_expression_attribute_values(put.expression_attribute_values)
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(put).build())
+            .transact_items(TransactWriteItem::builder().condition_check(asset).build())
             .send()
             .await
         {
             Ok(_) => Ok(Some(next)),
             Err(failure)
-                if failure
-                    .as_service_error()
-                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+                if matches!(
+                    failure.as_service_error(),
+                    Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                        if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+                ) =>
             {
                 Ok(None)
             }
@@ -299,6 +324,18 @@ impl JobQueue {
             .build()?;
         Ok(TransactWriteItem::builder().put(put).build())
     }
+}
+
+pub fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut conflict = false;
+    for code in codes {
+        match code {
+            Some("ConditionalCheckFailed" | "TransactionConflict") => conflict = true,
+            Some("None") => {}
+            _ => return false,
+        }
+    }
+    conflict
 }
 
 fn job_item(job: &Value) -> Result<HashMap<String, AttributeValue>, Failure> {
