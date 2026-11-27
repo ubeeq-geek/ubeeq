@@ -68,3 +68,10 @@ asset-processing Lambda ZIP. Set single-cell CDK context
 for development qualification. The function uses the existing SQS event source
 and durable DynamoDB job records. Verify source reads, rendition recovery,
 and processing evidence before using this asset for a release.
+
+The `reference-api-rust-al2023-x86-64` CI artifact contains the Rust reference
+API ZIP. For development qualification, set single-cell CDK context
+`rustReferenceApiAssetPath` or `UBEEQ_RUST_REFERENCE_API_ASSET_PATH` to the ZIP.
+The HTTP API and IAM Function URL use the selected handler. The port is still
+in progress. Qualify the implemented routes in a development stack before
+considering runtime cutover.

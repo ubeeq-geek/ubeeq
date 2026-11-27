@@ -128,3 +128,38 @@ test('the Rust reference worker retains the SQS trigger and runtime configuratio
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('the Rust reference API retains its HTTP integrations and Cognito configuration', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-api-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const node = join(directory, 'node');
+    const rust = join(directory, 'rust');
+    await mkdir(node);
+    await mkdir(rust);
+    await writeFile(join(node, 'lambda.js'), 'synthetic Node asset');
+    await writeFile(join(rust, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: node, rustReferenceApiAssetPath: rust,
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustReferenceApi', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const resources = Template.fromStack(stack).toJSON().Resources;
+    const [apiId, api] = Object.entries(resources)
+      .find(([id, resource]) => id.startsWith('ReferenceApi') && resource.Type === 'AWS::Lambda::Function');
+    assert.equal(api.Properties.Runtime, 'provided.al2023');
+    assert.equal(api.Properties.Handler, 'bootstrap');
+    assert.equal(api.Properties.Environment.Variables.UBEEQ_PASSWORD_AUTH_ENABLED, 'true');
+    assert.ok(api.Properties.Environment.Variables.UBEEQ_USER_POOL_ID);
+    assert.ok(api.Properties.Environment.Variables.UBEEQ_PUBLIC_BASE_URL);
+    const apiArn = { 'Fn::GetAtt': [apiId, 'Arn'] };
+    const integrations = Object.values(resources).filter(resource => resource.Type === 'AWS::ApiGatewayV2::Integration');
+    assert.equal(integrations.filter(resource => JSON.stringify(resource.Properties.IntegrationUri) === JSON.stringify(apiArn)).length, 2);
+    const functionUrl = Object.values(resources).find(resource => resource.Type === 'AWS::Lambda::Url');
+    assert.deepEqual(functionUrl.Properties.TargetFunctionArn, apiArn);
+    assert.equal(functionUrl.Properties.AuthType, 'AWS_IAM');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

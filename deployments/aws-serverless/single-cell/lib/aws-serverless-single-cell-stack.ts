@@ -54,7 +54,14 @@ export class AwsServerlessSingleCellStack extends Stack {
     if (routingDirectoryTableName && !routingDirectoryTableArn) throw new Error("UBEEQ_ROUTING_DIRECTORY_TABLE_ARN is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME so a cell can read a control-plane table in another region.");
     if (routingDirectoryTableName && !routingDirectoryRegion) throw new Error("UBEEQ_ROUTING_DIRECTORY_REGION is required with UBEEQ_ROUTING_DIRECTORY_TABLE_NAME.");
     const runtimeEnvironment = { UBEEQ_INSTANCE_ID: "aws-reference", UBEEQ_CELL_ID: cellId, UBEEQ_CELL_REGION: cellRegion, UBEEQ_CELL_OPERATOR: "self-hosted", UBEEQ_RUNTIME_REVISION: runtimeRevision, UBEEQ_PUBLIC_BASE_URL: referenceApiPublicBaseUrl, UBEEQ_RECORDS_TABLE: records.tableName, UBEEQ_SOURCE_BUCKET: sourceStore.bucketName, UBEEQ_JOBS_QUEUE_URL: jobs.queueUrl, UBEEQ_USER_POOL_ID: userPool.userPoolId, UBEEQ_USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId, UBEEQ_PASSWORD_AUTH_ENABLED: "true", UBEEQ_CREDENTIAL_SECRET_PREFIX: "ubeeq/credentials", ...(routingDirectoryTableName ? { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routingDirectoryTableName, UBEEQ_ROUTING_DIRECTORY_REGION: routingDirectoryRegion! } : {}) };
-    const health = new lambda.Function(this, "ReferenceApi", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.handler", timeout: Duration.seconds(30), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
+    const rustReferenceApiAsset = this.node.tryGetContext("rustReferenceApiAssetPath") || process.env.UBEEQ_RUST_REFERENCE_API_ASSET_PATH;
+    const health = new lambda.Function(this, "ReferenceApi", {
+      runtime: rustReferenceApiAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustReferenceApiAsset ? "bootstrap" : "lambda.handler",
+      timeout: Duration.seconds(30),
+      code: lambda.Code.fromAsset(rustReferenceApiAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      environment: runtimeEnvironment,
+    });
     const rustWebAsset = this.node.tryGetContext("rustWebAssetPath") || process.env.UBEEQ_RUST_WEB_ASSET_PATH;
     const web = new lambda.Function(this, "ReferenceWeb", {
       runtime: rustWebAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
