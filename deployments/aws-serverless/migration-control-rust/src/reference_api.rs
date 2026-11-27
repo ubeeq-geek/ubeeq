@@ -23,6 +23,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
+    reference_jobs::processing_job_id,
     regional::portability::{
         asset_inventory, create_export, verified_unsigned, verify_record_graph,
     },
@@ -3538,15 +3539,6 @@ async fn initiate_upload(
 
 fn completion_upload_id(path: &str) -> Option<&str> {
     single_path_id(path.strip_suffix("/complete")?, "/v1/uploads/")
-}
-
-fn processing_job_id(cell: &str, intent: &str) -> String {
-    let hash: String = Sha256::digest(format!("{cell}:{intent}").as_bytes())
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("job-{hash}")
 }
 
 async fn complete_upload(
