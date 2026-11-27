@@ -54,6 +54,34 @@ if (missing.length) {
     }
     throw new Error(`Timed out waiting for ${description}.`);
   };
+  const findRegionalFixture = async (resource, token, match, filters = {}) => {
+    const path = `/v1/operations/regional/${resource}`;
+    if ((await call(path)).response.status !== 401) {
+      throw new Error(`Regional ${resource} must require a bearer session.`);
+    }
+    const query = new URLSearchParams({ limit: "1", ...filters });
+    const cursors = new Set();
+    for (let page = 0; page < 100; page += 1) {
+      const { response, value } = await call(`${path}?${query}`, { token });
+      const rows = value?.[resource];
+      if (response.status !== 200 || !Array.isArray(rows) || rows.length > 1) {
+        throw new Error(`Regional ${resource} returned an invalid page (${response.status}).`);
+      }
+      if (filters.creatorId && rows.some((row) => row.creatorId !== filters.creatorId)) {
+        throw new Error("Regional migrations returned a checkpoint for another Creator.");
+      }
+      const fixture = rows.find(match);
+      if (fixture) return fixture;
+      const cursor = value.nextCursor;
+      if (!cursor) break;
+      if (typeof cursor !== "string" || cursors.has(cursor)) {
+        throw new Error(`Regional ${resource} returned an invalid cursor.`);
+      }
+      cursors.add(cursor);
+      query.set("cursor", cursor);
+    }
+    return undefined;
+  };
   const removeMarkerRecords = async (dynamo, table) => {
     let cursor;
     do {
@@ -125,6 +153,16 @@ if (missing.length) {
     if (checkpoint.objectCount !== checkpoint.verifiedObjectCount || checkpoint.objectCount !== 3) throw new Error(`Migration inventory verification failed: ${JSON.stringify(checkpoint)}`);
     const cutoverRoute = await control.routingDirectory.get(creatorId);
     if (cutoverRoute?.homeCellId !== destination.cellId || cutoverRoute.routingRevision !== 2) throw new Error("Migration route did not cut over atomically.");
+    if (process.env.UBEEQ_AWS_VERIFY_REGIONAL_OPERATOR_READS === "true") {
+      await waitFor(async () => {
+        const route = await findRegionalFixture("routes", token, (row) => row.creatorId === creatorId);
+        const migration = await findRegionalFixture(
+          "migrations", token, (row) => row.id === migrationId, { creatorId },
+        );
+        return route?.homeCellId === destination.cellId && route.routingRevision === 2
+          && migration?.state === "cutover" && migration.destination?.cellId === destination.cellId;
+      }, "operator visibility of cutover");
+    }
     const held = await call("/v1/works", { method: "POST", token, body: { title: `${marker}-held` } });
     if (held.response.status !== 409 || held.value?.error?.code !== "migration_source_held") throw new Error(`Source write was not held: ${JSON.stringify(held.value)}`);
     const importedCreator = await destinationDynamo.send(new GetCommand({ TableName: destination.table, Key: { pk: `creators#${creatorId}`, sk: "record" } }));
