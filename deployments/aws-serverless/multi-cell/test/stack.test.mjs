@@ -19,6 +19,9 @@ test('multi-cell control preserves recovery state, requires IAM and confines mig
   const resources=Object.values(template.toJSON().Resources),table=resources.find(r=>r.Type==='AWS::DynamoDB::Table');
   assert.equal(table.DeletionPolicy,'Retain');assert.equal(table.Properties.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled,true);
   const api=resources.find(r=>r.Type==='AWS::Lambda::Function'&&r.Properties.Handler==='lambda.migrationControlApi');assert.equal(api.Properties.Environment.Variables.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN,principal);
+  template.resourceCountIs('AWS::Lambda::Permission',2);
+  template.hasResourceProperties('AWS::Lambda::Permission',{Action:'lambda:InvokeFunctionUrl',Principal:principal,FunctionUrlAuthType:'AWS_IAM'});
+  template.hasResourceProperties('AWS::Lambda::Permission',{Action:'lambda:InvokeFunction',Principal:principal,InvokedViaFunctionUrl:true});
   const statements=resources.filter(r=>r.Type==='AWS::IAM::Policy').flatMap(r=>r.Properties.PolicyDocument.Statement);
   for(const [prefix,expected] of [['s3:',buckets.map(x=>x+'/*')],['lambda:InvokeFunction',functions]]){
    const granted=statements.filter(s=>(Array.isArray(s.Action)?s.Action:[s.Action]).some(a=>a.startsWith(prefix))).flatMap(s=>Array.isArray(s.Resource)?s.Resource:[s.Resource]);

@@ -37,7 +37,11 @@ export class AwsServerlessMultiCellStack extends Stack {
       code: lambda.Code.fromAsset(rustWorkerAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routes.tableName, UBEEQ_ROUTING_DIRECTORY_REGION: this.region },
     });
-    const operatorPrincipalArn = this.node.tryGetContext("migrationOperatorPrincipalArn") || process.env.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN || "arn:aws:iam::000000000000:role/UNCONFIGURED";
+    const configuredOperator = this.node.tryGetContext("migrationOperatorPrincipalArn") || process.env.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN;
+    if (configuredOperator && !/^arn:aws(?:-us-gov|-cn)?:iam::\d{12}:role\/[\w+=,.@/-]+$/.test(configuredOperator)) {
+      throw new Error("UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN must be an IAM role ARN.");
+    }
+    const operatorPrincipalArn = configuredOperator || "arn:aws:iam::000000000000:role/UNCONFIGURED";
     const rustOperatorAsset = this.node.tryGetContext("rustMigrationControlApiAssetPath") || process.env.UBEEQ_RUST_MIGRATION_CONTROL_API_ASSET_PATH;
     const operatorApi = new lambda.Function(this, "MigrationControlApi", {
       runtime: rustOperatorAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
@@ -98,7 +102,17 @@ export class AwsServerlessMultiCellStack extends Stack {
     new CfnOutput(this, "MigrationCommandsQueueUrl", { value: commands.queueUrl });
     new CfnOutput(this, "MigrationControlWorkerArn", { value: worker.functionArn });
     new CfnOutput(this, "MigrationControlWorkerRoleArn", { value: worker.role!.roleArn });
-    new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM }).url });
+    const operatorUrl = operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
+    if (configuredOperator) {
+      const principal = new iam.ArnPrincipal(configuredOperator);
+      operatorApi.addPermission("OperatorInvokeUrl", {
+        principal, action: "lambda:InvokeFunctionUrl", functionUrlAuthType: lambda.FunctionUrlAuthType.AWS_IAM,
+      });
+      operatorApi.addPermission("OperatorInvokeViaUrl", {
+        principal, action: "lambda:InvokeFunction", invokedViaFunctionUrl: true,
+      });
+    }
+    new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorUrl.url });
     new CfnOutput(this, "MigrationOperationsDashboardName", { value: dashboard.dashboardName });
   }
 }

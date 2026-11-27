@@ -4,6 +4,7 @@ import {publishReferenceWhenReady} from '../single-cell/reference-publication-re
  * Opt-in real AWS migration proof. It creates only marker-tagged disposable
  * data, proves cutover and rollback, then removes every tracked record/object.
  */
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID, randomBytes } from "node:crypto";
 import { AdminCreateUserCommand, AdminDeleteUserCommand, AdminSetUserPasswordCommand, CognitoIdentityProviderClient, InitiateAuthCommand, GetUserCommand } from "@aws-sdk/client-cognito-identity-provider";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -39,6 +40,46 @@ if (missing.length) {
   const destinationS3 = new S3Client({ region: destination.region });
   const control = createAwsRoutingControlPlane({ tableName: process.env.UBEEQ_AWS_ROUTING_TABLE, region: process.env.UBEEQ_AWS_ROUTING_REGION });
   const commands = createAwsMigrationCommandQueue({ queueUrl: process.env.UBEEQ_AWS_MIGRATION_QUEUE_URL, region: process.env.UBEEQ_AWS_ROUTING_REGION });
+  const sendMigrationCommand = async (input) => {
+    const operatorUrl = process.env.UBEEQ_AWS_MIGRATION_OPERATOR_URL;
+    if (!operatorUrl) return commands.enqueue(input);
+    const region = process.env.UBEEQ_AWS_ROUTING_REGION;
+    const url = new URL(operatorUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.port
+      || !url.hostname.endsWith(`.lambda-url.${region}.on.aws`)) {
+      throw new Error("Expected an AWS Lambda Function URL in the migration control region.");
+    }
+    const { AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN } = process.env;
+    if (!AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !AWS_SESSION_TOKEN) {
+      throw new Error("The migration Function URL proof requires temporary AWS credentials.");
+    }
+    url.pathname = `/v1/operations/regional/migrations/${encodeURIComponent(input.migrationId)}/${input.operation}`;
+    url.search = "";
+    url.hash = "";
+    const body = JSON.stringify(input.rollbackWindowSeconds ? { rollbackWindowSeconds: input.rollbackWindowSeconds } : {});
+    const hash = createHash("sha256").update(body).digest("hex");
+    const config = [
+      ["user", `${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}`],
+      ["header", `x-amz-security-token: ${AWS_SESSION_TOKEN}`],
+      ["data", body],
+    ].map(([option, value]) => `${option} = ${JSON.stringify(value)}`).join("\n");
+    // Pass credentials through stdin so they never appear in the command line.
+    const result = spawnSync("curl", [
+      "--disable", "--config", "-", "--silent", "--max-time", "30",
+      "--aws-sigv4", `aws:amz:${region}:lambda`,
+      "--header", "content-type: application/json",
+      "--header", `x-amz-content-sha256: ${hash}`,
+      "--write-out", "\n%{http_code}", url.href,
+    ], { input: config, encoding: "utf8" });
+    if (result.status !== 0) throw new Error("The signed migration Function URL request failed.");
+    const separator = result.stdout.lastIndexOf("\n");
+    const status = result.stdout.slice(separator + 1);
+    if (status !== "202") throw new Error(`The migration Function URL returned HTTP ${status}.`);
+    const value = JSON.parse(result.stdout.slice(0, separator));
+    if (value.migrationId !== input.migrationId || value.operation !== input.operation || value.state !== "queued") {
+      throw new Error("The migration Function URL returned an invalid command receipt.");
+    }
+  };
   const createdIds = new Set(); let username; let creatorId; let checkpoint; let operatorFixture;
   const instanceId=process.env.UBEEQ_AWS_INSTANCE_ID ?? "aws-reference";
   const call = async (path, { method = "GET", token, body, headers = {} } = {}) => {
@@ -158,7 +199,7 @@ if (missing.length) {
         throw new Error("The reference API did not report a read-only migration control plane.");
       }
     }
-    await commands.enqueue({ migrationId, operation: "resume", rollbackWindowSeconds: 300 });
+    await sendMigrationCommand({ migrationId, operation: "resume", rollbackWindowSeconds: 300 });
     checkpoint = await waitFor(async () => { const value = await control.migrationCheckpoints.get(migrationId); return value?.state === "cutover" ? value : undefined; }, "migration cutover");
     if (checkpoint.objectCount !== checkpoint.verifiedObjectCount || checkpoint.objectCount !== 3) throw new Error(`Migration inventory verification failed: ${JSON.stringify(checkpoint)}`);
     const cutoverRoute = await control.routingDirectory.get(creatorId);
@@ -182,7 +223,7 @@ if (missing.length) {
       const head = await destinationS3.send(new HeadObjectCommand({ Bucket: destination.bucket, Key: item.destination.key }));
       if (head.ContentLength !== item.byteLength || head.Metadata?.checksum !== item.checksum) throw new Error(`Destination object ${item.id} failed checksum/count verification.`);
     }
-    await commands.enqueue({ migrationId, operation: "rollback" });
+    await sendMigrationCommand({ migrationId, operation: "rollback" });
     checkpoint = await waitFor(async () => { const value = await control.migrationCheckpoints.get(migrationId); return value?.state === "rolled_back" ? value : undefined; }, "migration rollback");
     const rollbackRoute = await control.routingDirectory.get(creatorId);
     if (rollbackRoute?.homeCellId !== source.cellId || rollbackRoute.routingRevision !== 3) throw new Error("Migration route did not roll back atomically.");
