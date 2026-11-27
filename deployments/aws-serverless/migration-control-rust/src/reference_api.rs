@@ -12,8 +12,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
+    lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
     store::{MigrationStore, document},
 };
@@ -151,11 +153,12 @@ struct Runtime {
     credentials: Option<SharedCredentialsProvider>,
 }
 
-fn creator_page(
+fn repository_page(
     client: &Client,
     table: &str,
     cursor: Option<HashMap<String, AttributeValue>>,
     limit: i32,
+    repository: &str,
 ) -> QueryFluentBuilder {
     client
         .query()
@@ -163,7 +166,7 @@ fn creator_page(
         .index_name("repository-id-index")
         .key_condition_expression("#repository = :repository")
         .expression_attribute_names("#repository", "repository")
-        .expression_attribute_values(":repository", AttributeValue::S("creators".into()))
+        .expression_attribute_values(":repository", AttributeValue::S(repository.into()))
         .limit(limit)
         .set_exclusive_start_key(cursor)
 }
@@ -187,7 +190,10 @@ async fn readiness(runtime: &Runtime, id: &str) -> Response {
     };
     let mut cursor = None;
     loop {
-        let page = match creator_page(client, table, cursor, 1).send().await {
+        let page = match repository_page(client, table, cursor, 1, "creators")
+            .send()
+            .await
+        {
             Ok(page) => page,
             Err(_) => return error(500, id, "internal_error", "Unable to check persistence"),
         };
@@ -414,11 +420,14 @@ impl CreatorRecords<'_> {
             .transpose()
     }
 
-    async fn list(&self) -> Result<Vec<Value>, ubeeq_migration_control_api::lifecycle::Failure> {
+    async fn list(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<Value>, ubeeq_migration_control_api::lifecycle::Failure> {
         let mut records = Vec::new();
         let mut cursor = None;
         loop {
-            let page = creator_page(self.client, self.table, cursor, 100)
+            let page = repository_page(self.client, self.table, cursor, 100, repository)
                 .send()
                 .await?;
             for mut item in page.items.unwrap_or_default() {
@@ -446,6 +455,187 @@ impl CreatorRecords<'_> {
                 && record["instanceId"].as_str() == Some(self.instance)
                 && record["subjectId"].as_str() == Some(subject)
         }))
+    }
+}
+
+const DIRECTORY_ERROR: &str = "Collection directory requires reconciliation.";
+
+fn collection_directory(record: &Value, creator: &Value) -> Result<(Vec<String>, bool), Failure> {
+    let values = &record["value"];
+    if record["homeCellId"] != creator["homeCellId"]
+        || record["dataHomeRegion"] != creator["dataHomeRegion"]
+        || record["instanceId"] != creator["instanceId"]
+        || record["scopeId"] != creator["id"]
+        || record["namespace"] != "runtime-collection-directory"
+        || record["key"] != "directory"
+        || values["schemaVersion"] != 1
+    {
+        return Err(DIRECTORY_ERROR.into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let ids = values["collectionIds"]
+        .as_array()
+        .ok_or(DIRECTORY_ERROR)?
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .filter(|id| !id.is_empty() && seen.insert(*id))
+                .map(str::to_owned)
+                .ok_or(DIRECTORY_ERROR)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ready = match values.get("requiresMigration") {
+        None => true,
+        Some(value) => !value.as_bool().ok_or(DIRECTORY_ERROR)?,
+    };
+    Ok((ids, ready))
+}
+
+fn aggregate_members(collection: &Value) -> Option<Vec<String>> {
+    let aggregate = &collection["collectionManagement"];
+    if aggregate["schemaVersion"] != 1 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    aggregate["members"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let work = member["workId"].as_str()?;
+            if member["collectionId"] != collection["id"]
+                || member["position"] != index
+                || work.is_empty()
+                || !seen.insert(work)
+                || OffsetDateTime::parse(member["addedAt"].as_str()?, &Rfc3339).is_err()
+            {
+                return None;
+            }
+            Some(work.to_owned())
+        })
+        .collect()
+}
+
+fn collection_view(collection: &Value, work_ids: Vec<String>, ready: bool) -> Value {
+    let fields = [
+        "id",
+        "creatorId",
+        "title",
+        "description",
+        "type",
+        "visibility",
+        "slug",
+        "slugHistory",
+        "status",
+        "coverAssetId",
+        "createdAt",
+        "updatedAt",
+        "revision",
+        "archivedAt",
+        "deletedAt",
+        "workPublicationHistoryAt",
+    ];
+    let mut view: serde_json::Map<String, Value> = fields
+        .into_iter()
+        .filter_map(|key| {
+            collection
+                .get(key)
+                .cloned()
+                .map(|value| (key.into(), value))
+        })
+        .collect();
+    for (name, fallback) in [
+        ("type", json!("collection")),
+        ("status", json!("draft")),
+        ("slug", collection["id"].clone()),
+        ("slugHistory", json!([])),
+    ] {
+        if view.get(name).is_none_or(Value::is_null) {
+            view.insert(name.into(), fallback);
+        }
+    }
+    view.insert("managementReady".into(), json!(ready));
+    view.insert("permissions".into(), json!({"canEdit": ready}));
+    view.insert("workIds".into(), json!(work_ids));
+    Value::Object(view)
+}
+
+fn same_creator_region(record: &Value, creator: &Value) -> bool {
+    record["creatorId"] == creator["id"]
+        && record["homeCellId"] == creator["homeCellId"]
+        && record["instanceId"] == creator["instanceId"]
+        && record["dataHomeRegion"] == creator["dataHomeRegion"]
+}
+
+impl CreatorRecords<'_> {
+    async fn collections(&self, creator: &Value) -> Result<(Vec<Value>, bool), Failure> {
+        let creator_id = creator["id"].as_str().ok_or("Creator ID is missing")?;
+        let digest = Sha256::digest(serde_json::to_vec(&[self.instance, creator_id])?);
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let key = format!("collection-directory-{hex}");
+        let (ids, can_create) = match self.read("hostRecords", &key).await? {
+            Some(directory) => collection_directory(&directory, creator)?,
+            None => (Vec::new(), false),
+        };
+        let mut rows = Vec::new();
+        for id in &ids {
+            rows.push(
+                self.read("collections", id)
+                    .await?
+                    .filter(|row| same_creator_region(row, creator))
+                    .ok_or(DIRECTORY_ERROR)?,
+            );
+        }
+        rows.extend(self.list("collections").await?.into_iter().filter(|row| {
+            same_creator_region(row, creator)
+                && row["id"]
+                    .as_str()
+                    .is_some_and(|id| !ids.iter().any(|known| known == id))
+        }));
+        let mut legacy = None;
+        let mut views = Vec::new();
+        for row in rows.into_iter().filter(|row| row["status"] != "deleted") {
+            let row_id = row["id"].as_str().ok_or("Collection ID is missing")?;
+            let aggregate = aggregate_members(&row);
+            let ready = can_create && ids.iter().any(|id| id == row_id) && aggregate.is_some();
+            let work_ids = if ready {
+                aggregate.unwrap_or_default()
+            } else {
+                let candidates = match aggregate {
+                    Some(ids) => ids,
+                    None => {
+                        if legacy.is_none() {
+                            legacy = Some(self.list("workMemberships").await?);
+                        }
+                        let mut rows: Vec<_> = legacy
+                            .iter()
+                            .flatten()
+                            .filter(|member| {
+                                member["collectionId"] == row_id
+                                    && member["dataHomeRegion"] == creator["dataHomeRegion"]
+                            })
+                            .collect();
+                        rows.sort_by_key(|member| member["position"].as_i64());
+                        rows.into_iter()
+                            .filter_map(|member| member["workId"].as_str().map(str::to_owned))
+                            .collect()
+                    }
+                };
+                let mut scoped = Vec::new();
+                for work_id in candidates {
+                    if self
+                        .read("works", &work_id)
+                        .await?
+                        .is_some_and(|work| same_creator_region(&work, creator))
+                    {
+                        scoped.push(work_id);
+                    }
+                }
+                scoped
+            };
+            views.push(collection_view(&row, work_ids, ready));
+        }
+        Ok((views, can_create))
     }
 }
 
@@ -480,7 +670,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let ids = if operator.is_some_and(|actor| actor != subject) {
         Vec::new()
     } else {
-        let Ok(mut records) = repository.list().await else {
+        let Ok(mut records) = repository.list("creators").await else {
             return unavailable();
         };
         accessible_creator_ids(&mut records, operator, &subject)
@@ -518,7 +708,49 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     }
     let creator_id = requested.as_ref().unwrap_or(default_id);
     match repository.owned_creator(creator_id, &subject).await {
-        Ok(Some(record)) => respond(200, id, json!({"creator": record, "requestId": id})),
+        Ok(Some(record)) => {
+            if request.raw_path == "/v1/creators/me" {
+                return respond(200, id, json!({"creator": record, "requestId": id}));
+            }
+            if record["contentAuthority"] == "retained-v1" {
+                return error(
+                    503,
+                    id,
+                    "retained_content_routes_unavailable",
+                    "This Creator requires the retained content routes.",
+                );
+            }
+            if request.raw_path == "/v1/works" {
+                return match repository.list("works").await {
+                    Ok(works) => {
+                        let works: Vec<_> = works
+                            .into_iter()
+                            .filter(|work| {
+                                work["creatorId"] == record["id"] && work["status"] != "deleted"
+                            })
+                            .collect();
+                        respond(200, id, json!({"works": works, "requestId": id}))
+                    }
+                    Err(_) => error(500, id, "internal_error", "Unable to read Works"),
+                };
+            }
+            if record["dataHomeRegion"] != runtime.cell.region {
+                return error(404, id, "creator_not_found", "Creator not found.");
+            }
+            match repository.collections(&record).await {
+                Ok((collections, can_create)) => respond(
+                    200,
+                    id,
+                    json!({
+                        "collections": collections, "capabilities":{"canCreate":can_create}, "requestId": id
+                    }),
+                ),
+                Err(failure) if failure.to_string() == DIRECTORY_ERROR => {
+                    error(500, id, "internal_error", DIRECTORY_ERROR)
+                }
+                Err(_) => error(500, id, "internal_error", "Unable to read Collections"),
+            }
+        }
         Ok(None) => error(
             404,
             id,
@@ -550,7 +782,12 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "Operator operations are not configured",
         );
     }
-    if method == "GET" && matches!(path, "/v1/creators" | "/v1/creators/me") {
+    if method == "GET"
+        && matches!(
+            path,
+            "/v1/creators" | "/v1/creators/me" | "/v1/works" | "/v1/collections"
+        )
+    {
         return creator_read(&request, runtime, &id).await;
     }
     if (method, path) == ("GET", "/v1/host-capabilities") {
@@ -794,6 +1031,34 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(creator_selection(&request).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn collection_directory_and_membership_preserve_management_authority() {
+        let creator = json!({"id":"creator","homeCellId":"cell","instanceId":"instance","dataHomeRegion":"region"});
+        let mut directory = json!({"homeCellId":"cell","instanceId":"instance","dataHomeRegion":"region",
+            "scopeId":"creator","namespace":"runtime-collection-directory","key":"directory",
+            "value":{"schemaVersion":1,"collectionIds":["c"]}});
+        assert_eq!(
+            collection_directory(&directory, &creator).unwrap(),
+            (vec!["c".into()], true)
+        );
+        directory["value"]["requiresMigration"] = json!(true);
+        assert!(!collection_directory(&directory, &creator).unwrap().1);
+        directory["value"]["collectionIds"] = json!(["c", "c"]);
+        assert!(collection_directory(&directory, &creator).is_err());
+
+        let mut collection = json!({"id":"c","creatorId":"creator","internal":"opaque","collectionManagement":{
+            "schemaVersion":1,"members":[{"collectionId":"c","workId":"w","position":0,"addedAt":"2026-02-01T00:00:00Z"}]
+        }});
+        let members = aggregate_members(&collection).unwrap();
+        let view = collection_view(&collection, members, false);
+        assert_eq!(view["workIds"], json!(["w"]));
+        assert_eq!(view["status"], "draft");
+        assert_eq!(view["permissions"]["canEdit"], false);
+        assert!(view.get("internal").is_none());
+        collection["collectionManagement"]["members"][0]["position"] = json!(2);
+        assert!(aggregate_members(&collection).is_none());
     }
 
     #[test]
