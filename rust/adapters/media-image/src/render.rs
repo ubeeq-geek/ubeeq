@@ -184,6 +184,63 @@ mod tests {
     }
 
     #[test]
+    fn native_inspection_agrees_with_the_decoder_for_each_supported_format() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            11,
+            7,
+            image::Rgb([12, 50, 180]),
+        ));
+        let limits = DecodeLimits {
+            bytes: 4096,
+            pixels: 77,
+            allocation_bytes: 1024 * 1024,
+        };
+        for (format, mime) in [
+            (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::Gif, "image/gif"),
+            (ImageFormat::WebP, "image/webp"),
+        ] {
+            let mut encoded = Cursor::new(Vec::new());
+            source.write_to(&mut encoded, format).unwrap();
+            let bytes = encoded.get_ref();
+            let size = inspect_dimensions(bytes, mime, limits).unwrap();
+            let decoded = SourceImage::decode(bytes, limits).unwrap();
+            assert_eq!((size.width.get(), size.height.get()), (11, 7), "{mime}");
+            assert_eq!(size.width, decoded.size.width, "{mime}");
+            assert_eq!(size.height, decoded.size.height, "{mime}");
+            assert!(
+                inspect_dimensions(bytes, "image/avif", limits).is_err(),
+                "{mime}"
+            );
+            assert!(
+                inspect_dimensions(
+                    bytes,
+                    mime,
+                    DecodeLimits {
+                        pixels: 76,
+                        ..limits
+                    }
+                )
+                .is_err(),
+                "{mime}"
+            );
+            assert!(
+                inspect_dimensions(
+                    bytes,
+                    mime,
+                    DecodeLimits {
+                        bytes: bytes.len() - 1,
+                        ..limits
+                    }
+                )
+                .is_err(),
+                "{mime}"
+            );
+        }
+    }
+
+    #[test]
     fn png_crop_produces_a_jpeg_from_only_the_selected_pixels() {
         let source = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(8, 8, |x, _| {
             if x < 4 {
