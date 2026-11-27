@@ -3891,6 +3891,165 @@ async fn complete_upload(
     ))
 }
 
+fn content_upload_id(path: &str) -> Option<&str> {
+    single_path_id(path.strip_suffix("/content")?, "/v1/uploads/")
+}
+
+async fn direct_upload_content(
+    request: &Request,
+    repository: &CreatorRecords<'_>,
+    creator: &Value,
+    upload_id: &str,
+    id: &str,
+) -> Result<Response, Failure> {
+    let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
+    if repository.migration_held(creator_id).await? {
+        return Ok(error(
+            409,
+            id,
+            "migration_source_held",
+            "Creator writes are paused while a regional migration is in progress",
+        ));
+    }
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let Some(encoded) = body["base64"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(error(400, id, "invalid_request", "base64 is required"));
+    };
+    let row_id = format!(
+        "upload-{}",
+        upload_digest(&json!([repository.instance, "runtime-upload", upload_id]))
+    );
+    let Some(row) = repository.read("hostRecords", &row_id).await? else {
+        return Ok(error(
+            404,
+            id,
+            "upload_not_found",
+            "Upload session was not found.",
+        ));
+    };
+    let intent = &row["value"];
+    if row["instanceId"] != repository.instance
+        || row["homeCellId"] != repository.cell
+        || row["namespace"] != "runtime-upload"
+        || row["key"] != upload_id
+        || row["scopeId"] != creator_id
+        || intent["creatorId"] != creator_id
+        || intent["uploadId"] != upload_id
+    {
+        return Ok(error(
+            409,
+            id,
+            "upload_scope_conflict",
+            "Upload is not writable by this Creator.",
+        ));
+    }
+    match intent["phase"].as_str() {
+        Some("sealed") => {
+            return Ok(error(
+                409,
+                id,
+                "upload_closed",
+                "That upload was closed before any data was saved. Retry the file.",
+            ));
+        }
+        Some("closing") => {
+            return Ok(error(
+                409,
+                id,
+                "upload_recovery_pending",
+                "This upload is being recovered. Retry shortly.",
+            ));
+        }
+        Some("retained") => {
+            return Ok(error(
+                409,
+                id,
+                "upload_retained",
+                "Your original is saved. Contact support to recover it.",
+            ));
+        }
+        Some("issued" | "completed") if intent["provider"].is_object() => {}
+        _ => {
+            return Ok(error(
+                409,
+                id,
+                "upload_scope_conflict",
+                "Upload is not writable by this Creator.",
+            ));
+        }
+    }
+    let decode_input: String = encoded
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_'))
+        .collect();
+    let normalized = decode_input
+        .split('=')
+        .next()
+        .unwrap_or_default()
+        .replace('-', "+")
+        .replace('_', "/");
+    let decoder = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+    let end = normalized.len() - usize::from(normalized.len() % 4 == 1);
+    let bytes = decoder.decode(&normalized[..end])?;
+    let checksum = intent["completion"]["checksum"]
+        .as_str()
+        .or_else(|| intent["expected"]["checksum"].as_str());
+    if intent["expected"]["byteLength"].as_u64() != Some(bytes.len() as u64)
+        || checksum.is_some_and(|expected| {
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+                != expected
+        })
+    {
+        return Ok(error(
+            400,
+            id,
+            "upload_content_conflict",
+            "Upload content differs from the requested bytes.",
+        ));
+    }
+    if intent["phase"] == "completed" {
+        let mut response = respond(204, id, Value::Null);
+        response.body.clear();
+        return Ok(response);
+    }
+    Ok(error(
+        405,
+        id,
+        "direct_upload_required",
+        "Upload content must be sent to the issued direct-upload URL.",
+    ))
+}
+
+fn disabled_feature(path: &str, method: &str) -> Option<&'static str> {
+    if method == "GET" {
+        return None;
+    }
+    let suffix = path
+        .strip_prefix("/v1/")
+        .or_else(|| path.strip_prefix("/studio/"))?;
+    if suffix == "organizations" || suffix.starts_with("organizations/") {
+        return Some("Organization management");
+    }
+    let (creator, action) = suffix.strip_prefix("creators/")?.split_once('/')?;
+    (!creator.is_empty() && (action.starts_with("members") || action.starts_with("invitations")))
+        .then_some("Contributor management")
+}
+
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
     let (_, subject) = match creator_session(request, runtime, id).await {
         Ok(session) => session,
@@ -4029,6 +4188,14 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     let creator_id = requested.as_ref().unwrap_or(default_id);
     match repository.owned_creator(creator_id, &subject).await {
         Ok(Some(record)) => {
+            if let Some(upload_id) = content_upload_id(&request.raw_path) {
+                return match direct_upload_content(request, &repository, &record, upload_id, id)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => error(500, id, "internal_error", "Unable to verify upload content"),
+                };
+            }
             if let Some(work) = work {
                 if let Some(body) = upload {
                     if let Some(upload_id) = completion_id {
@@ -4368,6 +4535,36 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "operations_unavailable",
             "Operator operations are not configured",
         );
+    }
+    if let Some(feature) = disabled_feature(path, method) {
+        return error(
+            403,
+            &id,
+            "FEATURE_DISABLED_IN_SINGLE_OPERATOR_MODE",
+            &format!("{feature} is disabled in single-operator Ubeeq mode."),
+        );
+    }
+    if path == "/v1/websites" || path.starts_with("/v1/websites/") {
+        return private_response(error(
+            404,
+            &id,
+            "websites_unavailable",
+            "Website publishing is not configured.",
+        ));
+    }
+    if (method, path) == ("POST", "/v1/activity/command") {
+        if let Err(response) = creator_session(&request, runtime, &id).await {
+            return response;
+        }
+        return error(
+            404,
+            &id,
+            "activity_unavailable",
+            "Activity interface is not configured",
+        );
+    }
+    if method == "PUT" && content_upload_id(path).is_some() {
+        return creator_read(&request, runtime, &id).await;
     }
     if matches!(method, "GET" | "PATCH" | "DELETE") && single_path_id(path, "/v1/works/").is_some()
     {
@@ -4814,6 +5011,21 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn single_operator_mutation_gates_match_both_http_namespaces() {
+        assert_eq!(disabled_feature("/v1/creators/c/members", "GET"), None);
+        assert_eq!(
+            disabled_feature("/studio/creators/c/invitations", "POST"),
+            Some("Contributor management")
+        );
+        assert_eq!(
+            disabled_feature("/v1/organizations/new", "POST"),
+            Some("Organization management")
+        );
+        assert_eq!(disabled_feature("/v1/organizations-other", "POST"), None);
+        assert_eq!(content_upload_id("/v1/uploads/id/content"), Some("id"));
     }
 
     #[test]
