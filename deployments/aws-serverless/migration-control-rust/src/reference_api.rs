@@ -20,7 +20,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
     reference_identity::{AccountScope, CognitoIdentity, SignInError},
-    regional::portability::{asset_inventory, create_export},
+    regional::portability::{
+        asset_inventory, create_export, verified_unsigned, verify_record_graph,
+    },
     store::{MigrationStore, attribute, document},
 };
 use url::Url;
@@ -2646,6 +2648,108 @@ async fn create_creator(
     }
 }
 
+const IMPORT_RESOURCES: [(&str, &str); 11] = [
+    ("work", "works"),
+    ("asset", "assets"),
+    ("collection", "collections"),
+    ("publication", "publications"),
+    ("publicationIntent", "publicationIntents"),
+    ("moderationEvidence", "moderationEvidence"),
+    ("moderationHold", "moderationHolds"),
+    ("reviewCase", "reviewCases"),
+    ("auditEvent", "auditEvents"),
+    ("usageEvent", "usageEvents"),
+    ("integrationAccount", "integrationAccounts"),
+];
+
+fn import_plan(
+    manifest: &Value,
+    existing: &HashMap<&str, std::collections::HashSet<String>>,
+) -> Value {
+    let count = |field: &str| manifest[field].as_array().map_or(0, Vec::len);
+    let mut conflicts = Vec::new();
+    for (resource, repository) in IMPORT_RESOURCES {
+        let ids = existing.get(repository);
+        for row in manifest[repository].as_array().into_iter().flatten() {
+            let Some(key) = row["id"].as_str() else {
+                continue;
+            };
+            let reason = if matches!(resource, "work" | "asset" | "collection")
+                && row["creatorId"] != manifest["creator"]["id"]
+            {
+                "creator_mismatch"
+            } else if ids.is_some_and(|ids| ids.contains(key)) {
+                "id_exists"
+            } else {
+                continue;
+            };
+            conflicts.push(json!({"resource":resource,"id":key,"reason":reason}));
+        }
+    }
+    json!({"valid":conflicts.is_empty(),"conflicts":conflicts,"itemCounts":{
+        "works":count("works"),"assets":count("assets"),"collections":count("collections"),
+        "publications":count("publications"),"publicationIntents":count("publicationIntents"),
+        "moderationRecords":count("moderationEvidence")+count("moderationHolds")+count("reviewCases"),
+        "auditEvents":count("auditEvents"),"usageEvents":count("usageEvents"),"integrationAccounts":count("integrationAccounts")
+    }})
+}
+
+async fn validate_import(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<Response, Failure> {
+    if let Err(response) = creator_session(request, runtime, id).await {
+        return Ok(response);
+    }
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let manifest = match verified_unsigned(&body["manifest"]).and_then(|unsigned| {
+        verify_record_graph(&unsigned)?;
+        Ok(unsigned)
+    }) {
+        Ok(manifest) => manifest,
+        Err(failure) => {
+            return Ok(error(
+                400,
+                id,
+                "invalid_export_manifest",
+                &failure.to_string(),
+            ));
+        }
+    };
+    let (client, table) = runtime
+        .records
+        .as_ref()
+        .ok_or("Persistence is not configured")?;
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let mut existing = HashMap::new();
+    for (_, name) in IMPORT_RESOURCES {
+        if manifest[name].as_array().is_none_or(Vec::is_empty) {
+            continue;
+        }
+        let ids = repository
+            .list(name)
+            .await?
+            .into_iter()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect();
+        existing.insert(name, ids);
+    }
+    Ok(respond(
+        200,
+        id,
+        json!({"plan":import_plan(&manifest, &existing),"requestId":id}),
+    ))
+}
+
 async fn export_creator(
     repository: &CreatorRecords<'_>,
     creator: &Value,
@@ -3255,6 +3359,17 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     if method == "POST" && matches!(path, "/v1/migrations" | "/v1/works" | "/v1/collections") {
         return creator_read(&request, runtime, &id).await;
     }
+    if (method, path) == ("POST", "/v1/imports/validate") {
+        return match validate_import(&request, runtime, &id).await {
+            Ok(response) => response,
+            Err(_) => error(
+                500,
+                &id,
+                "internal_error",
+                "Unable to validate Creator import",
+            ),
+        };
+    }
     if (method, path) == ("POST", "/v1/creators") {
         return match create_creator(&request, runtime, &id).await {
             Ok(response) => response,
@@ -3612,6 +3727,31 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn import_plan_reports_conflicts_in_contract_order() {
+        let manifest = json!({"creator":{"id":"c"},
+            "works":[{"id":"w","creatorId":"c"}], "assets":[{"id":"a","creatorId":"c"}],
+            "reviewCases":[{"id":"review"}], "moderationEvidence":[{"id":"evidence"}]});
+        let existing = HashMap::from([
+            (
+                "reviewCases",
+                std::collections::HashSet::from(["review".into()]),
+            ),
+            ("works", std::collections::HashSet::from(["w".into()])),
+        ]);
+        let plan = import_plan(&manifest, &existing);
+        assert_eq!(plan["valid"], false);
+        assert_eq!(
+            plan["conflicts"],
+            json!([
+                {"resource":"work","id":"w","reason":"id_exists"},
+                {"resource":"reviewCase","id":"review","reason":"id_exists"}
+            ])
+        );
+        assert_eq!(plan["itemCounts"]["moderationRecords"], 2);
+        assert_eq!(plan["itemCounts"]["assets"], 1);
     }
 
     #[test]
