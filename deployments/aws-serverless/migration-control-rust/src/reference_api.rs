@@ -5218,6 +5218,143 @@ fn private_response(mut response: Response) -> Response {
     response
 }
 
+fn public_job(mut job: Value) -> Value {
+    if let Some(fields) = job.as_object_mut() {
+        match fields.remove("requestCorrelationId") {
+            Some(Value::String(trace)) => {
+                fields.insert("correlationId".into(), Value::String(trace));
+            }
+            None if fields.get("attempt").and_then(Value::as_u64) == Some(0) => {}
+            _ => {
+                fields.remove("correlationId");
+            }
+        }
+    }
+    job
+}
+
+async fn list_processing_jobs(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, subject) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let denied = || {
+        error(
+            403,
+            id,
+            "operator_authorization_denied",
+            "Current instance operator access is required.",
+        )
+    };
+    let claim = repository
+        .read("instanceOperators", repository.instance)
+        .await?;
+    if !claim.as_ref().is_some_and(|claim| {
+        claim["actorId"] == subject && claim["instanceId"] == repository.instance
+    }) {
+        return Ok(denied());
+    }
+    let params: Vec<_> = url::form_urlencoded::parse(request.raw_query_string.as_bytes()).collect();
+    let limit = params
+        .iter()
+        .find(|(key, _)| key == "limit")
+        .map_or(Some(50), |(_, value)| value.parse::<usize>().ok());
+    let Some(limit) = limit.filter(|limit| *limit > 0) else {
+        return Ok(error(
+            400,
+            id,
+            "invalid_request",
+            "Job limit must be a positive integer.",
+        ));
+    };
+    let states: Vec<_> = params
+        .iter()
+        .filter_map(|(key, state)| {
+            (key == "state"
+                && matches!(
+                    state.as_ref(),
+                    "queued"
+                        | "leased"
+                        | "completed"
+                        | "retry_scheduled"
+                        | "dead_lettered"
+                        | "cancelled"
+                ))
+            .then_some(state.as_ref())
+        })
+        .collect();
+    let mut jobs = Vec::new();
+    let mut cursor = None;
+    'pages: loop {
+        let page = repository_page(client, table, cursor, 100, "durableJobs")
+            .send()
+            .await?;
+        for mut item in page.items.unwrap_or_default() {
+            let job = document(item.remove("value").ok_or("Missing durable job record")?)?;
+            if job["cellId"] != repository.cell
+                || job["type"] != "asset.process"
+                || (!states.is_empty()
+                    && !job["state"]
+                        .as_str()
+                        .is_some_and(|state| states.contains(&state)))
+            {
+                continue;
+            }
+            let Some(asset) = job["payload"]["assetId"].as_str() else {
+                continue;
+            };
+            if !repository
+                .read("assets", asset)
+                .await?
+                .is_some_and(|asset| {
+                    asset["instanceId"] == repository.instance
+                        && asset["homeCellId"] == repository.cell
+                })
+            {
+                continue;
+            }
+            jobs.push(public_job(job));
+            if jobs.len() == limit {
+                break 'pages;
+            }
+        }
+        cursor = page.last_evaluated_key;
+        if cursor.as_ref().is_none_or(HashMap::is_empty) {
+            break;
+        }
+    }
+    if repository
+        .read("instanceOperators", repository.instance)
+        .await?
+        != claim
+    {
+        return Ok(denied());
+    }
+    Ok(private_response(respond(
+        200,
+        id,
+        json!({"jobs":jobs,"requestId":id}),
+    )))
+}
+
 async fn handle(request: Request, runtime: &Runtime) -> Response {
     let id = request
         .headers
@@ -5227,6 +5364,18 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    if (method, path) == ("GET", "/v1/operations/jobs") {
+        return list_processing_jobs(&request, runtime, &id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "operations_unavailable",
+                    "Processing jobs are temporarily unavailable.",
+                )
+            });
+    }
     if path == "/v1/operations" || path.starts_with("/v1/operations/") {
         return error(
             404,
@@ -5542,6 +5691,24 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_job_keeps_request_trace_and_excludes_worker_claim() {
+        assert_eq!(
+            public_job(
+                json!({"attempt":1,"correlationId":"lease","requestCorrelationId":"request"})
+            ),
+            json!({"attempt":1,"correlationId":"request"})
+        );
+        assert_eq!(
+            public_job(json!({"attempt":1,"correlationId":"lease"})),
+            json!({"attempt":1})
+        );
+        assert_eq!(
+            public_job(json!({"attempt":0,"correlationId":"legacy-request"})),
+            json!({"attempt":0,"correlationId":"legacy-request"})
+        );
+    }
 
     #[test]
     fn publication_retries_only_explicit_transaction_conflicts() {
