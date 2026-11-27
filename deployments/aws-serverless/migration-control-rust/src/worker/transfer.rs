@@ -175,6 +175,10 @@ pub(super) async fn copy(
         .set_version_id(object.source.version_id.clone())
         .send()
         .await?;
+    let scope = value
+        .metadata()
+        .and_then(|metadata| metadata.get("scope"))
+        .cloned();
     let content_type = value.content_type().map(str::to_owned);
     let temporary = tempfile::NamedTempFile::new()?;
     let mut output = tokio::fs::File::from_std(temporary.reopen()?);
@@ -182,7 +186,7 @@ pub(super) async fn copy(
     output.flush().await?;
     drop(output);
     check_hash(&digest, &object.checksum)?;
-    let put = destination
+    let mut put = destination
         .put_object()
         .bucket(&object.destination.bucket)
         .key(&object.destination.key)
@@ -193,9 +197,11 @@ pub(super) async fn copy(
         .checksum_sha256(STANDARD.encode(digest))
         .metadata("checksum", &object.checksum)
         .metadata("byteLength", object.byte_length.to_string())
-        .metadata("migrationId", migration)
-        .send()
-        .await;
+        .metadata("migrationId", migration);
+    if let Some(scope) = scope {
+        put = put.metadata("scope", scope);
+    }
+    let put = put.send().await;
     if let Err(error) = put {
         // A request can commit before its acknowledgement is lost.
         if verify_object(destination, &object, migration)

@@ -18,7 +18,6 @@ use super::{RegionalCommand, RegionalOperation, required};
 type Item = HashMap<String, AttributeValue>;
 const HOLD: &str = "moderationHolds";
 const AUDIT: &str = "auditEvents";
-const FENCE: &str = "__ubeeq_repository_snapshot#moderationHolds";
 const CREATOR_FENCE: &str = "__ubeeq_repository_snapshot#creators";
 const GLOBAL: &str = "__ubeeq_repository_snapshot#global-v2";
 
@@ -60,9 +59,9 @@ fn stamp(record: &mut Value) -> Result<(), Failure> {
 pub struct RegionalStore {
     client: Client,
     table: String,
-    instance: String,
-    cell: String,
-    region: String,
+    pub(super) instance: String,
+    pub(super) cell: String,
+    pub(super) region: String,
 }
 
 impl RegionalStore {
@@ -242,7 +241,8 @@ impl RegionalStore {
             "state":"active","reason":command.hold_reason(),
         });
         stamp(&mut record)?;
-        self.write_hold(
+        self.write_guarded(
+            HOLD,
             &record,
             None,
             Some((command.creator(), creator_revision, creator_fence)),
@@ -280,17 +280,19 @@ impl RegionalStore {
         hold["revision"] = json!(previous.checked_add(1).ok_or("Hold revision exhausted.")?);
         hold["state"] = json!("released");
         hold["updatedAt"] = json!(timestamp(OffsetDateTime::now_utc())?);
-        self.write_hold(&hold, Some(previous), None).await
+        self.write_guarded(HOLD, &hold, Some(previous), None).await
     }
 
-    async fn write_hold(
+    async fn write_guarded(
         &self,
+        repository: &str,
         record: &Value,
         previous: Option<u64>,
         creator: Option<(&str, u64, Option<String>)>,
     ) -> Result<(), Failure> {
-        let mut fence = key(FENCE.into(), "fence");
-        let old_marker = self.marker(FENCE).await?;
+        let marker_key = format!("__ubeeq_repository_snapshot#{repository}");
+        let mut fence = key(marker_key.clone(), "fence");
+        let old_marker = self.marker(&marker_key).await?;
         fence.insert(
             "version".into(),
             AttributeValue::S(Uuid::new_v4().to_string()),
@@ -307,7 +309,7 @@ impl RegionalStore {
 
         let hold = Put::builder()
             .table_name(&self.table)
-            .set_item(Some(record_item(HOLD, record)?));
+            .set_item(Some(record_item(repository, record)?));
         let hold = if let Some(revision) = previous {
             hold.condition_expression("#revision = :old")
                 .expression_attribute_names("#revision", "revision")
@@ -361,6 +363,42 @@ impl RegionalStore {
         }
         transaction.send().await?;
         Ok(())
+    }
+
+    pub(super) async fn create_imported(
+        &self,
+        repository: &str,
+        mut record: Value,
+    ) -> Result<(), Failure> {
+        if !self.owns(&record) {
+            return Err("Imported record is outside the destination cell.".into());
+        }
+        let id = required(&record, "id")?.to_owned();
+        if let Some(existing) = self.record(repository, &id).await? {
+            let equal = record
+                .as_object()
+                .ok_or("Invalid imported record.")?
+                .iter()
+                .all(|(key, value)| existing[key] == *value);
+            return if equal {
+                Ok(())
+            } else {
+                Err("Existing destination record conflicts with migration import.".into())
+            };
+        }
+        stamp(&mut record)?;
+        if ["creators", "assets", "publications", HOLD].contains(&repository) {
+            self.write_guarded(repository, &record, None, None).await
+        } else {
+            self.client
+                .put_item()
+                .table_name(&self.table)
+                .set_item(Some(record_item(repository, &record)?))
+                .condition_expression("attribute_not_exists(pk)")
+                .send()
+                .await?;
+            Ok(())
+        }
     }
 
     async fn audit(&self, command: &RegionalCommand) -> Result<(), Failure> {

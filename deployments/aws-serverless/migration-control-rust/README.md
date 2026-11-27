@@ -44,3 +44,10 @@ Regional export projects portable publication-image evidence and records a
 versioned, conditionally written S3 manifest. An ambiguous write is reconciled
 against the previously written bytes. Regional import, retirement and the
 Lambda entry point are still required before deployment.
+
+Regional import verifies the transferred manifest against both the byte digest
+and the portable checksum. It checks asset inventory scope and verifies
+destination bytes before writing records, preserves versioned rendition
+references, and blocks integration credentials. Conditional creates and
+snapshot guards protect destination retries. Regional retirement and the
+Lambda entry point remain open.

@@ -1,5 +1,7 @@
 #[cfg(feature = "worker")]
 mod export;
+#[cfg(feature = "worker")]
+mod import;
 pub mod portability;
 mod records;
 
