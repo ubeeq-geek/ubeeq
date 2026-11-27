@@ -5259,6 +5259,129 @@ async fn run_processing_job(
     )))
 }
 
+fn cancelled_job(mut job: Value, reason: Option<&str>, now: &str) -> Result<Value, Failure> {
+    let revision = job["revision"]
+        .as_u64()
+        .and_then(|revision| revision.checked_add(1))
+        .ok_or("Invalid job revision")?;
+    let fields = job.as_object_mut().ok_or("Invalid job record")?;
+    fields.remove("leaseExpiresAt");
+    fields.remove("lastError");
+    if let Some(reason) = reason.filter(|reason| !reason.is_empty()) {
+        fields.insert(
+            "lastError".into(),
+            json!({"code":"cancelled","message":reason}),
+        );
+    }
+    fields.insert("state".into(), json!("cancelled"));
+    fields.insert("revision".into(), json!(revision));
+    fields.insert("updatedAt".into(), json!(now));
+    Ok(job)
+}
+
+async fn cancel_processing_job(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    job_id: &str,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Some(claim) = operator_claim(&repository, &actor).await? else {
+        return Ok(operator_denied(id));
+    };
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let missing = || error(404, id, "job_not_found", "Job was not found");
+    let Some(job) = repository.read("durableJobs", job_id).await?.filter(|job| {
+        job["id"] == job_id && job["cellId"] == repository.cell && job["type"] == "asset.process"
+    }) else {
+        return Ok(missing());
+    };
+    let Some(asset_id) = job["payload"]["assetId"].as_str() else {
+        return Ok(missing());
+    };
+    let Some(asset) = repository.read("assets", asset_id).await?.filter(|asset| {
+        asset["id"] == asset_id
+            && asset["instanceId"] == repository.instance
+            && asset["homeCellId"] == repository.cell
+    }) else {
+        return Ok(missing());
+    };
+    let reply = || {
+        let mut response = private_response(respond(204, id, Value::Null));
+        response.body.clear();
+        response
+    };
+    if job["state"] == "cancelled" {
+        return Ok(reply());
+    }
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    let revision = job["revision"].as_u64().ok_or("Invalid job revision")?;
+    let asset_key = format!("assets#{asset_id}");
+    let next = cancelled_job(job, body["reason"].as_str(), &now)?;
+    let audit_id = Uuid::new_v4().to_string();
+    let mut audit = json!({"id":audit_id,"action":"job.cancelled","actorId":actor,"subjectId":job_id,"payload":{}});
+    rehome_import(&mut audit, &asset, &now);
+    let writes = vec![
+        repository.replace_revisioned("durableJobs", &next, revision)?,
+        repository.create_item("auditEvents", &audit)?,
+        repository.item_guard(&asset_key, "record", Some(("value", attribute(&asset))))?,
+        repository.item_guard(
+            &format!("instanceOperators#{}", repository.instance),
+            "record",
+            Some(("value", attribute(&claim))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ];
+    match client
+        .transact_write_items()
+        .set_transact_items(Some(writes))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(reply()),
+        Err(failure) => {
+            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+                return Ok(operator_denied(id));
+            }
+            if repository.read("auditEvents", &audit_id).await?.as_ref() == Some(&audit) {
+                return Ok(reply());
+            }
+            if matches!(failure.as_service_error(),
+                Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                    if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+            ) {
+                return Ok(error(
+                    409,
+                    id,
+                    "revision_conflict",
+                    "The processing job changed. Try the request again.",
+                ));
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 fn operator_denied(id: &str) -> Response {
     error(
         403,
@@ -5988,6 +6111,22 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
                 )
             });
     }
+    if method == "POST"
+        && let Some(job_id) = path
+            .strip_suffix("/cancel")
+            .and_then(|path| single_path_id(path, "/v1/operations/jobs/"))
+    {
+        return cancel_processing_job(&request, runtime, &id, job_id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "processing_unavailable",
+                    "The worker could not cancel the processing job.",
+                )
+            });
+    }
     let review_case_id = single_path_id(path, "/v1/operations/review-cases/");
     if method == "POST" && (path == "/v1/operations/review-cases" || review_case_id.is_some()) {
         return write_review_case(&request, runtime, &id, review_case_id)
@@ -6387,6 +6526,29 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_fences_leases_and_preserves_attempts_and_trace() {
+        let job = json!({"state":"leased","revision":3,"attempt":2,"leaseExpiresAt":"later",
+            "requestCorrelationId":"original","correlationId":"owner","lastError":{"code":"earlier"}});
+        let next = cancelled_job(job.clone(), Some("operator"), "now").unwrap();
+        assert_eq!(next["state"], "cancelled");
+        assert_eq!(next["revision"], 4);
+        assert_eq!(next["attempt"], 2);
+        assert_eq!(next["updatedAt"], "now");
+        assert_eq!(next["requestCorrelationId"], "original");
+        assert_eq!(
+            next["lastError"],
+            json!({"code":"cancelled","message":"operator"})
+        );
+        assert!(next.get("leaseExpiresAt").is_none());
+        assert!(
+            cancelled_job(job, None, "now")
+                .unwrap()
+                .get("lastError")
+                .is_none()
+        );
+    }
 
     #[test]
     fn review_case_state_preserves_the_supported_state_values() {
