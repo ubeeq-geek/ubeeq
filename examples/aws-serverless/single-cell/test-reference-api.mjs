@@ -78,7 +78,7 @@ if (missing.length) {
     created.add(completed.value.asset.id); created.add(completed.value.job.id); object = completed.value.asset.storage;
     const published=await publishReferenceWhenReady((path,options)=>call(path,{...options,token}),{workId:work.value.work.id,idempotencyKey:marker+'-publication'});
     created.add(published.intent.id);created.add(published.publication.id);
-    if (process.env.UBEEQ_AWS_VERIFY_PROCESSING_JOBS === "true") {
+    if (process.env.UBEEQ_AWS_VERIFY_OPERATOR_READS === "true") {
       const jobsPath = "/v1/operations/jobs?state=completed&limit=250";
       const unauthenticated = await call(jobsPath);
       if (unauthenticated.response.status !== 401) throw new Error("Processing jobs must require authentication.");
@@ -97,6 +97,40 @@ if (missing.length) {
       }
       if (job.correlationId !== completed.value.job.correlationId || Object.hasOwn(job, "requestCorrelationId")) {
         throw new Error("The processing job list did not preserve the public request trace.");
+      }
+      const findEvent = async (kind, matches) => {
+        const path = `/v1/operations/${kind}-events`;
+        if ((await call(path)).response.status !== 401) {
+          throw new Error(`Operator ${kind} events must require authentication.`);
+        }
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          let cursor;
+          for (let page = 0; page < 25; page += 1) {
+            const query = new URLSearchParams({ limit: "100" });
+            if (cursor) query.set("cursor", cursor);
+            const result = await call(`${path}?${query}`, { token });
+            if (result.response.status !== 200 || !Array.isArray(result.value?.events)) {
+              throw new Error(`Operator ${kind} event listing failed (${result.response.status}).`);
+            }
+            const event = result.value.events.find(matches);
+            if (event) return event;
+            cursor = result.value.nextCursor;
+            if (!cursor) break;
+          }
+          if (attempt < 4) await wait(1000);
+        }
+        throw new Error(`The operator ${kind} event listing did not return the fixture.`);
+      };
+      const audit = await findEvent("audit", event =>
+        event.action === "work.published" && event.subjectId === work.value.work.id
+        && event.payload?.publicationId === published.publication.id);
+      const usage = await findEvent("usage", event =>
+        event.accountId === creator.value.creator.id && event.meter === "processing_units"
+        && event.idempotencyKey === `asset-processing:${completed.value.asset.id}:${completed.value.asset.objectVersion}`);
+      if (audit.actorId !== actorId || usage.quantity !== 1
+        || [audit, usage].some(event => event.instanceId !== instanceId
+          || event.homeCellId !== creator.value.creator.homeCellId)) {
+        throw new Error("Operator evidence did not match the fixture actor, usage, or cell.");
       }
     }
     const replay = await publishReferenceWhenReady((path, options) => call(path, { ...options, token }), {
