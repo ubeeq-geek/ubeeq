@@ -24,11 +24,11 @@ name = "reference-api"
 path = "src/reference_api.rs"
 
 [features]
-worker = ["dep:aws-sdk-lambda", "dep:aws-sdk-s3", "dep:tempfile"]
+worker = ["dep:aws-sdk-lambda", "dep:tempfile"]
 
 [dependencies]
 aws-sdk-lambda = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rt-tokio", "default-https-client"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 sha2 = "0.11"
 tempfile = { version = "3", optional = true }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }

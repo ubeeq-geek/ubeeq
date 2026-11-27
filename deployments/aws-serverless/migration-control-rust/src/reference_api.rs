@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    time::Duration as StdDuration,
 };
 
 use aws_config::{BehaviorVersion, Region};
@@ -147,6 +148,7 @@ struct Runtime {
     instance_id: String,
     cell: Cell,
     records: Option<(Client, String)>,
+    delivery: Option<(aws_sdk_s3::Client, String)>,
     routing: Option<MigrationStore>,
     identity: Option<CognitoIdentity>,
     password_authentication: bool,
@@ -953,6 +955,138 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
     }
 }
 
+fn single_path_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    path.strip_prefix(prefix)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn delivery_key(key: &str, cell: &str, creator: &str) -> bool {
+    let canonical = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part
+                .bytes()
+                .any(|byte| byte <= 31 || byte == 127 || matches!(byte, b'%' | b'\\'))
+    };
+    canonical(cell)
+        && canonical(creator)
+        && !cell.contains('/')
+        && !creator.contains('/')
+        && key.starts_with(&format!("cells/{cell}/creators/{creator}/"))
+        && key.split('/').all(canonical)
+}
+
+fn has_public_hold(holds: &[Value], creator: &str, work: &str, assets: &[Value]) -> bool {
+    holds.iter().any(|hold| {
+        hold["state"] == "active"
+            && hold["subjectId"].as_str().is_some_and(|subject| {
+                subject == creator
+                    || subject == work
+                    || assets.iter().any(|asset| asset["id"] == subject)
+            })
+    })
+}
+
+async fn public_work(runtime: &Runtime, work_id: &str) -> Result<Option<Value>, Failure> {
+    let (client, table) = runtime
+        .records
+        .as_ref()
+        .ok_or("Persistence is not configured")?;
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let local = |record: &Value| {
+        record["instanceId"] == runtime.instance_id && record["homeCellId"] == runtime.cell.id
+    };
+    let Some(work) = repository.read("works", work_id).await?.filter(|work| {
+        local(work)
+            && work["id"] == work_id
+            && matches!(work["status"].as_str(), Some("ready" | "published"))
+    }) else {
+        return Ok(None);
+    };
+    let creator = work["creatorId"]
+        .as_str()
+        .filter(|creator| !creator.is_empty())
+        .ok_or("Missing Work Creator")?;
+    if !repository
+        .read("creators", creator)
+        .await?
+        .is_some_and(|record| local(&record) && record["id"] == creator)
+    {
+        return Ok(None);
+    }
+    let assets: Vec<_> = repository
+        .list("assets")
+        .await?
+        .into_iter()
+        .filter(|asset| {
+            asset["workId"] == work_id
+                && asset["creatorId"] == creator
+                && asset["status"] == "ready"
+        })
+        .collect();
+    let publications: Vec<_> = repository
+        .list("publications")
+        .await?
+        .into_iter()
+        .filter(|publication| publication["workId"] == work_id && publication["status"] == "live")
+        .collect();
+    if assets.is_empty()
+        || publications.is_empty()
+        || has_public_hold(
+            &repository.list("moderationHolds").await?,
+            creator,
+            work_id,
+            &assets,
+        )
+    {
+        return Ok(None);
+    }
+
+    let (s3, bucket) = runtime
+        .delivery
+        .as_ref()
+        .ok_or("Delivery is not configured")?;
+    let expires_at = (OffsetDateTime::now_utc() + time::Duration::hours(1)).format(&Rfc3339)?;
+    let mut delivered = Vec::with_capacity(assets.len());
+    for mut asset in assets {
+        let storage = &asset["storage"];
+        let key = storage["key"]
+            .as_str()
+            .filter(|key| delivery_key(key, &runtime.cell.id, creator))
+            .ok_or("Invalid Work asset key")?;
+        let url = s3
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(storage["versionId"].as_str().map(str::to_owned))
+            .presigned(aws_sdk_s3::presigning::PresigningConfig::expires_in(
+                StdDuration::from_secs(3600),
+            )?)
+            .await?;
+        if asset["deliveryMimeType"].is_null() {
+            asset["deliveryMimeType"] = asset["mimeType"].clone();
+        }
+        asset["delivery"] = json!({"url":url.uri(), "expiresAt":expires_at});
+        delivered.push(asset);
+    }
+    Ok(Some(
+        json!({"work": work, "assets": delivered, "publications": publications}),
+    ))
+}
+
+fn private_response(mut response: Response) -> Response {
+    response
+        .headers
+        .insert("cache-control", "private, no-store".into());
+    response
+}
+
 async fn handle(request: Request, runtime: &Runtime) -> Response {
     let id = request
         .headers
@@ -990,6 +1124,27 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             ))
     {
         return creator_read(&request, runtime, &id).await;
+    }
+    if method == "GET" {
+        if let Some(work_id) = single_path_id(path, "/v1/public/works/") {
+            let response = match public_work(runtime, work_id).await {
+                Ok(Some(mut body)) => {
+                    body["requestId"] = json!(id);
+                    respond(200, &id, body)
+                }
+                Ok(None) => error(404, &id, "work_not_found", "Published work was not found"),
+                Err(_) => error(500, &id, "internal_error", "Unable to read published Work"),
+            };
+            return private_response(response);
+        }
+        if single_path_id(path, "/v1/delivery/").is_some() {
+            return private_response(error(
+                404,
+                &id,
+                "delivery_not_found",
+                "This delivery URL is served by the configured delivery provider",
+            ));
+        }
     }
     if (method, path) == ("POST", "/v1/migrations") {
         return creator_read(&request, runtime, &id).await;
@@ -1114,12 +1269,13 @@ async fn main() -> Result<(), Error> {
             .unwrap_or_else(|| "unknown".into()),
         operator: env::var("UBEEQ_CELL_OPERATOR").unwrap_or_else(|_| "self-hosted".into()),
     };
-    let records = if let Ok(table) = env::var("UBEEQ_RECORDS_TABLE") {
-        let configuration = aws_config::defaults(BehaviorVersion::latest()).load().await;
-        Some((Client::new(&configuration), table))
-    } else {
-        None
-    };
+    let configuration = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let records = env::var("UBEEQ_RECORDS_TABLE")
+        .ok()
+        .map(|table| (Client::new(&configuration), table));
+    let delivery = env::var("UBEEQ_SOURCE_BUCKET")
+        .ok()
+        .map(|bucket| (aws_sdk_s3::Client::new(&configuration), bucket));
     let routing = if let Ok(table) = env::var("UBEEQ_ROUTING_DIRECTORY_TABLE_NAME") {
         let region = env::var("UBEEQ_ROUTING_DIRECTORY_REGION")?;
         let configuration = aws_config::defaults(BehaviorVersion::latest())
@@ -1143,10 +1299,7 @@ async fn main() -> Result<(), Error> {
     };
     let password_authentication = env::var("UBEEQ_PASSWORD_AUTH_ENABLED").as_deref() == Ok("true");
     let credentials = if password_authentication && identity.is_some() {
-        aws_config::defaults(BehaviorVersion::latest())
-            .load()
-            .await
-            .credentials_provider()
+        configuration.credentials_provider()
     } else {
         None
     };
@@ -1154,6 +1307,7 @@ async fn main() -> Result<(), Error> {
         instance_id: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
         cell,
         records,
+        delivery,
         routing,
         identity,
         password_authentication,
@@ -1183,6 +1337,7 @@ mod tests {
             },
             instance_id: "reference-test".into(),
             records: None,
+            delivery: None,
             routing: None,
             identity: None,
             password_authentication: false,
@@ -1255,6 +1410,40 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(creator_selection(&request).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn public_delivery_keys_and_holds_are_scoped() {
+        assert!(delivery_key(
+            "cells/c/creators/owner/renditions/id",
+            "c",
+            "owner"
+        ));
+        for key in [
+            "cells/c/creators/other/renditions/id",
+            "cells/other/creators/owner/id",
+            "cells/c/creators/owner/../other",
+            "cells/c/creators/owner/a%2Fb",
+            "cells/c/creators/owner/",
+        ] {
+            assert!(!delivery_key(key, "c", "owner"));
+        }
+        let assets = [json!({"id":"asset"})];
+        assert!(has_public_hold(
+            &[json!({"subjectId":"asset","state":"active"})],
+            "owner",
+            "work",
+            &assets
+        ));
+        assert!(!has_public_hold(
+            &[
+                json!({"subjectId":"unrelated","state":"active"}),
+                json!({"subjectId":"work","state":"released"})
+            ],
+            "owner",
+            "work",
+            &assets
+        ));
     }
 
     #[test]
