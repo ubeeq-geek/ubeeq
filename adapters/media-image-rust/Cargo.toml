@@ -1,0 +1,10 @@
+[package]
+name = "ubeeq-media-image"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "LICENSE"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+serde_json = "1"
