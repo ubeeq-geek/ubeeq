@@ -64,7 +64,12 @@ impl MigrationStore {
         Self { client, table }
     }
 
-    async fn read(&self, partition: &str, id: &str, field: &str) -> Result<Value, Failure> {
+    async fn read_optional(
+        &self,
+        partition: &str,
+        id: &str,
+        field: &str,
+    ) -> Result<Option<Value>, Failure> {
         let output = self
             .client
             .get_item()
@@ -73,11 +78,21 @@ impl MigrationStore {
             .consistent_read(true)
             .send()
             .await?;
-        let value = output
+        output
             .item
             .and_then(|mut item| item.remove(field))
-            .ok_or("Control-plane metadata was not found.")?;
-        document(value)
+            .map(document)
+            .transpose()
+    }
+
+    async fn read(&self, partition: &str, id: &str, field: &str) -> Result<Value, Failure> {
+        self.read_optional(partition, id, field)
+            .await?
+            .ok_or_else(|| "Control-plane metadata was not found.".into())
+    }
+
+    pub async fn route_optional(&self, creator: &str) -> Result<Option<Value>, Failure> {
+        self.read_optional("route", creator, "route").await
     }
 
     pub async fn checkpoint(&self, id: &str) -> Result<Value, Failure> {

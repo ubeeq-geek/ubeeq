@@ -19,6 +19,10 @@ name = "migration-cell"
 path = "src/cell.rs"
 required-features = ["worker"]
 
+[[bin]]
+name = "reference-api"
+path = "src/reference_api.rs"
+
 [features]
 worker = ["dep:aws-sdk-lambda", "dep:aws-sdk-s3", "dep:tempfile"]
 
