@@ -790,6 +790,147 @@ impl CreatorRecords<'_> {
     }
 }
 
+fn collection_slug(value: &str) -> String {
+    let normalized = value.to_lowercase();
+    let mut slug = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    slug.truncate(160);
+    if slug.is_empty() {
+        "collection".into()
+    } else {
+        slug
+    }
+}
+
+fn collection_changes(
+    collection: &mut Value,
+    body: &Value,
+    deleting: bool,
+    now: &str,
+    id: &str,
+) -> Result<(), Response> {
+    let internal = |message| error(500, id, "internal_error", message);
+    let before = collection["status"].as_str().unwrap_or("draft").to_owned();
+    if deleting {
+        collection["status"] = json!("deleted");
+    } else {
+        for name in [
+            "title",
+            "description",
+            "slug",
+            "type",
+            "visibility",
+            "coverAssetId",
+            "status",
+        ] {
+            let Some(value) = body.get(name) else {
+                continue;
+            };
+            if name == "coverAssetId" {
+                if value.is_null() {
+                    collection
+                        .as_object_mut()
+                        .expect("Collection record has fields")
+                        .remove(name);
+                    continue;
+                }
+                if value.as_str().is_none_or(str::is_empty) {
+                    return Err(error(
+                        400,
+                        id,
+                        "invalid_request",
+                        "Cover asset ID is invalid.",
+                    ));
+                }
+            }
+            collection[name] = if matches!(name, "title" | "slug") {
+                let text = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        error(400, id, "invalid_request", &format!("{name} is required"))
+                    })?;
+                if name == "slug" {
+                    json!(collection_slug(text))
+                } else {
+                    json!(text)
+                }
+            } else {
+                value.clone()
+            };
+        }
+    }
+    let status = collection["status"]
+        .as_str()
+        .ok_or_else(|| internal("Collection details are invalid."))?;
+    let previously_published = collection["workPublicationHistoryAt"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty());
+    match status {
+        "deleted" if previously_published => {
+            return Err(internal(
+                "Works have been published to this collection. Archive it instead of deleting it.",
+            ));
+        }
+        "archived" if !previously_published => {
+            return Err(internal(
+                "No Works have been published to this collection. Delete it instead of archiving it.",
+            ));
+        }
+        "published" if before != "published" => {
+            return Err(internal(
+                "Use the collection publication workflow to change release state.",
+            ));
+        }
+        _ if before == "deleted" && status != "deleted" => {
+            return Err(internal("Deleted collections cannot be restored."));
+        }
+        _ => {}
+    }
+    if !matches!(status, "draft" | "published" | "archived" | "deleted")
+        || !matches!(
+            collection["type"].as_str(),
+            Some("collection" | "gallery" | "series" | "playlist")
+        )
+        || !matches!(
+            collection["visibility"].as_str(),
+            Some("private" | "unlisted" | "public")
+        )
+        || collection["title"]
+            .as_str()
+            .is_none_or(|text| text.trim().is_empty() || text.encode_utf16().count() > 500)
+        || collection.get("description").is_some_and(|value| {
+            value
+                .as_str()
+                .is_none_or(|text| text.encode_utf16().count() > 50000)
+        })
+        || collection["slug"]
+            .as_str()
+            .is_none_or(|slug| collection_slug(slug) != slug)
+    {
+        return Err(internal("Collection details are invalid."));
+    }
+    let status = status.to_owned();
+    let fields = collection
+        .as_object_mut()
+        .expect("Collection record has fields");
+    if status == "archived" {
+        fields.entry("archivedAt").or_insert_with(|| json!(now));
+    } else {
+        fields.remove("archivedAt");
+    }
+    if status == "deleted" {
+        fields.insert("deletedAt".into(), json!(now));
+    } else {
+        fields.remove("deletedAt");
+    }
+    Ok(())
+}
+
 async fn mutate_collection(
     request: &Request,
     repository: &CreatorRecords<'_>,
@@ -813,7 +954,8 @@ async fn mutate_collection(
         Err(response) => return Ok(response),
     };
     let deleting = request.request_context.http.method == "DELETE";
-    let (revision, membership) = if deleting {
+    let editing = request.request_context.http.method == "PATCH";
+    let (revision, membership) = if deleting || editing {
         let Some(revision) = body["revision"]
             .as_u64()
             .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
@@ -825,7 +967,22 @@ async fn mutate_collection(
                 "A current collection revision is required.",
             ));
         };
-        if body.as_object().is_none_or(|fields| fields.len() != 1) {
+        if body.as_object().is_none_or(|fields| {
+            fields.keys().any(|key| {
+                key != "revision"
+                    && (!editing
+                        || !matches!(
+                            key.as_str(),
+                            "title"
+                                | "description"
+                                | "slug"
+                                | "type"
+                                | "visibility"
+                                | "coverAssetId"
+                                | "status"
+                        ))
+            })
+        }) {
             return Ok(error(
                 400,
                 id,
@@ -903,25 +1060,58 @@ async fn mutate_collection(
         collection["collectionManagement"] = revised_members(&collection, &requested, &now);
         requested
     } else {
-        if collection["status"] == "deleted" {
+        let prior = collection.clone();
+        if let Err(response) = collection_changes(&mut collection, &body, deleting, &now, id) {
+            return Ok(response);
+        }
+        if prior["status"] == "deleted" && collection["status"] == "deleted" {
             return Ok(respond(
                 200,
                 id,
-                json!({"collection":collection_view(&collection, old, true),"requestId":id}),
+                json!({"collection":collection_view(&prior, old, true),"requestId":id}),
             ));
         }
-        if collection["workPublicationHistoryAt"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty())
+        let mut aliases = prior["slugHistory"]
+            .as_array()
+            .ok_or(DIRECTORY_ERROR)?
+            .clone();
+        for slug in [&prior["slug"], &collection["slug"]] {
+            if !aliases.contains(slug) {
+                aliases.push(slug.clone());
+            }
+        }
+        collection["slugHistory"] = json!(aliases);
+        if collection["status"] != "deleted" {
+            let (ids, _) = collection_directory(&directory, creator)?;
+            for other_id in ids
+                .into_iter()
+                .filter(|other| collection["id"] != other.as_str())
+            {
+                let other = repository
+                    .read("collections", &other_id)
+                    .await?
+                    .filter(|other| same_creator_region(other, creator))
+                    .ok_or(DIRECTORY_ERROR)?;
+                let history = other["slugHistory"].as_array().ok_or(DIRECTORY_ERROR)?;
+                if other["slug"].as_str().is_none() {
+                    return Err(DIRECTORY_ERROR.into());
+                }
+                if other["status"] != "deleted"
+                    && (aliases.contains(&other["slug"])
+                        || history.iter().any(|alias| aliases.contains(alias)))
+                {
+                    return Ok(error(
+                        409,
+                        id,
+                        "slug_conflict",
+                        "Collection slug is already in use.",
+                    ));
+                }
+            }
+        }
+        if collection["status"] != "deleted"
+            && let Some(cover_id) = collection["coverAssetId"].as_str()
         {
-            return Ok(error(
-                500,
-                id,
-                "internal_error",
-                "Works have been published to this collection. Archive it instead of deleting it.",
-            ));
-        }
-        if let Some(cover_id) = collection["coverAssetId"].as_str() {
             let asset = repository.read("assets", cover_id).await?;
             let Some(asset) = asset.filter(|asset| {
                 same_creator_region(asset, creator)
@@ -971,11 +1161,6 @@ async fn mutate_collection(
                 "record",
                 Some(("revision", AttributeValue::N(revision.to_string()))),
             )?);
-        }
-        collection["status"] = json!("deleted");
-        collection["deletedAt"] = json!(now);
-        if let Some(fields) = collection.as_object_mut() {
-            fields.remove("archivedAt");
         }
         old
     };
@@ -1966,7 +2151,7 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
                 }
                 if matches!(
                     request.request_context.http.method.as_str(),
-                    "PUT" | "DELETE"
+                    "PUT" | "DELETE" | "PATCH"
                 ) {
                     return match mutate_collection(request, &repository, &record, collection, id)
                         .await
@@ -2210,7 +2395,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     {
         return creator_read(&request, runtime, &id).await;
     }
-    if matches!(method, "PUT" | "DELETE")
+    if matches!(method, "PUT" | "DELETE" | "PATCH")
         && let Some((_, works)) = collection_path(path)
     {
         if works == (method == "PUT") {
@@ -2619,6 +2804,44 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn collection_metadata_normalizes_slugs_and_enforces_archive_rules() {
+        let mut collection = json!({"id":"c","status":"draft","type":"gallery","visibility":"private","title":"Original","slug":"original","coverAssetId":"asset"});
+        collection_changes(
+            &mut collection,
+            &json!({"slug":" A Test / URL ","coverAssetId":null}),
+            false,
+            "now",
+            "id",
+        )
+        .unwrap();
+        assert_eq!(collection["slug"], "a-test-url");
+        assert!(collection.get("coverAssetId").is_none());
+        assert!(
+            collection_changes(
+                &mut collection.clone(),
+                &json!({"status":"published"}),
+                false,
+                "now",
+                "id"
+            )
+            .is_err()
+        );
+        collection["workPublicationHistoryAt"] = json!("earlier");
+        assert!(
+            collection_changes(&mut collection.clone(), &json!({}), true, "now", "id").is_err()
+        );
+        collection_changes(
+            &mut collection,
+            &json!({"status":"archived"}),
+            false,
+            "now",
+            "id",
+        )
+        .unwrap();
+        assert_eq!(collection["archivedAt"], "now");
     }
 
     #[test]
