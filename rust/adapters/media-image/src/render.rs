@@ -77,12 +77,16 @@ impl SourceImage {
             target.height.get(),
             image::imageops::FilterType::Lanczos3,
         );
-        let rgba = resized.into_rgba8();
-        let rgb = image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
-            let [r, g, b, a] = rgba.get_pixel(x, y).0;
-            let flatten = |channel: u8| ((u16::from(channel) * u16::from(a) + 127) / 255) as u8;
-            image::Rgb([flatten(r), flatten(g), flatten(b)])
-        });
+        let rgb = if resized.color().has_alpha() {
+            let rgba = resized.into_rgba8();
+            image::RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+                let [r, g, b, a] = rgba.get_pixel(x, y).0;
+                let flatten = |channel: u8| ((u16::from(channel) * u16::from(a) + 127) / 255) as u8;
+                image::Rgb([flatten(r), flatten(g), flatten(b)])
+            })
+        } else {
+            resized.into_rgb8()
+        };
 
         let mut output = Vec::new();
         JpegEncoder::new_with_quality(&mut output, quality).encode_image(&rgb)?;
