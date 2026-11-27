@@ -2,3 +2,5 @@
 pub mod lifecycle;
 pub mod store;
 pub mod regional;
+
+pub mod reference_identity;

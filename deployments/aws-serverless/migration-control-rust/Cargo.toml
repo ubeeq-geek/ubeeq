@@ -35,6 +35,7 @@ aws-config = { version = "1", default-features = false, features = ["rt-tokio", 
 aws-sdk-dynamodb = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"] }
 base64 = "0.22"
+ring = "0.17"
 lambda_runtime = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }

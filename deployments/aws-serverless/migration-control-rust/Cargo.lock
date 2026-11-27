@@ -2094,6 +2094,7 @@ dependencies = [
  "icu_collator",
  "icu_locale",
  "lambda_runtime",
+ "ring",
  "ryu-js",
  "serde",
  "serde_json",
