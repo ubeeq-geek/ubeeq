@@ -52,3 +52,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 strip = true
+
+[[bin]]
+name = "reference-worker"
+path = "src/reference_worker.rs"

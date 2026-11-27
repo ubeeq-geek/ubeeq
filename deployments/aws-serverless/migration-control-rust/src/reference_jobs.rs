@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::{
     Client,
-    types::{AttributeValue, Put, TransactWriteItem},
+    types::{AttributeValue, ConditionCheck, Put, TransactWriteItem},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -176,6 +176,23 @@ impl JobQueue {
                 return Ok(None);
             }
         }
+    }
+
+    pub fn guard(&self, lease: &Value, now: OffsetDateTime) -> Result<TransactWriteItem, Failure> {
+        let put = self
+            .finish(lease, JobOutcome::Completed, now)?
+            .put
+            .ok_or("Missing lease conditions")?;
+        let id = lease["id"].as_str().ok_or("Missing job ID")?;
+        let check = ConditionCheck::builder()
+            .table_name(put.table_name)
+            .key("pk", AttributeValue::S(format!("durableJobs#{id}")))
+            .key("sk", AttributeValue::S("record".into()))
+            .condition_expression(put.condition_expression.ok_or("Missing lease condition")?)
+            .set_expression_attribute_names(put.expression_attribute_names)
+            .set_expression_attribute_values(put.expression_attribute_values)
+            .build()?;
+        Ok(TransactWriteItem::builder().condition_check(check).build())
     }
 
     /// Enlist the final job transition with its effect records in the same transaction.
