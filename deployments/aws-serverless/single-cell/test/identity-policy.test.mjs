@@ -60,3 +60,38 @@ test('the reference web function can use its own Rust bootstrap asset', async ()
     template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'lambda.handler', Runtime: 'nodejs22.x' });
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test('the Rust migration cell gets only point reads on the control directory', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'migration-cell-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const cell = join(directory, 'cell');
+    await mkdir(api);
+    await mkdir(cell);
+    await writeFile(join(api, 'lambda.js'), 'synthetic API asset');
+    await writeFile(join(cell, 'bootstrap'), 'synthetic migration cell asset');
+    const routingArn = 'arn:aws:dynamodb:us-east-2:111111111111:table/control-directory';
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: api, rustMigrationCellAssetPath: cell,
+      routingDirectoryTableArn: routingArn, routingDirectoryTableName: 'control-directory',
+      routingDirectoryRegion: 'us-east-2',
+      migrationControlWorkerPrincipalArn: 'arn:aws:iam::111111111111:role/migration-worker',
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustMigrationCell', {
+      env: { account: '111111111111', region: 'eu-central-1' },
+    });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Permission', {
+      Action: 'lambda:InvokeFunction', Principal: 'arn:aws:iam::111111111111:role/migration-worker',
+    });
+    const resources = Object.values(template.toJSON().Resources);
+    const role = resources.filter(value => value.Type === 'AWS::IAM::Policy')
+      .find(value => value.Properties.Roles.some(role => role.Ref?.startsWith('MigrationCellServiceRole')));
+    const directoryGrants = role.Properties.PolicyDocument.Statement.filter(statement => statement.Resource === routingArn);
+    assert.deepEqual(directoryGrants, [{ Action: 'dynamodb:GetItem', Effect: 'Allow', Resource: routingArn }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

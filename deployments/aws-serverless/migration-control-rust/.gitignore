@@ -1,3 +1,4 @@
 /target/
 /migration-control-api-rust.zip
 /migration-control-worker-rust.zip
+/migration-cell-rust.zip

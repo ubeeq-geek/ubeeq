@@ -4,6 +4,8 @@ mod export;
 mod import;
 pub mod portability;
 mod records;
+#[cfg(feature = "worker")]
+mod retire;
 
 pub use records::RegionalStore;
 

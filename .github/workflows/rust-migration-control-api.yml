@@ -5,12 +5,14 @@ on:
     paths:
       - .github/workflows/rust-migration-control-api.yml
       - deployments/aws-serverless/multi-cell/**
+      - deployments/aws-serverless/single-cell/**
       - deployments/aws-serverless/migration-control-rust/**
   push:
     branches: [main]
     paths:
       - .github/workflows/rust-migration-control-api.yml
       - deployments/aws-serverless/multi-cell/**
+      - deployments/aws-serverless/single-cell/**
       - deployments/aws-serverless/migration-control-rust/**
 
 permissions:
@@ -46,6 +48,10 @@ jobs:
           cp target/release/migration-worker target/worker-package/bootstrap
           test -x target/worker-package/bootstrap
           zip -j migration-control-worker-rust.zip target/worker-package/bootstrap
+          mkdir -p target/cell-package
+          cp target/release/migration-cell target/cell-package/bootstrap
+          test -x target/cell-package/bootstrap
+          zip -j migration-cell-rust.zip target/cell-package/bootstrap
       - uses: actions/upload-artifact@v4
         with:
           name: migration-control-api-rust-al2023-x86-64
@@ -55,4 +61,9 @@ jobs:
         with:
           name: migration-control-worker-rust-al2023-x86-64
           path: deployments/aws-serverless/migration-control-rust/migration-control-worker-rust.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: migration-cell-rust-al2023-x86-64
+          path: deployments/aws-serverless/migration-control-rust/migration-cell-rust.zip
           if-no-files-found: error

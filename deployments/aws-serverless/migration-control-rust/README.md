@@ -28,12 +28,11 @@ The Rust profile allocates 6 GiB of temporary storage. It uses single-object
 PUTs, as the Node migration adapter does. The regional migration cell command
 implementation is a separate port.
 
-## Regional cell port status
+## Regional cell Lambda
 
 The regional module validates command identity and cell/region scope, writes
 source holds and releases with the existing DynamoDB snapshot fences, and
-writes the existing destination audit records. The regional Lambda entry point
-also needs the import and retirement operations before deployment.
+writes the existing destination audit records.
 
 The regional portability module implements the existing export checksum and
 record graph checks. Its canonical encoder uses English collation, JavaScript
@@ -42,12 +41,23 @@ implementation verifies the cross-runtime digest. The module also prepares
 asset transfer entries for the declared source and destination cells.
 Regional export projects portable publication-image evidence and records a
 versioned, conditionally written S3 manifest. An ambiguous write is reconciled
-against the previously written bytes. Regional import, retirement and the
-Lambda entry point are still required before deployment.
+against the previously written bytes.
 
 Regional import verifies the transferred manifest against both the byte digest
 and the portable checksum. It checks asset inventory scope and verifies
 destination bytes before writing records, preserves versioned rendition
 references, and blocks integration credentials. Conditional creates and
-snapshot guards protect destination retries. Regional retirement and the
-Lambda entry point remain open.
+snapshot guards protect destination retries.
+
+
+The regional ZIP uses its own bootstrap. Select it with
+`rustMigrationCellAssetPath` or `UBEEQ_RUST_MIGRATION_CELL_ASSET_PATH` in
+single-cell CDK synthesis. Retirement requires the current cutover checkpoint
+and destination route from the configured control table, an expired rollback
+window, and the active source hold. It deletes explicit source object versions
+and stops on a failed or ambiguous deletion. It retains source audit, usage,
+financial records, and the migration hold. Legacy asset records that lack an
+immutable source version require reconciliation before retirement.
+
+Run the full live regional migration proof with disposable fixtures before
+promoting any of the Rust migration functions.

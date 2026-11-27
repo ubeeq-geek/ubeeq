@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+#[cfg(feature = "worker")]
+use aws_sdk_dynamodb::types::Delete;
 use aws_sdk_dynamodb::{
     Client,
     types::{AttributeValue, ConditionCheck, Put, TransactWriteItem},
@@ -180,6 +182,126 @@ impl RegionalStore {
             }
         }
         Ok(records)
+    }
+
+    #[cfg(feature = "worker")]
+    pub(super) async fn retirement_records(&self, repository: &str) -> Result<Vec<Value>, Failure> {
+        let mut cursor = None;
+        let mut records = Vec::new();
+        loop {
+            let output = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .consistent_read(true)
+                .filter_expression("#repository = :repository")
+                .expression_attribute_names("#repository", "repository")
+                .expression_attribute_values(":repository", AttributeValue::S(repository.into()))
+                .set_exclusive_start_key(cursor)
+                .limit(100)
+                .send()
+                .await?;
+            for mut item in output.items.unwrap_or_default() {
+                let value = document(
+                    item.remove("value")
+                        .ok_or("Missing retirement repository document.")?,
+                )?;
+                if self.owns(&value) {
+                    let expected = record_item(repository, &value)?;
+                    if ["id", "pk", "sk", "repository", "revision"]
+                        .iter()
+                        .any(|field| item.get(*field) != expected.get(*field))
+                    {
+                        return Err("Retirement repository record envelope conflicts.".into());
+                    }
+                    records.push(value);
+                }
+            }
+            cursor = output.last_evaluated_key.filter(|key| !key.is_empty());
+            if cursor.is_none() {
+                return Ok(records);
+            }
+        }
+    }
+
+    #[cfg(feature = "worker")]
+    pub(super) async fn remove_owned(
+        &self,
+        repository: &str,
+        record: &Value,
+    ) -> Result<(), Failure> {
+        if !self.owns(record) {
+            return Err("Retirement record is outside the source cell.".into());
+        }
+        let id = required(record, "id")?;
+        let revision = record["revision"]
+            .as_u64()
+            .ok_or("Missing retirement record revision.")?;
+        let current = self.record(repository, id).await?;
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if &current != record {
+            return Err("Retirement record changed after discovery.".into());
+        }
+        let guard = "#revision = :revision AND #value = :value";
+        if !["creators", "assets", "publications", HOLD].contains(&repository) {
+            self.client
+                .delete_item()
+                .table_name(&self.table)
+                .set_key(Some(record_key(repository, id)))
+                .condition_expression(guard)
+                .expression_attribute_names("#revision", "revision")
+                .expression_attribute_names("#value", "value")
+                .expression_attribute_values(":revision", AttributeValue::N(revision.to_string()))
+                .expression_attribute_values(":value", attribute(record))
+                .send()
+                .await?;
+            return Ok(());
+        }
+        let marker_name = format!("__ubeeq_repository_snapshot#{repository}");
+        let mut next_marker = key(marker_name.clone(), "fence");
+        next_marker.insert(
+            "version".into(),
+            AttributeValue::S(Uuid::new_v4().to_string()),
+        );
+        let marker = Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(next_marker));
+        let marker = if let Some(old) = self.marker(&marker_name).await? {
+            marker
+                .condition_expression("#version = :old")
+                .expression_attribute_names("#version", "version")
+                .expression_attribute_values(":old", AttributeValue::S(old))
+        } else {
+            marker.condition_expression("attribute_not_exists(pk)")
+        };
+        let protocol = ConditionCheck::builder()
+            .table_name(&self.table)
+            .set_key(Some(key(GLOBAL.into(), "fence")))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()?;
+        let delete = Delete::builder()
+            .table_name(&self.table)
+            .set_key(Some(record_key(repository, id)))
+            .condition_expression(guard)
+            .expression_attribute_names("#revision", "revision")
+            .expression_attribute_names("#value", "value")
+            .expression_attribute_values(":revision", AttributeValue::N(revision.to_string()))
+            .expression_attribute_values(":value", attribute(record))
+            .build()?;
+        self.client
+            .transact_write_items()
+            .transact_items(
+                TransactWriteItem::builder()
+                    .condition_check(protocol)
+                    .build(),
+            )
+            .transact_items(TransactWriteItem::builder().put(marker.build()?).build())
+            .transact_items(TransactWriteItem::builder().delete(delete).build())
+            .send()
+            .await?;
+        Ok(())
     }
 
     pub(super) fn owns(&self, value: &Value) -> bool {

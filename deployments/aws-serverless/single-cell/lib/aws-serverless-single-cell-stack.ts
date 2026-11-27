@@ -67,7 +67,14 @@ export class AwsServerlessSingleCellStack extends Stack {
     // This private handler is intentionally distinct from the HTTP API. Only
     // the explicitly nominated multi-cell control worker may invoke it, and
     // it receives regional migration commands rather than viewer traffic.
-    const migrationCell = new lambda.Function(this, "MigrationCell", { runtime: lambda.Runtime.NODEJS_22_X, handler: "lambda.migrationCell", timeout: Duration.minutes(2), code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }), environment: runtimeEnvironment });
+    const rustMigrationCellAsset = this.node.tryGetContext("rustMigrationCellAssetPath") || process.env.UBEEQ_RUST_MIGRATION_CELL_ASSET_PATH;
+    const migrationCell = new lambda.Function(this, "MigrationCell", {
+      runtime: rustMigrationCellAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustMigrationCellAsset ? "bootstrap" : "lambda.migrationCell",
+      timeout: Duration.minutes(2),
+      code: lambda.Code.fromAsset(rustMigrationCellAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      environment: runtimeEnvironment,
+    });
     records.grantReadWriteData(health); sourceStore.grantReadWrite(health); deliveryStore.grantReadWrite(health); jobs.grantConsumeMessages(health); jobs.grantSendMessages(health); credentialKey.grantRead(health);
     records.grantReadWriteData(worker); sourceStore.grantReadWrite(worker); deliveryStore.grantReadWrite(worker); jobs.grantConsumeMessages(worker); jobs.grantSendMessages(worker); credentialKey.grantRead(worker);
     records.grantReadWriteData(migrationCell); sourceStore.grantReadWrite(migrationCell);
@@ -75,6 +82,9 @@ export class AwsServerlessSingleCellStack extends Stack {
     userPool.grant(health, "cognito-idp:AdminGetUser", "cognito-idp:AdminListGroupsForUser");
     userPool.grant(worker, "cognito-idp:AdminGetUser", "cognito-idp:AdminListGroupsForUser");
     if (migrationControlWorkerPrincipalArn) migrationCell.addPermission("MigrationControlWorkerInvoke", { action: "lambda:InvokeFunction", principal: new iam.ArnPrincipal(migrationControlWorkerPrincipalArn) });
+    if (rustMigrationCellAsset && routingDirectoryTableName && routingDirectoryTableArn) {
+      migrationCell.addToRolePolicy(new iam.PolicyStatement({ actions: ["dynamodb:GetItem"], resources: [routingDirectoryTableArn] }));
+    }
     if (routingDirectoryTableName && routingDirectoryTableArn) {
       const routingDirectory = dynamodb.Table.fromTableArn(this, "RoutingDirectory", routingDirectoryTableArn);
       // Route resolution is read-only in each cell. Migration writes belong to
