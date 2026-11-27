@@ -1,7 +1,11 @@
+use std::time::{Duration, Instant};
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, RsaPublicKeyComponents};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 #[derive(Deserialize)]
 struct Header {
@@ -118,6 +122,151 @@ pub fn bind_user(
         | (Some("creator_operator"), Some("creator_operator")) => Some(AccountScope::Creator),
         (Some("customer_account"), Some("customer_account")) => Some(AccountScope::Customer),
         _ => None,
+    }
+}
+
+pub struct CognitoIdentity {
+    http: reqwest::Client,
+    endpoint: String,
+    issuer: String,
+    client_id: String,
+    keys: Mutex<Option<KeySet>>,
+}
+
+struct KeySet {
+    fetched_at: Instant,
+    keys: Vec<Jwk>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CurrentUser {
+    username: String,
+    user_attributes: Vec<UserAttribute>,
+}
+
+#[derive(Deserialize)]
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+impl CognitoIdentity {
+    pub fn new(
+        pool_id: &str,
+        client_id: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((region, pool)) = pool_id.split_once('_') else {
+            return Err("Invalid Cognito user pool ID".into());
+        };
+        if region.is_empty()
+            || !region
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || pool.is_empty()
+            || !pool.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            || client_id.is_empty()
+        {
+            return Err("Invalid Cognito user pool or app client configuration".into());
+        }
+        let suffix = if region.starts_with("cn-") {
+            "amazonaws.com.cn"
+        } else {
+            "amazonaws.com"
+        };
+        let endpoint = format!("https://cognito-idp.{region}.{suffix}");
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()?,
+            issuer: format!("{endpoint}/{pool_id}"),
+            endpoint,
+            client_id,
+            keys: Mutex::new(None),
+        })
+    }
+
+    async fn current_user_operation(&self, target: &str, token: &str) -> Option<reqwest::Response> {
+        self.http
+            .post(&self.endpoint)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", target)
+            .json(&json!({"AccessToken": token}))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()
+            .filter(|response| response.status().is_success())
+    }
+
+    pub async fn verify_session(&self, token: &str) -> Option<AccountScope> {
+        let (header, _) = token.split_once('.')?;
+        if token.len() > 32_768 {
+            return None;
+        }
+        let header: Header = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
+        if header.alg != "RS256" || header.kid.is_empty() {
+            return None;
+        }
+        let claims = {
+            let mut cache = self.keys.lock().await;
+            if cache.as_ref().is_none_or(|set| {
+                let age = set.fetched_at.elapsed();
+                age >= Duration::from_secs(3600)
+                    || (age >= Duration::from_secs(30)
+                        && !set.keys.iter().any(|key| key.kid == header.kid))
+            }) {
+                let response = self
+                    .http
+                    .get(format!("{}/.well-known/jwks.json", self.issuer))
+                    .send()
+                    .await
+                    .ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+                let set: Jwks = response.json().await.ok()?;
+                *cache = Some(KeySet {
+                    fetched_at: Instant::now(),
+                    keys: set.keys,
+                });
+            }
+            verify_access_token(
+                token,
+                &self.issuer,
+                &self.client_id,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                &cache.as_ref()?.keys,
+            )?
+        };
+        let user: CurrentUser = self
+            .current_user_operation("AWSCognitoIdentityProviderService.GetUser", token)
+            .await?
+            .json()
+            .await
+            .ok()?;
+        if claims.exp <= OffsetDateTime::now_utc().unix_timestamp() {
+            return None;
+        }
+        let scope = bind_user(&claims, &user.username, &user.user_attributes)?;
+        Some(
+            if claims.groups.as_array().is_some_and(|groups| {
+                groups
+                    .iter()
+                    .any(|role| role.as_str() == Some("customer_account"))
+            }) {
+                AccountScope::Customer
+            } else {
+                scope
+            },
+        )
+    }
+
+    pub async fn sign_out(&self, token: &str) -> bool {
+        self.current_user_operation("AWSCognitoIdentityProviderService.GlobalSignOut", token)
+            .await
+            .is_some()
     }
 }
 

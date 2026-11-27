@@ -10,7 +10,10 @@ use aws_sdk_dynamodb::{
 use lambda_runtime::{Error, LambdaEvent, run, service_fn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use ubeeq_migration_control_api::store::MigrationStore;
+use ubeeq_migration_control_api::{
+    reference_identity::{AccountScope, CognitoIdentity},
+    store::MigrationStore,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -137,6 +140,7 @@ struct Runtime {
     cell: Cell,
     records: Option<(Client, String)>,
     routing: Option<MigrationStore>,
+    identity: Option<CognitoIdentity>,
 }
 
 fn creator_page(
@@ -197,6 +201,52 @@ async fn readiness(runtime: &Runtime, id: &str) -> Response {
     )
 }
 
+fn bearer(request: &Request) -> Option<&str> {
+    let value = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))?
+        .1
+        .as_str();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    let token = token.trim_start();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+async fn creator_session<'a>(
+    request: &'a Request,
+    runtime: &Runtime,
+    id: &str,
+) -> Result<&'a str, Response> {
+    let token = bearer(request).ok_or_else(|| {
+        error(
+            401,
+            id,
+            "authentication_required",
+            "A bearer session is required",
+        )
+    })?;
+    let scope = match &runtime.identity {
+        Some(identity) => identity.verify_session(token).await,
+        None => None,
+    };
+    match scope {
+        Some(AccountScope::Creator) => Ok(token),
+        Some(AccountScope::Customer) => Err(error(
+            403,
+            id,
+            "creator_access_denied",
+            "Customer accounts do not have creator access.",
+        )),
+        None => Err(error(
+            401,
+            id,
+            "authentication_invalid",
+            "The session is invalid or expired",
+        )),
+    }
+}
+
 async fn handle(request: Request, runtime: &Runtime) -> Response {
     let id = request
         .headers
@@ -204,6 +254,49 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .find(|(name, value)| name.eq_ignore_ascii_case("x-request-id") && !value.is_empty())
         .map(|(_, value)| value.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let method = request.request_context.http.method.as_str();
+    let path = request.raw_path.as_str();
+    if path == "/v1/operations" || path.starts_with("/v1/operations/") {
+        return error(
+            404,
+            &id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        );
+    }
+    if (method, path) == ("GET", "/v1/host-capabilities") {
+        if let Err(response) = creator_session(&request, runtime, &id).await {
+            return response;
+        }
+        return respond(
+            200,
+            &id,
+            json!({
+                "slots": {}, "transforms": {"graphicWatermark": false, "imageAdjustments": false}, "requestId": id
+            }),
+        );
+    }
+    if (method, path) == ("POST", "/v1/auth/sign-out") {
+        let token = match creator_session(&request, runtime, &id).await {
+            Ok(token) => token,
+            Err(response) => return response,
+        };
+        if let Some(identity) = &runtime.identity
+            && identity.sign_out(token).await
+        {
+            return Response {
+                status_code: 204,
+                headers: BTreeMap::from([
+                    ("cache-control", "no-store".into()),
+                    ("content-type", "application/json; charset=utf-8".into()),
+                    ("x-request-id", id),
+                ]),
+                body: String::new(),
+                is_base64_encoded: None,
+            };
+        }
+        return error(500, &id, "internal_error", "Unable to sign out of Cognito");
+    }
     if request.request_context.http.method == "GET" {
         if request.raw_path == "/health" {
             return respond(200, &id, json!({"ok": true, "requestId": id}));
@@ -287,11 +380,20 @@ async fn main() -> Result<(), Error> {
     } else {
         None
     };
+    let identity = match (
+        env::var("UBEEQ_USER_POOL_ID"),
+        env::var("UBEEQ_USER_POOL_CLIENT_ID"),
+    ) {
+        (Ok(pool), Ok(client)) => Some(CognitoIdentity::new(&pool, client)?),
+        (Err(env::VarError::NotPresent), Err(env::VarError::NotPresent)) => None,
+        _ => return Err("Cognito user pool and app client must both be configured".into()),
+    };
     let runtime = Runtime {
         instance_id: env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into()),
         cell,
         records,
         routing,
+        identity,
     };
     run(service_fn(|event: LambdaEvent<Request>| {
         handle_event(event, &runtime)
@@ -318,8 +420,19 @@ mod tests {
             instance_id: "reference-test".into(),
             records: None,
             routing: None,
+            identity: None,
         };
         for (path, status, fields) in [
+            (
+                "/v1/host-capabilities",
+                401,
+                json!({"error":{"code":"authentication_required","message":"A bearer session is required","requestId":"test-id"}}),
+            ),
+            (
+                "/v1/operations/jobs",
+                404,
+                json!({"error":{"code":"operations_unavailable","message":"Operator operations are not configured","requestId":"test-id"}}),
+            ),
             ("/health", 200, json!({"ok": true, "requestId": "test-id"})),
             (
                 "/.well-known/ubeeq",
