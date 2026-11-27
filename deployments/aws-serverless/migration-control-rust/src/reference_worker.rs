@@ -29,6 +29,16 @@ struct Batch {
 #[serde(rename_all = "camelCase")]
 struct Message {
     message_id: String,
+    body: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Notification {
+    id: String,
+    cell_id: String,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 struct Worker {
@@ -310,11 +320,22 @@ impl Worker {
     }
 
     async fn one(&self, message: &Message) -> Result<(), Failure> {
-        let Some(lease) = self
-            .queue
-            .lease(&format!("aws-worker:{}", message.message_id))
-            .await?
-        else {
+        let worker = format!("aws-worker:{}", message.message_id);
+        let notification = message
+            .body
+            .as_deref()
+            .map(serde_json::from_str::<Notification>)
+            .transpose()?;
+        let lease = match notification {
+            Some(notification)
+                if notification.cell_id == self.cell && notification.kind == "asset.process" =>
+            {
+                self.queue.lease_notified(&notification.id, &worker).await?
+            }
+            Some(_) => return Err("SQS notification does not belong to this worker".into()),
+            None => self.queue.lease(&worker).await?,
+        };
+        let Some(lease) = lease else {
             return Ok(());
         };
         if let Err(error) = self.process(&lease).await {
@@ -328,7 +349,19 @@ impl Worker {
                 },
                 now,
             )?;
-            self.commit(vec![retry]).await?;
+            let mut actions = vec![retry];
+            if let Some(asset_id) = lease["payload"]["assetId"].as_str()
+                && let Some(asset) = self.read("assets", asset_id).await?
+                && asset["instanceId"] == self.instance
+                && asset["homeCellId"] == self.cell
+            {
+                let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"asset.processing_failed",
+                    "subjectId":asset_id,"payload":{"jobId":lease["id"],"attempt":lease["attempt"],
+                    "error":{"code":"processing_failed","message":"Asset processing could not be completed"}}});
+                stamp(&mut audit, &asset, &timestamp(now)?);
+                actions.push(self.put("auditEvents", &audit, None)?);
+            }
+            self.commit(actions).await?;
             if lease["attempt"].as_u64() < lease["maxAttempts"].as_u64() {
                 return Err(error);
             }

@@ -138,37 +138,10 @@ impl JobQueue {
                 let Some(due) = due_field(&job, now) else {
                     continue;
                 };
-                let next = claim(&job, &format!("{worker}:{}", Uuid::new_v4()), due, now)?;
-                let put = Put::builder().table_name(&self.table).set_item(Some(job_item(&next)?))
-                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now")
-                    .expression_attribute_names("#rev","revision")
-                    .expression_attribute_names("#value","value")
-                    .expression_attribute_names("#cell","cellId")
-                    .expression_attribute_names("#state","state")
-                    .expression_attribute_names("#due",due)
-                    .expression_attribute_values(":rev",AttributeValue::N(number(&job,"revision")?.to_string()))
-                    .expression_attribute_values(":cell",AttributeValue::S(self.cell.clone()))
-                    .expression_attribute_values(":state",text(&job,"state")?)
-                    .expression_attribute_values(":now",AttributeValue::S(timestamp(now)?))
-                    .build()?;
-                match self
-                    .client
-                    .put_item()
-                    .table_name(put.table_name)
-                    .set_item(Some(put.item))
-                    .set_condition_expression(put.condition_expression)
-                    .set_expression_attribute_names(put.expression_attribute_names)
-                    .set_expression_attribute_values(put.expression_attribute_values)
-                    .send()
-                    .await
+                if let Some(next) = self.claim_job(&job, worker, due, now).await?
+                    && next["state"] == "leased"
                 {
-                    Ok(_) if next["state"] == "leased" => return Ok(Some(next)),
-                    Ok(_) => {}
-                    Err(failure)
-                        if failure
-                            .as_service_error()
-                            .is_some_and(|e| e.is_conditional_check_failed_exception()) => {}
-                    Err(failure) => return Err(failure.into()),
+                    return Ok(Some(next));
                 }
             }
             cursor = page.last_evaluated_key;
@@ -176,6 +149,84 @@ impl JobQueue {
                 return Ok(None);
             }
         }
+    }
+
+    async fn claim_job(
+        &self,
+        job: &Value,
+        worker: &str,
+        due: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Value>, Failure> {
+        let next = claim(job, &format!("{worker}:{}", Uuid::new_v4()), due, now)?;
+        let put = Put::builder().table_name(&self.table).set_item(Some(job_item(&next)?))
+                    .condition_expression("#rev = :rev AND #value.#cell = :cell AND #value.#state = :state AND #value.#due <= :now")
+                    .expression_attribute_names("#rev","revision")
+                    .expression_attribute_names("#value","value")
+                    .expression_attribute_names("#cell","cellId")
+                    .expression_attribute_names("#state","state")
+                    .expression_attribute_names("#due",due)
+                    .expression_attribute_values(":rev",AttributeValue::N(number(job,"revision")?.to_string()))
+                    .expression_attribute_values(":cell",AttributeValue::S(self.cell.clone()))
+                    .expression_attribute_values(":state",text(job,"state")?)
+                    .expression_attribute_values(":now",AttributeValue::S(timestamp(now)?))
+                    .build()?;
+        match self
+            .client
+            .put_item()
+            .table_name(put.table_name)
+            .set_item(Some(put.item))
+            .set_condition_expression(put.condition_expression)
+            .set_expression_attribute_names(put.expression_attribute_names)
+            .set_expression_attribute_values(put.expression_attribute_values)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(Some(next)),
+            Err(failure)
+                if failure
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
+            {
+                Ok(None)
+            }
+            Err(failure) => Err(failure.into()),
+        }
+    }
+
+    pub async fn lease_notified(
+        &self,
+        job_id: &str,
+        worker: &str,
+    ) -> Result<Option<Value>, Failure> {
+        let mut row = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", AttributeValue::S(format!("durableJobs#{job_id}")))
+            .key("sk", AttributeValue::S("record".into()))
+            .consistent_read(true)
+            .send()
+            .await?
+            .item
+            .ok_or("Notified job is unavailable")?;
+        let job = document(row.remove("value").ok_or("Notified job has no record")?)?;
+        if job["id"] != job_id || job["cellId"] != self.cell || job["type"] != "asset.process" {
+            return Err("Notified job does not belong to this worker".into());
+        }
+        if matches!(
+            job["state"].as_str(),
+            Some("completed" | "dead_lettered" | "cancelled")
+        ) {
+            return Ok(None);
+        }
+        let now = OffsetDateTime::now_utc();
+        let due = due_field(&job, now).ok_or("Notified job is not yet available")?;
+        let next = self
+            .claim_job(&job, worker, due, now)
+            .await?
+            .ok_or("Notified job changed while claiming")?;
+        Ok((next["state"] == "leased").then_some(next))
     }
 
     pub fn guard(&self, lease: &Value, now: OffsetDateTime) -> Result<TransactWriteItem, Failure> {
