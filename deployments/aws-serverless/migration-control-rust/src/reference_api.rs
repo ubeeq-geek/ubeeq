@@ -578,15 +578,19 @@ fn same_creator_region(record: &Value, creator: &Value) -> bool {
         && record["dataHomeRegion"] == creator["dataHomeRegion"]
 }
 
+fn collection_directory_id(instance: &str, creator: &str) -> Result<String, Failure> {
+    let digest = Sha256::digest(serde_json::to_vec(&[instance, creator])?);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("collection-directory-{hex}"))
+}
+
 impl CreatorRecords<'_> {
     async fn read_collection_directory(
         &self,
         creator: &Value,
     ) -> Result<(Vec<String>, bool), Failure> {
         let creator_id = creator["id"].as_str().ok_or("Creator ID is missing")?;
-        let digest = Sha256::digest(serde_json::to_vec(&[self.instance, creator_id])?);
-        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        let key = format!("collection-directory-{hex}");
+        let key = collection_directory_id(self.instance, creator_id)?;
         match self.read("hostRecords", &key).await? {
             Some(directory) => collection_directory(&directory, creator),
             None => Ok((Vec::new(), false)),
@@ -850,7 +854,11 @@ impl CreatorRecords<'_> {
             .transpose()
     }
 
-    async fn migration_held(&self, creator: &str) -> Result<bool, Failure> {
+    async fn has_current_record(
+        &self,
+        repository: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Result<bool, Failure> {
         let mut cursor = None;
         loop {
             let page = self
@@ -859,24 +867,15 @@ impl CreatorRecords<'_> {
                 .table_name(self.table)
                 .consistent_read(true)
                 .filter_expression("begins_with(pk, :prefix) AND sk = :record")
-                .expression_attribute_values(
-                    ":prefix",
-                    AttributeValue::S("moderationHolds#".into()),
-                )
+                .expression_attribute_values(":prefix", AttributeValue::S(format!("{repository}#")))
                 .expression_attribute_values(":record", AttributeValue::S("record".into()))
                 .set_exclusive_start_key(cursor)
                 .send()
                 .await?;
             for mut item in page.items.unwrap_or_default() {
                 if in_cell(&item, self.cell) {
-                    let hold = document(item.remove("value").ok_or("Missing hold record")?)?;
-                    if hold["instanceId"] == self.instance
-                        && hold["subjectId"] == creator
-                        && hold["state"] == "active"
-                        && hold["reason"]
-                            .as_str()
-                            .is_some_and(|reason| reason.starts_with("migration:"))
-                    {
+                    let row = document(item.remove("value").ok_or("Missing repository record")?)?;
+                    if row["instanceId"] == self.instance && predicate(&row) {
                         return Ok(true);
                     }
                 }
@@ -886,6 +885,17 @@ impl CreatorRecords<'_> {
                 return Ok(false);
             }
         }
+    }
+
+    async fn migration_held(&self, creator: &str) -> Result<bool, Failure> {
+        self.has_current_record("moderationHolds", |hold| {
+            hold["subjectId"] == creator
+                && hold["state"] == "active"
+                && hold["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("migration:"))
+        })
+        .await
     }
 
     async fn recover_work(
@@ -1154,7 +1164,7 @@ async fn create_work(
     }
 }
 
-fn work_edit(work: &Value, body: &Value, id: &str) -> Result<Value, Response> {
+fn work_edit(work: &Value, body: &Value, deleting: bool, id: &str) -> Result<Value, Response> {
     let conflict = || {
         error(
             409,
@@ -1170,17 +1180,21 @@ fn work_edit(work: &Value, body: &Value, id: &str) -> Result<Value, Response> {
     if body["revision"].as_u64() != Some(revision) {
         return Err(conflict());
     }
-    let title = body
-        .get("title")
-        .filter(|title| !title.is_null())
-        .unwrap_or(&work["title"])
-        .as_str()
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .ok_or_else(|| error(400, id, "invalid_request", "title is required"))?;
     let mut updated = work.clone();
     updated["revision"] = json!(revision + 1);
-    updated["title"] = json!(title);
+    if deleting {
+        updated["status"] = json!("deleted");
+    } else {
+        let title = body
+            .get("title")
+            .filter(|title| !title.is_null())
+            .unwrap_or(&work["title"])
+            .as_str()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| error(400, id, "invalid_request", "title is required"))?;
+        updated["title"] = json!(title);
+    }
     updated["updatedAt"] = json!(
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -1189,14 +1203,21 @@ fn work_edit(work: &Value, body: &Value, id: &str) -> Result<Value, Response> {
     Ok(updated)
 }
 
+enum WorkUpdate {
+    Saved,
+    Stale,
+    Published,
+}
+
 impl CreatorRecords<'_> {
-    async fn patch_work(
+    async fn update_work(
         &self,
         creator: &Value,
         work: &Value,
         updated: &Value,
         hold_version: Option<String>,
-    ) -> Result<bool, Failure> {
+        deleting: bool,
+    ) -> Result<WorkUpdate, Failure> {
         let creator_id = creator["id"].as_str().ok_or("Missing Creator ID")?;
         let revision = creator["revision"]
             .as_u64()
@@ -1209,7 +1230,7 @@ impl CreatorRecords<'_> {
             .expression_attribute_names("#revision", "revision")
             .expression_attribute_values(":revision", AttributeValue::N(prior.to_string()))
             .build()?;
-        let actions = vec![
+        let mut actions = vec![
             TransactWriteItem::builder().put(put).build(),
             self.item_guard(
                 &format!("creators#{creator_id}"),
@@ -1223,6 +1244,65 @@ impl CreatorRecords<'_> {
             )?,
             self.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
         ];
+        if deleting {
+            let publication_fence = "__ubeeq_repository_snapshot#publications";
+            let version = self.marker(publication_fence).await?;
+            if self
+                .has_current_record("publications", |row| {
+                    row["workId"] == work["id"] && row["status"] == "live"
+                })
+                .await?
+            {
+                return Ok(WorkUpdate::Published);
+            }
+            actions.push(self.item_guard(
+                publication_fence,
+                "fence",
+                version.map(|version| ("version", AttributeValue::S(version))),
+            )?);
+            let directory_id = collection_directory_id(self.instance, creator_id)?;
+            if let Some(mut directory) = self.read("hostRecords", &directory_id).await? {
+                collection_directory(&directory, creator)?;
+                let revision = directory["revision"]
+                    .as_u64()
+                    .filter(|revision| *revision < 9_007_199_254_740_991)
+                    .ok_or(DIRECTORY_ERROR)?;
+                directory["revision"] = json!(revision + 1);
+                directory["updatedAt"] = updated["updatedAt"].clone();
+                let put = Put::builder()
+                    .table_name(self.table)
+                    .set_item(Some(build_record("hostRecords", &directory)?))
+                    .condition_expression("#revision = :revision")
+                    .expression_attribute_names("#revision", "revision")
+                    .expression_attribute_values(
+                        ":revision",
+                        AttributeValue::N(revision.to_string()),
+                    )
+                    .build()?;
+                actions.push(TransactWriteItem::builder().put(put).build());
+                let host_fence = "__ubeeq_repository_snapshot#hostRecords";
+                let mut item = item_key(host_fence, "fence");
+                item.insert(
+                    "version".into(),
+                    AttributeValue::S(Uuid::new_v4().to_string()),
+                );
+                let put = Put::builder().table_name(self.table).set_item(Some(item));
+                let put = match self.marker(host_fence).await? {
+                    Some(version) => put
+                        .condition_expression("#version = :version")
+                        .expression_attribute_names("#version", "version")
+                        .expression_attribute_values(":version", AttributeValue::S(version)),
+                    None => put.condition_expression("attribute_not_exists(pk)"),
+                };
+                actions.push(TransactWriteItem::builder().put(put.build()?).build());
+            } else {
+                actions.push(self.item_guard(
+                    &format!("hostRecords#{directory_id}"),
+                    "record",
+                    None,
+                )?);
+            }
+        }
         match self
             .client
             .transact_write_items()
@@ -1230,7 +1310,7 @@ impl CreatorRecords<'_> {
             .send()
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(WorkUpdate::Saved),
             Err(failure)
                 if failure
                     .as_service_error()
@@ -1240,7 +1320,7 @@ impl CreatorRecords<'_> {
                         _ => false,
                     }) =>
             {
-                Ok(false)
+                Ok(WorkUpdate::Stale)
             }
             Err(failure) => Err(failure.into()),
         }
@@ -1259,7 +1339,8 @@ async fn private_work(
     let Some(creator_id) = creator["id"].as_str() else {
         return unavailable();
     };
-    let writing = request.request_context.http.method == "PATCH";
+    let deleting = request.request_context.http.method == "DELETE";
+    let writing = deleting || request.request_context.http.method == "PATCH";
     let hold_version = if writing {
         match repository
             .marker("__ubeeq_repository_snapshot#moderationHolds")
@@ -1342,20 +1423,26 @@ async fn private_work(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let updated = match work_edit(&work, &body, id) {
+    let updated = match work_edit(&work, &body, deleting, id) {
         Ok(updated) => updated,
         Err(response) => return response,
     };
     match repository
-        .patch_work(creator, &work, &updated, hold_version)
+        .update_work(creator, &work, &updated, hold_version, deleting)
         .await
     {
-        Ok(true) => respond(200, id, json!({"work":updated,"requestId":id})),
-        Ok(false) => error(
+        Ok(WorkUpdate::Saved) => respond(200, id, json!({"work":updated,"requestId":id})),
+        Ok(WorkUpdate::Stale) => error(
             409,
             id,
             "revision_conflict",
             "Reload the work before saving changes.",
+        ),
+        Ok(WorkUpdate::Published) => error(
+            409,
+            id,
+            "work_is_published",
+            "Unpublish the Work before deleting it.",
         ),
         Err(_) => unavailable(),
     }
@@ -1742,7 +1829,8 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "Operator operations are not configured",
         );
     }
-    if matches!(method, "GET" | "PATCH") && single_path_id(path, "/v1/works/").is_some() {
+    if matches!(method, "GET" | "PATCH" | "DELETE") && single_path_id(path, "/v1/works/").is_some()
+    {
         return creator_read(&request, runtime, &id).await;
     }
     if method == "GET" && collection_path(path).is_some_and(|(_, works)| works) {
@@ -2057,15 +2145,19 @@ mod tests {
     fn work_edits_reject_stale_revisions_and_preserve_status() {
         let work = json!({"id":"w","revision":3,"title":"old","status":"published"});
         assert_eq!(
-            work_edit(&work, &json!({"revision":2,"title":"new"}), "id")
+            work_edit(&work, &json!({"revision":2,"title":"new"}), false, "id")
                 .unwrap_err()
                 .status_code,
             409
         );
-        let updated = work_edit(&work, &json!({"revision":3,"title":" new "}), "id").unwrap();
+        let updated =
+            work_edit(&work, &json!({"revision":3,"title":" new "}), false, "id").unwrap();
         assert_eq!(updated["revision"], 4);
         assert_eq!(updated["title"], "new");
         assert_eq!(updated["status"], "published");
+        let deleted = work_edit(&work, &json!({"revision":3}), true, "id").unwrap();
+        assert_eq!(deleted["status"], "deleted");
+        assert_eq!(deleted["title"], "old");
     }
     #[test]
     fn work_intake_uses_existing_node_receipt_identity_and_dynamo_envelope() {
