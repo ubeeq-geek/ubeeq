@@ -555,7 +555,10 @@ fn collection_view(collection: &Value, work_ids: Vec<String>, ready: bool) -> Va
         }
     }
     view.insert("managementReady".into(), json!(ready));
-    view.insert("permissions".into(), json!({"canEdit": ready}));
+    view.insert(
+        "permissions".into(),
+        json!({"canEdit": ready && collection["status"] != "deleted"}),
+    );
     view.insert("workIds".into(), json!(work_ids));
     Value::Object(view)
 }
@@ -568,15 +571,22 @@ fn same_creator_region(record: &Value, creator: &Value) -> bool {
 }
 
 impl CreatorRecords<'_> {
-    async fn collections(&self, creator: &Value) -> Result<(Vec<Value>, bool), Failure> {
+    async fn read_collection_directory(
+        &self,
+        creator: &Value,
+    ) -> Result<(Vec<String>, bool), Failure> {
         let creator_id = creator["id"].as_str().ok_or("Creator ID is missing")?;
         let digest = Sha256::digest(serde_json::to_vec(&[self.instance, creator_id])?);
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         let key = format!("collection-directory-{hex}");
-        let (ids, can_create) = match self.read("hostRecords", &key).await? {
-            Some(directory) => collection_directory(&directory, creator)?,
-            None => (Vec::new(), false),
-        };
+        match self.read("hostRecords", &key).await? {
+            Some(directory) => collection_directory(&directory, creator),
+            None => Ok((Vec::new(), false)),
+        }
+    }
+
+    async fn collections(&self, creator: &Value) -> Result<(Vec<Value>, bool), Failure> {
+        let (ids, can_create) = self.read_collection_directory(creator).await?;
         let mut rows = Vec::new();
         for id in &ids {
             rows.push(
@@ -595,48 +605,75 @@ impl CreatorRecords<'_> {
         let mut legacy = None;
         let mut views = Vec::new();
         for row in rows.into_iter().filter(|row| row["status"] != "deleted") {
-            let row_id = row["id"].as_str().ok_or("Collection ID is missing")?;
-            let aggregate = aggregate_members(&row);
-            let ready = can_create && ids.iter().any(|id| id == row_id) && aggregate.is_some();
-            let work_ids = if ready {
-                aggregate.unwrap_or_default()
-            } else {
-                let candidates = match aggregate {
-                    Some(ids) => ids,
-                    None => {
-                        if legacy.is_none() {
-                            legacy = Some(self.list("workMemberships").await?);
-                        }
-                        let mut rows: Vec<_> = legacy
-                            .iter()
-                            .flatten()
-                            .filter(|member| {
-                                member["collectionId"] == row_id
-                                    && member["dataHomeRegion"] == creator["dataHomeRegion"]
-                            })
-                            .collect();
-                        rows.sort_by_key(|member| member["position"].as_i64());
-                        rows.into_iter()
-                            .filter_map(|member| member["workId"].as_str().map(str::to_owned))
-                            .collect()
-                    }
-                };
-                let mut scoped = Vec::new();
-                for work_id in candidates {
-                    if self
-                        .read("works", &work_id)
-                        .await?
-                        .is_some_and(|work| same_creator_region(&work, creator))
-                    {
-                        scoped.push(work_id);
-                    }
-                }
-                scoped
-            };
-            views.push(collection_view(&row, work_ids, ready));
+            views.push(
+                self.collection_with_members(&row, creator, &ids, can_create, &mut legacy)
+                    .await?,
+            );
         }
         Ok((views, can_create))
     }
+
+    async fn collection_with_members(
+        &self,
+        row: &Value,
+        creator: &Value,
+        ids: &[String],
+        can_create: bool,
+        legacy: &mut Option<Vec<Value>>,
+    ) -> Result<Value, Failure> {
+        let row_id = row["id"].as_str().ok_or("Collection ID is missing")?;
+        let aggregate = aggregate_members(row);
+        let ready = can_create && ids.iter().any(|id| id == row_id) && aggregate.is_some();
+        let work_ids = if ready {
+            aggregate.unwrap_or_default()
+        } else {
+            let candidates = match aggregate {
+                Some(ids) => ids,
+                None => {
+                    if legacy.is_none() {
+                        *legacy = Some(self.list("workMemberships").await?);
+                    }
+                    let mut rows: Vec<_> = legacy
+                        .iter()
+                        .flatten()
+                        .filter(|member| {
+                            member["collectionId"] == row_id
+                                && member["dataHomeRegion"] == creator["dataHomeRegion"]
+                        })
+                        .collect();
+                    rows.sort_by_key(|member| member["position"].as_i64());
+                    rows.into_iter()
+                        .filter_map(|member| member["workId"].as_str().map(str::to_owned))
+                        .collect()
+                }
+            };
+            let mut scoped = Vec::new();
+            for work_id in candidates {
+                if self
+                    .read("works", &work_id)
+                    .await?
+                    .is_some_and(|work| same_creator_region(&work, creator))
+                {
+                    scoped.push(work_id);
+                }
+            }
+            scoped
+        };
+        Ok(collection_view(row, work_ids, ready))
+    }
+}
+
+fn collection_path(path: &str) -> Option<(&str, bool)> {
+    let remainder = path.strip_prefix("/v1/collections/")?;
+    let (id, works) = match remainder.strip_suffix("/works") {
+        Some(id) => (id, true),
+        None => (remainder, false),
+    };
+    (!id.is_empty() && !id.contains('/')).then_some((id, works))
+}
+
+fn collection_not_found(id: &str) -> Response {
+    error(404, id, "collection_not_found", "Collection not found.")
 }
 
 async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Response {
@@ -653,6 +690,20 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         table,
         cell: &runtime.cell.id,
         instance: &runtime.instance_id,
+    };
+    let collection = if let Some((collection_id, false)) = collection_path(&request.raw_path) {
+        match repository.read("collections", collection_id).await {
+            Ok(Some(record))
+                if record["homeCellId"] == runtime.cell.id
+                    && record["instanceId"] == runtime.instance_id =>
+            {
+                Some(record)
+            }
+            Ok(_) => return collection_not_found(id),
+            Err(_) => return unavailable(),
+        }
+    } else {
+        None
     };
     let Ok(claim) = repository
         .read("instanceOperators", &runtime.instance_id)
@@ -694,7 +745,13 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
             "This account does not have creator access in this instance.",
         );
     };
-    let requested = creator_selection(request);
+    let requested = creator_selection(request).or_else(|| {
+        collection
+            .as_ref()?
+            .get("creatorId")?
+            .as_str()
+            .map(str::to_owned)
+    });
     if requested
         .as_ref()
         .is_some_and(|requested| !ids.contains(requested))
@@ -711,6 +768,38 @@ async fn creator_read(request: &Request, runtime: &Runtime, id: &str) -> Respons
         Ok(Some(record)) => {
             if request.raw_path == "/v1/creators/me" {
                 return respond(200, id, json!({"creator": record, "requestId": id}));
+            }
+            if let Some(collection) = collection {
+                if collection["creatorId"] != record["id"] {
+                    return collection_not_found(id);
+                }
+                if collection["dataHomeRegion"] != record["dataHomeRegion"]
+                    || collection["routingRevision"] != record["routingRevision"]
+                {
+                    return error(
+                        409,
+                        id,
+                        "data_home_mismatch",
+                        "Collection and Creator data homes do not match.",
+                    );
+                }
+                if record["dataHomeRegion"] != runtime.cell.region {
+                    return error(404, id, "creator_not_found", "Creator not found.");
+                }
+                let result = async {
+                    let (ids, ready) = repository.read_collection_directory(&record).await?;
+                    repository
+                        .collection_with_members(&collection, &record, &ids, ready, &mut None)
+                        .await
+                }
+                .await;
+                return match result {
+                    Ok(view) => respond(200, id, json!({"collection":view,"requestId":id})),
+                    Err(failure) if failure.to_string() == DIRECTORY_ERROR => {
+                        error(500, id, "internal_error", DIRECTORY_ERROR)
+                    }
+                    Err(_) => error(500, id, "internal_error", "Unable to read Collection"),
+                };
             }
             if record["contentAuthority"] == "retained-v1" {
                 return error(
@@ -782,11 +871,20 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
             "Operator operations are not configured",
         );
     }
+    if method == "GET" && collection_path(path).is_some_and(|(_, works)| works) {
+        return error(
+            405,
+            &id,
+            "method_not_allowed",
+            "Collection method is not supported.",
+        );
+    }
     if method == "GET"
-        && matches!(
-            path,
-            "/v1/creators" | "/v1/creators/me" | "/v1/works" | "/v1/collections"
-        )
+        && (collection_path(path).is_some()
+            || matches!(
+                path,
+                "/v1/creators" | "/v1/creators/me" | "/v1/works" | "/v1/collections"
+            ))
     {
         return creator_read(&request, runtime, &id).await;
     }
@@ -1057,6 +1155,17 @@ mod tests {
         assert_eq!(view["status"], "draft");
         assert_eq!(view["permissions"]["canEdit"], false);
         assert!(view.get("internal").is_none());
+        collection["status"] = json!("deleted");
+        assert_eq!(
+            collection_view(&collection, vec![], true)["permissions"]["canEdit"],
+            false
+        );
+        assert_eq!(collection_path("/v1/collections/a"), Some(("a", false)));
+        assert_eq!(
+            collection_path("/v1/collections/a/works"),
+            Some(("a", true))
+        );
+        assert_eq!(collection_path("/v1/collections/a/extra"), None);
         collection["collectionManagement"]["members"][0]["position"] = json!(2);
         assert!(aggregate_members(&collection).is_none());
     }
