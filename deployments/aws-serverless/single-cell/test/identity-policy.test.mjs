@@ -126,6 +126,11 @@ test('the Rust reference worker retains the SQS trigger and runtime configuratio
     assert.deepEqual(trigger.Properties.FunctionResponseTypes, ['ReportBatchItemFailures']);
     const schedule = Object.values(resources).find(resource => resource.Type === 'AWS::Events::Rule');
     assert.deepEqual(schedule.Properties.Targets[0].Arn, { 'Fn::GetAtt': [workerId, 'Arn'] });
+    const workerEnvironment = workerResource.Properties.Environment.Variables;
+    assert.deepEqual(workerEnvironment.UBEEQ_JOBS_QUEUE_ARN, trigger.Properties.EventSourceArn);
+    assert.deepEqual(workerEnvironment.UBEEQ_RECOVERY_SCHEDULE_ARN, {
+      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, `:events:us-east-2:111111111111:rule/${schedule.Properties.Name}`]],
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

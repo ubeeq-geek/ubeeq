@@ -1,4 +1,4 @@
-import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Stack, Tags, type StackProps } from "aws-cdk-lib";
+import { ArnFormat, CfnOutput, Duration, IgnoreMode, Names, RemovalPolicy, Stack, Tags, type StackProps } from "aws-cdk-lib";
 import { resolve } from "node:path";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
@@ -38,7 +38,13 @@ export class AwsServerlessSingleCellStack extends Stack {
     records.addGlobalSecondaryIndex({ indexName: "repository-id-index", partitionKey: { name: "repository", type: dynamodb.AttributeType.STRING }, sortKey: { name: "id", type: dynamodb.AttributeType.STRING } });
     const deadLetters = new sqs.Queue(this, "DeadLetters", { encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14), removalPolicy: RemovalPolicy.RETAIN });
     const jobs = new sqs.Queue(this, "Jobs", { encryption: sqs.QueueEncryption.SQS_MANAGED, deadLetterQueue: { queue: deadLetters, maxReceiveCount: 3 }, visibilityTimeout: Duration.minutes(5), removalPolicy: RemovalPolicy.RETAIN });
-    const recoverySchedule = new events.Rule(this, "RecoverySchedule", { schedule: events.Schedule.rate(Duration.minutes(5)), description: "Neutral scheduled recovery trigger for Ubeeq durable jobs" });
+    const rustReferenceWorkerAsset = this.node.tryGetContext("rustReferenceWorkerAssetPath") || process.env.UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH;
+    const recoveryRuleName = Names.uniqueResourceName(this, { maxLength: 48, separator: "-" }) + "-job-recovery";
+    const recoverySchedule = new events.Rule(this, "RecoverySchedule", {
+      schedule: events.Schedule.rate(Duration.minutes(5)),
+      description: "Neutral scheduled recovery trigger for Ubeeq durable jobs",
+      ...(rustReferenceWorkerAsset ? { ruleName: recoveryRuleName } : {}),
+    });
     const userPool = new cognito.UserPool(this, "Users", { selfSignUpEnabled: false, signInAliases: { email: true }, removalPolicy: RemovalPolicy.RETAIN, passwordPolicy: { minLength: 12, requireDigits: true, requireLowercase: true, requireUppercase: true, requireSymbols: false } });
     const userPoolClient = userPool.addClient("ReferenceApi", { authFlows: { userPassword: true, userSrp: true } });
     const credentialKey = new secretsmanager.Secret(this, "CredentialVaultKey", { description: "Application-owned encryption material for the optional Ubeeq AWS credential vault", removalPolicy: RemovalPolicy.RETAIN });
@@ -72,13 +78,21 @@ export class AwsServerlessSingleCellStack extends Stack {
       code: lambda.Code.fromAsset(rustWebAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_REFERENCE_WEB_API_URL: referenceApiPublicBaseUrl },
     });
-    const rustReferenceWorkerAsset = this.node.tryGetContext("rustReferenceWorkerAssetPath") || process.env.UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH;
     const worker = new lambda.Function(this, "ReferenceWorker", {
       runtime: rustReferenceWorkerAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
       handler: rustReferenceWorkerAsset ? "bootstrap" : "lambda.worker",
       timeout: Duration.minutes(2),
       code: lambda.Code.fromAsset(rustReferenceWorkerAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
-      environment: runtimeEnvironment,
+      environment: rustReferenceWorkerAsset ? {
+        ...runtimeEnvironment,
+        UBEEQ_JOBS_QUEUE_ARN: jobs.queueArn,
+        // Resolve the name without a CloudFormation dependency on the rule,
+        // whose target already depends on this function.
+        UBEEQ_RECOVERY_SCHEDULE_ARN: this.formatArn({
+          service: "events", resource: "rule", resourceName: recoveryRuleName,
+          arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+        }),
+      } : runtimeEnvironment,
     });
     // This private handler is intentionally distinct from the HTTP API. Only
     // the explicitly nominated multi-cell control worker may invoke it, and

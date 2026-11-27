@@ -26,13 +26,16 @@ struct Batch {
     source: Option<String>,
     #[serde(rename = "detail-type")]
     detail_type: Option<String>,
+    #[serde(default)]
+    resources: Vec<String>,
 }
 
 impl Batch {
-    fn is_recovery_tick(&self) -> bool {
+    fn is_recovery_tick(&self, schedule_arn: &str) -> bool {
         self.records.is_empty()
             && self.source.as_deref() == Some("aws.events")
             && self.detail_type.as_deref() == Some("Scheduled Event")
+            && self.resources == [schedule_arn]
     }
 }
 
@@ -41,6 +44,16 @@ impl Batch {
 struct Message {
     message_id: String,
     body: Option<String>,
+    event_source: Option<String>,
+    #[serde(rename = "eventSourceARN")]
+    event_source_arn: Option<String>,
+}
+
+impl Message {
+    fn from_queue(&self, queue_arn: &str) -> bool {
+        self.event_source.as_deref() == Some("aws:sqs")
+            && self.event_source_arn.as_deref() == Some(queue_arn)
+    }
 }
 
 #[derive(Deserialize)]
@@ -519,6 +532,8 @@ async fn main() -> Result<(), Error> {
     let table = env::var("UBEEQ_RECORDS_TABLE")?;
     let cell = env::var("UBEEQ_CELL_ID").or_else(|_| env::var("AWS_REGION"))?;
     let instance = env::var("UBEEQ_INSTANCE_ID").unwrap_or_else(|_| "aws-reference".into());
+    let queue_arn = env::var("UBEEQ_JOBS_QUEUE_ARN")?;
+    let schedule_arn = env::var("UBEEQ_RECOVERY_SCHEDULE_ARN")?;
     let worker = Worker {
         queue: JobQueue::new(db.clone(), table.clone(), cell.clone(), instance.clone()),
         sqs: aws_sdk_sqs::Client::new(&config),
@@ -531,21 +546,34 @@ async fn main() -> Result<(), Error> {
         instance,
     };
     run(service_fn(|event: LambdaEvent<Batch>| async {
-        if worker.repair_upload_notifications().await.is_err() {
+        let recovering = event.payload.is_recovery_tick(&schedule_arn);
+        if (recovering
+            || event
+                .payload
+                .records
+                .iter()
+                .any(|message| message.from_queue(&queue_arn)))
+            && worker.repair_upload_notifications().await.is_err()
+        {
             eprintln!("Upload processing notification repair deferred");
         }
-        if event.payload.is_recovery_tick() {
+        if recovering {
             worker
                 .one(&Message {
                     message_id: event.context.request_id,
                     body: None,
+                    event_source: None,
+                    event_source_arn: None,
                 })
                 .await
                 .map_err(|_| Error::from("Scheduled processing job could not be completed"))?;
         }
         let mut failures = Vec::new();
         for message in event.payload.records {
-            if worker.one(&message).await.is_err() {
+            if !message.from_queue(&queue_arn)
+                || message.body.is_none()
+                || worker.one(&message).await.is_err()
+            {
                 failures.push(json!({"itemIdentifier":message.message_id}));
             }
         }
@@ -562,10 +590,14 @@ mod tests {
     fn only_an_eventbridge_tick_runs_scheduled_job_recovery() {
         for (payload, expected) in [
             (
-                json!({"source":"aws.events","detail-type":"Scheduled Event"}),
+                json!({"source":"aws.events","detail-type":"Scheduled Event","resources":["expected-schedule"]}),
                 true,
             ),
             (json!({"Records":[]}), false),
+            (
+                json!({"source":"aws.events","detail-type":"Scheduled Event","resources":["foreign-schedule"]}),
+                false,
+            ),
             (
                 json!({"source":"aws.events","detail-type":"Other Event"}),
                 false,
@@ -576,7 +608,16 @@ mod tests {
             ),
         ] {
             let batch: Batch = serde_json::from_value(payload).unwrap();
-            assert_eq!(batch.is_recovery_tick(), expected);
+            assert_eq!(batch.is_recovery_tick("expected-schedule"), expected);
         }
+    }
+
+    #[test]
+    fn an_sqs_delivery_must_identify_the_configured_queue() {
+        let message: Message = serde_json::from_value(json!({
+            "messageId": "job-notification", "body": "{}", "eventSource": "aws:sqs", "eventSourceARN": "expected-queue"
+        })).unwrap();
+        assert!(message.from_queue("expected-queue"));
+        assert!(!message.from_queue("foreign-queue"));
     }
 }
