@@ -5252,7 +5252,7 @@ async fn operator_claim(
         .filter(|claim| claim["actorId"] == subject && claim["instanceId"] == repository.instance))
 }
 
-fn event_cursor(repository: &str, input: &str) -> Option<HashMap<String, AttributeValue>> {
+fn operator_cursor(repository: &str, input: &str) -> Option<HashMap<String, AttributeValue>> {
     if input.len() > 2048 {
         return None;
     }
@@ -5273,11 +5273,12 @@ fn event_cursor(repository: &str, input: &str) -> Option<HashMap<String, Attribu
         .collect()
 }
 
-async fn list_operator_events(
+async fn list_operator_records(
     request: &Request,
     runtime: &Runtime,
     id: &str,
     name: &str,
+    response_key: &str,
 ) -> Result<Response, Failure> {
     let Some((client, table)) = &runtime.records else {
         return Ok(error(
@@ -5313,14 +5314,14 @@ async fn list_operator_events(
         .unwrap_or(50)
         .clamp(1, 100);
     let cursor = match param("cursor").filter(|value| !value.is_empty()) {
-        Some(input) => match event_cursor(name, input) {
+        Some(input) => match operator_cursor(name, input) {
             Some(cursor) => Some(cursor),
             None => {
                 return Ok(error(
                     400,
                     id,
                     "invalid_cursor",
-                    "The event page cursor is invalid.",
+                    "The operator page cursor is invalid.",
                 ));
             }
         },
@@ -5329,23 +5330,24 @@ async fn list_operator_events(
     let page = repository_page(client, table, cursor, limit, name)
         .send()
         .await?;
-    let mut events = Vec::new();
+    let mut records = Vec::new();
     for mut item in page.items.unwrap_or_default() {
         if in_cell(&item, repository.cell) {
-            let record = document(item.remove("value").ok_or("Missing operator event")?)?;
+            let record = document(item.remove("value").ok_or("Missing operator record")?)?;
             if record["instanceId"] == repository.instance {
-                events.push(record);
+                records.push(record);
             }
         }
     }
     if operator_claim(&repository, &subject).await?.as_ref() != Some(&claim) {
         return Ok(operator_denied(id));
     }
-    let mut body = json!({"cell":{"cellId":runtime.cell.id,"region":runtime.cell.region,"routingRevision":1},"events":events,"requestId":id});
+    let mut body = json!({"cell":{"cellId":runtime.cell.id,"region":runtime.cell.region,"routingRevision":1},"requestId":id});
+    body[response_key] = json!(records);
     if let Some(key) = page.last_evaluated_key.filter(|key| !key.is_empty()) {
         let parts: BTreeMap<_, _> = key
             .iter()
-            .map(|(name, value)| Ok((name, value.as_s().map_err(|_| "Invalid event page key")?)))
+            .map(|(name, value)| Ok((name, value.as_s().map_err(|_| "Invalid operator page key")?)))
             .collect::<Result<_, Failure>>()?;
         body["nextCursor"] = json!(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&parts)?));
     }
@@ -5466,19 +5468,22 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
-    if let Some(name) = match (method, path) {
-        ("GET", "/v1/operations/audit-events") => Some("auditEvents"),
-        ("GET", "/v1/operations/usage-events") => Some("usageEvents"),
+    if let Some((name, response_key)) = match (method, path) {
+        ("GET", "/v1/operations/audit-events") => Some(("auditEvents", "events")),
+        ("GET", "/v1/operations/usage-events") => Some(("usageEvents", "events")),
+        ("GET", "/v1/operations/holds") => Some(("moderationHolds", "holds")),
+        ("GET", "/v1/operations/review-cases") => Some(("reviewCases", "reviewCases")),
+        ("GET", "/v1/operations/moderation-evidence") => Some(("moderationEvidence", "evidence")),
         _ => None,
     } {
-        return list_operator_events(&request, runtime, &id, name)
+        return list_operator_records(&request, runtime, &id, name, response_key)
             .await
             .unwrap_or_else(|_| {
                 error(
                     503,
                     &id,
                     "operations_unavailable",
-                    "Operator events are temporarily unavailable.",
+                    "Operator records are temporarily unavailable.",
                 )
             });
     }
@@ -5814,13 +5819,19 @@ mod tests {
     fn operator_event_cursor_uses_node_key_shape_and_stays_in_its_repository() {
         let payload = json!({"pk":"auditEvents#event-1","sk":"record","repository":"auditEvents","id":"event-1"});
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
-        let key = event_cursor("auditEvents", &encoded).unwrap();
+        let key = operator_cursor("auditEvents", &encoded).unwrap();
         assert_eq!(key["pk"], AttributeValue::S("auditEvents#event-1".into()));
-        assert!(event_cursor("usageEvents", &encoded).is_none());
+        assert!(operator_cursor("usageEvents", &encoded).is_none());
+        for name in ["reviewCases", "moderationHolds", "moderationEvidence"] {
+            let key = json!({"pk":format!("{name}#record-1"),"sk":"record","repository":name,"id":"record-1"});
+            let cursor = URL_SAFE_NO_PAD.encode(key.to_string());
+            assert!(operator_cursor(name, &cursor).is_some());
+            assert!(operator_cursor("auditEvents", &cursor).is_none());
+        }
         let forged = payload
             .to_string()
             .replace("auditEvents#event-1", "assets#asset-1");
-        assert!(event_cursor("auditEvents", &URL_SAFE_NO_PAD.encode(forged)).is_none());
+        assert!(operator_cursor("auditEvents", &URL_SAFE_NO_PAD.encode(forged)).is_none());
     }
 
     #[test]
