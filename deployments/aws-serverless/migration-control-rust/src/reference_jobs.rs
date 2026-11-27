@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::{
     Client,
-    types::{AttributeValue, ConditionCheck, Put, TransactWriteItem},
+    types::{AttributeValue, ConditionCheck, Put, TransactWriteItem, Update},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -167,7 +167,7 @@ impl JobQueue {
             return Ok(None);
         };
         let next = claim(job, &format!("{worker}:{}", Uuid::new_v4()), due, now)?;
-        let actions = claim_transaction(
+        let mut actions = claim_transaction(
             &self.table,
             &self.instance,
             &self.cell,
@@ -177,6 +177,38 @@ impl JobQueue {
             due,
             now,
         )?;
+        if next["state"] == "dead_lettered" {
+            let item = self
+                .client
+                .get_item()
+                .table_name(&self.table)
+                .key("pk", AttributeValue::S(format!("assets#{asset_id}")))
+                .key("sk", AttributeValue::S("record".into()))
+                .consistent_read(true)
+                .send()
+                .await?
+                .item;
+            if let Some(asset) = item
+                .and_then(|mut row| row.remove("value"))
+                .map(document)
+                .transpose()?
+                && asset["id"] == asset_id
+                && asset["instanceId"] == self.instance
+                && asset["homeCellId"] == self.cell
+            {
+                let guard = actions
+                    .pop()
+                    .and_then(|action| action.condition_check)
+                    .ok_or("Missing asset claim guard")?;
+                actions.extend(expired_asset_actions(
+                    &self.table,
+                    guard,
+                    asset,
+                    &next,
+                    now,
+                )?);
+            }
+        }
         match self
             .client
             .transact_write_items()
@@ -363,27 +395,164 @@ pub fn transaction_revision_conflict<'a>(codes: impl Iterator<Item = Option<&'a 
     conflict
 }
 
+pub fn failed_asset(mut asset: Value, now: &str) -> Result<Option<(Value, u64)>, Failure> {
+    if !matches!(asset["status"].as_str(), Some("pending" | "processing")) {
+        return Ok(None);
+    }
+    let previous = number(&asset, "revision")?;
+    if previous == 0 {
+        return Err("Invalid asset revision".into());
+    }
+    asset["status"] = json!("failed");
+    asset["revision"] = json!(previous + 1);
+    asset["updatedAt"] = json!(now);
+    Ok(Some((asset, previous)))
+}
+
+fn expired_asset_actions(
+    table: &str,
+    guard: ConditionCheck,
+    asset: Value,
+    job: &Value,
+    now: OffsetDateTime,
+) -> Result<Vec<TransactWriteItem>, Failure> {
+    let stamp = timestamp(now)?;
+    let Some((failed, previous)) = failed_asset(asset, &stamp)? else {
+        return Ok(vec![
+            TransactWriteItem::builder().condition_check(guard).build(),
+        ]);
+    };
+    let condition = format!("{} AND #rev = :rev", guard.condition_expression);
+    let mut values = guard.expression_attribute_values.unwrap_or_default();
+    values.insert(":rev".into(), AttributeValue::N(previous.to_string()));
+    let mut names = guard.expression_attribute_names.unwrap_or_default();
+    names.insert("#rev".into(), "revision".into());
+    let asset = Put::builder()
+        .table_name(table)
+        .set_item(Some(processing_record_item("assets", &failed)?))
+        .condition_expression(condition)
+        .set_expression_attribute_names(Some(names))
+        .set_expression_attribute_values(Some(values))
+        .build()?;
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"asset.processing_failed","subjectId":failed["id"],
+        "payload":{"jobId":job["id"],"attempt":job["attempt"],"error":job["lastError"]},
+        "revision":1,"createdAt":stamp,"updatedAt":stamp});
+    for field in [
+        "instanceId",
+        "homeCellId",
+        "dataHomeRegion",
+        "dataHomeAssignedAt",
+        "routingRevision",
+    ] {
+        audit[field] = failed[field].clone();
+    }
+    let audit_write = Put::builder()
+        .table_name(table)
+        .set_item(Some(processing_record_item("auditEvents", &audit)?))
+        .condition_expression("attribute_not_exists(pk)")
+        .build()?;
+    let fence = Update::builder()
+        .table_name(table)
+        .key(
+            "pk",
+            AttributeValue::S("__ubeeq_repository_snapshot#assets".into()),
+        )
+        .key("sk", AttributeValue::S("fence".into()))
+        .update_expression("SET #version = :version")
+        .expression_attribute_names("#version", "version")
+        .expression_attribute_values(":version", AttributeValue::S(Uuid::new_v4().to_string()))
+        .build()?;
+    let global = ConditionCheck::builder()
+        .table_name(table)
+        .key(
+            "pk",
+            AttributeValue::S("__ubeeq_repository_snapshot#global-v2".into()),
+        )
+        .key("sk", AttributeValue::S("fence".into()))
+        .condition_expression("attribute_not_exists(pk)")
+        .build()?;
+    Ok(vec![
+        TransactWriteItem::builder().put(asset).build(),
+        TransactWriteItem::builder().put(audit_write).build(),
+        TransactWriteItem::builder().update(fence).build(),
+        TransactWriteItem::builder().condition_check(global).build(),
+    ])
+}
+
 fn job_item(job: &Value) -> Result<HashMap<String, AttributeValue>, Failure> {
-    let id = job["id"]
+    processing_record_item("durableJobs", job)
+}
+
+fn processing_record_item(
+    repository: &str,
+    record: &Value,
+) -> Result<HashMap<String, AttributeValue>, Failure> {
+    let id = record["id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .ok_or("Missing job ID")?;
     Ok(HashMap::from([
-        ("pk".into(), AttributeValue::S(format!("durableJobs#{id}"))),
+        ("pk".into(), AttributeValue::S(format!("{repository}#{id}"))),
         ("sk".into(), AttributeValue::S("record".into())),
-        ("repository".into(), AttributeValue::S("durableJobs".into())),
+        ("repository".into(), AttributeValue::S(repository.into())),
         ("id".into(), AttributeValue::S(id.into())),
         (
             "revision".into(),
-            AttributeValue::N(number(job, "revision")?.to_string()),
+            AttributeValue::N(number(record, "revision")?.to_string()),
         ),
-        ("value".into(), attribute(job)),
+        ("value".into(), attribute(record)),
     ]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_final_lease_records_the_asset_failure_and_audit_in_the_claim_transaction() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let job = json!({"id":"job-1","state":"leased","leaseExpiresAt":"1970-01-01T00:00:00.000Z",
+            "revision":2,"attempt":2,"maxAttempts":2,"payload":{"assetId":"asset-1"}});
+        let terminal = claim(&job, "worker:token", "leaseExpiresAt", now).unwrap();
+        let mut actions = claim_transaction(
+            "records",
+            "i",
+            "c",
+            "asset-1",
+            &job,
+            &terminal,
+            "leaseExpiresAt",
+            now,
+        )
+        .unwrap();
+        let guard = actions.pop().unwrap().condition_check.unwrap();
+        let asset = json!({"id":"asset-1","instanceId":"i","homeCellId":"c","status":"processing","revision":5});
+        let extras =
+            expired_asset_actions("records", guard.clone(), asset, &terminal, now).unwrap();
+        actions.extend(extras);
+        assert_eq!(actions.len(), 5);
+        let updated = actions[1].put.as_ref().unwrap();
+        assert_eq!(
+            document(updated.item["value"].clone()).unwrap()["status"],
+            "failed"
+        );
+        assert_eq!(
+            updated.expression_attribute_values.as_ref().unwrap()[":rev"],
+            AttributeValue::N("5".into())
+        );
+        let audit = actions[2].put.as_ref().unwrap();
+        assert_eq!(
+            document(audit.item["value"].clone()).unwrap()["payload"]["error"]["code"],
+            "lease_attempts_exhausted"
+        );
+        assert!(actions[3].update.is_some());
+        assert!(actions[4].condition_check.is_some());
+        let ready =
+            expired_asset_actions("records", guard, json!({"status":"ready"}), &terminal, now)
+                .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].condition_check.is_some());
+    }
 
     #[test]
     fn claim_transaction_binds_the_job_to_the_current_asset_instance_and_cell() {

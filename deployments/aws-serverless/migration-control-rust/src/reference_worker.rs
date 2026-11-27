@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ubeeq_migration_control_api::{
     lifecycle::Failure,
-    reference_jobs::{JobOutcome, JobQueue, processing_job_id},
+    reference_jobs::{JobOutcome, JobQueue, failed_asset, processing_job_id},
     reference_media::{copy_rendition, plan_rendition, verify_source},
     store::{attribute, document},
 };
@@ -109,17 +109,6 @@ fn timestamp(now: OffsetDateTime) -> Result<String, Failure> {
         whole.trim_end_matches('Z'),
         now.millisecond()
     ))
-}
-
-fn failed_asset(mut asset: Value, now: &str) -> Result<Option<(Value, u64)>, Failure> {
-    if !matches!(asset["status"].as_str(), Some("pending" | "processing")) {
-        return Ok(None);
-    }
-    let previous = revision(&asset)?;
-    asset["status"] = json!("failed");
-    asset["revision"] = json!(previous + 1);
-    asset["updatedAt"] = json!(now);
-    Ok(Some((asset, previous)))
 }
 
 fn stamp(record: &mut Value, asset: &Value, now: &str) {
