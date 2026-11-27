@@ -5521,6 +5521,219 @@ async fn release_moderation_hold(
     }
 }
 
+fn review_case_state(body: &Value) -> Option<&str> {
+    body["state"]
+        .as_str()
+        .map(str::trim)
+        .filter(|state| matches!(*state, "open" | "assigned" | "decided" | "closed"))
+}
+
+async fn write_review_case(
+    request: &Request,
+    runtime: &Runtime,
+    id: &str,
+    existing_id: Option<&str>,
+) -> Result<Response, Failure> {
+    let Some((client, table)) = &runtime.records else {
+        return Ok(error(
+            404,
+            id,
+            "operations_unavailable",
+            "Operator operations are not configured",
+        ));
+    };
+    let (_, actor) = match creator_session(request, runtime, id).await {
+        Ok(session) => session,
+        Err(response) => return Ok(response),
+    };
+    let repository = CreatorRecords {
+        client,
+        table,
+        cell: &runtime.cell.id,
+        instance: &runtime.instance_id,
+    };
+    let Some(claim) = operator_claim(&repository, &actor).await? else {
+        return Ok(operator_denied(id));
+    };
+    let body = match json_body(request, id) {
+        Ok(body) => body,
+        Err(response) => return Ok(response),
+    };
+    let reply = |status, case| {
+        private_response(respond(
+            status,
+            id,
+            json!({"reviewCase":case,"requestId":id}),
+        ))
+    };
+    let local = |record: &Value| {
+        record["instanceId"] == repository.instance
+            && record["homeCellId"] == repository.cell
+            && record["dataHomeRegion"] == runtime.cell.region
+    };
+    let now = iso_millis(OffsetDateTime::now_utc())?;
+    let (case, change, action) = if let Some(case_id) = existing_id {
+        let Some(state) = review_case_state(&body) else {
+            return Ok(error(
+                400,
+                id,
+                "invalid_request",
+                "Review case state is invalid",
+            ));
+        };
+        let Some(mut case) = repository
+            .read("reviewCases", case_id)
+            .await?
+            .filter(|case| local(case) && case["id"] == case_id)
+        else {
+            return Ok(error(
+                404,
+                id,
+                "review_case_not_found",
+                "Review case was not found",
+            ));
+        };
+        let assignee = body["assigneeId"].as_str();
+        if case["state"] == state && assignee.is_none_or(|value| case["assigneeId"] == value) {
+            return Ok(
+                if operator_claim(&repository, &actor).await?.as_ref() == Some(&claim) {
+                    reply(200, case)
+                } else {
+                    operator_denied(id)
+                },
+            );
+        }
+        let revision = case["revision"]
+            .as_u64()
+            .filter(|revision| *revision < 9_007_199_254_740_991)
+            .ok_or("Invalid review case revision")?;
+        case["state"] = json!(state);
+        if let Some(assignee) = assignee {
+            case["assigneeId"] = json!(assignee);
+        }
+        case["revision"] = json!(revision + 1);
+        case["updatedAt"] = json!(now);
+        let change = repository.replace_revisioned("reviewCases", &case, revision)?;
+        (case, change, "moderation.review_case_updated")
+    } else {
+        let Some(subject) = body["subjectId"]
+            .as_str()
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty())
+        else {
+            return Ok(error(400, id, "invalid_request", "subjectId is required"));
+        };
+        let key = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("idempotency-key"))
+            .map(|(_, value)| value.trim());
+        if key.is_some_and(|key| key.is_empty() || key.encode_utf16().count() > 200) {
+            return Ok(error(
+                400,
+                id,
+                "invalid_idempotency_key",
+                "Use a non-empty idempotency key of at most 200 characters",
+            ));
+        }
+        let case_id = key
+            .map(|key| {
+                format!(
+                    "review-case-{}",
+                    upload_digest(&json!([repository.instance, repository.cell, actor, key]))
+                )
+            })
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        if let Some(case) = repository.read("reviewCases", &case_id).await? {
+            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+                return Ok(operator_denied(id));
+            }
+            return Ok(
+                if local(&case) && case["id"] == case_id && case["subjectId"] == subject {
+                    reply(200, case)
+                } else {
+                    error(
+                        409,
+                        id,
+                        "idempotency_conflict",
+                        "The idempotency key belongs to a different review case.",
+                    )
+                },
+            );
+        }
+        let case = json!({"id":case_id,"instanceId":repository.instance,"homeCellId":repository.cell,
+            "dataHomeRegion":runtime.cell.region,"dataHomeAssignedAt":now,"routingRevision":1,
+            "revision":1,"createdAt":now,"updatedAt":now,"subjectId":subject,"state":"open"});
+        let change = repository.create_item("reviewCases", &case)?;
+        (case, change, "moderation.review_case_opened")
+    };
+    let mut audit = json!({"id":Uuid::new_v4().to_string(),"actorId":actor,"action":action,
+        "subjectId":case["subjectId"],"payload":{"reviewCaseId":case["id"]}});
+    if existing_id.is_some() {
+        audit["payload"]["state"] = case["state"].clone();
+    }
+    rehome_import(&mut audit, &case, &now);
+    let fence = "__ubeeq_repository_snapshot#reviewCases";
+    let actions = vec![
+        change,
+        repository.create_item("auditEvents", &audit)?,
+        repository.advance_fence(fence, repository.marker(fence).await?)?,
+        repository.item_guard(
+            &format!("instanceOperators#{}", repository.instance),
+            "record",
+            Some(("value", attribute(&claim))),
+        )?,
+        repository.item_guard("__ubeeq_repository_snapshot#global-v2", "fence", None)?,
+    ];
+    match client
+        .transact_write_items()
+        .set_transact_items(Some(actions))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(reply(if existing_id.is_some() { 200 } else { 201 }, case)),
+        Err(failure) => {
+            if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+                return Ok(operator_denied(id));
+            }
+            let case_id = case["id"].as_str().ok_or("Missing review case ID")?;
+            if let Some(current) = repository.read("reviewCases", case_id).await? {
+                let same_case = local(&current)
+                    && current["id"] == case_id
+                    && current["subjectId"] == case["subjectId"];
+                if same_case
+                    && (existing_id.is_none()
+                        || (current["state"] == case["state"]
+                            && current["assigneeId"] == case["assigneeId"]))
+                {
+                    return Ok(reply(200, current));
+                }
+                if existing_id.is_none() {
+                    return Ok(error(
+                        409,
+                        id,
+                        "idempotency_conflict",
+                        "The idempotency key belongs to a different review case.",
+                    ));
+                }
+            }
+            if matches!(
+                failure.as_service_error(),
+                Some(aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(cancelled))
+                    if transaction_revision_conflict(cancelled.cancellation_reasons().iter().map(|reason| reason.code()))
+            ) {
+                return Ok(error(
+                    409,
+                    id,
+                    "revision_conflict",
+                    "Review case evidence changed. Retry the same request.",
+                ));
+            }
+            Err(failure.into())
+        }
+    }
+}
+
 fn operator_cursor(repository: &str, input: &str) -> Option<HashMap<String, AttributeValue>> {
     if input.len() > 2048 {
         return None;
@@ -5737,6 +5950,19 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let method = request.request_context.http.method.as_str();
     let path = request.raw_path.as_str();
+    let review_case_id = single_path_id(path, "/v1/operations/review-cases/");
+    if method == "POST" && (path == "/v1/operations/review-cases" || review_case_id.is_some()) {
+        return write_review_case(&request, runtime, &id, review_case_id)
+            .await
+            .unwrap_or_else(|_| {
+                error(
+                    503,
+                    &id,
+                    "operations_unavailable",
+                    "Review cases are temporarily unavailable.",
+                )
+            });
+    }
     if (method, path) == ("POST", "/v1/operations/holds") {
         return create_moderation_hold(&request, runtime, &id)
             .await
@@ -6111,6 +6337,18 @@ async fn handle_event(event: LambdaEvent<Request>, runtime: &Runtime) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_case_state_preserves_the_supported_state_values() {
+        for state in ["open", "assigned", "decided", "closed"] {
+            assert_eq!(
+                review_case_state(&json!({"state":format!(" {state} ")})),
+                Some(state)
+            );
+        }
+        assert_eq!(review_case_state(&json!({"state":"active"})), None);
+        assert_eq!(review_case_state(&json!({})), None);
+    }
 
     #[test]
     fn operator_event_cursor_uses_node_key_shape_and_stays_in_its_repository() {
