@@ -111,6 +111,17 @@ fn timestamp(now: OffsetDateTime) -> Result<String, Failure> {
     ))
 }
 
+fn failed_asset(mut asset: Value, now: &str) -> Result<Option<(Value, u64)>, Failure> {
+    if !matches!(asset["status"].as_str(), Some("pending" | "processing")) {
+        return Ok(None);
+    }
+    let previous = revision(&asset)?;
+    asset["status"] = json!("failed");
+    asset["revision"] = json!(previous + 1);
+    asset["updatedAt"] = json!(now);
+    Ok(Some((asset, previous)))
+}
+
 fn stamp(record: &mut Value, asset: &Value, now: &str) {
     for name in [
         "instanceId",
@@ -495,6 +506,7 @@ impl Worker {
         };
         if let Err(error) = self.process(&lease).await {
             let now = OffsetDateTime::now_utc();
+            let exhausted = lease["attempt"].as_u64() >= lease["maxAttempts"].as_u64();
             let retry = self.queue.finish(
                 &lease,
                 JobOutcome::Retry {
@@ -507,17 +519,28 @@ impl Worker {
             let mut actions = vec![retry];
             if let Some(asset_id) = lease["payload"]["assetId"].as_str()
                 && let Some(asset) = self.read("assets", asset_id).await?
+                && asset["id"] == asset_id
                 && asset["instanceId"] == self.instance
                 && asset["homeCellId"] == self.cell
             {
+                let updated_at = timestamp(now)?;
                 let mut audit = json!({"id":Uuid::new_v4().to_string(),"action":"asset.processing_failed",
                     "subjectId":asset_id,"payload":{"jobId":lease["id"],"attempt":lease["attempt"],
                     "error":{"code":"processing_failed","message":"Asset processing could not be completed"}}});
-                stamp(&mut audit, &asset, &timestamp(now)?);
+                stamp(&mut audit, &asset, &updated_at);
                 actions.push(self.put("auditEvents", &audit, None)?);
+                if exhausted && let Some((failed, previous)) = failed_asset(asset, &updated_at)? {
+                    actions.push(self.put("assets", &failed, Some(previous))?);
+                    actions.push(self.fence("assets").await?);
+                    actions.push(self.check(
+                        "__ubeeq_repository_snapshot#global-v2",
+                        "fence",
+                        None,
+                    )?);
+                }
             }
             self.commit(actions).await?;
-            if lease["attempt"].as_u64() < lease["maxAttempts"].as_u64() {
+            if !exhausted {
                 return Err(error);
             }
         }
@@ -585,6 +608,29 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_processing_failure_only_changes_an_unfinished_asset() {
+        let now = "2026-11-27T00:00:00.000Z";
+        for status in ["pending", "processing"] {
+            let (failed, previous) =
+                failed_asset(json!({"id":"asset","revision":4,"status":status}), now)
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(previous, 4);
+            assert_eq!(
+                failed,
+                json!({"id":"asset","revision":5,"status":"failed","updatedAt":now})
+            );
+        }
+        for status in ["ready", "deleted", "failed"] {
+            assert!(
+                failed_asset(json!({"id":"asset","revision":4,"status":status}), now)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn only_an_eventbridge_tick_runs_scheduled_job_recovery() {
