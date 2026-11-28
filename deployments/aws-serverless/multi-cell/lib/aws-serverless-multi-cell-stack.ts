@@ -1,4 +1,4 @@
-import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Stack, type StackProps } from "aws-cdk-lib";
+import { CfnOutput, Duration, IgnoreMode, RemovalPolicy, Size, Stack, type StackProps } from "aws-cdk-lib";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import { resolve } from "node:path";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
@@ -28,19 +28,26 @@ export class AwsServerlessMultiCellStack extends Stack {
     const deadLetters = new sqs.Queue(this, "MigrationDeadLetters", { encryption: sqs.QueueEncryption.SQS_MANAGED, retentionPeriod: Duration.days(14), removalPolicy: RemovalPolicy.RETAIN });
     const commands = new sqs.Queue(this, "MigrationCommands", { encryption: sqs.QueueEncryption.SQS_MANAGED, visibilityTimeout: Duration.minutes(15), deadLetterQueue: { queue: deadLetters, maxReceiveCount: 3 }, removalPolicy: RemovalPolicy.RETAIN });
     const referenceApiAsset = this.node.tryGetContext("referenceApiAssetPath") || process.env.UBEEQ_REFERENCE_API_ASSET_PATH || resolve(__dirname, "../../../../apps/reference-api/lambda-package");
+    const rustWorkerAsset = this.node.tryGetContext("rustMigrationControlWorkerAssetPath") || process.env.UBEEQ_RUST_MIGRATION_CONTROL_WORKER_ASSET_PATH;
     const worker = new lambda.Function(this, "MigrationControlWorker", {
-      runtime: lambda.Runtime.NODEJS_22_X,
-      handler: "lambda.migrationControlWorker",
+      runtime: rustWorkerAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustWorkerAsset ? "bootstrap" : "lambda.migrationControlWorker",
       timeout: Duration.minutes(14),
-      code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      ...(rustWorkerAsset ? { ephemeralStorageSize: Size.gibibytes(6) } : {}),
+      code: lambda.Code.fromAsset(rustWorkerAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routes.tableName, UBEEQ_ROUTING_DIRECTORY_REGION: this.region },
     });
-    const operatorPrincipalArn = this.node.tryGetContext("migrationOperatorPrincipalArn") || process.env.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN || "arn:aws:iam::000000000000:role/UNCONFIGURED";
+    const configuredOperator = this.node.tryGetContext("migrationOperatorPrincipalArn") || process.env.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN;
+    if (configuredOperator && !/^arn:aws(?:-us-gov|-cn)?:iam::\d{12}:role\/[\w+=,.@/-]+$/.test(configuredOperator)) {
+      throw new Error("UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN must be an IAM role ARN.");
+    }
+    const operatorPrincipalArn = configuredOperator || "arn:aws:iam::000000000000:role/UNCONFIGURED";
+    const rustOperatorAsset = this.node.tryGetContext("rustMigrationControlApiAssetPath") || process.env.UBEEQ_RUST_MIGRATION_CONTROL_API_ASSET_PATH;
     const operatorApi = new lambda.Function(this, "MigrationControlApi", {
-      runtime: lambda.Runtime.NODEJS_22_X,
-      handler: "lambda.migrationControlApi",
+      runtime: rustOperatorAsset ? lambda.Runtime.PROVIDED_AL2023 : lambda.Runtime.NODEJS_22_X,
+      handler: rustOperatorAsset ? "bootstrap" : "lambda.migrationControlApi",
       timeout: Duration.seconds(30),
-      code: lambda.Code.fromAsset(referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
+      code: lambda.Code.fromAsset(rustOperatorAsset || referenceApiAsset, { ignoreMode: IgnoreMode.GLOB }),
       environment: { UBEEQ_ROUTING_DIRECTORY_TABLE_NAME: routes.tableName, UBEEQ_ROUTING_DIRECTORY_REGION: this.region, UBEEQ_MIGRATION_COMMANDS_QUEUE_URL: commands.queueUrl, UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN: operatorPrincipalArn },
     });
     routes.grantReadWriteData(worker);
@@ -95,7 +102,17 @@ export class AwsServerlessMultiCellStack extends Stack {
     new CfnOutput(this, "MigrationCommandsQueueUrl", { value: commands.queueUrl });
     new CfnOutput(this, "MigrationControlWorkerArn", { value: worker.functionArn });
     new CfnOutput(this, "MigrationControlWorkerRoleArn", { value: worker.role!.roleArn });
-    new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM }).url });
+    const operatorUrl = operatorApi.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.AWS_IAM });
+    if (configuredOperator) {
+      const principal = new iam.ArnPrincipal(configuredOperator);
+      operatorApi.addPermission("OperatorInvokeUrl", {
+        principal, action: "lambda:InvokeFunctionUrl", functionUrlAuthType: lambda.FunctionUrlAuthType.AWS_IAM,
+      });
+      operatorApi.addPermission("OperatorInvokeViaUrl", {
+        principal, action: "lambda:InvokeFunction", invokedViaFunctionUrl: true,
+      });
+    }
+    new CfnOutput(this, "MigrationControlOperatorUrl", { value: operatorUrl.url });
     new CfnOutput(this, "MigrationOperationsDashboardName", { value: dashboard.dashboardName });
   }
 }

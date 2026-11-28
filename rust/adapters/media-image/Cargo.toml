@@ -1,0 +1,16 @@
+[package]
+name = "ubeeq-media-image"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "LICENSE"
+
+[features]
+avif = ["dep:avif-rust"]
+still-images = ["image/tiff", "dep:tiff"]
+
+[dependencies]
+avif-rust = { version = "0.3", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+serde_json = "1"
+tiff = { version = "0.11", optional = true }

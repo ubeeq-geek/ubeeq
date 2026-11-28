@@ -42,3 +42,173 @@ test('API and worker account-status and group permissions are scoped to their co
     assert.equal(template.Resources[pool].Properties.AdminCreateUserConfig.AllowAdminCreateUserOnly, true);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+test('the reference web function can use its own Rust bootstrap asset', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-web-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const web = join(directory, 'web');
+    await mkdir(api);
+    await mkdir(web);
+    await writeFile(join(api, 'lambda.js'), 'exports.handler=async()=>({statusCode:200});\n');
+    await writeFile(join(web, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'cdk.out'), context: { referenceApiAssetPath: api, rustWebAssetPath: web } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustWebTest', { env: { account: '000000000000', region: 'us-east-2' } });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'lambda.handler', Runtime: 'nodejs22.x' });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('the Rust migration cell gets only point reads on the control directory', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'migration-cell-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const cell = join(directory, 'cell');
+    await mkdir(api);
+    await mkdir(cell);
+    await writeFile(join(api, 'lambda.js'), 'synthetic API asset');
+    await writeFile(join(cell, 'bootstrap'), 'synthetic migration cell asset');
+    const routingArn = 'arn:aws:dynamodb:us-east-2:111111111111:table/control-directory';
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: api, rustMigrationCellAssetPath: cell,
+      routingDirectoryTableArn: routingArn, routingDirectoryTableName: 'control-directory',
+      routingDirectoryRegion: 'us-east-2',
+      migrationControlWorkerPrincipalArn: 'arn:aws:iam::111111111111:role/migration-worker',
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustMigrationCell', {
+      env: { account: '111111111111', region: 'eu-central-1' },
+    });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Permission', {
+      Action: 'lambda:InvokeFunction', Principal: 'arn:aws:iam::111111111111:role/migration-worker',
+    });
+    const resources = Object.values(template.toJSON().Resources);
+    const role = resources.filter(value => value.Type === 'AWS::IAM::Policy')
+      .find(value => value.Properties.Roles.some(role => role.Ref?.startsWith('MigrationCellServiceRole')));
+    const directoryGrants = role.Properties.PolicyDocument.Statement.filter(statement => statement.Resource === routingArn);
+    assert.deepEqual(directoryGrants, [{ Action: 'dynamodb:GetItem', Effect: 'Allow', Resource: routingArn }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('the Rust reference worker retains the SQS trigger and runtime configuration', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-worker-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const api = join(directory, 'api');
+    const worker = join(directory, 'worker');
+    await mkdir(api);
+    await mkdir(worker);
+    await writeFile(join(api, 'lambda.js'), 'synthetic Node asset');
+    await writeFile(join(worker, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: api, rustReferenceWorkerAssetPath: worker,
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustReferenceWorker', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const resources = Template.fromStack(stack).toJSON().Resources;
+    const [workerId, workerResource] = Object.entries(resources)
+      .find(([id, resource]) => id.startsWith('ReferenceWorker') && resource.Type === 'AWS::Lambda::Function');
+    assert.equal(workerResource.Properties.Runtime, 'provided.al2023');
+    assert.equal(workerResource.Properties.Handler, 'bootstrap');
+    assert.equal(workerResource.Properties.Timeout, 120);
+    for (const name of ['UBEEQ_RECORDS_TABLE', 'UBEEQ_SOURCE_BUCKET', 'UBEEQ_CELL_ID']) {
+      assert.ok(workerResource.Properties.Environment.Variables[name]);
+    }
+    const trigger = Object.values(resources).find(resource => resource.Type === 'AWS::Lambda::EventSourceMapping');
+    assert.deepEqual(trigger.Properties.FunctionName, { Ref: workerId });
+    assert.deepEqual(trigger.Properties.FunctionResponseTypes, ['ReportBatchItemFailures']);
+    const schedule = Object.values(resources).find(resource => resource.Type === 'AWS::Events::Rule');
+    assert.deepEqual(schedule.Properties.Targets[0].Arn, { 'Fn::GetAtt': [workerId, 'Arn'] });
+    const workerEnvironment = workerResource.Properties.Environment.Variables;
+    assert.deepEqual(workerEnvironment.UBEEQ_JOBS_QUEUE_ARN, trigger.Properties.EventSourceArn);
+    assert.deepEqual(workerEnvironment.UBEEQ_RECOVERY_SCHEDULE_ARN, {
+      'Fn::Join': ['', ['arn:', { Ref: 'AWS::Partition' }, `:events:us-east-2:111111111111:rule/${schedule.Properties.Name}`]],
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('the Rust reference API retains its HTTP integrations and Cognito configuration', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'reference-api-rust-'));
+  try {
+    const { mkdir } = await import('node:fs/promises');
+    const node = join(directory, 'node');
+    const rust = join(directory, 'rust');
+    await mkdir(node);
+    await mkdir(rust);
+    await writeFile(join(node, 'lambda.js'), 'synthetic Node asset');
+    await writeFile(join(rust, 'bootstrap'), 'synthetic Rust asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: node, rustReferenceApiAssetPath: rust,
+    } });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustReferenceApi', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const resources = Template.fromStack(stack).toJSON().Resources;
+    const [apiId, api] = Object.entries(resources)
+      .find(([id, resource]) => id.startsWith('ReferenceApi') && resource.Type === 'AWS::Lambda::Function');
+    assert.equal(api.Properties.Runtime, 'provided.al2023');
+    assert.equal(api.Properties.Handler, 'bootstrap');
+    assert.equal(api.Properties.Environment.Variables.UBEEQ_PASSWORD_AUTH_ENABLED, 'true');
+    assert.ok(api.Properties.Environment.Variables.UBEEQ_USER_POOL_ID);
+    assert.ok(api.Properties.Environment.Variables.UBEEQ_PUBLIC_BASE_URL);
+    const apiArn = { 'Fn::GetAtt': [apiId, 'Arn'] };
+    const integrations = Object.values(resources).filter(resource => resource.Type === 'AWS::ApiGatewayV2::Integration');
+    assert.equal(integrations.filter(resource => JSON.stringify(resource.Properties.IntegrationUri) === JSON.stringify(apiArn)).length, 2);
+    const functionUrl = Object.values(resources).find(resource => resource.Type === 'AWS::Lambda::Url');
+    assert.deepEqual(functionUrl.Properties.TargetFunctionArn, apiArn);
+    assert.equal(functionUrl.Properties.AuthType, 'AWS_IAM');
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a cell supplied with all Rust assets synthesizes without a Node package', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'rust-single-cell-'));
+  try {
+    const context = { referenceApiAssetPath: join(directory, 'missing-node-package') };
+    for (const option of ['rustReferenceApiAssetPath', 'rustWebAssetPath', 'rustReferenceWorkerAssetPath', 'rustMigrationCellAssetPath']) {
+      const asset = join(directory, option + '.zip');
+      await writeFile(asset, option);
+      context[option] = asset;
+    }
+    const app = new App({ outdir: join(directory, 'cdk.out'), context });
+    const stack = new AwsServerlessSingleCellStack(app, 'RustCell', { env: { account: '111111111111', region: 'us-east-2' } });
+    const template = Template.fromStack(stack);
+    const functions = Object.values(template.findResources('AWS::Lambda::Function'));
+    assert.equal(functions.length, 4);
+    const endpoint = template.toJSON().Outputs.ReferenceApiGatewayUrl.Value;
+    template.hasResourceProperties('AWS::S3::Bucket', {
+      CorsConfiguration: { CorsRules: [{
+        AllowedMethods: ['PUT'],
+        AllowedOrigins: [template.toJSON().Outputs.ReferenceWebGatewayUrl.Value],
+        AllowedHeaders: [
+          'content-type', 'if-none-match', 'x-amz-checksum-sha256',
+          'x-amz-meta-checksum', 'x-amz-meta-scope', 'x-amz-meta-bytelength',
+          'x-amz-sdk-checksum-algorithm',
+        ],
+      }] },
+    });
+    const web = functions.find(({ Properties }) => 'UBEEQ_REFERENCE_WEB_API_URL' in Properties.Environment.Variables);
+    assert.deepEqual(web.Properties.Environment.Variables.UBEEQ_REFERENCE_WEB_API_URL, endpoint);
+    for (const { Properties } of functions.filter(({ Properties }) => 'UBEEQ_PUBLIC_BASE_URL' in Properties.Environment.Variables)) {
+      assert.deepEqual(Properties.Environment.Variables.UBEEQ_PUBLIC_BASE_URL, endpoint);
+    }
+    assert.equal(new Set(functions.map(({ Properties }) => Properties.Code.S3Key)).size, 4);
+    for (const { Properties } of functions) {
+      assert.equal(Properties.Runtime, 'provided.al2023');
+      assert.equal(Properties.Handler, 'bootstrap');
+      assert.deepEqual(Properties.Architectures ?? ['x86_64'], ['x86_64']);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

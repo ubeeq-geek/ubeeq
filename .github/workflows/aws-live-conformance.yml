@@ -1,8 +1,13 @@
-name: Optional AWS live conformance
+name: AWS Dev single-cell live conformance
 
 on:
   workflow_dispatch:
     inputs:
+      runtime:
+        description: Lambda runtime for the isolated development cell
+        type: choice
+        options: [rust, node]
+        default: rust
       role-to-assume:
         description: IAM role ARN authorized only for an isolated Ubeeq AWS serverless single-cell stack
         required: true
@@ -22,12 +27,26 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: aws-serverless-single-cell-live-${{ inputs.region }}-${{ inputs.stack-name }}
+  cancel-in-progress: false
+
 jobs:
+  rust-cell:
+    if: inputs.runtime == 'rust'
+    uses: ./.github/workflows/rust-migration-control-api.yml
+  rust-web:
+    if: inputs.runtime == 'rust'
+    uses: ./.github/workflows/rust-reference-web.yml
   conformance:
+    needs: [rust-cell, rust-web]
+    if: ${{ !cancelled() && (inputs.runtime == 'node' || (needs.rust-cell.result == 'success' && needs.rust-web.result == 'success')) }}
     environment: aws-serverless-single-cell-live
     runs-on: ubuntu-latest
     env:
       AWS_REGION: ${{ inputs.region }}
+      UBEEQ_DEPLOYMENT_REGION: ${{ inputs.region }}
+      UBEEQ_RUNTIME_REVISION: ${{ github.sha }}
       STACK_NAME: ${{ inputs.stack-name }}
       TEST_USERNAME: ubeeq-live-${{ github.run_id }}@invalid.example
       TEST_PASSWORD: UbeeqLive${{ github.run_id }}A!
@@ -37,18 +56,63 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: actions/download-artifact@v4
+        if: inputs.runtime == 'rust'
+        with:
+          pattern: '*-rust-al2023-x86-64'
+          path: ${{ runner.temp }}/ubeeq-rust-assets
+      - name: Require the four Rust cell Lambda packages
+        if: inputs.runtime == 'rust'
+        env:
+          ASSET_DIRECTORY: ${{ runner.temp }}/ubeeq-rust-assets
+        run: |
+          while read -r binary variable; do
+            asset="$ASSET_DIRECTORY/$binary-rust-al2023-x86-64/$binary-rust.zip"
+            test -s "$asset"
+            unzip -tq "$asset"
+            printf '%s=%s\n' "$variable" "$asset" >> "$GITHUB_ENV"
+          done <<'ASSETS'
+          migration-cell UBEEQ_RUST_MIGRATION_CELL_ASSET_PATH
+          reference-api UBEEQ_RUST_REFERENCE_API_ASSET_PATH
+          reference-worker UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH
+          reference-web UBEEQ_RUST_WEB_ASSET_PATH
+          ASSETS
+      - name: Require protected Dev account configuration
+        env:
+          DEV_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+          DEV_ROLE: ${{ inputs.role-to-assume }}
+        run: |
+          [[ "$DEV_ACCOUNT" =~ ^[0-9]{12}$ ]]
+          [[ "$DEV_ROLE" == "arn:aws:iam::$DEV_ACCOUNT:role/"* ]]
+          case "$STACK_NAME" in
+            UbeeqSelfHostDev|UbeeqSelfHostDevEuCentral1|UbeeqMultiCellDev) exit 1 ;;
+          esac
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ inputs.region }}
+      - name: Verify the AWS caller is in the Dev account
+        env:
+          DEV_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$DEV_ACCOUNT"
       - run: npm ci
       - run: npm run build
-      - name: Deploy isolated AWS serverless single-cell stack
+      - name: Deploy isolated Rust single-cell stack
+        if: inputs.runtime == 'rust'
+        run: npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk deploy --require-approval never
+      - name: Deploy isolated Node single-cell stack
+        if: inputs.runtime == 'node'
         run: npm run deploy --workspace @ubeeq/deployment-aws-serverless-single-cell -- --require-approval never
       - name: Read stack outputs
         run: |
           aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json > /tmp/ubeeq-outputs.json
           node -e 'const o=require("/tmp/ubeeq-outputs.json"); for (const x of o) console.log(`${x.OutputKey}=${x.OutputValue}`)' >> "$GITHUB_ENV"
+      - name: Verify the Rust web Lambda and packaged assets
+        if: inputs.runtime == 'rust'
+        run: |
+          curl --fail --silent --show-error --retry 3 "$ReferenceWebGatewayUrl/health"
+          curl --fail --silent --show-error --retry 3 "$ReferenceWebGatewayUrl/workspace" --output /dev/null
+          curl --fail --silent --show-error --retry 3 "$ReferenceWebGatewayUrl/api/health"
       - name: Create disposable Cognito test user
         run: |
           aws cognito-idp admin-create-user --user-pool-id "$UserPoolId" --username "$TEST_USERNAME" --user-attributes Name=email,Value="$TEST_USERNAME" Name=email_verified,Value=true --message-action SUPPRESS
@@ -58,7 +122,7 @@ jobs:
           UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_JOBS_QUEUE_URL="$JobsQueueUrl" UBEEQ_AWS_USER_POOL_ID="$UserPoolId" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:live --workspace @ubeeq/adapter-aws
       - name: Run authenticated API upload, worker, publication, and delivery flow
         run: |
-          UBEEQ_AWS_API_URL="$ReferenceApiGatewayUrl" UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
+          UBEEQ_AWS_VERIFY_OPERATOR_READS="${{ inputs.runtime == 'rust' }}" UBEEQ_AWS_WEB_ORIGIN="$ReferenceWebGatewayUrl" UBEEQ_AWS_API_URL="$ReferenceApiGatewayUrl" UBEEQ_AWS_REGION="$AWS_REGION" UBEEQ_AWS_RECORDS_TABLE="$RecordsTableName" UBEEQ_AWS_OBJECT_BUCKET="$SourceStoreName" UBEEQ_AWS_USER_POOL_CLIENT_ID="$UserPoolClientId" UBEEQ_AWS_TEST_USERNAME="$TEST_USERNAME" UBEEQ_AWS_TEST_PASSWORD="$TEST_PASSWORD" npm run test:aws --workspace @ubeeq/reference-api
       - name: Delete disposable identity
         if: always()
         run: aws cognito-idp admin-delete-user --user-pool-id "$UserPoolId" --username "$TEST_USERNAME" || true

@@ -19,10 +19,91 @@ test('multi-cell control preserves recovery state, requires IAM and confines mig
   const resources=Object.values(template.toJSON().Resources),table=resources.find(r=>r.Type==='AWS::DynamoDB::Table');
   assert.equal(table.DeletionPolicy,'Retain');assert.equal(table.Properties.PointInTimeRecoverySpecification.PointInTimeRecoveryEnabled,true);
   const api=resources.find(r=>r.Type==='AWS::Lambda::Function'&&r.Properties.Handler==='lambda.migrationControlApi');assert.equal(api.Properties.Environment.Variables.UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN,principal);
+  template.resourceCountIs('AWS::Lambda::Permission',2);
+  template.hasResourceProperties('AWS::Lambda::Permission',{Action:'lambda:InvokeFunctionUrl',Principal:principal,FunctionUrlAuthType:'AWS_IAM'});
+  template.hasResourceProperties('AWS::Lambda::Permission',{Action:'lambda:InvokeFunction',Principal:principal,InvokedViaFunctionUrl:true});
   const statements=resources.filter(r=>r.Type==='AWS::IAM::Policy').flatMap(r=>r.Properties.PolicyDocument.Statement);
   for(const [prefix,expected] of [['s3:',buckets.map(x=>x+'/*')],['lambda:InvokeFunction',functions]]){
    const granted=statements.filter(s=>(Array.isArray(s.Action)?s.Action:[s.Action]).some(a=>a.startsWith(prefix))).flatMap(s=>Array.isArray(s.Resource)?s.Resource:[s.Resource]);
    assert.deepEqual([...new Set(granted)].sort(),[...expected].sort());
   }
  }finally{await rm(directory,{recursive:true,force:true});}
+});
+
+test('the Rust operator API uses its own asset and keeps the IAM Function URL', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'migration-api-rust-'));
+  try {
+    const referenceAsset = join(directory, 'node');
+    const rustAsset = join(directory, 'rust');
+    await mkdir(referenceAsset);
+    await mkdir(rustAsset);
+    await writeFile(join(referenceAsset, 'lambda.js'), 'synthetic worker asset');
+    await writeFile(join(rustAsset, 'bootstrap'), 'synthetic operator API asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: referenceAsset,
+      rustMigrationControlApiAssetPath: rustAsset,
+    } });
+    const stack = new AwsServerlessMultiCellStack(app, 'RustControl', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'bootstrap', Runtime: 'provided.al2023' });
+    template.hasResourceProperties('AWS::Lambda::Function', { Handler: 'lambda.migrationControlWorker', Runtime: 'nodejs22.x' });
+    template.hasResourceProperties('AWS::Lambda::Url', { AuthType: 'AWS_IAM' });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('the native migration worker keeps partial SQS retries and allocates transfer storage', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'migration-worker-rust-'));
+  try {
+    const referenceAsset = join(directory, 'node');
+    const rustAsset = join(directory, 'rust');
+    await mkdir(referenceAsset);
+    await mkdir(rustAsset);
+    await writeFile(join(referenceAsset, 'lambda.js'), 'synthetic API asset');
+    await writeFile(join(rustAsset, 'bootstrap'), 'synthetic worker asset');
+    const app = new App({ outdir: join(directory, 'out'), context: {
+      referenceApiAssetPath: referenceAsset,
+      rustMigrationControlWorkerAssetPath: rustAsset,
+    } });
+    const stack = new AwsServerlessMultiCellStack(app, 'RustWorker', {
+      env: { account: '111111111111', region: 'us-east-2' },
+    });
+    const template = Template.fromStack(stack);
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Handler: 'bootstrap', Runtime: 'provided.al2023', Timeout: 840,
+      EphemeralStorage: { Size: 6144 },
+    });
+    template.hasResourceProperties('AWS::Lambda::EventSourceMapping', {
+      FunctionResponseTypes: ['ReportBatchItemFailures'],
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a control plane supplied with both Rust assets synthesizes without a Node package', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'rust-multi-cell-'));
+  try {
+    const context = { referenceApiAssetPath: join(directory, 'missing-node-package') };
+    for (const option of ['rustMigrationControlApiAssetPath', 'rustMigrationControlWorkerAssetPath']) {
+      const asset = join(directory, option + '.zip');
+      await writeFile(asset, option);
+      context[option] = asset;
+    }
+    const app = new App({ outdir: join(directory, 'cdk.out'), context });
+    const stack = new AwsServerlessMultiCellStack(app, 'RustControlPlane', { env: { account: '111111111111', region: 'us-east-2' } });
+    const functions = Object.values(Template.fromStack(stack).findResources('AWS::Lambda::Function'));
+    assert.equal(functions.length, 2);
+    assert.equal(new Set(functions.map(({ Properties }) => Properties.Code.S3Key)).size, 2);
+    for (const { Properties } of functions) {
+      assert.equal(Properties.Runtime, 'provided.al2023');
+      assert.equal(Properties.Handler, 'bootstrap');
+      assert.deepEqual(Properties.Architectures ?? ['x86_64'], ['x86_64']);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

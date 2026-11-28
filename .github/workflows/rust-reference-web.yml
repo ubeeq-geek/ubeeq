@@ -1,0 +1,64 @@
+name: Rust reference web Lambda
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - .github/workflows/rust-reference-web.yml
+      - deployments/aws-serverless/reference-web-rust/**
+      - deployments/aws-serverless/single-cell/**
+      - apps/web-reference/**
+      - packages/**
+      - package.json
+      - package-lock.json
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/rust-reference-web.yml
+      - deployments/aws-serverless/reference-web-rust/**
+      - deployments/aws-serverless/single-cell/**
+      - apps/web-reference/**
+      - packages/**
+      - package.json
+      - package-lock.json
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container: public.ecr.aws/amazonlinux/amazonlinux:2023
+    steps:
+      - run: dnf install -y gcc gcc-c++ make cmake pkgconf-pkg-config git tar gzip zip unzip binutils
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci && npm run build
+      - name: Install the Rust toolchain
+        run: |
+          curl --fail --silent --show-error https://sh.rustup.rs --output /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.100.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Test and package the native Lambda
+        working-directory: deployments/aws-serverless/reference-web-rust
+        run: |
+          cargo test --locked
+          cargo build --locked --release
+          node package-assets.mjs package/assets
+          install -m 0755 target/release/bootstrap package/bootstrap
+          LC_ALL=C readelf -h package/bootstrap | grep 'Advanced Micro Devices X86-64'
+          cd package
+          rm -f reference-web-rust.zip
+          zip -r reference-web-rust.zip bootstrap assets
+          unzip -tq reference-web-rust.zip
+          unzip -p reference-web-rust.zip assets/workspace.html > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-web-rust-al2023-x86-64
+          path: deployments/aws-serverless/reference-web-rust/package/reference-web-rust.zip
+          if-no-files-found: error

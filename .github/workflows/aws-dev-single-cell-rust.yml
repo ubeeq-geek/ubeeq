@@ -1,0 +1,94 @@
+name: AWS Dev single-cell Rust qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubeeq-dev-single-cell-rust
+  cancel-in-progress: false
+
+jobs:
+  rust-cell:
+    uses: ./.github/workflows/rust-migration-control-api.yml
+  rust-web:
+    uses: ./.github/workflows/rust-reference-web.yml
+  qualify:
+    if: github.ref == 'refs/heads/main'
+    needs: [rust-cell, rust-web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ubeeq-dev-single-cell-rust
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEV_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+      DEV_ROLE: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
+      STACK_NAME: UbeeqStandaloneRustDev
+      UBEEQ_DEPLOYMENT_REGION: us-east-2
+      UBEEQ_CELL_ID: standalone-rust-dev
+      UBEEQ_RUNTIME_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-rust-al2023-x86-64'
+          path: ${{ runner.temp }}/ubeeq-rust-assets
+      - name: Require the four Rust packages and Dev role
+        shell: bash
+        run: |
+          [[ "$DEV_ACCOUNT" =~ ^[0-9]{12}$ ]]
+          [[ "$DEV_ROLE" =~ ^arn:aws:iam::${DEV_ACCOUNT}:role/[a-zA-Z0-9_+=,.@/-]+$ ]]
+          while read -r binary variable; do
+            asset="$RUNNER_TEMP/ubeeq-rust-assets/$binary-rust-al2023-x86-64/$binary-rust.zip"
+            unzip -tq "$asset"
+            unzip -p "$asset" bootstrap > "$RUNNER_TEMP/$binary-bootstrap"
+            LC_ALL=C readelf -h "$RUNNER_TEMP/$binary-bootstrap" | grep 'Advanced Micro Devices X86-64'
+            printf '%s=%s\n' "$variable" "$asset" >> "$GITHUB_ENV"
+          done <<'ASSETS'
+          migration-cell UBEEQ_RUST_MIGRATION_CELL_ASSET_PATH
+          reference-api UBEEQ_RUST_REFERENCE_API_ASSET_PATH
+          reference-worker UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH
+          reference-web UBEEQ_RUST_WEB_ASSET_PATH
+          ASSETS
+      - run: npm ci
+      - run: npm run build
+      - name: Synthesize and verify the Rust-only stack
+        shell: bash
+        run: |
+          export CDK_DEFAULT_ACCOUNT="$DEV_ACCOUNT"
+          assembly="$RUNNER_TEMP/ubeeq-single-cell-rust"
+          npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk synth --output "$assembly"
+          jq -e '
+            [.Resources[] | select(.Type == "AWS::Lambda::Function") | .Properties]
+            | length == 4 and all(.[]; .Runtime == "provided.al2023" and .Handler == "bootstrap"
+              and (.Architectures // ["x86_64"]) == ["x86_64"])
+          ' "$assembly/$STACK_NAME.template.json" >/dev/null
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
+          aws-region: us-east-2
+      - name: Deploy and verify the isolated single cell
+        shell: bash
+        run: |
+          test "$(aws sts get-caller-identity --query Account --output text)" = "$DEV_ACCOUNT"
+          npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk deploy \
+            --app "$RUNNER_TEMP/ubeeq-single-cell-rust" --require-approval never
+          output=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json)
+          url=$(jq -er '.[] | select(.OutputKey == "ReferenceApiGatewayUrl") | .OutputValue' <<< "$output")
+          [[ "$url" == https://*.execute-api.us-east-2.amazonaws.com ]]
+          curl --fail --silent --show-error --max-time 30 --retry 5 "$url/health" |
+            jq -e '.ok == true' >/dev/null
+          web=$(jq -er '.[] | select(.OutputKey == "ReferenceWebGatewayUrl") | .OutputValue' <<< "$output")
+          [[ "$web" == https://*.execute-api.us-east-2.amazonaws.com ]]
+          curl --fail --silent --show-error --max-time 30 --retry 5 "$web/health" |
+            jq -e '.status == "ok"' >/dev/null
