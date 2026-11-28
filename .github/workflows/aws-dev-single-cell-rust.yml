@@ -62,6 +62,17 @@ jobs:
           ASSETS
       - run: npm ci
       - run: npm run build
+      - name: Synthesize and verify the Rust-only stack
+        shell: bash
+        run: |
+          export CDK_DEFAULT_ACCOUNT="$DEV_ACCOUNT"
+          assembly="$RUNNER_TEMP/ubeeq-single-cell-rust"
+          npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk synth --output "$assembly"
+          jq -e '
+            [.Resources[] | select(.Type == "AWS::Lambda::Function") | .Properties]
+            | length == 4 and all(.[]; .Runtime == "provided.al2023" and .Handler == "bootstrap"
+              and (.Architectures // ["x86_64"]) == ["x86_64"])
+          ' "$assembly/$STACK_NAME.template.json" >/dev/null
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
@@ -70,7 +81,8 @@ jobs:
         shell: bash
         run: |
           test "$(aws sts get-caller-identity --query Account --output text)" = "$DEV_ACCOUNT"
-          npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk deploy --require-approval never
+          npm exec --workspace @ubeeq/deployment-aws-serverless-single-cell -- cdk deploy \
+            --app "$RUNNER_TEMP/ubeeq-single-cell-rust" --require-approval never
           output=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json)
           url=$(jq -er '.[] | select(.OutputKey == "ReferenceApiGatewayUrl") | .OutputValue' <<< "$output")
           [[ "$url" == https://*.execute-api.us-east-2.amazonaws.com ]]
