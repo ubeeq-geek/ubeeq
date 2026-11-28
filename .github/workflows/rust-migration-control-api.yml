@@ -9,7 +9,6 @@ on:
       - deployments/aws-serverless/single-cell/**
       - deployments/aws-serverless/migration-control-rust/**
       - rust/adapters/media-image/**
-      - rust/adapters/media-image/**
   push:
     branches: [main]
     paths:
@@ -17,7 +16,6 @@ on:
       - deployments/aws-serverless/multi-cell/**
       - deployments/aws-serverless/single-cell/**
       - deployments/aws-serverless/migration-control-rust/**
-      - rust/adapters/media-image/**
       - rust/adapters/media-image/**
 
 permissions:
@@ -45,11 +43,10 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Test shared Rust media adapter
         working-directory: rust/adapters/media-image
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          cargo test --locked --features still-images
       - run: cargo test --locked --features worker
-      - name: Test the shared still-image decoder
-        working-directory: rust/adapters/media-image
-        run: cargo test --locked --features still-images
       - name: Build the Linux Lambda ZIPs
         run: |
           cargo build --locked --release --features worker
