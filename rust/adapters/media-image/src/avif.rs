@@ -1,4 +1,6 @@
-use avif_rust::{CleanAperture, NativeDecodeLimits, decode_frame_bytes_strict_with_limits};
+use avif_rust::{
+    CleanAperture, NativeDecodeLimits, decode_frame_bytes_strict_with_limits, parse_native_info,
+};
 use image::{DynamicImage, RgbaImage, metadata::Orientation};
 
 use crate::render::{DecodeLimits, Error};
@@ -33,8 +35,48 @@ fn file_type(source: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&payload[..4], &payload[8..]))
 }
 
-/// Decode a bounded still AVIF item and apply its container orientation.
-pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<DynamicImage, Error> {
+/// Inspect the declared still AVIF dimensions, including presentation crop and rotation.
+pub fn inspect_dimensions(source: &[u8], budget: DecodeLimits) -> Result<[u32; 2], Error> {
+    if !is_avif(source) {
+        return Err("Image does not match its declared MIME type".into());
+    }
+    let limits = still_limits(source, budget)?;
+    let metadata = parse_native_info(source, &limits)?;
+    let info = metadata.info();
+    if metadata.primary_item_type() != Some(*b"av01")
+        || info.primary_item_payload.is_empty()
+        || info.av1_config.is_none()
+        || !info.sequence_sample_payloads.is_empty()
+    {
+        return Err("A supported still AVIF item is required".into());
+    }
+    let [Some(width), Some(height)] = [info.width, info.height] else {
+        return Err("AVIF image dimensions are unavailable".into());
+    };
+    if width == 0
+        || height == 0
+        || width as usize > limits.max_width()
+        || height as usize > limits.max_height()
+        || u64::from(width) * u64::from(height) > limits.max_pixels() as u64
+    {
+        return Err("AVIF image exceeds the pixel limit".into());
+    }
+    let (width, height) = match info.clean_aperture {
+        Some(aperture) => {
+            let (_, _, width, height) =
+                clean_aperture(width, height, aperture).ok_or("Invalid AVIF clean aperture")?;
+            (width, height)
+        }
+        None => (width, height),
+    };
+    let dimensions = match rotation(info.rotation.map(|rotation| rotation.angle))? {
+        Orientation::Rotate90 | Orientation::Rotate270 => [height, width],
+        _ => [width, height],
+    };
+    Ok(dimensions)
+}
+
+fn still_limits(source: &[u8], budget: DecodeLimits) -> Result<NativeDecodeLimits, Error> {
     if source.is_empty() || source.len() > budget.bytes {
         return Err("Image source exceeds the input byte limit".into());
     }
@@ -49,7 +91,7 @@ pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<Dyna
     if pixels == 0 {
         return Err("AVIF image exceeds the allocation limit".into());
     }
-    let limits = NativeDecodeLimits::new(
+    Ok(NativeDecodeLimits::new(
         budget.bytes,
         8192,
         8192,
@@ -63,7 +105,22 @@ pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<Dyna
         0,
         1,
     )
-    .with_max_live_allocation_bytes(allocation)?;
+    .with_max_live_allocation_bytes(allocation)?)
+}
+
+fn rotation(angle: Option<u8>) -> Result<Orientation, Error> {
+    match angle {
+        None | Some(0) => Ok(Orientation::NoTransforms),
+        Some(1) => Ok(Orientation::Rotate270),
+        Some(2) => Ok(Orientation::Rotate180),
+        Some(3) => Ok(Orientation::Rotate90),
+        _ => Err("Invalid AVIF rotation angle".into()),
+    }
+}
+
+/// Decode a bounded still AVIF item and apply its container orientation.
+pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<DynamicImage, Error> {
+    let limits = still_limits(source, budget)?;
     let (frame, metadata) = decode_frame_bytes_strict_with_limits(source, &limits)?.into_parts();
     let info = metadata.info();
     if info.major_brand == *b"avis" || info.compatible_brands.contains(b"avis") {
@@ -87,16 +144,7 @@ pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<Dyna
         };
         pixels.apply_orientation(orientation);
     }
-    if let Some(rotation) = info.rotation {
-        let orientation = match rotation.angle {
-            0 => Orientation::NoTransforms,
-            1 => Orientation::Rotate270,
-            2 => Orientation::Rotate180,
-            3 => Orientation::Rotate90,
-            _ => return Err("Invalid AVIF rotation angle".into()),
-        };
-        pixels.apply_orientation(orientation);
-    }
+    pixels.apply_orientation(rotation(info.rotation.map(|value| value.angle))?);
     Ok(pixels)
 }
 
@@ -285,6 +333,8 @@ mod tests {
             "A still AVIF image is required"
         );
         assert!(!is_avif(&STILL[..16]));
+        assert_eq!(inspect_dimensions(STILL, budget).unwrap(), [8, 6]);
+        assert!(inspect_dimensions(&[0; 64], budget).is_err());
         let pixels = decode_oriented_still(STILL, budget).unwrap().into_rgba8();
         assert_eq!(pixels.dimensions(), (8, 6));
         let [r, g, b, a] = pixels.get_pixel(0, 0).0;
