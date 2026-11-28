@@ -238,6 +238,56 @@ fn center_to_fill(mut crop: Crop, target: ImageSize) -> Crop {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "still-images")]
+    #[test]
+    fn still_decoder_enforces_format_and_resource_limits() {
+        let pixels =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(4, 3, image::Rgb([24, 64, 128])));
+        let budget = DecodeLimits {
+            bytes: 4096,
+            pixels: 12,
+            allocation_bytes: 1024 * 1024,
+        };
+
+        for format in [ImageFormat::Png, ImageFormat::Tiff] {
+            let mut source = Cursor::new(Vec::new());
+            pixels.write_to(&mut source, format).unwrap();
+            let source = source.into_inner();
+            assert_eq!(decode_oriented_still(&source, budget).unwrap(), pixels);
+            for small_budget in [
+                DecodeLimits {
+                    bytes: source.len() - 1,
+                    ..budget
+                },
+                DecodeLimits {
+                    pixels: 11,
+                    ..budget
+                },
+                DecodeLimits {
+                    allocation_bytes: 1,
+                    ..budget
+                },
+            ] {
+                assert!(decode_oriented_still(&source, small_budget).is_err());
+            }
+        }
+
+        let mut source = Cursor::new(Vec::new());
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut source).unwrap();
+            for _ in 0..2 {
+                encoder
+                    .write_image::<tiff::encoder::colortype::RGB8>(4, 3, pixels.as_bytes())
+                    .unwrap();
+            }
+        }
+        assert!(decode_oriented_still(source.get_ref(), budget).is_err());
+
+        let mut source = Cursor::new(Vec::new());
+        pixels.write_to(&mut source, ImageFormat::Gif).unwrap();
+        assert!(decode_oriented_still(source.get_ref(), budget).is_err());
+    }
+
     #[test]
     fn extreme_aspect_crops_stay_within_the_source() {
         let target = ImageSize {
