@@ -1737,11 +1737,11 @@ fn regional_migration_command(path: &str) -> bool {
         })
 }
 
-async fn require_regional_operator(
+async fn require_regional_operator<'a>(
     request: &Request,
-    runtime: &Runtime,
+    runtime: &'a Runtime,
     id: &str,
-) -> Result<(), Response> {
+) -> Result<(CreatorRecords<'a>, String, Value), Response> {
     let (_, actor) = creator_session(request, runtime, id).await?;
     let Some((client, table)) = &runtime.records else {
         return Err(operator_denied(id));
@@ -1753,7 +1753,7 @@ async fn require_regional_operator(
         instance: &runtime.instance_id,
     };
     match operator_claim(&repository, &actor).await {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(claim)) => Ok((repository, actor, claim)),
         Ok(None) => Err(operator_denied(id)),
         Err(_) => Err(error(
             503,
@@ -1770,9 +1770,10 @@ async fn list_regional_control(
     id: &str,
     routes: bool,
 ) -> Result<Response, Failure> {
-    if let Err(response) = require_regional_operator(request, runtime, id).await {
-        return Ok(response);
-    }
+    let (repository, actor, claim) = match require_regional_operator(request, runtime, id).await {
+        Ok(authorized) => authorized,
+        Err(response) => return Ok(response),
+    };
     let Some(store) = &runtime.routing else {
         return Ok(regional_write_unavailable(false, id));
     };
@@ -1790,6 +1791,9 @@ async fn list_regional_control(
                 .await?,
         )
     };
+    if operator_claim(&repository, &actor).await?.as_ref() != Some(&claim) {
+        return Ok(operator_denied(id));
+    }
     let mut body = json!({"requestId":id});
     body[field] = json!(items);
     if let Some(cursor) = cursor {
@@ -6292,7 +6296,7 @@ async fn handle(request: Request, runtime: &Runtime) -> Response {
     }
     if method == "POST" && regional_migration_command(path) {
         return match require_regional_operator(&request, runtime, &id).await {
-            Ok(()) => regional_write_unavailable(runtime.routing.is_some(), &id),
+            Ok(_) => regional_write_unavailable(runtime.routing.is_some(), &id),
             Err(response) => response,
         };
     }
