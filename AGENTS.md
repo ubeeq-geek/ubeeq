@@ -25,6 +25,14 @@
 - Do not silently update downstream compatibility pins from this repository. Record the required companion work in the pull request.
 - Preserve public-package boundaries with `npm run check:public-boundary`, `npm run check:adapter-contracts`, and `npm run check:publish-workflow` when relevant.
 
+# Native runtime candidates
+
+- Treat Node and Rust implementations of the same Lambda boundary as one compatibility surface. Preserve event envelopes, response and error behavior, authorization, idempotency, partial-batch failures, deadlines, and persisted representations.
+- Keep the existing implementation and deployment selection available until the candidate has explicit compatibility evidence and authorized development-environment qualification. Do not switch a deployment default or claim replacement parity from unit tests alone.
+- Pin cross-repository Rust dependencies to immutable commit SHAs and keep each `Cargo.lock` synchronized. Never build or qualify code selected through a moving branch or tag.
+- Use the Rust toolchain pinned by the relevant workflow and run the locked formatting, lint, test, packaging, and Lambda Runtime API fixture checks applicable to the changed crate.
+- Inspect the Amazon Linux 2023 artifact as a `bootstrap` ZIP and verify its digest and architecture before qualification. Record unported routes, handlers, providers, and live-environment checks in the pull request.
+
 # Validation
 
 - Use Node 22.5 or newer and install with `npm ci`.
