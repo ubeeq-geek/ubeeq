@@ -45,7 +45,7 @@ jobs:
         working-directory: rust/adapters/media-image
         run: |
           cargo test --locked
-          cargo test --locked --features still-images
+          cargo test --locked --features avif,still-images
       - run: cargo test --locked --features worker
       - name: Build the Linux Lambda ZIPs
         run: |
