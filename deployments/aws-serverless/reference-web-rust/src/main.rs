@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_binary_proxy_content_and_selected_headers() {
+    async fn decodes_compressed_binary_proxy_content_and_preserves_selected_headers() {
         let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = Url::parse(&format!("http://{}", upstream.local_addr().unwrap())).unwrap();
         let server = std::thread::spawn(move || {
@@ -329,11 +329,16 @@ mod tests {
             let headers = request.to_ascii_lowercase();
             assert!(headers.contains("authorization: bearer fixture"));
             assert!(headers.contains("idempotency-key: fixture"));
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line.starts_with("accept-encoding:") && line.contains("gzip"))
+            );
             assert!(!headers.contains("cookie:"));
             let mut body = [0; 3];
             reader.read_exact(&mut body).unwrap();
             assert_eq!(body, [0, 255, 42]);
-            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\nSet-Cookie: private=test\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\x00\xff\x2a").unwrap();
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Encoding: gzip\r\nContent-Disposition: attachment\r\nSet-Cookie: private=test\r\nContent-Length: 23\r\nConnection: close\r\n\r\n\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x63\xf8\xaf\x05\x00\xb6\xed\xde\xb7\x03\x00\x00\x00").unwrap();
         });
         let web = Web {
             upstream: url,
@@ -361,6 +366,7 @@ mod tests {
         assert_eq!(response.status_code, 206);
         assert_eq!(response.headers["content-disposition"], "attachment");
         assert!(!response.headers.contains_key("set-cookie"));
+        assert!(!response.headers.contains_key("content-encoding"));
         assert!(response.is_base64_encoded);
         assert_eq!(STANDARD.decode(response.body).unwrap(), [0, 255, 42]);
         server.join().unwrap();
