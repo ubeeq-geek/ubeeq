@@ -142,15 +142,38 @@ pub fn inspect_dimensions(
     Ok(size)
 }
 
+/// Decode one still image and apply its embedded orientation. The caller owns
+/// rendition, transparency, and publication policy.
+#[cfg(feature = "still-images")]
+pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<DynamicImage, Error> {
+    use image::codecs::{png::PngDecoder, webp::WebPDecoder};
+
+    let reader = source_reader(source, budget)?;
+    let input = Cursor::new(source);
+    let still = match reader.format() {
+        Some(ImageFormat::Jpeg) => true,
+        Some(ImageFormat::Png) => !PngDecoder::new(input)?.is_apng()?,
+        Some(ImageFormat::WebP) => !WebPDecoder::new(input)?.has_animation(),
+        Some(ImageFormat::Tiff) => !tiff::decoder::Decoder::new(input)?.more_images(),
+        _ => false,
+    };
+    if !still {
+        return Err("A supported still image is required".into());
+    }
+
+    let (mut decoder, _) = bounded_decoder(reader, budget)?;
+    let orientation = decoder.orientation()?;
+    let mut pixels = DynamicImage::from_decoder(decoder)?;
+    pixels.apply_orientation(orientation);
+    Ok(pixels)
+}
+
 fn source_decoder<'a>(
     source: &'a [u8],
     budget: DecodeLimits,
     mime: Option<&str>,
 ) -> Result<(impl ImageDecoder + 'a, ImageSize, &'static str), Error> {
-    if source.is_empty() || source.len() > budget.bytes {
-        return Err("Image source exceeds the input byte limit".into());
-    }
-    let mut reader = ImageReader::new(Cursor::new(source)).with_guessed_format()?;
+    let reader = source_reader(source, budget)?;
     let detected = match reader.format() {
         Some(ImageFormat::Jpeg) => "image/jpeg",
         Some(ImageFormat::Png) => "image/png",
@@ -161,7 +184,21 @@ fn source_decoder<'a>(
     if mime.is_some_and(|mime| mime != detected) {
         return Err("Image does not match its declared MIME type".into());
     }
-    // Crop coordinates refer to stored pixels, so leave EXIF orientation unapplied.
+    let (decoder, size) = bounded_decoder(reader, budget)?;
+    Ok((decoder, size, detected))
+}
+
+fn source_reader(source: &[u8], budget: DecodeLimits) -> Result<ImageReader<Cursor<&[u8]>>, Error> {
+    if source.is_empty() || source.len() > budget.bytes {
+        return Err("Image source exceeds the input byte limit".into());
+    }
+    Ok(ImageReader::new(Cursor::new(source)).with_guessed_format()?)
+}
+
+fn bounded_decoder(
+    mut reader: ImageReader<Cursor<&[u8]>>,
+    budget: DecodeLimits,
+) -> Result<(impl ImageDecoder + '_, ImageSize), Error> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(budget.allocation_bytes);
     reader.limits(limits.clone());
@@ -176,7 +213,7 @@ fn source_decoder<'a>(
     };
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
-    Ok((decoder, size, detected))
+    Ok((decoder, size))
 }
 
 fn center_to_fill(mut crop: Crop, target: ImageSize) -> Crop {
