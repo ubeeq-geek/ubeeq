@@ -1,4 +1,4 @@
-use avif_rust::{NativeDecodeLimits, decode_frame_bytes_strict_with_limits};
+use avif_rust::{CleanAperture, NativeDecodeLimits, decode_frame_bytes_strict_with_limits};
 use image::{DynamicImage, RgbaImage, metadata::Orientation};
 
 use crate::render::{DecodeLimits, Error};
@@ -69,14 +69,16 @@ pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<Dyna
     if info.major_brand == *b"avis" || info.compatible_brands.contains(b"avis") {
         return Err("A still AVIF image is required".into());
     }
-    if info.clean_aperture.is_some() {
-        return Err("AVIF clean apertures are unsupported".into());
-    }
     let rgba = frame.to_rgba8()?;
     let mut pixels = DynamicImage::ImageRgba8(
         RgbaImage::from_raw(rgba.width.try_into()?, rgba.height.try_into()?, rgba.rgba)
             .ok_or("AVIF decoder returned invalid dimensions")?,
     );
+    if let Some(aperture) = info.clean_aperture {
+        let (x, y, width, height) = clean_aperture(pixels.width(), pixels.height(), aperture)
+            .ok_or("Invalid AVIF clean aperture")?;
+        pixels = pixels.crop_imm(x, y, width, height);
+    }
     if let Some(mirror) = info.mirror {
         let orientation = match mirror.axis {
             0 => Orientation::FlipHorizontal,
@@ -96,6 +98,59 @@ pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<Dyna
         pixels.apply_orientation(orientation);
     }
     Ok(pixels)
+}
+
+fn clean_aperture(
+    width: u32,
+    height: u32,
+    aperture: CleanAperture,
+) -> Option<(u32, u32, u32, u32)> {
+    let (x, width) = aperture_axis(
+        width,
+        aperture.width_n,
+        aperture.width_d,
+        aperture.horizontal_offset_n as i32,
+        aperture.horizontal_offset_d,
+    )?;
+    let (y, height) = aperture_axis(
+        height,
+        aperture.height_n,
+        aperture.height_d,
+        aperture.vertical_offset_n as i32,
+        aperture.vertical_offset_d,
+    )?;
+    Some((x, y, width, height))
+}
+
+fn aperture_axis(
+    extent: u32,
+    size_numerator: u32,
+    size_denominator: u32,
+    offset_numerator: i32,
+    offset_denominator: u32,
+) -> Option<(u32, u32)> {
+    if size_denominator == 0
+        || size_denominator > i32::MAX as u32
+        || offset_denominator == 0
+        || offset_denominator > i32::MAX as u32
+        || size_numerator > i32::MAX as u32
+        || size_numerator % size_denominator != 0
+    {
+        return None;
+    }
+    let size = size_numerator / size_denominator;
+    if size == 0 || size > extent {
+        return None;
+    }
+    // The crop starts at (extent - size) / 2 + offset in stored pixel coordinates.
+    let denominator = i64::from(offset_denominator) * 2;
+    let numerator =
+        i64::from(extent - size) * i64::from(offset_denominator) + 2 * i64::from(offset_numerator);
+    if numerator % denominator != 0 {
+        return None;
+    }
+    let start = u32::try_from(numerator / denominator).ok()?;
+    (start <= extent - size).then_some((start, size))
 }
 
 #[cfg(test)]
@@ -127,6 +182,54 @@ mod tests {
         0x00, 0x00, 0x50, 0x00, 0x00, 0x40, 0x03, 0x52, 0xed, 0xe7, 0x17, 0xf4, 0xf3, 0x45, 0xa6,
         0x20,
     ];
+
+    #[test]
+    fn clean_aperture_requires_exact_in_bounds_pixel_coordinates() {
+        let aperture = CleanAperture {
+            width_n: 5,
+            width_d: 1,
+            height_n: 4,
+            height_d: 1,
+            horizontal_offset_n: (-1i32) as u32,
+            horizontal_offset_d: 2,
+            vertical_offset_n: 1,
+            vertical_offset_d: 1,
+        };
+        assert_eq!(clean_aperture(8, 6, aperture), Some((1, 2, 5, 4)));
+        assert_eq!(
+            clean_aperture(
+                8,
+                6,
+                CleanAperture {
+                    horizontal_offset_n: 0,
+                    ..aperture
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            clean_aperture(
+                8,
+                6,
+                CleanAperture {
+                    vertical_offset_n: 2,
+                    ..aperture
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            clean_aperture(
+                8,
+                6,
+                CleanAperture {
+                    width_d: 0,
+                    ..aperture
+                }
+            ),
+            None
+        );
+    }
 
     #[test]
     fn decodes_a_still_avif_and_rejects_unbounded_inputs() {
