@@ -101,12 +101,21 @@ jobs:
           reference-worker UBEEQ_RUST_REFERENCE_WORKER_ASSET_PATH
           reference-web UBEEQ_RUST_WEB_ASSET_PATH
           ASSETS
+      - name: Validate the configured development role
+        env:
+          DEV_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+          DEV_ROLE: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
+        run: |
+          [[ ${#DEV_ACCOUNT} == 12 && "$DEV_ACCOUNT" != *[!0-9]* ]] || exit 1
+          [[ "$DEV_ROLE" =~ ^arn:aws:iam::${DEV_ACCOUNT}:role/[a-zA-Z0-9_+=,.@/-]+$ ]]
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
           aws-region: us-east-2
       - name: Require the protected development account
-        run: test "$(aws sts get-caller-identity --query Account --output text)" = "${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}"
+        env:
+          DEV_ACCOUNT: ${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}
+        run: test "$(aws sts get-caller-identity --query Account --output text)" = "$DEV_ACCOUNT"
       - run: npm ci
       - run: npm run build
       - name: Resolve development cell identities
@@ -133,6 +142,7 @@ jobs:
       - name: Deploy fixed development cells
         env:
           UBEEQ_LAMBDA_RUNTIME: ${{ inputs.runtime || 'rust' }}
+          UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN: ${{ vars.UBEEQ_DEV_LIVE_ROLE_ARN }}
         run: |
           UBEEQ_SOURCE_REGION="$SOURCE_REGION" \
           UBEEQ_DESTINATION_REGION="$DESTINATION_REGION" \
@@ -144,7 +154,6 @@ jobs:
           UBEEQ_DESTINATION_CELL_ID="$DESTINATION_CELL_ID" \
           UBEEQ_SOURCE_BASE_URL="$SOURCE_EXISTING_API_URL" \
           UBEEQ_DESTINATION_BASE_URL="$DESTINATION_EXISTING_API_URL" \
-          UBEEQ_MIGRATION_OPERATOR_PRINCIPAL_ARN="arn:aws:iam::${{ vars.UBEEQ_DEV_AWS_ACCOUNT_ID }}:role/UbeeqDevMultiCellLiveGithubActions" \
           node scripts/deploy-aws-serverless-regional-cells.mjs
       - name: Read deployed development stack outputs
         run: |
