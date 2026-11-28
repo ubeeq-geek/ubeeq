@@ -3,10 +3,45 @@ use image::{DynamicImage, RgbaImage, metadata::Orientation};
 
 use crate::render::{DecodeLimits, Error};
 
+/// Recognize AVIF file-type brands without interpreting or allocating image data.
+pub fn is_avif(source: &[u8]) -> bool {
+    file_type(source).is_some_and(|(major, compatible)| {
+        avif_brand(major) || compatible.chunks_exact(4).any(avif_brand)
+    })
+}
+
+fn avif_brand(brand: &[u8]) -> bool {
+    matches!(brand, b"avif" | b"avis" | b"avio")
+}
+
+fn file_type(source: &[u8]) -> Option<(&[u8], &[u8])> {
+    if source.get(4..8)? != b"ftyp" {
+        return None;
+    }
+    let (size, header) = match u32::from_be_bytes(source.get(..4)?.try_into().ok()?) {
+        1 => (u64::from_be_bytes(source.get(8..16)?.try_into().ok()?), 16),
+        size => (u64::from(size), 8),
+    };
+    // File type has two fixed 4-byte fields and a byte-aligned brand table.
+    if size > 1024 {
+        return None;
+    }
+    let payload = source.get(header..usize::try_from(size).ok()?)?;
+    if payload.len() < 8 || payload.len() % 4 != 0 {
+        return None;
+    }
+    Some((&payload[..4], &payload[8..]))
+}
+
 /// Decode a bounded still AVIF item and apply its container orientation.
 pub fn decode_oriented_still(source: &[u8], budget: DecodeLimits) -> Result<DynamicImage, Error> {
     if source.is_empty() || source.len() > budget.bytes {
         return Err("Image source exceeds the input byte limit".into());
+    }
+    if let Some((major, compatible)) = file_type(source)
+        && (major == b"avis" || compatible.chunks_exact(4).any(|brand| brand == b"avis"))
+    {
+        return Err("A still AVIF image is required".into());
     }
     let allocation = usize::try_from(budget.allocation_bytes)?;
     // Reserve room for high-bit-depth planes, the RGBA conversion and orientation.
@@ -100,6 +135,19 @@ mod tests {
             pixels: 64,
             allocation_bytes: 64 * 1024 * 1024,
         };
+        let mut compatible = STILL.to_vec();
+        compatible[8..12].copy_from_slice(b"mif1");
+        assert!(is_avif(&compatible));
+        assert!(decode_oriented_still(&compatible, budget).is_ok());
+        compatible[8..12].copy_from_slice(b"avis");
+        assert!(is_avif(&compatible));
+        assert_eq!(
+            decode_oriented_still(&compatible, budget)
+                .unwrap_err()
+                .to_string(),
+            "A still AVIF image is required"
+        );
+        assert!(!is_avif(&STILL[..16]));
         let pixels = decode_oriented_still(STILL, budget).unwrap().into_rgba8();
         assert_eq!(pixels.dimensions(), (8, 6));
         let [r, g, b, a] = pixels.get_pixel(0, 0).0;
