@@ -1,0 +1,31 @@
+name: Rust shared adapters
+
+on:
+  pull_request:
+    paths:
+      - rust/**
+      - .github/workflows/rust-shared-adapters.yml
+  push:
+    branches: [main]
+    paths:
+      - rust/**
+      - .github/workflows/rust-shared-adapters.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0 --profile minimal
+      - name: Test locked shared crates with all features
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/ubeeq-rust-adapters-target"
+          cargo +1.100.0 test --locked --all-features --manifest-path rust/adapters/media-ffmpeg/Cargo.toml
+          cargo +1.100.0 test --locked --all-features --manifest-path rust/adapters/media-image/Cargo.toml
+          cargo +1.100.0 test --locked --all-features --manifest-path rust/integrations/vimeo/Cargo.toml
