@@ -9,6 +9,28 @@ pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROBE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Verifies that an absolute FFmpeg or ffprobe path can launch with its libraries.
+pub async fn verify_binary(path: &Path) -> Result<(), Error> {
+    if !path.is_absolute() {
+        return Err("An absolute video tool path is required".into());
+    }
+    let mut command = Command::new(path);
+    command
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(5), command.status())
+        .await
+        .map_err(|_| format!("Video tool startup timed out for {}", path.display()))?
+        .map_err(|error| format!("Could not start video tool {}: {error}", path.display()))?;
+    if !status.success() {
+        return Err(format!("Video tool {} exited with {status}", path.display()).into());
+    }
+    Ok(())
+}
+
 /// Reads raw stream and container metadata from a local media file.
 pub async fn probe(ffprobe: &Path, input: &Path) -> Result<Value, Error> {
     let format = input_format(input)?;
@@ -242,6 +264,14 @@ mod process_tests {
         }.await;
         std::fs::remove_dir_all(directory)?;
         result
+    }
+
+    #[tokio::test]
+    async fn requires_a_working_absolute_tool() {
+        assert!(verify_binary(Path::new("/usr/bin/true")).await.is_ok());
+        assert!(verify_binary(Path::new("ffprobe")).await.is_err());
+        assert!(verify_binary(Path::new("/usr/bin/false")).await.is_err());
+        assert!(verify_binary(Path::new("/dev/null")).await.is_err());
     }
 
     #[tokio::test]
