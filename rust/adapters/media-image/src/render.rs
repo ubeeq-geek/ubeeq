@@ -179,6 +179,8 @@ fn source_decoder<'a>(
         Some(ImageFormat::Png) => "image/png",
         Some(ImageFormat::Gif) => "image/gif",
         Some(ImageFormat::WebP) => "image/webp",
+        #[cfg(feature = "still-images")]
+        Some(ImageFormat::Tiff) => "image/tiff",
         _ => return Err("Unsupported source image format".into()),
     };
     if mime.is_some_and(|mime| mime != detected) {
@@ -343,6 +345,8 @@ mod tests {
             (ImageFormat::Png, "image/png"),
             (ImageFormat::Gif, "image/gif"),
             (ImageFormat::WebP, "image/webp"),
+            #[cfg(feature = "still-images")]
+            (ImageFormat::Tiff, "image/tiff"),
         ] {
             let mut encoded = Cursor::new(Vec::new());
             source.write_to(&mut encoded, format).unwrap();
