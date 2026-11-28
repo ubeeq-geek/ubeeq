@@ -80,6 +80,8 @@ pub fn render(input: ImageInput<'_>, profile: ImageProfile<'_>) -> Result<Rendit
         "image/png" => "png",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        #[cfg(feature = "avif")]
+        "image/avif" => "heif",
         #[cfg(feature = "still-images")]
         "image/tiff" => "tiff",
         _ => return Err("Unsupported source image format".into()),

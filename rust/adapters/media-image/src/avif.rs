@@ -232,6 +232,40 @@ mod tests {
     }
 
     #[test]
+    fn avif_renditions_keep_the_sharp_metadata_contract() {
+        use crate::renditions::{ImageInput, ImageProfile, render};
+
+        let rendition = render(
+            ImageInput {
+                asset_id: "asset",
+                source_version: "version",
+                mime: "image/avif",
+                bytes: STILL,
+                square_crop: None,
+            },
+            ImageProfile {
+                names: Some(&["w320"]),
+                oriented: true,
+                decode_limits: DecodeLimits {
+                    bytes: 1024,
+                    pixels: 64,
+                    allocation_bytes: 64 * 1024 * 1024,
+                },
+                max_output_bytes: 4096,
+            },
+        )
+        .unwrap();
+        assert_eq!(rendition.metadata["width"], 8);
+        assert_eq!(rendition.metadata["rawSourceWidth"], 8);
+        assert_eq!(rendition.metadata["sourceOrientation"], 1);
+        assert_eq!(rendition.metadata["decodedFormat"], "heif");
+        assert_eq!(
+            rendition.renditions[0].lineage["sourceVersionId"],
+            "version"
+        );
+    }
+
+    #[test]
     fn decodes_a_still_avif_and_rejects_unbounded_inputs() {
         let budget = DecodeLimits {
             bytes: 1024,

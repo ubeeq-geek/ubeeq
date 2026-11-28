@@ -110,6 +110,20 @@ pub(crate) fn decode_rendition_source(
     limits: DecodeLimits,
     oriented: bool,
 ) -> Result<(SourceImage, ImageSize, u8, &'static str), Error> {
+    #[cfg(feature = "avif")]
+    if mime == "image/avif" {
+        if !crate::avif::is_avif(source) {
+            return Err("Image does not match its declared MIME type".into());
+        }
+        let pixels = crate::avif::decode_oriented_still(source, limits)?;
+        // The container's crop and orientation are part of the decoded image.
+        // Crop coordinates and raw geometry refer to that image in both profiles.
+        let size = ImageSize {
+            width: pixels.width().try_into()?,
+            height: pixels.height().try_into()?,
+        };
+        return Ok((SourceImage { pixels, size }, size, 1, "image/avif"));
+    }
     let (mut decoder, raw_size, format) = source_decoder(source, limits, Some(mime))?;
     let orientation = if oriented {
         decoder.orientation()?
